@@ -632,7 +632,25 @@ Meta options cannot be removed: they are appended to every judge choice regardle
   are dropped when the task changes, after 2 minutes, or when the spawn that consumed them settles
   (the order is retired on the SPAWN, not on the task tool's own `tool_result`, which omp emits
   first - see F1 in the hand-off gate above).
-- Provider prompt-cache hits are not measured.
+- Provider prompt-cache hits for the Jev route are not claimed: that route reports exactly
+  `input_tokens`/`output_tokens` and no cache field. The executor route does report them (`cacheRead`,
+  `cacheWrite`) and a live cached-token hit was observed, but this repository contains no capture code
+  for that route.
+- The acceptance side of the hand-off gate is opt-in through `gates.handoffAcceptance` (off by
+  default) because the host delivers the delegated result as a background completion; with it off,
+  the spawn acknowledgement is recorded as not judged rather than judged wrongly.
+- A dispatch refusal is recorded after the host's `task` tool result exists in the session (the
+  verdict lands 299-428 ms later), so whether omp still cancels the spawn at that point is unproven:
+  no refusal has been produced in a live run.
+- The judge abstains on questions that rest on the owner's preference rather than on evidence in the
+  request - "should this be built" asked of it returned `insufficient_evidence` (0.35-0.64) three
+  times, and the product's fail-closed rule then leaves the decision unmade rather than guessing it.
+- The product's value is not demonstrated in its own favour. Two blind with-or-without runs over 72
+  requirement observations found no outcome difference (both arms kept every requirement) and a real
+  cost difference - 24 judge consultations and 78k judge input tokens on the addon side against none
+  on the control in the second run. The task sets did not make the control arm drift, so the benefit
+  is untested, not disproved; the cost is measured. The harness that produced both runs is
+  `tools/measurement/` (`bun run tools/measurement/run.ts --self-test` validates the checks first).
 - Completion judging does not guarantee correctness.
 
 ## License
