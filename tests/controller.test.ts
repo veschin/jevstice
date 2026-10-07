@@ -721,7 +721,49 @@ describe("jev controller", () => {
 		expect(outcome.reasons.join(" ")).toContain("fail-closed");
 	});
 
-	test("calibration rule: two consecutive mid-band approves record approval and pass stop gate", async () => {
+	test("round6/7: openAspectGaps restored from persisted state keeps completion teeth", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({
+			judge: async () => {
+				throw new Error("must not be called");
+			},
+			catalogIds: new Set(ASPECTS),
+			aspectCoverageJudge: async () => ({
+				markings: { "topic-a": "applicable_and_addressed", "topic-b": "applicable_not_addressed" },
+				reasons: [],
+				judged: true,
+			}),
+		});
+		controller.register(harness.pi);
+		await controller.submitDecision(
+			aspectInput({
+				evidence: [evidence("spec", "REQ spec quote covering both aspects here"), evidence("execution", "dry-run output ok")],
+			}),
+		);
+		expect(controller.getState().openAspectGaps?.missed).toBeDefined();
+		const saved = harness.appended.filter(a => a.customType === "jev.state");
+		const harness2 = makeFakePi();
+		const controller2 = createJevController({ judge: async () => judgeResult({}) });
+		controller2.register(harness2.pi);
+		const last = saved[saved.length - 1]?.data;
+		controller2.onSessionStart([{ customType: "jev.state", data: last }]);
+		expect(controller2.getState().openAspectGaps?.missed).toBeDefined();
+	});
+
+	test("round6/7 F1: raised threshold keeps single strict bar, no streak credit", async () => {
+		const controller = createJevController({
+			judge: async () => judgeResult({ confidence: 0.65 }),
+			template: { confidenceThreshold: 0.9 },
+		});
+		const first = await controller.submitDecision(validDecisionInput());
+		const second = await controller.submitDecision(validDecisionInput());
+		expect(first.verdict).toBe("insufficient_evidence");
+		expect(second.verdict).toBe("insufficient_evidence");
+		expect(controller.getState().approvals.length).toBe(0);
+		expect(controller.getState().consecutiveCompletionApproves).toBeUndefined();
+	});
+
+	test("P3: duplicate + short evidence rejected pre-judge without counter burn", async () => {
 		const harness = makeFakePi();
 		let conf = 0.7;
 		const controller = createJevController({ judge: async () => judgeResult({ confidence: conf }) });

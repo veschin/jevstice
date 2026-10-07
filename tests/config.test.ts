@@ -143,6 +143,17 @@ describe("jev template config", () => {
 		}
 	});
 
+	test("D2: completion.confidenceFloor above the strict bar rejected as inert", () => {
+		try {
+			validateTemplateConfig(PROJECT_FILE, { completion: { confidenceFloor: 0.85 } });
+			expect.unreachable();
+		} catch (err) {
+			expect(err).toBeInstanceOf(JevConfigError);
+			expect((err as Error).message).toContain("confidenceFloor");
+			expect((err as Error).message).toContain("inert");
+		}
+	});
+
 	test("merge is per-key and keeps untouched keys", () => {
 		const user: JevTemplateConfig = {
 			stages: {

@@ -85,3 +85,10 @@ WHEN the executor submits stage=course_check with current action + requirement q
 THEN the judge returns per-requirement drift answers (still on track?) and a next-action from the fixed set [continue, return_to_requirement, replan, ask_user, verify_before_proceeding]; return_to_requirement/replan push same-session feedback and count toward bounded rework; ask_user escalates; continue/verify record without approving; judge failure/low confidence never resolves to continue.
 Evidence: tests/controller.test.ts (drift revise + not-on-track ids + feedback + no-approval; fail-closed; requirement-less rejection), tests/client.test.ts (createCourseCheckJudge body/fail-closed), live run in evidence/ac1-omp-smoke.log (course_check section: approve/verify_before_proceeding, reasons [low_confidence], confidence 0.74, judged=true — floor enforced live).
 Observed: PASS (drift Noul per requirement + fixed next-action wired in production path; reviewers round 3 CLEAR + round 4 wiring scope).
+
+## AC12 — aspect_coverage + calibration-tolerant completion (S:U11/S:U13 extension)
+GIVEN catalog topics and an executor submitting claimed aspects.
+WHEN stage=aspect_coverage with aspects[] (unknown ids rejected pre-judge).
+THEN three-way marking; missed aspects -> revise + feedback + completion blocker ("aspects not addressed") until re-submitted all-addressed; meta escape -> insufficient_evidence. Completion with confidence in [0.6,0.8) requires 2 consecutive approves (config raise-only); <0.6 never counts; exhaustion escalates.
+Evidence: tests/controller.test.ts (aspect + streak cases), tests/config.test.ts; live runs in evidence/.
+Observed: PASS (171/171; reviewers round 6 on deltas).

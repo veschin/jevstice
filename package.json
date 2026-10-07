@@ -1,5 +1,5 @@
 {
-  "name": "jev",
+  "name": "jevstice",
   "version": "0.1.0",
   "description": "Jev decision judge for oh my pi: TypeSafe systemone client, catalog routing, omp extension controller",
   "type": "module",

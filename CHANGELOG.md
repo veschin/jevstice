@@ -19,3 +19,4 @@
 - Polish phase (Jev-guided, 6 requests / 5 changes): evidence pre-check, verdict summary lines, friction texts, discriminating drift phrasing, drift visibility; judge-ordered freeze.
 - Field trial: minecraft clone built autonomously via the addon (deepseek-flash); work execution-verified; completion gate fail-closed on 5 sub-floor approves -> honest escalation (calibration finding for GAP:3). Verdict: evidence/mc-session-verdict.md.
 - Meta-options: every judge Choice carries ALL_OPTIONS_WRONG/PARTIALLY_RIGHT_NONE_FULL/NO_FIT_OTHER_REASON + meta_reason; escape never approves (review CLEAR).
+- Release gate: aspect-drift teeth persist across restarts; completion streak only at policy-default threshold (raised thresholds = strict single bar); inert confidenceFloor rejected at load; README rewritten for public release; MIT license; renamed jevstice. 174/174 tests, tsc clean, guard clean; reviews CLEAR rounds 6-8.

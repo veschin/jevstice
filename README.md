@@ -1,77 +1,64 @@
-# Jev — course-check judge for oh my pi
+# jevstice - Jev as architect over any omp executor
 
-Jev (TypeSafe systemone, `jev-latest` = jev-1.13.0) is a type-safe decision model: it answers Noul/Choice/Score questions — it never generates text. This package wires it into omp so the executor answers THROUGH the judge: **am I working correctly / have I drifted from the requirements / what to do next** (`course_check` stage: per-requirement drift Noul + next-action from a fixed set [continue, return_to_requirement, replan, ask_user, verify_before_proceeding]). File-mutation gating (plan/completion) remains as a backstop, not the product's face.
+*justice + Jev - jevstice for all.*
 
-Status, observed coverage, and honest limits: see `PLAN.md` and `PRD.md`.
+jevstice wires the TypeSafe decision model **Jev** (`jev-latest` = jev-1.13.0) into [oh-my-pi](https://github.com/can1357/oh-my-pi) as a universal decision-point engine: the executor answers THROUGH the judge instead of guessing - *am I working correctly, have I drifted from the requirements, what do I do next, is this done?* Jev answers only Noul/Choice/Score questions over fixed option sets; it never writes prose, and it can always escape a badly-framed question via mandatory meta-options (`ALL_OPTIONS_WRONG`, `PARTIALLY_RIGHT_NONE_FULL`, `NO_FIT_OTHER_REASON`).
 
-## Launch (verified)
+Status, observed coverage, and honest limits: see `PLAN.md`, `ACCEPTANCE.md`, and `evidence/`.
+
+## Quickstart
 
 ```sh
-cd /tmp/jev-smoke   # any project dir
+# one-shot launch (no global install):
+cd <your-project>
 TYPESAFE_API_KEY="$(pass show token/jev)" omp \
-  -e /home/veschin/ai/jev/src/index.ts \
-  -p "<your task; the agent must call the jev_decision tool for plan/completion gates>" \
-  --model zai/glm-5.3-flash
+  -e /path/to/jevstice/src/index.ts \
+  -p "<your task; the agent must call the jev_decision tool>" \
+  --model <your-model>
+
+# CLI:
+TYPESAFE_API_KEY="$(pass show token/jev)" bun src/cli.ts probe          # reachability check
+TYPESAFE_API_KEY="$(pass show token/jev)" bun src/cli.ts request.json   # DecisionRequest -> verdict
 ```
 
-No global install/config changes. In an interactive session the same `-e` flag loads the extension; the agent submits decisions via the registered `jev_decision` tool (never via file writes).
+Project-dir install (`.omp/extensions/`) or user-global `~/.omp/agent/extensions/` also work via omp's native discovery - those are user actions, not done by this repo.
 
-## Credentials
+## Gates (the presets)
 
-Never stored by Jev. Provide at runtime:
+- **plan** (`understanding_review` / `direction_review`): file-mutating calls are blocked until the judge approves a plan backed by verbatim quoted evidence. Reads stay free.
+- **completion** (`completion_review`): "done" requires execution/code/log evidence - a report alone never approves. Confidence in [0.6, 0.8) needs **2 consecutive approves** (calibration-tolerant); below 0.6 never counts.
+- **course_check**: per-requirement drift Noul + a next-action from a fixed set (`continue`, `return_to_requirement`, `replan`, `ask_user`, `verify_before_proceeding`).
+- **aspect_coverage**: forgotten-aspect detection - claimed aspects are three-way marked against a topic catalog (`applicable_and_addressed` / `applicable_not_addressed` / `not_applicable`); missed aspects block completion until addressed.
 
-```sh
-export TYPESAFE_API_KEY="$(pass show token/jev)"   # or your own env
-```
+Everything is fail-closed: judge errors, malformed answers, meta-option escapes and low confidence can **never** approve. Rework is bounded (3 iterations per stage, then an explicit `ask_user` - no fake success). Approvals bind to a task fingerprint + content digest + work revision, so stale approvals can't be replayed.
 
-Optional: `TYPESAFE_API_URL` (default `https://api.typesafe.ai/v1/systemone`).
+## Configuration
 
-## CLI
-
-```sh
-bun run src/cli.ts probe            # live reachability check; error JSON on stderr, exit 4 on failure
-bun run src/cli.ts request.json     # DecisionRequest (or - for stdin) -> DecisionResult JSON on stdout
-```
-
-Request JSON: `{stage, task, proposal, options:[{id,label,meaning}], evidence:[{kind,source,quote}]}`. Exit codes: 0 = valid judge verdict (even revise); 2 = invalid input; 4 = transport/auth/config error. Errors go to stderr as JSON; stdout stays empty on failure. Judge failure never approves.
-
-## Templates and overrides
-
-Defaults (stage instructions, option sets, thresholds, capability defaults) are versioned in the package. Override file (JSON), searched at:
-
-1. `<cwd>/.omp/jev.config.json` (project)
-2. `~/.omp/agent/jev.config.json` (user)
+Optional JSON overrides, searched at `<cwd>/.omp/jev.config.json` (project) then `~/.omp/agent/jev.config.json` (user):
 
 ```json
 {
   "confidenceThreshold": 0.9,
+  "completion": { "consecutiveApproves": 3, "confidenceFloor": 0.7 },
   "stages": {
     "direction_review": {
-      "instructions": "Additional project-specific review focus (appended after the built-in untrusted-evidence policy).",
-      "options": [ { "id": "proceed", "label": "Proceed", "meaning": "continue the plan" },
-                   { "id": "stop", "label": "Stop", "meaning": "abort" } ]
+      "instructions": "extra review focus (appended after the built-in untrusted-evidence policy)",
+      "options": [ { "id": "proceed", "label": "Proceed", "meaning": "continue" } ]
     }
   },
-  "capabilities": ["feature-id-a", "feature-id-b"]
+  "controlPoints": { "my_checkpoint": { "trigger": "on_demand", "instructions": "..." } }
 }
 ```
 
-Trust model: config files are trusted input from the person running omp; a project file shapes prompts but cannot weaken the approval floor (`confidenceThreshold` may only raise it above 0.8; precedence user > project for the threshold, project > user for prompt-shaping keys). Invalid override → the extension refuses to register `jev_decision` with the file path and problem — never a silent fallback.
-
-## Control points (universal engine)
-
-All decision stages are presets of one declarative engine. Built-in presets: `understanding_review`, `direction_review` (trigger: mutation gate), `completion_review` (trigger: session stop), `course_check` (on-demand drift check + next action). Custom control points can be declared in `jev.config.json` under `controlPoints` — currently `trigger: "on_demand"` only (advisory: verdicts are recorded and fed back in-session, they never grant approvals); declaring gate triggers is rejected with an explicit error (roadmap). Engine services shared by every preset: fail-closed verdict handling, digest/fingerprint staleness, bounded rework, same-session feedback.
+Thresholds and counts are raise-only. Service/meta options cannot be removed. Invalid config -> the extension refuses to register the tool, naming the file and the problem - never a silent fallback. Config files are trusted input from the person running omp; a project file shapes prompts but cannot weaken the approval floor.
 
 ## Known limits
 
-- Mutation gate covers builtin mutating tools (edit, write, ast_edit, bash, memory_edit, manage_skill); custom/MCP tools are outside it.
-- Subagent sessions load their own extensions: gates are per-session; a subagent's mutations are not seen by the parent's gate but the subagent must satisfy its own plan/completion gates.
-- Provider prompt-cache hits are NOT claimed; cache measurement is deferred scope.
-- Completion judging reduces but does not eliminate wrong-approval risk; numeric quality metrics remain an open user decision (PRD GAP:1).
+- The mutation gate covers builtin mutating tools only; custom/MCP tools are outside it.
+- Subagent sessions enforce their own gates (per-session state); the parent does not see subagent tool calls.
+- Provider prompt-cache hits are not claimed or measured.
+- Completion judging reduces, but does not eliminate, wrong-approval risk.
 
-## Policy defaults (choices, not user-approved requirements)
+## License
 
-- Judge failure / unavailability / confidence < 0.8 -> `revise`/`insufficient_evidence`/`ask_user`; never approve.
-- Executor↔judge rework bounded at 3 iterations, then escalate with a blocker.
-- Model routing only among caller-configured candidates; judge model fixed `jev-latest`, no fallback.
-- Completion claims need code/execution/log/docs evidence; a report alone cannot approve.
+[MIT](LICENSE)

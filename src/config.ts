@@ -13,6 +13,7 @@ import * as fs from "node:fs";
 import { isRecord, nonEmptyString } from "./guards.js";
 import { validateDeclaredControlPoint } from "./control-points.js";
 import { STAGES } from "./stages.js";
+import { POLICY } from "./types.js";
 
 export interface StageTemplate {
 	/** Extra instructions prepended to the judge request for this stage. */
@@ -115,6 +116,13 @@ export function validateTemplateConfig(file: string, raw: unknown): JevTemplateC
 		if (cf !== undefined) {
 			if (typeof cf !== "number" || !Number.isFinite(cf) || cf < 0 || cf > 1) {
 				throw new JevConfigError(file, "completion.confidenceFloor must be a number in 0..1");
+			}
+			if (cf > POLICY.minConfidenceToApprove) {
+				// D2: a floor above the strict bar is silently inert — reject instead.
+				throw new JevConfigError(
+					file,
+					`completion.confidenceFloor ${cf} exceeds the strict bar ${POLICY.minConfidenceToApprove} and would be inert`,
+				);
 			}
 			completion.confidenceFloor = cf;
 		}

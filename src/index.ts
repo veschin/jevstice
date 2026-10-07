@@ -127,12 +127,15 @@ export function createJevExtension(deps: Partial<ControllerDeps> = {}) {
 							if (result.applicable[a.id] !== true) {
 								markings[a.id] = "not_applicable";
 							} else {
+								// F2: word-boundary match (same rule as coverageGaps), not substring.
 								const labelWords = (aspectTexts.get(a.id) ?? a.text)
 									.toLowerCase()
 									.split(/[^\p{L}\p{N}]+/u)
 									.filter(w => w.length > 3);
 								markings[a.id] =
-									labelWords.some(w => corpus.includes(w))
+									labelWords.some(w =>
+										new RegExp(`(^|[^\\p{L}\\p{N}_])${w}([^\\p{L}\\p{N}_]|$)`, "u").test(corpus),
+									)
 										? "applicable_and_addressed"
 										: "applicable_not_addressed";
 							}

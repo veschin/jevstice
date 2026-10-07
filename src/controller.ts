@@ -651,7 +651,7 @@ export class JevController {
 				routedModel: typeof data["routedModel"] === "string" ? data["routedModel"] : undefined,
 				routedSkill: typeof data["routedSkill"] === "string" ? data["routedSkill"] : undefined,
 				lastCourseCheck: undefined,
-				openAspectGaps: undefined,
+				openAspectGaps: restoreAspectGaps(data["openAspectGaps"]),
 				consecutiveCompletionApproves: undefined,
 			};
 			return;
@@ -874,7 +874,10 @@ export class JevController {
 		// Calibration-tolerant completion: normalize with the lowered bar so mid-band
 		// approves survive; the counting block below enforces floor/count/teeth.
 		const stopStage = lookupControlPoint(input.stage, this.extraPoints)?.trigger === "session_stop";
-		const normalizeBar = stopStage
+		// F1 policy interaction: the streak path applies ONLY at the POLICY default bar;
+		// a raised threshold keeps a single strict bar (no streak credit).
+		const streakEligible = this.minConfidence === POLICY.minConfidenceToApprove;
+		const normalizeBar = stopStage && streakEligible
 			? Math.min(this.minConfidence, this.completionConfidenceFloor)
 			: this.minConfidence;
 		const normalized = normalizeJudgeResult(rawResult, judgeOptions, normalizeBar);
@@ -924,6 +927,7 @@ export class JevController {
 		}
 		if (
 			stopStage &&
+			streakEligible &&
 			result.verdict === "approve" &&
 			result.confidence !== undefined &&
 			result.confidence < this.minConfidence
@@ -1271,6 +1275,17 @@ export class JevController {
 	private persist(): void {
 		this.pi?.appendEntry(STATE_ENTRY_TYPE, this.state);
 	}
+}
+
+/** Validate persisted aspect gaps (D1): a restart must not bypass completion teeth. */
+function restoreAspectGaps(raw: unknown): { missed: string[]; taskFingerprint: string | undefined } | undefined {
+	if (!isRecord(raw)) return undefined;
+	const missed = Array.isArray(raw["missed"]) ? raw["missed"].filter((m): m is string => typeof m === "string") : [];
+	if (missed.length === 0) return undefined;
+	return {
+		missed,
+		taskFingerprint: typeof raw["taskFingerprint"] === "string" ? raw["taskFingerprint"] : undefined,
+	};
 }
 
 function extraPointsFromTemplate(template: JevTemplateConfig): ReadonlyMap<string, ControlPoint> {
