@@ -546,8 +546,9 @@ export function createClaimCheckJudge(config: JevClientConfig): ClaimCheckJudge 
       );
     }
     const claims = request.claims ?? [];
-    if (claims.length === 0) {
-      throw new JevApiError("invalid_input", "claim check needs at least one claim");
+    if (claims.length < 2) {
+      // One claim is the single-question form this preset replaces; the type documents 2..N.
+      throw new JevApiError("invalid_input", "claim check needs at least two claims");
     }
     claims.forEach((claim, i) => {
       if (typeof claim.id !== "string" || claim.id.length === 0) {
@@ -606,8 +607,10 @@ export function createClaimCheckJudge(config: JevClientConfig): ClaimCheckJudge 
         }
         supported[claim.id] = p >= CLAIM_CHECK_SUPPORTED_THRESHOLD;
       }
+      // Per batch, not against the accumulated map: with >255 claims (several shards) an echo of an
+      // earlier batch's id must still fail closed.
       for (const id of Object.keys(answers)) {
-        if (!(id in supported)) return claimFailClosed(`unknown id ${id}`);
+        if (!batch.some(c => c.id === id)) return claimFailClosed(`unknown id ${id}`);
       }
     }
     return { supported, reasons: [], judged: true };

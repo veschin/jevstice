@@ -2050,6 +2050,27 @@ describe("jev controller: frame-escape advice (a rejected option set names the f
 		expect(outcome.summary).toContain(SERVICE_OPTION_FIX["ALL_OPTIONS_WRONG"] as string);
 	});
 
+	test("a frame escape that maps to revise or ask_user carries the fix in the summary line", async () => {
+		const cases: Array<[string, DecisionResult["verdict"], string]> = [
+			["PARTIALLY_RIGHT_NONE_FULL", "revise", "sent back with reasons"],
+			["NO_FIT_OTHER_REASON", "ask_user", "escalate to the user"],
+		];
+		for (const [service, verdict, base] of cases) {
+			const fix = SERVICE_OPTION_FIX[service] as string;
+			const controller = createJevController({
+				judge: async () => ({
+					verdict,
+					reasons: ["meta_option", service, "meta_reason:options_incomplete", `${FRAME_FIX_PREFIX}${fix}`],
+					confidence: 0.97,
+				}),
+			});
+			const outcome = await controller.submitDecision(validDecisionInput());
+			expect(outcome.verdict).toBe(verdict);
+			expect(outcome.summary).toContain(base);
+			expect(outcome.summary).toContain(fix);
+		}
+	});
+
 	test("a non-escape insufficient_evidence keeps its generic summary", async () => {
 		const controller = createJevController({
 			judge: async () => ({ verdict: "insufficient_evidence", reasons: ["judge_insufficient_evidence"], confidence: 0.5 }),
@@ -2392,5 +2413,24 @@ describe("jev controller: subagent handoff (FR-11)", () => {
 		expect(calls.length).toBe(1);
 		expect(calls[0]?.evidence.some(e => e.quote.includes(WORK_ORDER))).toBe(true);
 		expect(calls[0]?.evidence.some(e => e.quote.includes("refused before it reached the host"))).toBe(false);
+	});
+});
+
+describe("jev controller: FR-10 stages", () => {
+	test("important_decision and code_review are submittable and never grant an approval", async () => {
+		for (const stage of ["important_decision", "code_review"] as const) {
+			const controller = createJevController({ judge: async () => judgeResult({}) });
+			const out = await controller.submitDecision(validDecisionInput({ stage }));
+			expect(out.verdict).toBe("approve");
+			expect(controller.getState().approvals.length).toBe(0);
+		}
+	});
+
+	test("the removed refactor_check name is rejected as an unknown stage", async () => {
+		const controller = createJevController({ judge: async () => judgeResult({}) });
+		const out = await controller.submitDecision(validDecisionInput({ stage: "refactor_check" as never }));
+		expect(out.verdict).toBe("insufficient_evidence");
+		expect(out.judged).toBe(false);
+		expect(out.reasons.join(" ")).toContain("stage must be one of");
 	});
 });

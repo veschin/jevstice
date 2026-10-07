@@ -594,9 +594,10 @@ export class JevController {
 				"Consultation protocol (it decides the answer quality; live: 0.14-0.26 ungrounded against " +
 				"0.79-0.96 for the same material phrased as a claim): one decision per request — write a claim " +
 				"and ask whether the quoted evidence supports it, never an open request to approve a summary; " +
-				"3-6 short non-duplicate quotes, and on plan stages at least one requirement quote (kind user or " +
-				"spec) appearing verbatim inside the proposal, so the plan is a claim checked against the quoted " +
-				"evidence; 2-4 real alternatives whose meanings state what choosing them commits you to. " +
+				"3-6 short non-duplicate quotes; on plan stages at least one submitted quote (20+ characters) must " +
+				"appear verbatim inside the proposal and at least one requirement quote (kind user or spec) must be " +
+				"among the evidence, so the plan is a claim checked against the quoted evidence; 2-4 real " +
+				"alternatives whose meanings state what choosing them commits you to. " +
 				"A plan-stage proposal that quotes no evidence is refused before any judge call, consuming no " +
 				"rework, with the fix named. An abstention is not a verdict: insufficient_evidence means better " +
 				"evidence is needed, not the same request again, and a judge-chosen service option means the " +
@@ -1212,10 +1213,14 @@ export class JevController {
 				line = `${stage}: approve — ${outcome.selectedOption ?? ""}${meaningOf(outcome.selectedOption)}`;
 				break;
 			case "revise":
-				line = `${stage}: revise — sent back with reasons (iteration ${used}/${this.maxReworkIterations})`;
+				line =
+					`${stage}: revise — sent back with reasons (iteration ${used}/${this.maxReworkIterations})` +
+					(frameFix !== undefined ? ` — ${frameFix.slice(FRAME_FIX_PREFIX.length)}` : "");
 				break;
 			case "ask_user":
-				line = `${stage}: ask_user — escalate to the user`;
+				line =
+					`${stage}: ask_user — escalate to the user` +
+					(frameFix !== undefined ? ` — ${frameFix.slice(FRAME_FIX_PREFIX.length)}` : "");
 				break;
 			default:
 				if (frameFix !== undefined) {

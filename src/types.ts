@@ -36,7 +36,6 @@ export type DecisionStage =
   | "important_decision" // FR-10: main-model decision gate
   | "code_review" // FR-10: code review gate
   | "subagent_handoff" // FR-11: validate dispatch and acceptance
-  | "refactor_check" // FR-13: capability preservation
   | "aspect_coverage" // universal engine: forgotten-aspect three-way coverage check + FR-18 course_check (see control-points registry)
   | "claim_check"; // universal engine: per-claim support marking against quoted evidence (measured decisive per-claim regime)
 

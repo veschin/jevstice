@@ -64,6 +64,20 @@ export const CONTROL_POINT_REGISTRY: Readonly<Record<string, ControlPoint>> = {
 		fixedOptionIds: COURSE_CHECK_OPTION_IDS,
 		verdictMapping: "course_check",
 	},
+	// FR-10: the main model puts an important decision, and a finished code review, to the
+	// judge through fixed options and acts on the answer. On-demand, never gate-granting.
+	important_decision: {
+		stage: "important_decision",
+		trigger: "on_demand",
+		verdictMapping: "standard",
+	},
+	code_review: {
+		stage: "code_review",
+		trigger: "on_demand",
+		verdictMapping: "standard",
+	},
+	// FR-11 dispatch/acceptance: the controller consults the judge around a subagent handoff
+	// (wired only when the owner configures the stage). On-demand, never gate-granting.
 	// FR-02/FR-03: the executor asks for a routing decision; the controller applies the
 	// selected skill or model. On-demand, never gate-granting.
 	skill_routing: {

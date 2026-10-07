@@ -627,6 +627,18 @@ describe("claim check judge", () => {
     );
   });
 
+  test("a single claim is refused as invalid_input before any transport (2..N contract)", async () => {
+    const fetchFn = (async () => {
+      throw new Error("transport must not be reached");
+    }) as unknown as typeof fetch;
+    const err = await createClaimCheckJudge({ apiKey: "k", fetchFn })({
+      ...okClaims,
+      claims: [{ id: "claim-1", text: "the only claim in this submission" }],
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(JevApiError);
+    expect((err as JevApiError).code).toBe("invalid_input");
+  });
+
   test("255 claims -> one systemone request; 256 -> two shards", async () => {
     const claimsOf = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `c${i}`, text: `claim ${i}` }));
     const counting = (counter: { calls: number }) =>
@@ -644,6 +656,26 @@ describe("claim check judge", () => {
     counter.calls = 0;
     await judge({ ...okClaims, claims: claimsOf(256) });
     expect(counter.calls).toBe(2);
+  });
+
+  test("a later shard echoing an earlier shard's id fails closed (per-batch unknown-id check)", async () => {
+    const claims = Array.from({ length: 256 }, (_, i) => ({ id: `c${i}`, text: `claim ${i}` }));
+    let shard = 0;
+    const fetchFn = (async (_url: unknown, init?: RequestInit) => {
+      const body = JSON.parse(init?.body as string) as { questions: Record<string, unknown> };
+      const answers: Record<string, unknown> = Object.fromEntries(
+        Object.keys(body.questions).map((id) => [id, { type: "noul", noul: 0.9 }]),
+      );
+      // Second shard echoes the first shard's first id: unknown for THIS batch.
+      if (shard === 1) answers["c0"] = { type: "noul", noul: 0.9 };
+      shard++;
+      return jsonResponse({ model: "jev-1.13.0", answers, usage: { input_tokens: 1, output_tokens: 1 } });
+    }) as unknown as typeof fetch;
+    const judge = createClaimCheckJudge({ apiKey: "k", fetchFn });
+    const result = await judge({ ...okClaims, claims });
+    expect(result.judged).toBe(false);
+    expect(result.supported).toEqual({});
+    expect(result.reasons.join(" ")).toContain("c0");
   });
 });
 

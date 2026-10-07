@@ -111,6 +111,11 @@
 
 ## 0.5.0 - 2026-10-07
 
+- FR-10 stages registered: `important_decision` and `code_review` were declared in the stage
+  vocabulary but had no control point, so the executor could not submit them; both are now
+  on-demand presets that never grant an approval. The declared-but-unregistered `refactor_check`
+  name is removed (its coverage lives in completion_review capabilities, AC6).
+
 - Consultation forcing (owner order: "чем лучше продукт форсит условия, тем лучше будет результат"),
   implementing the measured regimes recorded in `evidence/consultation-forcing.md`:
   - Plan stages (`understanding_review` / `direction_review`) gained a pre-judge grounding check: a

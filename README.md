@@ -129,10 +129,11 @@ uncertainty instead of stopping the work.
   calls are blocked until the judge approves a plan for the current task. Reads stay free. Submit the
   plan as a claim checked against verbatim quoted evidence (`state what it asserts, which quote
   supports it`): the judge verifies claims against quoted sources and does not score an open plan
-  summary. A plan-stage submission that quotes no evidence verbatim in its proposal (at least one
-  quote of 20+ characters), carries no `user`/`spec` evidence, repeats a quote or uses a quote
-  shorter than 20 characters is refused before the judge is called, consuming no rework, with the
-  fix named. Set `gates.mutation: false` to lift this gate entirely.
+  summary. A plan-stage submission is refused before the judge is called, consuming no rework and
+  naming the fix, when its proposal quotes no submitted evidence verbatim (at least one quote of 20+
+  characters), when it carries no `user`/`spec` evidence, or when it accumulates any two quality
+  problems (a repeated quote, a quote shorter than 20 characters). A single quality problem is judged
+  with a warning. Set `gates.mutation: false` to lift this gate entirely.
 - **completion** (`completion_review`, trigger `session_stop`): execution/code/log evidence required;
   a report alone never approves. Every task - read-only included - needs a plan-stage approval, a
   fresh `course_check` with `continue` and a completion approval for the current task fingerprint
@@ -195,6 +196,8 @@ submittable `stage` and is shaped by the config key shown:
 | `skill_routing` | `on_demand` | skill choice from `routing.skills` | `stages.skill_routing` |
 | `model_routing` | `on_demand` | model choice from `routing.models` | `stages.model_routing` |
 | `subagent_handoff` | `on_demand` | FR-11 hand-off check at the task-tool boundary (opt-in) | `stages.subagent_handoff` |
+| `important_decision` | `on_demand` | FR-10: an important decision put to the judge through fixed options | `stages.important_decision` |
+| `code_review` | `on_demand` | FR-10: a finished code review put to the judge | `stages.code_review` |
 
 `stages.<stage>` takes `instructions` (appended after the built-in untrusted-evidence policy) and
 `options` (a full replacement option set: at least 2 items with unique ids, each `{id, label,
