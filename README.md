@@ -29,6 +29,25 @@ TYPESAFE_API_KEY="$(pass show token/jev)" bun ~/.omp/agent/extensions/jevstice/s
 All submissions to the judge are written in English: the executor's own text (task, proposal,
 option labels and meanings) is English, while quoted evidence keeps its source wording verbatim.
 
+## Routing
+
+Skill and model routing read the candidate lists the owner holds:
+
+```json
+{
+  "routing": {
+    "skills": [ { "id": "harden-plan", "label": "harden-plan", "meaning": "harden a plan with a curated checklist" } ],
+    "models": [ { "id": "deepseek/deepseek-flash", "label": "fast", "meaning": "cheap, for mechanical work" } ],
+    "allowlist": ["deepseek/deepseek-flash"]
+  }
+}
+```
+
+The judge chooses only from those candidates, so it can never invent a skill or a model. Submit the
+`skill_routing` or `model_routing` stage to get a choice; an approved skill is recorded, and an
+approved model is enforced at the next subagent spawn. `allowlist` defaults to the model candidate
+list. Without candidates the stage refuses explicitly - no candidates, no routing.
+
 ## Catalog checks
 
 At the start of a new task the extension classifies it (development / analytics / query) and marks

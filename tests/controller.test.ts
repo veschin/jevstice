@@ -1664,3 +1664,74 @@ describe("jev controller: catalog checks at task start (FR-01, FR-04)", () => {
 		expect(controller.getState().taskType).toBeUndefined();
 	});
 });
+
+describe("jev controller: skill and model routing (FR-02, FR-03)", () => {
+	const routing = {
+		skills: [{ id: "harden-plan", label: "harden-plan", meaning: "apply the plan hardening pack" }],
+		models: [
+			{ id: "cheap/fast", label: "cheap", meaning: "fast cheap model" },
+			{ id: "strong/slow", label: "strong", meaning: "slow thorough model" },
+		],
+	};
+
+	test("the judge's skill choice is recorded and the candidate set is the owner's", async () => {
+		let seen: string[] = [];
+		const controller = createJevController({
+			judge: async req => {
+				seen = req.options.map(o => o.id);
+				return judgeResult({ selectedOption: "harden-plan" });
+			},
+			template: { routing },
+		});
+		const out = await controller.submitDecision(validDecisionInput({ stage: "skill_routing" }));
+		expect(seen).toEqual(["harden-plan"]);
+		expect(out.verdict).toBe("approve");
+		expect(controller.getState().routedSkill).toBe("harden-plan");
+	});
+
+	test("the judge's model choice is enforced at the next spawn", async () => {
+		const controller = createJevController({
+			judge: async () => judgeResult({ selectedOption: "cheap/fast" }),
+			template: { routing },
+		});
+		const out = await controller.submitDecision(validDecisionInput({ stage: "model_routing" }));
+		expect(out.verdict).toBe("approve");
+		expect(controller.getState().routedModel).toBe("cheap/fast");
+		const applied = controller.onBeforeSubagentSpawn({ type: "before_subagent_spawn" }, ["cheap/fast", "other/model"]);
+		expect(applied?.model).toBe("cheap/fast");
+	});
+
+	test("a model outside the allowlist never reaches the judge", async () => {
+		let seen: string[] = [];
+		const controller = createJevController({
+			judge: async req => {
+				seen = req.options.map(o => o.id);
+				return judgeResult({ selectedOption: "cheap/fast" });
+			},
+			template: { routing: { ...routing, allowlist: ["cheap/fast"] } },
+		});
+		const out = await controller.submitDecision(validDecisionInput({ stage: "model_routing" }));
+		expect(seen).toEqual(["cheap/fast"]);
+		expect(out.verdict).toBe("approve");
+		expect(controller.getState().routedModel).toBe("cheap/fast");
+	});
+
+	test("an abstaining judge applies no routing", async () => {
+		const controller = createJevController({
+			judge: async () => ({ verdict: "insufficient_evidence", reasons: ["low_confidence"], confidence: 0.3 }),
+			template: { routing },
+		});
+		const out = await controller.submitDecision(validDecisionInput({ stage: "model_routing" }));
+		expect(out.verdict).toBe("insufficient_evidence");
+		expect(controller.getState().routedModel).toBeUndefined();
+	});
+
+	test("without a routing config the stage refuses explicitly instead of approving nothing", async () => {
+		const controller = createJevController({ judge: async () => judgeResult({}) });
+		const out = await controller.submitDecision(validDecisionInput({ stage: "skill_routing" }));
+		expect(out.verdict).toBe("insufficient_evidence");
+		expect(out.judged).toBe(false);
+		expect(out.reasons.join(" ")).toContain("routing.skills");
+		expect(controller.getState().routedSkill).toBeUndefined();
+	});
+});

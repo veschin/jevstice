@@ -94,3 +94,17 @@
   the environment. FR-02/FR-03 (skill and model routing) therefore wait for an owner-held candidate
   list in the config.
 - 242/242 tests, `tsc --noEmit` clean.
+
+## 0.4.1 - 2026-10-07
+
+- FR-02/FR-03 wired: `skill_routing` and `model_routing` are registry stages and the controller
+  routes them through the catalog library against the candidate lists the owner holds in
+  `jev.config.json` (`routing.skills`, `routing.models`, optional `routing.allowlist`, which
+  defaults to the model candidate list). An approved skill is recorded; an approved model is
+  enforced at the next subagent spawn. A model outside the allowlist never reaches the judge.
+- Without candidates the stage refuses explicitly (`routing.skills` / `routing.models` named) and
+  judges nothing - the old code approved such a submission while applying nothing, which read as a
+  successful routing that never happened. That dead branch is removed.
+- Live check against the real endpoint: the routing path runs end to end, the judge abstained on a
+  one-line evidence set (0.33 skill, 0.67 model) and nothing was applied - the honest outcome.
+- 249/249 tests, `tsc --noEmit` clean.

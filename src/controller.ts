@@ -21,7 +21,7 @@ import {
 	lookupControlPoint,
 	validateDeclaredControlPoint,
 } from "./control-points.js";
-import { classifyTaskType, selectTopics, type CatalogTopic } from "./catalog.js";
+import { classifyTaskType, routeModel, routeSkills, selectTopics, type CatalogTopic } from "./catalog.js";
 import { STAGES } from "./stages.js";
 import {
 	POLICY,
@@ -919,6 +919,10 @@ export class JevController {
 		if (input.stage === "course_check" && this.courseCheckJudge !== undefined) {
 			return this.submitCourseCheck(input, boundKey, used);
 		}
+		if (input.stage === "skill_routing" || input.stage === "model_routing") {
+			const routed = await this.submitRouting(input);
+			if (routed !== undefined) return routed;
+		}
 		// aspect_coverage preset: catalog pre-check + dedicated three-way judge.
 		if (input.stage === "aspect_coverage") {
 			const unknown = input.aspects.filter(id => !this.catalogIds.has(id));
@@ -1142,15 +1146,6 @@ export class JevController {
 				selectedOption: result.selectedOption,
 				approvedAt: this.now(),
 			});
-			if (input.stage === "model_routing") {
-				const selected = judgeOptions.find(o => o.id === result.selectedOption);
-				// Host gate compares model IDs (ctx.models.list() ids); store the option ID.
-				if (selected) this.rememberModelRouting(selected.id);
-			}
-			if (input.stage === "skill_routing") {
-				const selected = judgeOptions.find(o => o.id === result.selectedOption);
-				if (selected) this.rememberSkillRouting(selected.label);
-			}
 		}
 		if (result.verdict === "revise") {
 			this.pushFeedback(`Jev judge asked for revision: ${result.reasons.join(" ")}`);
@@ -1513,6 +1508,74 @@ export class JevController {
 				lookupControlPoint(a.stage, this.extraPoints)?.trigger === "mutation_gate" &&
 				a.taskFingerprint === this.state.taskFingerprint,
 		);
+	}
+
+	/**
+	 * FR-02/FR-03: route the skill or the model from the owner-held candidate list in the
+	 * template config. The judge sees only those candidates, so it can never invent one; the
+	 * selection is applied (skill recorded, model enforced at spawn). On-demand, never
+	 * gate-granting, and fail-closed: a config or library problem reports uncertainty.
+	 */
+	private async submitRouting(input: ValidatedDecisionInput): Promise<DecisionOutcome | undefined> {
+		const routing = this.template.routing;
+		const candidatesConfigured =
+			input.stage === "skill_routing" ? (routing?.skills?.length ?? 0) > 0 : (routing?.models?.length ?? 0) > 0;
+		if (!candidatesConfigured) {
+			// No candidates, no routing: say so instead of approving nothing.
+			const key = input.stage === "skill_routing" ? "routing.skills" : "routing.models";
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [`${input.stage} needs candidate lists in jev.config.json (${key}); the judge may only choose from candidates the owner offered`],
+				judged: false,
+				summary: "",
+			};
+		}
+		try {
+			if (input.stage === "skill_routing") {
+				const candidates = routing!.skills!;
+				const result = await routeSkills({ task: input.task, evidence: input.evidence, candidates, judge: this.judge });
+				if (result.verdict === "approve" && result.selectedOption !== undefined) {
+					this.rememberSkillRouting(result.selectedOption);
+				}
+				return {
+					verdict: result.verdict,
+					selectedOption: result.selectedOption,
+					reasons: result.reasons,
+					confidence: result.confidence,
+					judged: true,
+					summary:
+						result.verdict === "approve"
+							? `skill_routing: approve — skill ${result.selectedOption ?? ""}`
+							: `skill_routing: ${result.verdict}`,
+				};
+			}
+			const candidates = routing!.models!;
+			// No separate allowlist given: the candidate list is itself the allowlist, so the
+			// judge still cannot reach a model the owner did not offer.
+			const allowlist = routing!.allowlist ?? candidates.map(c => c.id);
+			const result = await routeModel({ task: input.task, evidence: input.evidence, candidates, allowlist, judge: this.judge });
+			if (result.verdict === "approve" && result.selected !== undefined) {
+				this.rememberModelRouting(result.selected);
+			}
+			return {
+				verdict: result.verdict,
+				selectedOption: result.selected,
+				reasons: result.reasons,
+				confidence: result.confidence,
+				judged: result.verdict !== "ask_user" || result.confidence !== undefined,
+				summary:
+					result.verdict === "approve"
+						? `model_routing: approve — model ${result.selected ?? ""}`
+						: `model_routing: ${result.verdict}`,
+			};
+		} catch (err) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [`routing unavailable: ${err instanceof Error ? err.message : String(err)}`],
+				judged: false,
+				summary: "",
+			};
+		}
 	}
 
 	/**

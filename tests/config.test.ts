@@ -196,3 +196,28 @@ describe("jev template config: completion switch", () => {
 		expect(() => validateTemplateConfig(PROJECT_FILE, { gates: { completion: 1 } })).toThrow(/gates\.completion/);
 	});
 });
+
+describe("jev template config: routing candidates", () => {
+	test("routing lists are parsed; empty or malformed lists fail closed", () => {
+		const parsed = validateTemplateConfig(USER_FILE, {
+			routing: {
+				skills: [{ id: "s1", label: "S1", meaning: "m" }],
+				models: [{ id: "m1", label: "M1", meaning: "m" }],
+				allowlist: ["m1"],
+			},
+		});
+		expect(parsed.routing?.skills?.length).toBe(1);
+		expect(parsed.routing?.allowlist).toEqual(["m1"]);
+		expect(() => validateTemplateConfig(PROJECT_FILE, { routing: { skills: [] } })).toThrow(/routing\.skills/);
+		expect(() => validateTemplateConfig(PROJECT_FILE, { routing: { models: [{ id: "m", label: "M" }] } })).toThrow(/meaning/);
+		expect(() => validateTemplateConfig(PROJECT_FILE, { routing: { allowlist: [] } })).toThrow(/allowlist/);
+	});
+
+	test("the candidate lists are user-owned in the merge", () => {
+		const merged = mergeTemplateConfigs(
+			{ routing: { skills: [{ id: "user", label: "U", meaning: "m" }] } },
+			{ routing: { skills: [{ id: "proj", label: "P", meaning: "m" }] } },
+		);
+		expect(merged.routing?.skills?.[0]?.id).toBe("user");
+	});
+});

@@ -60,6 +60,18 @@ export const CONTROL_POINT_REGISTRY: Readonly<Record<string, ControlPoint>> = {
 		fixedOptionIds: COURSE_CHECK_OPTION_IDS,
 		verdictMapping: "course_check",
 	},
+	// FR-02/FR-03: the executor asks for a routing decision; the controller applies the
+	// selected skill or model. On-demand, never gate-granting.
+	skill_routing: {
+		stage: "skill_routing",
+		trigger: "on_demand",
+		verdictMapping: "standard",
+	},
+	model_routing: {
+		stage: "model_routing",
+		trigger: "on_demand",
+		verdictMapping: "standard",
+	},
 	aspect_coverage: {
 		stage: "aspect_coverage",
 		trigger: "on_demand",

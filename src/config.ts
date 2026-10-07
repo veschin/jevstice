@@ -12,6 +12,7 @@
 import * as fs from "node:fs";
 import { isRecord, nonEmptyString } from "./guards.js";
 import { validateDeclaredControlPoint } from "./control-points.js";
+import type { RoutingCandidate } from "./catalog.js";
 import { STAGES } from "./stages.js";
 import { POLICY } from "./types.js";
 
@@ -41,6 +42,12 @@ export interface JevTemplateConfig {
 	 * bounded rework and completion binding are unchanged.
 	 */
 	gates?: { mutation?: boolean; completion?: boolean };
+	/**
+	 * FR-02/FR-03 candidate lists, held by the owner. The judge chooses only from these,
+	 * so it can never invent a skill or a model. An empty list is a load error, not a
+	 * silent no-op.
+	 */
+	routing?: { skills?: RoutingCandidate[]; models?: RoutingCandidate[]; allowlist?: string[] };
 	controlPoints?: Record<
 		string,
 		{ trigger: "on_demand"; instructions?: string; options?: Array<{ id: string; label: string; meaning: string }> }
@@ -160,6 +167,35 @@ export function validateTemplateConfig(file: string, raw: unknown): JevTemplateC
 		}
 		out.capabilities = caps as string[];
 	}
+	if (raw["routing"] !== undefined) {
+		const bad = (problem: string): never => {
+			throw new JevConfigError(file, problem);
+		};
+		if (!isRecord(raw["routing"])) bad("routing must be an object");
+		const rawRouting = raw["routing"] as Record<string, unknown>;
+		const routing: { skills?: RoutingCandidate[]; models?: RoutingCandidate[]; allowlist?: string[] } = {};
+		for (const key of ["skills", "models"] as const) {
+			const list = rawRouting[key];
+			if (list === undefined) continue;
+			if (!Array.isArray(list) || list.length === 0) bad(`routing.${key} must be a non-empty array of {id,label,meaning}`);
+			routing[key] = (list as unknown[]).map((c, i) => {
+				if (!isRecord(c) || !nonEmptyString(c["id"]) || !nonEmptyString(c["label"]) || !nonEmptyString(c["meaning"])) {
+					return bad(`routing.${key}[${i}] must have non-empty id, label and meaning`);
+				}
+				return { id: c["id"] as string, label: c["label"] as string, meaning: c["meaning"] as string };
+			});
+			const ids = new Set(routing[key]!.map(c => c.id));
+			if (ids.size !== routing[key]!.length) bad(`routing.${key} ids must be unique`);
+		}
+		const allowlist = rawRouting["allowlist"];
+		if (allowlist !== undefined) {
+			if (!Array.isArray(allowlist) || allowlist.length === 0 || allowlist.some(a => !nonEmptyString(a))) {
+				bad("routing.allowlist must be a non-empty array of model ids");
+			}
+			routing.allowlist = allowlist as string[];
+		}
+		out.routing = routing;
+	}
 	if (raw["gates"] !== undefined) {
 		if (!isRecord(raw["gates"])) throw new JevConfigError(file, "gates must be an object");
 		const gates: { mutation?: boolean; completion?: boolean } = {};
@@ -187,6 +223,7 @@ export function mergeTemplateConfigs(user: JevTemplateConfig, project: JevTempla
 		capabilities: project.capabilities ?? user.capabilities,
 		// Trust split like the approval floor: the plan-gate switch is USER-owned.
 		gates: user.gates ?? project.gates,
+		routing: user.routing ?? project.routing,
 		completion:
 			user.completion === undefined && project.completion === undefined
 				? undefined
