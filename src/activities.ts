@@ -417,7 +417,10 @@ export const ACTIVITY_REGISTRY: Readonly<Record<string, Activity>> = {
 		},
 		enforcement: {
 			mode: "advisory",
-			armedBy: "code_review, claim_check and aspect_coverage are always submittable and hold no gate of their own",
+			armedBy:
+				"code_review, claim_check and aspect_coverage are always submittable and hold no gate of their own; " +
+				"business_review and architecture_review (the judge's must-be activities, 0.86/0.92) and the opt-in " +
+				"security_review (0.46) are submittable review stages that run the fixed question set the controller owns",
 		},
 		courseMechanism: "per-requirement claim markings and per-aspect coverage markings, both against quoted artifacts",
 		mechanisms: [
@@ -453,6 +456,36 @@ export const ACTIVITY_REGISTRY: Readonly<Record<string, Activity>> = {
 			},
 			{
 				stage: "aspect_coverage",
+				wiring: ["stage"],
+				outcomeEdges: [
+					{ verdict: "approve", outcome: "accept" },
+					{ verdict: "revise", outcome: "rework" },
+					{ verdict: "insufficient_evidence", outcome: "escalate" },
+					{ verdict: "ask_user", outcome: "escalate" },
+				],
+			},
+			{
+				stage: "business_review",
+				wiring: ["stage"],
+				outcomeEdges: [
+					{ verdict: "approve", outcome: "accept" },
+					{ verdict: "revise", outcome: "rework" },
+					{ verdict: "insufficient_evidence", outcome: "escalate" },
+					{ verdict: "ask_user", outcome: "escalate" },
+				],
+			},
+			{
+				stage: "architecture_review",
+				wiring: ["stage"],
+				outcomeEdges: [
+					{ verdict: "approve", outcome: "accept" },
+					{ verdict: "revise", outcome: "rework" },
+					{ verdict: "insufficient_evidence", outcome: "escalate" },
+					{ verdict: "ask_user", outcome: "escalate" },
+				],
+			},
+			{
+				stage: "security_review",
 				wiring: ["stage"],
 				outcomeEdges: [
 					{ verdict: "approve", outcome: "accept" },

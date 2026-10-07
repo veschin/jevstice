@@ -40,7 +40,10 @@ export type DecisionStage =
   | "destructive_action" // POLICY-DRAFT I: judge a destructive bash command at execution time, fresh (plan never covers it)
   | "claim_check" // universal engine: per-claim support marking against quoted evidence (measured decisive per-claim regime)
   | "requirements_formalization" // activities framework: numbered requirement list, each item traceable to a verbatim quote + coverage verdict
-  | "plan_mapping"; // activities framework (planning): per-requirement claim that the plan serves it, marked by the claim_check path
+  | "plan_mapping" // activities framework (planning): per-requirement claim that the plan serves it, marked by the claim_check path
+  | "business_review" // review activity (advisory): the product as it stands against the customer's promised outcome
+  | "architecture_review" // review activity (advisory): how well the implementation absorbs the next change
+  | "security_review"; // review activity (advisory, opt-in): per-surface attack/disclosure paths
 
 /** Fixed option set presented to the judge (FR-08). */
 export interface DecisionOption {
@@ -231,6 +234,61 @@ export interface RequirementsFormalizationResult {
 export type RequirementsFormalizationJudge = (
   request: RequirementsFormalizationRequest,
 ) => Promise<RequirementsFormalizationResult>;
+
+// ---------- Reviews (business / architecture / security; advisory activities) ----------
+
+/** The three question kinds a review's fixed question set is built from. */
+export type ReviewQuestionKind = "score" | "choice" | "noul";
+
+/**
+ * One question of a review's fixed set. The set is shipped with the descriptor (an owner may
+ * replace it per stage through `stages.<stage>.questions`, fail-closed on anything malformed);
+ * `score`/`noul` carry their rubric/criteria, `choice` carries the DECLARED candidate set so the
+ * judge can never invent a candidate.
+ */
+export interface ReviewQuestionWire {
+  id: string;
+  kind: ReviewQuestionKind;
+  question: string;
+  /** score: the 0..N rubric levels, in order (2..10 levels). */
+  rubric?: string[];
+  /** noul: the fixed true/false criteria. */
+  noul?: { true?: string; false?: string };
+  /** choice: candidate option id -> label or null; the candidates are the caller's declared list. */
+  options?: Record<string, string | null>;
+}
+
+export interface ReviewRequest {
+  stage: DecisionStage;
+  /** What the review is about (fixed template text; the material itself is in `evidence`). */
+  task: string;
+  questions: ReviewQuestionWire[];
+  evidence: Evidence[];
+  /** Per declared item questions only: the item texts, so the judge is not asked to guess them. */
+  items?: Array<{ id: string; text: string }>;
+}
+
+export interface ReviewAnswer {
+  id: string;
+  kind: ReviewQuestionKind;
+  /** score answers: the level value the rubric indexes. */
+  score?: number;
+  /** choice answers: the selected candidate id. */
+  choice?: string;
+  /** noul answers: the probability the statement holds. */
+  noul?: number;
+  confidence?: number;
+}
+
+export interface ReviewResult {
+  /** False when the judge could not be consulted or the answer was unusable: never a partial review. */
+  judged: boolean;
+  /** One entry per requested question id, in request order; empty when judged is false. */
+  answers: ReviewAnswer[];
+  reasons: string[];
+}
+
+export type ReviewJudge = (request: ReviewRequest) => Promise<ReviewResult>;
 
 // ---------- TypeSafe systemone wire types (S:API, verified from docs.typesafe.ai/api) ----------
 

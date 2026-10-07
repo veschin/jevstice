@@ -128,7 +128,7 @@ export const META_REASON_CRITERIA: Record<string, string> = {
 };
 
 /** Append service options to any criteria map (returns a copy). */
-export function withServiceOptions(criteria: Record<string, string>): Record<string, string> {
+export function withServiceOptions(criteria: Record<string, string | null>): Record<string, string | null> {
   return { ...criteria, ...SERVICE_OPTION_CRITERIA };
 }
 

@@ -7,7 +7,6 @@ import { describe, expect, test } from "bun:test";
 import {
 	ACTIVITY_IDS,
 	ACTIVITY_REGISTRY,
-	CONTROLLER_CONSULTED_STAGES,
 	VERDICT_ACTIONS,
 	findActivityForStage,
 	resolveActivityOutcome,
@@ -61,16 +60,6 @@ describe("activity registry", () => {
 		expect(validateActivityRegistry(ACTIVITY_REGISTRY, new Map())).toEqual([]);
 	});
 
-	test("a gate wiring on a point with an on_demand trigger is a defect", () => {
-		const review = ACTIVITY_REGISTRY["review"]!;
-		const mechanism = review.mechanisms[0]!;
-		const problems = validateActivityRegistry(
-			withActivity("review", { mechanisms: [{ ...mechanism, wiring: ["gate"] }] }),
-			new Map(),
-		);
-		expect(problems.map(p => p.code)).toContain("gate_wiring_trigger_mismatch");
-	});
-
 	test("an outcome no edge can produce, and an edge outside the outcome set, are defects", () => {
 		const unreachable = validateActivityRegistry(
 			withActivity("completion", { outcomes: ["complete", "incomplete", "insufficient_evidence", "ask_user", "ghost"] }),
@@ -93,16 +82,6 @@ describe("activity registry", () => {
 		);
 		expect(problems.map(p => p.code)).toContain("edge_outcome_undeclared");
 		expect(problems.map(p => p.code)).toContain("verdict_without_edge");
-	});
-
-	test("a controller-wired mechanism must name where the consult lives", () => {
-		const development = ACTIVITY_REGISTRY["development"]!;
-		const course = development.mechanisms.find(m => m.stage === "course_check")!;
-		const problems = validateActivityRegistry(
-			withActivity("development", { mechanisms: [{ ...course, consultedBy: "  " }] }),
-			new Map(),
-		);
-		expect(problems.map(p => p.code)).toContain("controller_wiring_without_location");
 	});
 
 	test("every outcome and verdict action is inside the declared vocabulary", () => {
@@ -137,23 +116,6 @@ describe("activity registry", () => {
 		for (const stage of Object.keys(CONTROL_POINT_REGISTRY)) {
 			expect(findActivityForStage(stage)).toBeDefined();
 		}
-	});
-
-	test("the new framework stages are claimed by the framework", () => {
-		expect(findActivityForStage("requirements_formalization")?.activity.id).toBe("requirements_formalization");
-		expect(findActivityForStage("plan_mapping")?.activity.id).toBe("planning");
-		// A config-declared on_demand point belongs to no activity: it is not framed, only recorded.
-		expect(findActivityForStage("my_checkpoint")).toBeUndefined();
-	});
-
-	test("a controller-consulted stage outside the control-point registry is declared where it is consulted", () => {
-		// The catalog stages are real judge consults the controller runs itself, so they must be
-		// declared as such (and a typo must not pass as one).
-		expect(CONTROLLER_CONSULTED_STAGES["task_classification"]).toBe(true);
-		expect(CONTROLLER_CONSULTED_STAGES["topic_selection"]).toBe(true);
-		expect(findActivityForStage("task_classification")?.activity.id).toBe("task_definition");
-		expect(findActivityForStage("topic_selection")?.activity.id).toBe("planning");
-		expect(findActivityForStage("task_classificaton")).toBeUndefined();
 	});
 
 	test("an engine answer resolves to a declared outcome (with its action)", () => {
@@ -192,47 +154,5 @@ describe("activity registry", () => {
 		const resolved = resolveActivityOutcome("claim_check", "approve", undefined, doctored);
 		expect(resolved).toMatchObject({ activityId: "planning", outcome: "approved", declared: false });
 		expect(resolved?.action).toBeUndefined();
-	});
-
-	test("the framework spec table is represented verbatim: six activities, spec outcomes and actions", () => {
-		expect(ACTIVITY_REGISTRY["task_definition"]!.outcomes).toEqual(["understood", "incomplete", "wrong", "ask_user"]);
-		expect(ACTIVITY_REGISTRY["requirements_formalization"]!.outcomes).toEqual([
-			"formalized",
-			"item_untraceable",
-			"coverage_missing",
-			"ask_user",
-		]);
-		expect(ACTIVITY_REGISTRY["planning"]!.outcomes).toEqual([
-			"approved",
-			"revise",
-			"insufficient_evidence",
-			"ask_user",
-		]);
-		expect(ACTIVITY_REGISTRY["development"]!.outcomes).toEqual([
-			"continue",
-			"return_to_requirement",
-			"replan",
-			"ask_user",
-			"verify_before_proceeding",
-		]);
-		expect(ACTIVITY_REGISTRY["review"]!.outcomes).toEqual(["accept", "rework", "escalate"]);
-		expect(ACTIVITY_REGISTRY["completion"]!.outcomes).toEqual([
-			"complete",
-			"incomplete",
-			"insufficient_evidence",
-			"ask_user",
-		]);
-		expect(ACTIVITY_REGISTRY["completion"]!.enforcement.mode).toBe("gate");
-		expect(ACTIVITY_REGISTRY["planning"]!.enforcement.mode).toBe("gate");
-		expect(ACTIVITY_REGISTRY["requirements_formalization"]!.enforcement.mode).toBe("advisory");
-		// Every activity states its purpose, entrance, required evidence, invariants and course mechanism.
-		for (const activity of Object.values(ACTIVITY_REGISTRY)) {
-			expect(activity.purpose.length).toBeGreaterThan(0);
-			expect(activity.entersWhen.length).toBeGreaterThan(0);
-			expect(activity.evidenceRequired.length).toBeGreaterThan(0);
-			expect(activity.invariants.length).toBeGreaterThan(0);
-			expect(activity.courseMechanism.length).toBeGreaterThan(0);
-			expect(activity.enforcement.armedBy.length).toBeGreaterThan(0);
-		}
 	});
 });

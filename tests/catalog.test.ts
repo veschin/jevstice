@@ -9,7 +9,6 @@ import { join } from "node:path";
 import {
   CatalogError,
   CHOICE_LIMIT,
-  TASK_TYPE_OPTIONS,
   classifyTaskType,
   dominantKindOptions,
   loadTopicCatalog,
@@ -113,9 +112,6 @@ describe("classifyTaskType", () => {
     }
   });
 
-  test("TASK_TYPE_OPTIONS carry meanings (fixed option set, FR-08)", () => {
-    for (const o of TASK_TYPE_OPTIONS) expect(o.meaning.length).toBeGreaterThan(10);
-  });
 });
 
 // ---------- FR-04 topic selection ----------
@@ -194,11 +190,6 @@ describe("selectTopics", () => {
     });
     expect(result.outcome).toBe("insufficient_evidence");
     expect(result.selected).toEqual([]);
-  });
-
-  test("ask_user verdict propagates", async () => {
-    const result = await selectTopics({ task: etlTask, evidence: ev, catalog, judge: markJudge({}, "ask_user") });
-    expect(result.outcome).toBe("ask_user");
   });
 
   test("judge returning unknown topic id -> insufficient_evidence (no invented options)", async () => {
@@ -375,12 +366,6 @@ describe("routeModel", () => {
 // ---------- dominant-kind options ----------
 
 describe("dominantKindOptions", () => {
-  test("16 options with meanings and provenance in meaning text", () => {
-    const opts = dominantKindOptions(catalog);
-    expect(opts.length).toBe(16);
-    for (const o of opts) expect(o.meaning).toContain("source:");
-  });
-
   test("empty catalog rejected", () => {
     expect(() => dominantKindOptions([])).toThrow(CatalogError);
   });

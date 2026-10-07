@@ -234,6 +234,83 @@ markings plus the coverage verdict naming the uncovered quote (`traceable: req-1
 req-3 false` for a fabricated item; `covered: quote-1 false, quote-2 true, quote-3 true`) - the
 requirement list itself, not only a verdict.
 
+## One mechanism: descriptors, modes, deadlines
+
+Every judge consultation the controller runs itself is a DESCRIPTOR in a single registry
+(`src/gates.ts`, `GATE_REGISTRY`); the three gates and the three review activities are the same
+mechanism in different modes. The review question sets and their runner live in `src/reviews.ts`.
+A descriptor declares:
+
+| Field | Meaning |
+| --- | --- |
+| `stage` | the registered control point the consult is filed under |
+| `mode` | `blocking` - refuse only on a confident explicit negative; `advisory` - record and surface, never refuse |
+| `trigger` | the control-point trigger the controller enforces (`mutation_gate`, `session_stop`, `on_demand`) |
+| `boundary` | where the mechanism is reached (the host handler, or the submission path) |
+| `armedBy` | the owner switch that arms it |
+| `evidenceRequired` / `evidenceKinds` | what a consult must quote |
+| `consult` | the frame: fixed question + claim shape built from the subject verbatim + offered options + refusal option (blocking); the fixed question set (review); or the approval binding (the plan gate) |
+
+The six descriptors:
+
+| Descriptor | Stage | Mode | Consulted by |
+| --- | --- | --- | --- |
+| `plan_mutation` | `understanding_review` / `direction_review` (+ `completion_review` at the stop) | blocking | the approval store, checked at `tool_call` and `session_stop` |
+| `subagent_handoff` | `subagent_handoff` | blocking | `before_subagent_spawn` (dispatch) and the delivered delegated result (acceptance) |
+| `destructive_action` | `destructive_action` | blocking | `tool_call`, for a `bash` command matching `gates.destructive.patterns` |
+| `business_review` | `business_review` | advisory | submission (`stage=business_review`) |
+| `architecture_review` | `architecture_review` | advisory | submission (`stage=architecture_review`) |
+| `security_review` | `security_review` | advisory | submission, opt-in (`stage=security_review`) |
+
+The two modes are structural, not conventional: a `decision` consult carries the refusal option and
+the deadline, a `review` consult carries neither, and the registry validator
+(`validateGateRegistry`) refuses a review that is not advisory, an advisory gate that carries a
+refusal path, a refusal option that is not in the offered set, a descriptor whose stage is not a
+registered control point, and any deadline at or above the host's 30s handler ceiling. Adding a gate
+or a review is adding a descriptor - there is no second code path.
+
+Deadlines: the internal consult deadline fires before the host does and takes the conservative path
+for its event. On `tool_call` the host's timeout is fail-closed (it blocks), so a destructive-gate
+verdict arriving after the deadline is never read (the command proceeds, the uncertainty is
+recorded); on `before_subagent_spawn` the host drops a timed-out handler result and proceeds, so the
+dispatch deadline has the same effect. The acceptance consult and the reviews are not on a
+host-bounded handler: they run in the background or inside the tool call.
+
+## Reviews: business, architecture, opt-in security
+
+Three review activities are stages with FIXED question sets, recorded per-item results and no
+blocking at all (judge verdict: business 0.86 and architecture 0.92 must-be, security 0.46 opt-in;
+spec in `evidence/review-activities.md`):
+
+- **`business_review`** - subject: the product as it stands, the customer's goal and problem, and
+  the executor's decisions under review. Questions: how likely the product is to produce the
+  promised outcome (0..9 rubric), how much of the described work serves it (0..9 rubric), a choice
+  over the DECLARED risk candidates, the fixed statement "the product's value is unverified", and
+  one statement per declared decision ("this decision serves the outcome and should be kept").
+- **`architecture_review`** - subject: a module inventory, the test inventory, the observed
+  duplication, the invariants. Questions: how well the implementation absorbs the next change
+  (0..9 rubric), one statement per declared defect ("a maintainability defect that must be
+  repaired"), a choice over the DECLARED candidate changes.
+- **`security_review`** (opt-in) - subject: the declared surfaces. Questions: one statement per
+  declared surface ("opens an attack or disclosure path"), a choice over the same declared surfaces
+  for the single worst.
+
+Submit them through `jev_decision` like any stage: `task` says what is under review, `evidence`
+carries the quoted material, `claims` lists the declared items (decisions, defects, surfaces) - one
+statement question per item - and `options` is the declared candidate set for the choice question.
+The whole set goes to the judge in ONE request; the recorded result carries the scores with their
+confidences, the chosen candidate and every per-item verdict (`JevState.reviews[stage]`), and the
+same-session feedback names the findings. A review never refuses an action: only a confident
+negative STATEMENT (per the question's polarity - a declared defect marked true, a decision marked
+"do not keep", the value-unverified statement marked true) is reported as a finding to answer; an
+abstention, a judge error, a low or absent confidence, a frame escape or a deadline loss records the
+uncertainty and surfaces it, and a review never records a gate approval or a blocker.
+
+A review costs a judge call, so it runs on demand (never on a timer). The question sets above are
+the shipped defaults; an owner may replace them per stage through `stages.<stage>.questions`
+(`[{id, kind, question, rubric?|noul?|candidates?, perItem?, findingWhen?}]`), fail-closed on
+anything malformed.
+
 ## Gates
 
 - **plan** (`understanding_review` / `direction_review`, trigger `mutation_gate`): mutating tool
@@ -272,15 +349,22 @@ requirement list itself, not only a verdict.
   Claim check above). Advisory: it records per-claim markings in the session state and nothing else -
   no gate approval, no block.
 - **subagent_handoff** (FR-11, `on_demand`, opt-in): when the config declares
-  `stages.subagent_handoff`, the controller judges each hand-off to a task agent twice - the work
-  order before the spawn (`before_subagent_spawn`) and the returned result after it (`tool_result`) -
-  against the requirement captured at task start. Only a judged `revise` at or above the confidence
-  floor refuses a spawn; an abstention, judge error, low confidence, frame escape, missing or
-  unattributable work order records the uncertainty and lets the work proceed. The acceptance side
-  cannot refuse a tool result (that host hook only rewrites it), so a confident negative is recorded
-  as an unresolved blocker and fed back into the session. Undeclared, the stage is still submittable
-  through the tool but no hand-off check runs - the PRD marks this policy unconfirmed (GAP:3).
-- **destructive_action** (`on_demand`, opt-in): when the config sets a non-empty
+  `stages.subagent_handoff`, the controller judges the work order of a task tool call before the
+  spawn (`before_subagent_spawn`) against the requirement captured at task start. Only a judged
+  `revise` at or above the confidence floor refuses a spawn; an abstention, judge error, low
+  confidence, frame escape, missing or unattributable work order records the uncertainty and lets
+  the work proceed. The captured work order is retired when the SPAWN is judged, never when the task
+  tool's own `tool_result` arrives: omp 18.6.3 emits that result before `before_subagent_spawn`
+  (measured 21:11:31.698 vs 21:11:31.705), so retiring on the result made the dispatch consult inert
+  in the real host (`evidence/smoke-gates-findings.md`, F1). The acceptance side is a separate,
+  explicitly opt-in switch - `gates.handoffAcceptance` - because omp's task tool returns a spawn
+  acknowledgement, not the delegated result: the acceptance consult judges the result the host
+  DELIVERS (`message_end` with the `async-result` delivery omp builds for a settled background job,
+  `src/session/async-job-delivery.ts`), and the acknowledgement is never judged (F2). The host hook
+  cannot refuse a delivery, so a confident negative is recorded as an unresolved blocker and fed
+  back into the session. Undeclared, the stage is still submittable through the tool but no hand-off
+  check runs - the PRD marks this policy unconfirmed (GAP:3).
+- **destructive_action** (POLICY-DRAFT I, `on_demand`, opt-in): when the config sets a non-empty
   `gates.destructive.patterns` list, a `bash` command matching any pattern is judged before it runs,
   with the command and the session task as evidence - a fresh execution-time decision the plan never
   covers (POLICY-DRAFT class I, `always_judge` 0.88). Only a judged `revise` at or above the
@@ -289,6 +373,13 @@ requirement list itself, not only a verdict.
   Patterns are case-insensitive literal substrings (whitespace collapsed), so pattern text is data and
   never a regular expression. An absent or empty list means the gate does not exist (default off); a
   `stages.destructive_action` template may still replace its option set.
+- **reviews** (`business_review`, `architecture_review`, `security_review`; `on_demand`,
+  advisory): the review activities above. They record per-item results and surface them; they never
+  refuse an action and never record an approval.
+
+The three gates and the three reviews are descriptors of ONE mechanism (see "One mechanism" above):
+`src/control-points.ts` still says where a stage fires, `src/gates.ts` says what each gate/review is
+and how its answer acts, and the controller runs every consult through the same runner.
 
 Confidence floors: an approve is recorded only at or above `confidenceThreshold` (default 0.8). At
 that default bar a completion approve in [0.6, 0.8) counts toward
@@ -325,14 +416,20 @@ submittable `stage` and is shaped by the config key shown:
 | `plan_mapping` | `on_demand` | per-requirement plan claims, marked by the claim-check path (planning activity) | `stages.plan_mapping` |
 | `skill_routing` | `on_demand` | skill choice from `routing.skills` | `stages.skill_routing` |
 | `model_routing` | `on_demand` | model choice from `routing.models` | `stages.model_routing` |
-| `subagent_handoff` | `on_demand` | FR-11 hand-off check at the task-tool boundary (opt-in) | `stages.subagent_handoff` |
+| `subagent_handoff` | `on_demand` | FR-11 hand-off check: dispatch before the spawn, acceptance on the delivered result (opt-in) | `stages.subagent_handoff` |
 | `destructive_action` | `on_demand` | execution-time judge of a destructive `bash` command (opt-in) | `stages.destructive_action` |
+| `business_review` | `on_demand` | business review: two 0..9 scores, declared-risk choice, value statement, one statement per declared decision (advisory) | `stages.business_review` |
+| `architecture_review` | `on_demand` | architecture review: 0..9 quality score, one statement per declared defect, declared-change choice (advisory) | `stages.architecture_review` |
+| `security_review` | `on_demand` | security review: one statement per declared surface, worst-surface choice (advisory, opt-in) | `stages.security_review` |
 | `important_decision` | `on_demand` | FR-10: an important decision put to the judge through fixed options | `stages.important_decision` |
 | `code_review` | `on_demand` | FR-10: a finished code review put to the judge | `stages.code_review` |
 
 `stages.<stage>` takes `instructions` (appended after the built-in untrusted-evidence policy) and
 `options` (a full replacement option set: at least 2 items with unique ids, each `{id, label,
-meaning}`). Only registry stages are valid keys - an unknown stage key is a config error.
+meaning}`). A review stage additionally takes `questions`: the fixed question set that replaces the
+shipped one (`[{id, kind: "score"|"choice"|"noul", question, rubric?|noul?|candidates?, perItem?,
+findingWhen?}]`), fail-closed on anything malformed. Only registry stages are valid keys - an unknown
+stage key is a config error.
 `course_check` keeps its fixed next-action ids unless a template replaces its options.
 
 A config can also declare extra control points: `controlPoints.<name>` with
@@ -359,7 +456,8 @@ the file and the problem.
 {
   "gates": {
     "mutation": false,
-    "destructive": { "patterns": ["rm -rf", "git push --force", "drop table"] }
+    "destructive": { "patterns": ["rm -rf", "git push --force", "drop table"] },
+    "handoffAcceptance": true
   },
   "courseCheck": { "everyMutations": 5 },
   "confidenceThreshold": 0.9,
@@ -407,7 +505,10 @@ Per key, with its trust rule:
   judging, content digests and bounded rework are unchanged. `gates.destructive.patterns` (an array
   of non-empty strings) arms the execution-time destructive-action gate; an absent or empty list
   means the gate does not exist. The FR-11 hand-off gate is not a `gates` switch: it runs only when
-  the config declares `stages.subagent_handoff` (see the preset above).
+  the config declares `stages.subagent_handoff` (see the preset above). Its acceptance side - the
+  check of the delegated result the host delivers - is a separate opt-in boolean,
+  `gates.handoffAcceptance` (default false), because it depends on the host's background-result
+  delivery rather than on a handler the smoke run has verified.
 
 Meta options cannot be removed: they are appended to every judge choice regardless of any template.
 
@@ -423,12 +524,15 @@ Meta options cannot be removed: they are appended to every judge choice regardle
   hook is `before_subagent_spawn`, where the routed model is enforced. `session_stop` never fires for
   task/subagent sessions, so the completion gate applies to the main session only.
 - `tool_result` cannot refuse a tool call: a handler may only rewrite its content, details or error
-  flag, so the FR-11 acceptance verdict is recorded and fed back instead of blocking the call.
+  flag, so the FR-11 acceptance verdict is recorded and fed back instead of blocking the call (and
+  the acceptance consult runs on the delegated result the host delivers, not on that tool result).
 - The FR-11 hand-off check reads the work order from the `task` tool call (keyed by toolCallId),
   because `before_subagent_spawn` carries neither the prompt nor a toolCallId. A spawn is judged only
   while exactly one captured order is pending: with parallel task calls the spawn cannot be
   attributed and nothing is judged, an `eval` `agent()` spawn is never judged, and captured orders
-  are dropped when the task changes or after 2 minutes.
+  are dropped when the task changes, after 2 minutes, or when the spawn that consumed them settles
+  (the order is retired on the SPAWN, not on the task tool's own `tool_result`, which omp emits
+  first - see F1 in the hand-off gate above).
 - Provider prompt-cache hits are not measured.
 - Completion judging does not guarantee correctness.
 

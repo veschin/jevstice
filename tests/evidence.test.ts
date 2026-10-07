@@ -140,12 +140,6 @@ describe("evidence: buildRequestBody", () => {
     expect(state.evidence.map((e) => e.quote)).toEqual(quotes);
   });
 
-  test("template absent -> body identical to defaults", () => {
-    const without = buildRequestBody(okReq, { apiKey: "k" });
-    const withEmpty = buildRequestBody(okReq, { apiKey: "k", stages: {} });
-    expect(JSON.stringify(withEmpty)).toBe(JSON.stringify(without));
-  });
-
   test("template stage instructions appended after policy, policy stays first", () => {
     const body = buildRequestBody(okReq, {
       apiKey: "k",

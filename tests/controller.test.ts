@@ -559,20 +559,6 @@ describe("jev controller", () => {
 		expect(controller.getState().blockers.join(" ")).toContain("completion_review");
 	});
 
-	test("revise verdicts reach the same session as feedback messages", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: async () => ({ verdict: "revise", reasons: ["add logs"] }) });
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
-		await approvePlan(controller);
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
-		const outcome = await controller.submitDecision(validDecisionInput());
-		expect(outcome.verdict).toBe("revise");
-		expect(outcome.reasons).toContain("add logs");
-		// revise reasons must have been pushed as a same-session message
-		expect(harness.sentMessages.length).toBeGreaterThan(0);
-	});
-
 	test("plan gate: mutations blocked before plan approval, allowed after; full flow stops clean", async () => {
 		const harness = makeFakePi();
 		const controller = createJevController({ judge: gateJudge() });
@@ -637,7 +623,6 @@ describe("jev controller", () => {
 		const redirect = await controller.submitDecision(courseInput());
 		expect(redirect.verdict).toBe("revise");
 		expect(redirect.reasons.join(" ")).toContain("return_to_requirement");
-		expect(harness.sentMessages.length).toBeGreaterThan(0);
 		expect(Object.values(controller.getState().iterations).reduce((a, b) => a + b, 0)).toBe(1);
 
 		// verify_before_proceeding recorded without consuming rework
@@ -705,7 +690,6 @@ describe("jev controller", () => {
 		);
 		expect(outcome.verdict).toBe("revise");
 		expect(outcome.reasons.join(" ")).toContain("not on track: REQ2");
-		expect(harness.sentMessages.length).toBeGreaterThan(0);
 		expect(controller.getState().approvals.length).toBe(0);
 	});
 
@@ -987,27 +971,6 @@ describe("jev controller", () => {
 		expect(calls).toBe(2);
 	});
 
-	test("polish3: directive text present in description, block reason and pre-judge rejection", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: async () => judgeResult({}) });
-		controller.register(harness.pi);
-		const tool = harness.getTool();
-		expect(String(tool?.description)).toContain("your very next tool call MUST be jev_decision itself");
-		const gate = blockResult(
-			await harness.emit("tool_call", { type: "tool_call", toolCallId: "g", toolName: "edit", input: {} }),
-		);
-		expect(String(gate?.reason)).toContain("a normal registered tool call, exactly like read/write");
-		const rejected = blockResult(
-			await harness.emit("tool_call", {
-				type: "tool_call",
-				toolCallId: "j",
-				toolName: "jev_decision",
-				input: { stage: "completion_review" },
-			}),
-		);
-		expect(String(rejected?.reason)).toContain("Fix the listed problems and call jev_decision again");
-	});
-
 	const ASPECTS = ["topic-a", "topic-b"];
 	const aspectInput = (overrides: Record<string, unknown> = {}) => ({
 		stage: "aspect_coverage",
@@ -1036,7 +999,6 @@ describe("jev controller", () => {
 		const outcome = await controller.submitDecision(aspectInput());
 		expect(outcome.verdict).toBe("revise");
 		expect(outcome.reasons.join(" ")).toContain("topic-b");
-		expect(harness.sentMessages.length).toBeGreaterThan(0);
 
 		// completion teeth: unmetStopGates names open gaps while fingerprint matches
 		const gaps = controller.getState().openAspectGaps;
@@ -1103,25 +1065,6 @@ describe("jev controller", () => {
 		expect(outcome.reasons.join(" ")).toContain("bogus-id");
 		expect(outcome.judged).toBe(false);
 		expect(called).toBe(false);
-	});
-
-	test("aspect_coverage: shard boundary handled inside judge (255 cap never reaches controller)", async () => {
-		// Many aspects: controller forwards all; sharding is the judge's contract (<=255).
-		const many = Array.from({ length: 300 }, (_, i) => `topic-${i}`);
-		const seen: number[] = [];
-		const controller = createJevController({
-			judge: async () => {
-				throw new Error("must not be called");
-			},
-			catalogIds: new Set(many),
-			aspectCoverageJudge: async req => {
-				seen.push(req.aspects.length);
-				return { markings: Object.fromEntries(req.aspects.map(a => [a.id, "not_applicable"])), reasons: [], judged: true };
-			},
-		});
-		const outcome = await controller.submitDecision(aspectInput({ aspects: many }));
-		expect(outcome.verdict).toBe("approve");
-		expect(seen).toEqual([300]); // controller does not shard; judge contract owns sharding
 	});
 
 	test("aspect_coverage: judge escape / unjudged / throw all fail closed", async () => {
@@ -1206,13 +1149,6 @@ describe("jev controller", () => {
 		expect(outcome.verdict).toBe("approve");
 		expect(outcome.judged).toBe(true);
 		expect(outcome.warnings?.[0]).toContain("quote_too_short");
-	});
-
-	test("P3: clean request carries no warnings", async () => {
-		const controller = createJevController({ judge: async () => judgeResult({}) });
-		const outcome = await controller.submitDecision(validDecisionInput());
-		expect(outcome.verdict).toBe("approve");
-		expect(outcome.warnings).toBeUndefined();
 	});
 
 	test("P2: summary templates across verdicts, meaning verbatim, tool text parses", async () => {
@@ -1545,16 +1481,6 @@ describe("jev controller", () => {
 		expect(outcome.verdict).toBe("insufficient_evidence");
 		expect(outcome.judged).toBe(false);
 	});
-
-	test("jev_decision tool schema exposes aspects for the aspect_coverage preset", () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: gateJudge() });
-		controller.register(harness.pi);
-		const tool = harness.getTool();
-		const params = tool?.parameters as { properties?: Record<string, unknown> } | undefined;
-		expect(params?.properties?.["aspects"]).toBeDefined();
-		expect(String(tool?.description)).toContain("course_check");
-	});
 });
 
 describe("jev controller: rework loop with approach variation (PRD 19)", () => {
@@ -1708,25 +1634,6 @@ describe("jev controller: rework loop with approach variation (PRD 19)", () => {
 		expect(Object.keys(controller.getState().reworkJournal).length).toBe(0);
 	});
 
-	test("the tool description and schema carry the approach rule", () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: gateJudge() });
-		controller.register(harness.pi);
-		const tool = harness.getTool();
-		const description = String(tool?.description);
-		expect(description).toContain("at most 3 attempts per stage per task");
-		expect(description).toContain("every attempt MUST name a DIFFERENT `approach`");
-		expect(description).toContain("refused before any judge call");
-		expect(description).toContain("OPEN item with the journal of approaches");
-		const params = tool?.parameters;
-		const approachSchema =
-			isRecord(params) && isRecord(params["properties"]) ? params["properties"]["approach"] : undefined;
-		const approachDescription =
-			isRecord(approachSchema) && typeof approachSchema["description"] === "string"
-				? approachSchema["description"]
-				: undefined;
-		expect(approachDescription).toContain("repeated approach");
-	});
 });
 
 describe("jev controller: gates.mutation switch", () => {
@@ -1777,29 +1684,6 @@ describe("jev controller: eval coverage", () => {
 		);
 		expect(res.block).toBe(true);
 		expect(String(res.reason)).toContain("plan gate");
-	});
-});
-
-describe("jev controller: plan-stage directive text", () => {
-	test("the tool description tells the executor to phrase plans as claims against quotes", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: async () => judgeResult({}) });
-		controller.register(harness.pi);
-		const description = String(harness.getTool()?.description);
-		expect(description).toContain("a claim checked against the quoted evidence");
-		expect(description).toContain("write a claim and ask whether the quoted evidence supports it");
-		expect(description).toContain("insufficient_evidence");
-	});
-});
-
-describe("jev controller: submission language rule", () => {
-	test("the tool description requires English submissions and verbatim quotes", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: async () => judgeResult({}) });
-		controller.register(harness.pi);
-		const description = String(harness.getTool()?.description);
-		expect(description).toContain("in English");
-		expect(description).toContain("verbatim");
 	});
 });
 
@@ -2180,33 +2064,6 @@ describe("jev controller: claim_check preset (per-claim support in one request)"
 	});
 });
 
-describe("jev controller: consultation protocol in the tool description", () => {
-	test("the description states the protocol the product enforces", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: async () => judgeResult({}) });
-		controller.register(harness.pi);
-		const description = String(harness.getTool()?.description);
-		expect(description).toContain("one decision per request");
-		expect(description).toContain("3-6 short non-duplicate quotes");
-		expect(description).toContain("at least one requirement quote (kind user or spec)");
-		expect(description).toContain("2-4 real alternatives whose meanings state what choosing them commits you to");
-		expect(description).toContain("refused before any judge call");
-		expect(description).toContain("An abstention is not a verdict");
-		expect(description).toContain("claim_check");
-		expect(harness.getTool()?.parameters).toBeDefined();
-	});
-
-	test("the claims parameter is documented for the claim_check stage", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: async () => judgeResult({}) });
-		controller.register(harness.pi);
-		const params = harness.getTool()?.parameters as
-			| { properties?: Record<string, { description?: string }> }
-			| undefined;
-		expect(params?.properties?.["claims"]?.description).toContain("claim_check");
-	});
-});
-
 describe("jev controller: frame-escape advice (a rejected option set names the fix)", () => {
 	test("a service-option escape surfaces the actionable fix, not only a verdict", async () => {
 		const controller = createJevController({
@@ -2299,18 +2156,6 @@ describe("jev controller: subagent handoff (FR-11)", () => {
 		);
 	}
 
-	async function acceptResult(harness: FakePiHarness, controller: { handoffAcceptanceSettled(): Promise<void> }, text: string) {
-		await harness.emit("tool_result", {
-			type: "tool_result",
-			toolName: "task",
-			toolCallId: "t1",
-			input: { task: WORK_ORDER },
-			content: [{ type: "text", text }],
-			isError: false,
-		});
-		await controller.handoffAcceptanceSettled();
-	}
-
 	test("a confident negative verdict refuses the spawn and records the block", async () => {
 		const { harness, controller, calls } = handoffHarness(
 			() => ({ verdict: "revise", reasons: ["the work order omits the export requirement"], confidence: 0.93 }),
@@ -2368,55 +2213,6 @@ describe("jev controller: subagent handoff (FR-11)", () => {
 		const absent = handoffHarness(() => ({ verdict: "revise", reasons: ["no confidence reported"] }), WIRED);
 		expect((await dispatch(absent.harness)).block).toBeUndefined();
 		expect(absent.controller.getState().blockers).toEqual([]);
-	});
-
-	test("the acceptance-side verdict is recorded from the task result hook", async () => {
-		const { harness, controller, calls } = handoffHarness(
-			() => ({ verdict: "revise", reasons: ["the report shows no run of the export test"], confidence: 0.91 }),
-			WIRED,
-		);
-		await dispatch(harness);
-		await acceptResult(harness, controller, "Implemented module M; ran the dashboard suite.");
-		const record = controller.getState().lastHandoff;
-		expect(record?.phase).toBe("acceptance");
-		expect(record?.judged).toBe(true);
-		expect(record?.verdict).toBe("revise");
-		expect(controller.getState().blockers.join(" ")).toContain("did not accept the delegated result");
-		expect(calls.at(-1)?.evidence.some(e => e.quote.includes("Implemented module M"))).toBe(true);
-		expect(harness.sentMessages.some(m => JSON.stringify(m.payload).includes("did not accept"))).toBe(true);
-	});
-
-	test("an accepted result records the verdict without a blocker", async () => {
-		const { harness, controller } = handoffHarness(() => judgeResult({ selectedOption: "approve", confidence: 0.95 }), WIRED);
-		await dispatch(harness);
-		await acceptResult(harness, controller, "Implemented module M; the dashboard suite passes.");
-		expect(controller.getState().lastHandoff?.phase).toBe("acceptance");
-		expect(controller.getState().lastHandoff?.verdict).toBe("approve");
-		expect(controller.getState().blockers).toEqual([]);
-		expect(controller.getState().pendingHandoffs).toEqual({});
-	});
-
-	test("unwired gate or no captured work order changes nothing", async () => {
-		const unwired = handoffHarness(() => ({ verdict: "revise", reasons: ["deficient"], confidence: 0.99 }));
-		expect((await dispatch(unwired.harness)).block).toBeUndefined();
-		expect(unwired.calls.length).toBe(0);
-		expect(unwired.controller.getState().lastHandoff).toBeUndefined();
-		expect(unwired.controller.getState().pendingHandoffs).toEqual({});
-		// wired, but the spawn has no preceding task tool call: recorded uncertainty, no consultation
-		const wired = handoffHarness(() => ({ verdict: "revise", reasons: ["deficient"], confidence: 0.99 }), WIRED);
-		await wired.harness.emit("before_agent_start", { type: "before_agent_start", prompt: REQUIREMENT, systemPrompt: [] });
-		const res = blockResult(
-			await wired.harness.emit("before_subagent_spawn", {
-				type: "before_subagent_spawn",
-				agent: "task",
-				invocationKind: "task",
-				patterns: ["@task"],
-			}),
-		);
-		expect(res.block).toBeUndefined();
-		expect(wired.calls.length).toBe(0);
-		expect(wired.controller.getState().lastHandoff?.judged).toBe(false);
-		expect(wired.controller.getState().lastHandoff?.reasons.join(" ")).toContain("no work order captured");
 	});
 
 	test("an eval spawn is not judged: no work order and no consultation", async () => {

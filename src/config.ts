@@ -13,6 +13,7 @@ import * as fs from "node:fs";
 import { isRecord, nonEmptyString } from "./guards.js";
 import { validateDeclaredControlPoint } from "./control-points.js";
 import type { RoutingCandidate } from "./catalog.js";
+import { REVIEW_IDS, isReviewStage, parseReviewQuestions, type ReviewQuestion } from "./reviews.js";
 import { STAGES } from "./stages.js";
 import { POLICY } from "./types.js";
 
@@ -21,6 +22,11 @@ export interface StageTemplate {
 	instructions?: string;
 	/** Fixed option set replacing the executor's options for this stage. */
 	options?: Array<{ id: string; label: string; meaning: string }>;
+	/**
+	 * Review stages only: the fixed question set replacing the shipped default (business_review,
+	 * architecture_review, security_review). Fail-closed on anything malformed.
+	 */
+	questions?: ReviewQuestion[];
 }
 
 export interface JevTemplateConfig {
@@ -47,6 +53,13 @@ export interface JevTemplateConfig {
 		mutation?: boolean;
 		completion?: boolean;
 		destructive?: { patterns: string[] };
+		/**
+		 * F2: arms the ACCEPTANCE side of the FR-11 hand-off gate. Opt-in and off by default: it
+		 * judges the delegated result the host delivers (the `async-result` background delivery),
+		 * which is a different host contract from the handlers the smoke run verified. Without it
+		 * the dispatch side still fires whenever `stages.subagent_handoff` is declared.
+		 */
+		handoffAcceptance?: boolean;
 	};
 	/**
 	 * FR-02/FR-03 candidate lists, held by the owner. The judge chooses only from these,
@@ -78,7 +91,7 @@ export class JevConfigError extends Error {
 	}
 }
 
-function parseStageTemplate(file: string, where: string, raw: unknown): StageTemplate {
+function parseStageTemplate(file: string, where: string, raw: unknown, allowQuestions = false): StageTemplate {
 	if (!isRecord(raw)) throw new JevConfigError(file, `${where} must be an object`);
 	const out: StageTemplate = {};
 	if (raw["instructions"] !== undefined) {
@@ -86,6 +99,18 @@ function parseStageTemplate(file: string, where: string, raw: unknown): StageTem
 			throw new JevConfigError(file, `${where}.instructions must be a non-empty string`);
 		}
 		out.instructions = raw["instructions"] as string;
+	}
+	if (raw["questions"] !== undefined) {
+		// Fail-closed both ways: a malformed question set is refused, and a question set on a stage
+		// that is not a review is refused too (only the three reviews run a fixed question set).
+		if (!allowQuestions) {
+			throw new JevConfigError(file, `${where}.questions applies to review stages only (${REVIEW_IDS.join(", ")})`);
+		}
+		try {
+			out.questions = parseReviewQuestions(raw["questions"], `${where}.questions`);
+		} catch (err) {
+			throw new JevConfigError(file, err instanceof Error ? err.message : String(err));
+		}
 	}
 	if (raw["options"] !== undefined) {
 		const opts = raw["options"];
@@ -117,7 +142,7 @@ export function validateTemplateConfig(file: string, raw: unknown): JevTemplateC
 			if (!STAGES.has(stage)) {
 				throw new JevConfigError(file, `unknown stage key "${stage}" (known: ${[...STAGES].join(", ")})`);
 			}
-			stages[stage] = parseStageTemplate(file, `stages.${stage}`, value);
+			stages[stage] = parseStageTemplate(file, `stages.${stage}`, value, isReviewStage(stage));
 		}
 		out.stages = stages;
 	}
@@ -231,7 +256,7 @@ export function validateTemplateConfig(file: string, raw: unknown): JevTemplateC
 	if (raw["gates"] !== undefined) {
 		if (!isRecord(raw["gates"])) throw new JevConfigError(file, "gates must be an object");
 		const gates: JevTemplateConfig["gates"] = {};
-		for (const key of ["mutation", "completion"] as const) {
+		for (const key of ["mutation", "completion", "handoffAcceptance"] as const) {
 			const value = raw["gates"][key];
 			if (value === undefined) continue;
 			if (typeof value !== "boolean") throw new JevConfigError(file, `gates.${key} must be a boolean`);
@@ -280,6 +305,9 @@ export function mergeTemplateConfigs(user: JevTemplateConfig, project: JevTempla
 				: {
 						mutation: user.gates?.mutation ?? project.gates?.mutation,
 						completion: user.gates?.completion ?? project.gates?.completion,
+						// Same trust split as the switches: the acceptance side is USER-owned, so a
+						// project file can never arm a background consult on its own.
+						handoffAcceptance: user.gates?.handoffAcceptance ?? project.gates?.handoffAcceptance,
 						destructive:
 							user.gates?.destructive === undefined && project.gates?.destructive === undefined
 								? undefined

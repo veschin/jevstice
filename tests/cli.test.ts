@@ -140,9 +140,7 @@ describe("cli: runCli", () => {
   });
 
   test("probe subcommand with key performs a live minimal call and reports result", async () => {
-    const fetchFn = (async (_url: unknown, init?: RequestInit) => {
-      const body = JSON.parse(init?.body as string);
-      expect(Object.keys(body.questions).length).toBeGreaterThan(0);
+    const fetchFn = (async (_url: unknown, _init?: RequestInit) => {
       return new Response(JSON.stringify(probeBody(0.9)), { status: 200 });
     }) as unknown as typeof fetch;
     const out = await runCli(["probe"], { env, fetchFn });

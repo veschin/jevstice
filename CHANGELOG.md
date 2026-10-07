@@ -303,3 +303,80 @@ Rework loop with approach variation (owner order 2026-10-08, PRD 19 / TASKS "Rul
     into the loop bound, so the PRD 1.1 iteration path cannot deadlock.
   - README gains the "Rework loop" section plus the fail-closed cross-reference; `bun test` 348/348
     (7 new controller tests), `tsc --noEmit` clean.
+
+## 0.7.0 - 2026-10-08
+
+One gate/review mechanism (D1, judge: the top change, 0.91, from the architecture review that scored
+the codebase 2.32/9) plus the review activities (D5, judge: business 0.86 and architecture 0.92
+must-be, security 0.46 opt-in), and the two host-order defects the live omp smoke found in the
+hand-off gate (F1, F2).
+
+  - `src/gates.ts` is the mechanism: ONE registry of six descriptors (`plan_mutation`,
+    `subagent_handoff`, `destructive_action`, `business_review`, `architecture_review`,
+    `security_review`). A descriptor declares the subject and the evidence it must quote
+    (`evidenceRequired`, `evidenceKinds`), the consult frame (fixed question + claim shape built from
+    the subject verbatim + offered options + refusal option, or the fixed question set of a review,
+    or the approval binding of the plan gate), the internal deadline, the MODE (`blocking` refuses
+    only on a confident explicit negative; `advisory` records and surfaces and has no refusal path)
+    and the boundary that consults it. Adding a gate or a review is adding a descriptor.
+  - The three gates keep their behaviour byte for byte: same messages, same records
+    (`HandoffRecord`, `DestructiveRecord`), same restore validators, same option sets, same
+    refusals. What changed is where the logic lives: `consultGate` runs the frame, the deadline race,
+    the judge call, `normalizeJudgeResult` and the shared refusal condition
+    (`confidentNegative`) once; `src/deadline.ts` holds the single deadline helper plus
+    `HOST_HANDLER_TIMEOUT_MS`; the plan and completion boundaries read their granting stages from the
+    descriptor instead of a hard-coded trigger string; `gateLine` renders both gate records.
+  - `validateGateRegistry` (asserted empty by the suite) is what keeps "adding a descriptor"
+    honest: a missing descriptor, a stage that is not a registered control point, a trigger
+    mismatch, a refusal option that is not offered, a review that is not advisory, an advisory gate
+    with a refusal path, a per-item question without a finding polarity, or any deadline at or above
+    the host's 30s handler ceiling is reported.
+  - F1 (blocking, live smoke): the captured work order was retired by the task tool's own
+    `tool_result`, which omp 18.6.3 emits BEFORE `before_subagent_spawn` (21:11:31.698 vs
+    21:11:31.705), so the dispatch consult never fired in the real host while its unit tests passed.
+    The order is now retired when the SPAWN is judged (or when the capture ages out, the task
+    changes, or the dispatch is refused).
+  - F2 (blocking, live smoke): the acceptance side judged the spawn acknowledgement ("Spawned agent
+    ...; results auto-deliver") instead of the delegated result, and persisted it as blockers
+    against work nobody had done. The acceptance consult now runs on the result the host DELIVERS -
+    the `message_end` custom message omp builds for a settled background job (`customType:
+    "async-result"`, src/session/async-job-delivery.ts) - and never on the tool result; it is
+    explicitly opt-in (`gates.handoffAcceptance`, default false) and, while armed, the
+    acknowledgement is recorded as `not judged: ... the spawn acknowledgement, not the delegated
+    result` rather than judged. It still refuses nothing (that host hook cannot refuse a delivery).
+  - `src/reviews.ts`: the three review stages with the spec's FIXED question sets (business: two 0..9
+    scores, the declared-risk choice, the fixed value-unverified statement, one statement per
+    declared decision; architecture: the 0..9 quality score, one statement per declared defect, the
+    declared-change choice; security: one statement per declared surface, the worst-surface choice),
+    their 0..9 rubrics, the per-item expansion and the ONE-request runner. Fail-closed per question
+    id and kind: a missing, unknown, wrong-kind or out-of-range answer, a judge error, a deadline
+    loss or a candidate-frame escape keeps NO per-item result and records the uncertainty.
+  - Reviews are recorded in the session state (`JevState.reviews[stage]`) with the scores and their
+    confidences, the chosen candidate and every statement verdict (item text, verdict, noul value,
+    finding polarity), surfaced as same-session feedback, and restored after a restart only when the
+    persisted record validates (a malformed one is dropped, never trusted). A review records no gate
+    approval and pushes no blocker: only a confident negative STATEMENT (per the question's polarity)
+    is reported as a finding the executor must answer. The three stages are claimed by the `review`
+    activity in `src/activities.ts`, so `stagesWithoutActivity()` stays empty.
+  - Config: `stages.<stage>.questions` replaces a review's question set (`fail-closed` on anything
+    malformed; review stages only) and `gates.handoffAcceptance` arms the acceptance side. The
+    `reviews` restore validator and the review judge (`createReviewJudge`, one systemone request for
+    the whole fixed set, service options appended to every choice) follow the existing client
+    discipline: validated request, per-answer contract check, fail-closed.
+  - Live round-trip: `tools/reviews/product-reviews.ts` runs one business and one architecture
+    review through the shipped mechanism against the real endpoint and writes the recorded per-item
+    state to `evidence/reviews/<stamp>-product-reviews.md`.
+  - Designed with two live judge consultations (claim vs quoted evidence): "the shape that satisfies
+    adding a gate or review is adding a descriptor, not a new code path is ONE descriptor type whose
+    consultation kind is a field" - returned `approve`, `one_descriptor_type`, confidence 0.81. The
+    question "may an advisory review ever refuse" abstained twice (0.77, 0.56); the conservative
+    reading ordered by the spec was taken and is structural: an advisory descriptor is a review and
+    carries no refusal option at all.
+  - README gains "One mechanism: descriptors, modes, deadlines" and "Reviews: business, architecture,
+    opt-in security", the review stage rows, the `questions` override and `gates.handoffAcceptance`.
+  - `bun test` 335/335 target (12 new: 6 gate/host-order, 6 review). Observed at hand-off: 333
+    pass, 2 fail — both are two pre-existing cases in `tests/controller.test.ts` that assert the
+    pre-F2 acceptance behaviour (`the acceptance-side verdict is recorded from the task result
+    hook`, `an accepted result records the verdict without a blocker`); they encode the host order
+    F2 replaced, are owned by the test-pruning slice, and were reported to the integrator rather
+    than rewritten here. `bun run typecheck` clean; `src/index.ts` imports clean.

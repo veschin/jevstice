@@ -23,6 +23,16 @@
  */
 import { isRecord, nonEmptyString } from "./guards.js";
 import type { JevTemplateConfig } from "./config.js";
+import * as mechanism from "./gates.js";
+import {
+	REVIEW_DEADLINE_MS,
+	consultReview,
+	isReviewStage,
+	reviewLine,
+	reviewRecord,
+	type ReviewId,
+	type ReviewRecord,
+} from "./reviews.js";
 import {
 	ACTIVITY_REGISTRY,
 	PLAN_MAPPING_APPROVED_OPTION,
@@ -54,6 +64,7 @@ import {
 	type MultiLabelJudge,
 	type RequirementsFormalizationJudge,
 	type RequirementsFormalizationResult,
+	type ReviewJudge,
 } from "./types.js";
 import {
 	type DecisionResult,
@@ -236,6 +247,13 @@ export interface JevState {
 	lastHandoff: HandoffRecord | undefined;
 	/** POLICY-DRAFT I: last destructive-action judgement - recorded, never a silent no-op. */
 	lastDestructive: DestructiveRecord | undefined;
+	/**
+	 * Latest recorded review per review stage (business_review, architecture_review,
+	 * security_review): the scores with their confidences, the chosen declared candidate and every
+	 * statement verdict. Advisory by construction - a review records no gate approval and pushes no
+	 * blocker.
+	 */
+	reviews: Partial<Record<ReviewId, ReviewRecord>>;
 }
 
 function freshState(): JevState {
@@ -262,6 +280,7 @@ function freshState(): JevState {
 		pendingHandoffs: {},
 		lastHandoff: undefined,
 		lastDestructive: undefined,
+		reviews: {},
 	};
 }
 
@@ -292,35 +311,20 @@ export interface SpawnRouteResult {
 	note?: string;
 }
 
-/** FR-11 record of one handoff consultation: dispatch (before_subagent_spawn) or acceptance (tool_result). */
-export interface HandoffRecord {
+/**
+ * FR-11 record of one hand-off consultation: dispatch (before_subagent_spawn) or acceptance (the
+ * delegated result the host delivers). The fields every gate record carries live in src/gates.ts.
+ */
+export interface HandoffRecord extends mechanism.GateRecordFields {
 	phase: "dispatch" | "acceptance";
-	/** Judge verdict when a consultation happened; absent when it never did. */
-	verdict?: DecisionVerdict;
-	/** True when the judge answered (an unusable answer is still a consultation, not a failure). */
-	judged: boolean;
-	confidence?: number;
-	reasons: string[];
-	/** A spawn was refused on this record (dispatch only; the acceptance hook cannot refuse). */
-	blocked: boolean;
-	at: number;
 }
 
 /** POLICY-DRAFT I record of one execution-time destructive-action consultation. */
-export interface DestructiveRecord {
+export interface DestructiveRecord extends mechanism.GateRecordFields {
 	/** The owner pattern that matched, verbatim from the config. */
 	pattern: string;
 	/** The bash command that was judged (verbatim prefix, capped for readability). */
 	command: string;
-	/** Judge verdict when a consultation happened; absent when it never did. */
-	verdict?: DecisionVerdict;
-	/** True when the judge answered (an unusable answer is still a consultation, not a failure). */
-	judged: boolean;
-	confidence?: number;
-	reasons: string[];
-	/** The command was refused before execution (only a confident explicit negative does this). */
-	blocked: boolean;
-	at: number;
 }
 
 // ---------- tool input validation ----------
@@ -354,10 +358,10 @@ const MUTATING_TOOLS: ReadonlySet<string> = new Set([
 const COURSE_CHECK_REDIRECTING: ReadonlySet<string> = new Set(["return_to_requirement", "replan"]);
 /**
  * Marker the client puts in `reasons` on a frame escape, followed by the service option id,
- * the companion meta_reason and the actionable fix (client.ts FRAME_FIX_PREFIX). Same literal
- * as HANDOFF_FRAME_ESCAPE_REASON below: the controller depends on the contract, not the module.
+ * the companion meta_reason and the actionable fix (client.ts FRAME_FIX_PREFIX). It is declared
+ * with the descriptors: src/gates.ts owns the contract, this module reads it.
  */
-const FRAME_ESCAPE_REASON = "meta_option";
+const FRAME_ESCAPE_REASON = mechanism.FRAME_ESCAPE_REASON;
 const FRAME_FIX_PREFIX = "frame_fix: ";
 /**
  * Plan stages: a proposal that quotes no evidence is not judgeable (live 0.14-0.26 against
@@ -412,86 +416,21 @@ const PLAN_MAPPING_OPTIONS: DecisionOption[] = [
 	},
 ];
 /**
- * FR-11 handoff options, shared by the dispatch and acceptance sides (a `stages.subagent_handoff`
- * template may replace them, R3). The option ids carry consequence: the controller reads an
- * explicit `revise` verdict as the negative; an `approve` is never required for the work to pass,
- * and a template that overrides the options without keeping `revise` leaves the gate advisory
- * (HANDOFF_REFUSAL_OPTION below).
+ * The gate option sets, refusal conditions, frame-escape marker and consult deadlines live with
+ * the descriptors (src/gates.ts): the three gates and the three reviews are one mechanism, so
+ * nothing about a gate's options or deadline is declared here any more.
  */
-const HANDOFF_OPTIONS: DecisionOption[] = [
-	{
-		id: "approve",
-		label: "Hand-off is sound",
-		meaning: "the work order or the returned result matches the quoted requirement and is complete enough to proceed",
-	},
-	{
-		id: "revise",
-		label: "Hand-off is deficient",
-		meaning: "the work order or result contradicts or omits part of the quoted requirement; name the deficiency",
-	},
-];
-/** Option id that expresses the refusal: the offered set must name it for the gate to have teeth. */
-const HANDOFF_REFUSAL_OPTION = "revise";
-/**
- * Marker the client puts in `reasons` when the judge rejected the caller's frame instead of
- * judging the hand-off (client.ts: "meta_option", serviceId, metaReason; asserted in
- * tests/client.test.ts). A frame rejection is never an explicit negative about the work, so it
- * can record but never block.
- */
-const HANDOFF_FRAME_ESCAPE_REASON = "meta_option";
-/**
- * Dispatch deadline for the FR-11 handoff consult. The host runs `before_subagent_spawn`
- * handlers under a 30s timeout and DROPS the handler result on timeout, letting the spawn
- * proceed (runner.ts EXTENSION_HANDLER_TIMEOUT_MS = 30_000, no onFailure for this event), while
- * this handler keeps running: a negative that arrives after that ceiling would be recorded as a
- * refusal that never applied. Live endpoint latency has been measured at 33s against the
- * resetting edge, so the gate decides well before the host gives up.
- */
-const HANDOFF_DISPATCH_DEADLINE_MS = 25_000;
 /**
  * Age bound for a captured work order. A `task` tool call refused between capture and execution
  * (a foreign `tool_call` block, a preflight refusal or an approval deny - wrapper.ts:284-327
- * throws before `execute`) never emits `tool_result`, so its order would linger and disarm the
- * dispatch check for the rest of the session; it is also cleared outright when the task changes.
+ * throws before `execute`) never reaches a spawn, so its order would linger and disarm the
+ * dispatch check for the rest of the session; it is cleared outright when the task changes, and a
+ * spawn that consumed it retires it when the order has served its purpose.
  * Two minutes is far longer than any real dispatch and far shorter than a task.
  */
 const HANDOFF_ORDER_MAX_AGE_MS = 120_000;
-/** Evidence quotes are capped for cost; the kept prefix stays verbatim and the source says it was capped. */
-const HANDOFF_QUOTE_CAP = 4000;
-/**
- * POLICY-DRAFT I (always_judge, 0.88): destructive actions are judged fresh at execution time.
- * The stage is the registry point the controller consults; the gate is armed only by a non-empty
- * `gates.destructive.patterns`. Options mirror the handoff set - the refusal is an explicit
- * `revise` verdict, an `approve` is never required for the command to run, and the offered set
- * must name the refusal for the gate to have teeth.
- */
-const DESTRUCTIVE_STAGE: DecisionStage = "destructive_action";
-const DESTRUCTIVE_OPTIONS: DecisionOption[] = [
-	{
-		id: "approve",
-		label: "Safe to execute",
-		meaning:
-			"the command is not destructive or irreversible, or it is scoped so that running it is clearly intended",
-	},
-	{
-		id: "revise",
-		label: "Destructive or irreversible",
-		meaning:
-			"the command deletes or overwrites data, rewrites history, drops schema or is otherwise hard to " +
-			"reverse; do not run it without a fresh explicit decision - name the hazard",
-	},
-];
-/** Option id that expresses the refusal: the offered set must name it for the gate to have teeth. */
-const DESTRUCTIVE_REFUSAL_OPTION = "revise";
-/**
- * Internal deadline for the destructive-action consult. The host bounds every `tool_call` handler
- * at 30s and its on-timeout policy is fail-CLOSED (`{ block: true }`, runner.ts emitToolCall), so
- * a slow judge would otherwise become a block this gate never decided. The deadline fires first
- * and takes the fail-open path: the uncertainty is recorded and the command proceeds. A verdict
- * landing after the deadline is never read - a late answer must not pin a refusal that never
- * applied.
- */
-const DESTRUCTIVE_DEADLINE_MS = 25_000;
+/** The host builds a settled background job's delivery as this custom message (session/async-job-delivery.ts). */
+const ASYNC_RESULT_MESSAGE_TYPE = "async-result";
 const STATE_ENTRY_TYPE = "jev.state";
 const TOOL_NAME = "jev_decision";
 
@@ -669,51 +608,11 @@ async function fingerprint(text: string): Promise<string> {
 
 const VERDICTS: ReadonlySet<string> = new Set(["approve", "revise", "insufficient_evidence", "ask_user"]);
 
-/** A judge answer approves only if fully well-formed, option-resolvable and confident enough (AC4c/d). */
-export function normalizeJudgeResult(raw: unknown, options: DecisionOption[], minConfidence: number): DecisionResult {
-	if (!isRecord(raw)) {
-		return { verdict: "insufficient_evidence", reasons: ["judge returned a non-object payload"] };
-	}
-	const verdict = raw["verdict"];
-	if (typeof verdict !== "string" || !VERDICTS.has(verdict)) {
-		return { verdict: "insufficient_evidence", reasons: [`judge returned unknown verdict: ${String(verdict)}`] };
-	}
-	const reasons = Array.isArray(raw["reasons"]) ? raw["reasons"].filter((r): r is string => typeof r === "string") : [];
-	const confidence = typeof raw["confidence"] === "number" ? raw["confidence"] : undefined;
-	if (verdict === "approve") {
-		const selected = raw["selectedOption"];
-		if (typeof selected !== "string" || !options.some(o => o.id === selected)) {
-			return {
-				verdict: "insufficient_evidence",
-				reasons: ["judge approved without naming one of the offered options"],
-			};
-		}
-		if (confidence !== undefined && (confidence < 0 || confidence > 1)) {
-			return {
-				verdict: "insufficient_evidence",
-				reasons: [`judge confidence ${confidence} outside 0..1 is malformed`],
-				confidence,
-			};
-		}
-		if (confidence === undefined || confidence < minConfidence) {
-			return {
-				verdict: "insufficient_evidence",
-				reasons: [
-					confidence === undefined
-						? `judge approved without reporting confidence; absent is not above the required ${minConfidence}`
-						: `judge confidence ${confidence} below required ${minConfidence}`,
-				],
-				confidence,
-			};
-		}
-	}
-	return {
-		verdict: verdict as DecisionVerdict,
-		selectedOption: typeof raw["selectedOption"] === "string" ? raw["selectedOption"] : undefined,
-		reasons: reasons.length > 0 ? reasons : [`judge verdict: ${verdict}`],
-		confidence,
-	};
-}
+/**
+ * The judge-result normalization is the mechanism's (src/gates.ts: the consult runner and this
+ * decision pipeline must share one fail-closed normalization); re-exported for existing importers.
+ */
+export const normalizeJudgeResult = mechanism.normalizeJudgeResult;
 
 // ---------- controller ----------
 
@@ -755,6 +654,10 @@ export interface ControllerDeps {
 	 * timeout, whose on-timeout policy is fail-closed (DESTRUCTIVE_DEADLINE_MS). Tests only.
 	 */
 	destructiveDeadlineMs?: number;
+	/** Review judge: the fixed question set of a review stage in one request (src/client.ts). */
+	reviewJudge?: ReviewJudge;
+	/** Review consult deadline; must stay under the host's handler timeout (REVIEW_DEADLINE_MS). Tests only. */
+	reviewDeadlineMs?: number;
 }
 
 /** Minimal structural surface of the omp ExtensionAPI the controller needs. */
@@ -808,6 +711,10 @@ export class JevController {
 	private readonly handoffDispatchDeadlineMs: number;
 	/** Destructive-action consult deadline (under the host's fail-closed 30s tool_call timeout). */
 	private readonly destructiveDeadlineMs: number;
+	/** Review judge: the fixed question set of a review stage in one request. */
+	private readonly reviewJudge: ReviewJudge | undefined;
+	/** Review consult deadline (under the host's handler timeout). */
+	private readonly reviewDeadlineMs: number;
 
 	constructor(deps: ControllerDeps) {
 		this.judge = deps.judge;
@@ -820,8 +727,10 @@ export class JevController {
 		this.catalog = deps.catalog;
 		this.multiLabelJudge = deps.multiLabelJudge;
 		this.maxReworkIterations = deps.maxReworkIterations ?? POLICY.maxReworkIterations;
-		this.handoffDispatchDeadlineMs = deps.handoffDispatchDeadlineMs ?? HANDOFF_DISPATCH_DEADLINE_MS;
-		this.destructiveDeadlineMs = deps.destructiveDeadlineMs ?? DESTRUCTIVE_DEADLINE_MS;
+		this.handoffDispatchDeadlineMs = deps.handoffDispatchDeadlineMs ?? mechanism.HANDOFF_DISPATCH_DEADLINE_MS;
+		this.destructiveDeadlineMs = deps.destructiveDeadlineMs ?? mechanism.DESTRUCTIVE_DEADLINE_MS;
+		this.reviewJudge = deps.reviewJudge;
+		this.reviewDeadlineMs = deps.reviewDeadlineMs ?? REVIEW_DEADLINE_MS;
 		// R1: a confidenceThreshold override may only RAISE the bar above POLICY.
 		this.minConfidence = Math.max(
 			deps.minConfidence ?? POLICY.minConfidenceToApprove,
@@ -917,7 +826,14 @@ export class JevController {
 				"the plan serves it); a requirement without a supported claim leaves planning incomplete and " +
 				"mutating work stays blocked until the mapping covers every requirement. " +
 				"(`options` and `proposal` stay required by the tool schema on both stages, but the judges read " +
-				"`task`, `requirements`/`planClaims` and `evidence`.)",
+				"`task`, `requirements`/`planClaims` and `evidence`.) " +
+				"Use stage=business_review, stage=architecture_review or stage=security_review for the review " +
+				"activities: pass the material as quoted evidence, the declared items (decisions, defects or " +
+				"surfaces) in `claims` and the declared candidates for the review's choice question in `options`. " +
+				"The review asks its fixed question set in ONE request and records the per-item results " +
+				"(scores with confidences, the chosen candidate, every statement verdict) in the session; it is " +
+				"advisory - it refuses nothing, and only a confident negative statement comes back as a finding to " +
+				"answer.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -957,7 +873,9 @@ export class JevController {
 						type: "array",
 						items: { type: "string" },
 						description:
-							"2+ claim texts for stage=claim_check; each is judged separately against the quoted evidence",
+							"2+ claim texts for stage=claim_check, each judged separately against the quoted evidence; " +
+							"for the review stages (business_review, architecture_review, security_review) the " +
+							"DECLARED items under review (decisions, defects, surfaces), one statement question per item",
 					},
 					requirements: {
 						type: "array",
@@ -1005,7 +923,11 @@ export class JevController {
 		// even when the judge consult runs long enough to hit the host's handler timeout (a
 		// timed-out handler result is dropped whole, routing included).
 		pi.on("before_subagent_spawn", (event, ctx) => this.onHandoffDispatch(event, ctx));
-		// FR-11 acceptance side: `tool_result` is the only hook that observes a task result.
+		// FR-11 acceptance side: omp's task tool returns a spawn acknowledgement, so the delegated
+		// result is judged where the host delivers it - the custom `async-result` message a settled
+		// background job produces (message_end is notification-only, so this handler cannot refuse).
+		pi.on("message_end", (event, ctx) => this.onDeliveredResult(event, ctx));
+		// The acknowledgement itself: recorded as not-judged while the acceptance side is armed.
 		pi.on("tool_result", (event, ctx) => this.onTaskResult(event, ctx));
 	}
 
@@ -1225,6 +1147,17 @@ export class JevController {
 	}
 
 	/**
+	 * The acceptance side is a separate, explicitly opt-in switch (`gates.handoffAcceptance`,
+	 * default false). F2: omp's task tool returns a spawn acknowledgement and the delegated report
+	 * arrives later as the host's `async-result` delivery, so this side depends on a host contract
+	 * the live smoke has not verified - it must be armed deliberately, and its uncertainty is
+	 * recorded instead of an acknowledgement being judged as a result.
+	 */
+	private acceptanceWired(): boolean {
+		return this.handoffWired() && this.template.gates?.handoffAcceptance === true;
+	}
+
+	/**
 	 * Drop captured work orders older than HANDOFF_ORDER_MAX_AGE_MS. A `task` tool call refused
 	 * between capture and execution (foreign `tool_call` block, preflight refusal, approval deny:
 	 * wrapper.ts:284-327 throws before `execute`) never emits `tool_result`, so its order would
@@ -1241,7 +1174,10 @@ export class JevController {
 	/**
 	 * Capture the work order of a task tool call for the dispatch check, keyed by toolCallId.
 	 * Only while the gate is wired: an unwired gate leaves the session state untouched. The entry
-	 * is retired when that call settles (onTaskResult); the spawn event carries no toolCallId, so
+	 * is NOT retired by the task tool's own `tool_result` - omp emits that before
+	 * `before_subagent_spawn` (measured 21:11:31.698 vs 21:11:31.705), so retiring it there made
+	 * the dispatch consult inert in the real host (F1). It is retired when the spawn it belongs to
+	 * is judged (or aged out / cleared with the task); the spawn event carries no toolCallId, so
 	 * exact attribution to a call is not possible without host support - see onHandoffDispatch.
 	 */
 	private captureHandoffWorkOrder(event: Record<string, unknown>): void {
@@ -1255,10 +1191,10 @@ export class JevController {
 
 	/**
 	 * FR-11 dispatch side (before_subagent_spawn): judge the work order the lead agent is about
-	 * to hand to a task agent against the requirement captured at task start. Refuses the spawn
-	 * ONLY on a judged verdict that is explicitly negative (revise) at or above the confidence
-	 * floor, with the offered option set naming that refusal, and with the answer arriving before
-	 * the deadline below. An abstention, a low-confidence answer, a judge error, a frame-escape
+	 * to hand to a task agent against the requirement captured at task start, through the
+	 * hand-off descriptor (src/gates.ts). Refuses the spawn ONLY on a confident explicit negative
+	 * with the offered option set naming that refusal and with the answer arriving before the
+	 * frame's deadline. An abstention, a low-confidence answer, a judge error, a frame-escape
 	 * answer, a missing requirement, an unattributable work order or an unwired gate let the spawn
 	 * through and are recorded - the owner measured that a gate which blocks on an abstention
 	 * becomes a permanent block.
@@ -1289,30 +1225,25 @@ export class JevController {
 			this.recordHandoffUncertainty("dispatch", "no user requirement captured for this task yet");
 			return undefined;
 		}
-		const workOrder = cappedQuote(order.text).quote;
-		const proposal =
-			"Claim under judgment: this work order is an adequate assignment for a task agent - it asks for the " +
-			"work the quoted user requirement needs, stays within it, and names a result the agent can hand back.\n\n" +
-			`Work order handed over by the lead agent (verbatim):\n${workOrder}`;
+		const gate = mechanism.decisionGate("subagent_handoff");
 		const evidence: Evidence[] = [
-			handoffEvidence("user", "session task prompt (the requirement)", requirement),
-			handoffEvidence("spec", "task tool call input (the work order)", order.text),
+			mechanism.gateEvidence("user", "session task prompt (the requirement)", requirement),
+			mechanism.gateEvidence("spec", "task tool call input (the work order)", order.text),
 		];
-		// A late answer must never block: the host already dropped this handler's result at its
-		// own ceiling (see HANDOFF_DISPATCH_DEADLINE_MS) and proceeded with the spawn.
-		let settled: { record: HandoffRecord; negative: boolean } | undefined;
-		let deadline: Timer | undefined;
-		try {
-			settled = await Promise.race([
-				this.judgeHandoff("dispatch", proposal, evidence),
-				new Promise<undefined>(resolve => {
-					deadline = setTimeout(() => resolve(undefined), this.handoffDispatchDeadlineMs);
-				}),
-			]);
-		} finally {
-			clearTimeout(deadline);
-		}
-		if (settled === undefined) {
+		const subject = mechanism.gateSubject("Work order handed over by the lead agent (verbatim)", order.text);
+		// A late answer must never block: the host already dropped this handler's result at its own
+		// ceiling and proceeded with the spawn (see the descriptor's frame deadline).
+		const consult = await mechanism.consultGate(gate, {
+			frame: "dispatch",
+			subject,
+			evidence,
+			options: this.template.stages?.["subagent_handoff"]?.options,
+			judge: this.judge,
+			minConfidence: this.minConfidence,
+			deadlineMs: this.handoffDispatchDeadlineMs,
+		});
+		if (consult.deadlineLost) {
+			delete this.state.pendingHandoffs[id];
 			this.recordHandoffUncertainty(
 				"dispatch",
 				`the judge did not answer before the dispatch deadline (${this.handoffDispatchDeadlineMs}ms, ` +
@@ -1320,75 +1251,140 @@ export class JevController {
 			);
 			return undefined;
 		}
-		const { record, negative } = settled;
-		if (negative) {
+		const record: HandoffRecord = {
+			phase: "dispatch",
+			judged: consult.judged,
+			verdict: consult.verdict,
+			confidence: consult.confidence,
+			reasons: consult.reasons,
+			blocked: false,
+			at: this.now(),
+		};
+		if (consult.negative) {
 			const reason =
 				`Jev handoff check refused the dispatch: ${record.reasons.join(" ")} ` +
 				`(judge revise at confidence ${record.confidence}). ` +
 				"Rewrite the work order so it covers the quoted requirement, then dispatch again - " +
 				"or escalate to the user.";
+			// A refused spawn produces no delegated result: the order has nothing left to do.
+			delete this.state.pendingHandoffs[id];
 			this.blockHandoff(record, reason);
 			return { block: true, reason };
 		}
+		// The order has served its purpose unless the acceptance side will need it to quote the
+		// work order alongside the delivered result.
+		if (!this.acceptanceWired()) delete this.state.pendingHandoffs[id];
 		this.state.lastHandoff = record;
-		this.pushFeedback(`Jev handoff (${handoffLine(record)}). The delegation proceeds.`);
+		this.pushFeedback(`Jev handoff (${mechanism.gateLine(record.phase, record)}). The delegation proceeds.`);
 		this.persist();
 		return undefined;
 	}
 
 	/**
-	 * FR-11 acceptance side (tool_result): when a task tool call settles, consult the judge about
-	 * the result before the lead agent builds on it. `tool_result` cannot refuse a call (the host
-	 * only lets a handler rewrite content/details/isError), so a confident negative is recorded as
-	 * an unresolved blocker and pushed back into the same session. The consult is not awaited: the
-	 * measured judge latency against a resetting endpoint (33s) must not delay the delegated
-	 * result reaching the model.
+	 * F2: the `task` tool's own result is NOT the delegated result - omp returns a spawn
+	 * acknowledgement ("Spawned agent ...; results auto-deliver") and the report arrives later as
+	 * the host's `async-result` delivery. This handler therefore never judges that result; while
+	 * the acceptance side is armed it records the honest uncertainty ("the spawn acknowledgement,
+	 * not the delegated result") and leaves the captured order for the spawn and the delivery. It
+	 * also never retires the captured order here: omp emits this result BEFORE
+	 * `before_subagent_spawn`, so retiring it here made the dispatch consult inert (F1).
 	 */
 	onTaskResult(event: unknown, _ctx?: unknown): undefined {
-		if (!this.handoffWired() || !isRecord(event) || event["toolName"] !== "task") return undefined;
-		const toolCallId = typeof event["toolCallId"] === "string" ? event["toolCallId"] : undefined;
-		const order = toolCallId !== undefined ? this.state.pendingHandoffs[toolCallId] : undefined;
-		// Retire the order of the call that settled, consumed by a spawn or not.
-		if (toolCallId !== undefined) delete this.state.pendingHandoffs[toolCallId];
+		if (!this.acceptanceWired() || !isRecord(event) || event["toolName"] !== "task") return undefined;
+		this.recordHandoffUncertainty(
+			"acceptance",
+			"not judged: the task tool result is the spawn acknowledgement, not the delegated result; the " +
+				"delegated result is judged when the host delivers it",
+		);
+		return undefined;
+	}
+
+	/**
+	 * FR-11 acceptance side, on the delivered result: omp injects a settled background job's result
+	 * as a custom `async-result` message (session/async-job-delivery.ts), which is what this handler
+	 * judges - before the lead agent builds on it. `message_end` is notification-only, so a
+	 * confident negative is recorded as an unresolved blocker and pushed back into the same session,
+	 * never a refusal. The consult is not awaited: measured judge latency reaches 33s against a
+	 * resetting endpoint, and the delivery must reach the model without that delay.
+	 */
+	onDeliveredResult(event: unknown, _ctx?: unknown): undefined {
+		if (!this.acceptanceWired() || !isRecord(event)) return undefined;
+		const message = event["message"];
+		if (!isRecord(message)) return undefined;
+		if (message["role"] !== "custom" || message["customType"] !== ASYNC_RESULT_MESSAGE_TYPE) return undefined;
+		const reported = messageText(message);
+		if (reported.length === 0) {
+			this.recordHandoffUncertainty("acceptance", "the delivered background result carried no text to judge");
+			return undefined;
+		}
 		const requirement = this.state.taskPrompt;
 		if (requirement === undefined) {
 			this.recordHandoffUncertainty("acceptance", "no user requirement captured for this task yet");
 			return undefined;
 		}
-		const reported = resultText(event);
-		if (reported.length === 0) {
-			this.recordHandoffUncertainty(
-				"acceptance",
-				`the task result carried no report text${event["isError"] === true ? " (the call failed)" : ""}`,
-			);
-			return undefined;
-		}
-		this.handoffAcceptance = this.runHandoffAcceptance(requirement, order?.text, reported).catch(() => {});
+		this.handoffAcceptance = this.runHandoffAcceptance(requirement, this.takeAwaitingOrder(), reported).catch(() => {});
 		return undefined;
 	}
 
-	/** Await the in-flight acceptance consult (test seam; the tool_result path never blocks on it). */
+	/**
+	 * The work order of the spawn whose result is being delivered: the single captured order a
+	 * spawn has consumed and no delivery has claimed yet. It is consumed here (the delivery is the
+	 * order's last reader). With several in flight the delivery cannot be attributed - the host's
+	 * delivery names the job, not the spawn key - so `undefined` judges the result against the
+	 * requirement alone, and an unconsumed order ages out as before.
+	 */
+	private takeAwaitingOrder(): string | undefined {
+		this.pruneStaleHandoffOrders();
+		const awaiting = Object.entries(this.state.pendingHandoffs).filter(([, entry]) => entry.usedBySpawn);
+		if (awaiting.length !== 1) return undefined;
+		const [key, entry] = awaiting[0]!;
+		delete this.state.pendingHandoffs[key];
+		return entry.text;
+	}
+
+	/** Await the in-flight acceptance consult (test seam; neither event path blocks on it). */
 	async handoffAcceptanceSettled(): Promise<void> {
 		await this.handoffAcceptance?.catch(() => {});
 	}
 
 	private async runHandoffAcceptance(requirement: string, workOrder: string | undefined, reported: string): Promise<void> {
-		const evidence: Evidence[] = [handoffEvidence("user", "session task prompt (the requirement)", requirement)];
+		const gate = mechanism.decisionGate("subagent_handoff");
+		const evidence: Evidence[] = [mechanism.gateEvidence("user", "session task prompt (the requirement)", requirement)];
 		if (workOrder !== undefined) {
-			evidence.push(handoffEvidence("spec", "task tool call input (the work order)", workOrder));
+			evidence.push(mechanism.gateEvidence("spec", "task tool call input (the work order)", workOrder));
 		}
 		// The delegated agent's own report is self-report, not artifact evidence (FR-16): the source
 		// says so, and a report-only acceptance claim is exactly what the judge may abstain on.
 		evidence.push(
-			handoffEvidence("log", "task tool result (the delegated agent's own report, not artifact-verified)", reported),
+			mechanism.gateEvidence(
+				"log",
+				"delivered background result (the delegated agent's own report, not artifact-verified)",
+				reported,
+			),
 		);
-		const proposal =
-			"Claim under judgment: the returned result satisfies the quoted user requirement and is supported by " +
-			"what the delegated agent reported; nothing the requirement asks for is missing or contradicted.\n\n" +
-			(workOrder !== undefined ? `Work order the agent was given (verbatim):\n${cappedQuote(workOrder).quote}\n\n` : "") +
-			`Result reported by the task agent (verbatim):\n${cappedQuote(reported).quote}`;
-		const { record, negative } = await this.judgeHandoff("acceptance", proposal, evidence);
-		if (negative) {
+		const subject =
+			(workOrder !== undefined
+				? `${mechanism.gateSubject("Work order the agent was given (verbatim)", workOrder)}\n\n`
+				: "") +
+			mechanism.gateSubject("Result reported by the task agent (verbatim)", reported);
+		const consult = await mechanism.consultGate(gate, {
+			frame: "acceptance",
+			subject,
+			evidence,
+			options: this.template.stages?.["subagent_handoff"]?.options,
+			judge: this.judge,
+			minConfidence: this.minConfidence,
+		});
+		const record: HandoffRecord = {
+			phase: "acceptance",
+			judged: consult.judged,
+			verdict: consult.verdict,
+			confidence: consult.confidence,
+			reasons: consult.reasons,
+			blocked: false,
+			at: this.now(),
+		};
+		if (consult.negative) {
 			this.blockHandoff(
 				record,
 				`Jev handoff check did not accept the delegated result: ${record.reasons.join(" ")} ` +
@@ -1398,61 +1394,8 @@ export class JevController {
 			return;
 		}
 		this.state.lastHandoff = record;
-		this.pushFeedback(`Jev handoff (${handoffLine(record)}).`);
+		this.pushFeedback(`Jev handoff (${mechanism.gateLine(record.phase, record)}).`);
 		this.persist();
-	}
-
-	/**
-	 * One handoff consultation. Never throws: a judge error is an unjudged record (it approves
-	 * nothing and blocks nothing). The negative is read from the verdict - the question the client
-	 * fixes for every caller - and is only decisive when the offered option set names the refusal,
-	 * the judge did not reject the frame instead (HANDOFF_FRAME_ESCAPE_REASON) and the confidence
-	 * is a real number at or above the floor and inside 0..1 (normalizeJudgeResult range-checks
-	 * confidence on the approve branch only, so a malformed 1.5 revise must not count).
-	 */
-	private async judgeHandoff(
-		phase: HandoffRecord["phase"],
-		proposal: string,
-		evidence: Evidence[],
-	): Promise<{ record: HandoffRecord; negative: boolean }> {
-		const options = this.template.stages?.["subagent_handoff"]?.options ?? HANDOFF_OPTIONS;
-		const base: HandoffRecord = { phase, judged: false, reasons: [], blocked: false, at: this.now() };
-		let raw: unknown;
-		try {
-			raw = await this.judge({
-				stage: "subagent_handoff",
-				task:
-					phase === "dispatch"
-						? "Validate the work order the lead agent is about to hand to a task agent, before dispatch (FR-11)."
-						: "Validate the result a task agent returned, before the lead agent accepts it and builds on it (FR-11).",
-				proposal,
-				options,
-				evidence,
-			});
-		} catch (err) {
-			return {
-				record: { ...base, reasons: [`judge unavailable: ${err instanceof Error ? err.message : String(err)}`] },
-				negative: false,
-			};
-		}
-		const result = normalizeJudgeResult(raw, options, this.minConfidence);
-		const negative =
-			result.verdict === "revise" &&
-			options.some(o => o.id === HANDOFF_REFUSAL_OPTION) &&
-			!result.reasons.includes(HANDOFF_FRAME_ESCAPE_REASON) &&
-			result.confidence !== undefined &&
-			result.confidence >= this.minConfidence &&
-			result.confidence <= 1;
-		return {
-			record: {
-				...base,
-				judged: true,
-				verdict: result.verdict,
-				confidence: result.confidence,
-				reasons: result.reasons,
-			},
-			negative,
-		};
 	}
 
 	/** Unjudged handoff outcome: recorded in state and surfaced, never a block (owner constraint). */
@@ -1492,29 +1435,24 @@ export class JevController {
 		if (command === undefined) return undefined;
 		const matched = destructivePatternMatch(command, patterns);
 		if (matched === undefined) return undefined;
-		const proposal =
-			"Claim under judgment: this shell command is destructive or irreversible enough that running it " +
-			"now is not safe without a fresh explicit decision - it deletes or overwrites data, rewrites " +
-			"history, drops schema, or is otherwise hard to reverse.\n\n" +
-			`Command about to run (verbatim):\n${cappedQuote(command).quote}`;
-		const evidence: Evidence[] = [handoffEvidence("spec", "bash tool call command (about to run)", command)];
+		const gate = mechanism.decisionGate("destructive_action");
+		const evidence: Evidence[] = [
+			mechanism.gateEvidence("spec", "bash tool call command (about to run)", command),
+		];
 		const task = this.state.taskPrompt;
-		if (task !== undefined) evidence.push(handoffEvidence("user", "session task prompt", task));
-		// A late answer must never block: the host's own tool_call timeout is fail-closed, so this
-		// deadline must fire first and take the fail-open path (see DESTRUCTIVE_DEADLINE_MS).
-		let settled: { record: DestructiveRecord; negative: boolean } | undefined;
-		let deadline: Timer | undefined;
-		try {
-			settled = await Promise.race([
-				this.judgeDestructive(matched, command, proposal, evidence),
-				new Promise<undefined>(resolve => {
-					deadline = setTimeout(() => resolve(undefined), this.destructiveDeadlineMs);
-				}),
-			]);
-		} finally {
-			clearTimeout(deadline);
-		}
-		if (settled === undefined) {
+		if (task !== undefined) evidence.push(mechanism.gateEvidence("user", "session task prompt", task));
+		// A late answer must never block: the host's own tool_call timeout is fail-closed, so the
+		// frame's deadline must fire first and take the fail-open path.
+		const consult = await mechanism.consultGate(gate, {
+			frame: "execution",
+			subject: mechanism.gateSubject("Command about to run (verbatim)", command),
+			evidence,
+			options: this.template.stages?.[gate.stage]?.options,
+			judge: this.judge,
+			minConfidence: this.minConfidence,
+			deadlineMs: this.destructiveDeadlineMs,
+		});
+		if (consult.deadlineLost) {
 			this.recordDestructiveUncertainty(
 				matched,
 				command,
@@ -1522,8 +1460,17 @@ export class JevController {
 			);
 			return undefined;
 		}
-		const { record, negative } = settled;
-		if (negative) {
+		const record: DestructiveRecord = {
+			pattern: matched,
+			command: mechanism.cappedQuote(command).quote,
+			judged: consult.judged,
+			verdict: consult.verdict,
+			confidence: consult.confidence,
+			reasons: consult.reasons,
+			blocked: false,
+			at: this.now(),
+		};
+		if (consult.negative) {
 			const reason =
 				`Jev destructive-action gate refused this command before execution: ${record.reasons.join(" ")} ` +
 				`(judge revise at confidence ${record.confidence}, matched pattern "${record.pattern}"). ` +
@@ -1532,76 +1479,19 @@ export class JevController {
 			return { block: true, reason };
 		}
 		this.state.lastDestructive = record;
-		this.pushFeedback(`Jev destructive-action gate (${destructiveLine(record)}). The command proceeds.`);
+		this.pushFeedback(
+			`Jev destructive-action gate (${mechanism.gateLine(`command matched "${record.pattern}"`, record)}). ` +
+				"The command proceeds.",
+		);
 		this.persist();
 		return undefined;
-	}
-
-	/**
-	 * One destructive-action consultation. Never throws: a judge error is an unjudged record (it
-	 * approves nothing and blocks nothing). The negative is read from the verdict and is only
-	 * decisive when the offered option set names the refusal, the judge did not reject the frame
-	 * instead and the confidence is a real number at or above the floor and inside 0..1
-	 * (normalizeJudgeResult range-checks confidence on the approve branch only, so a malformed 1.5
-	 * revise must not count).
-	 */
-	private async judgeDestructive(
-		pattern: string,
-		command: string,
-		proposal: string,
-		evidence: Evidence[],
-	): Promise<{ record: DestructiveRecord; negative: boolean }> {
-		const options = this.template.stages?.[DESTRUCTIVE_STAGE]?.options ?? DESTRUCTIVE_OPTIONS;
-		const base: DestructiveRecord = {
-			pattern,
-			command: cappedQuote(command).quote,
-			judged: false,
-			reasons: [],
-			blocked: false,
-			at: this.now(),
-		};
-		let raw: unknown;
-		try {
-			raw = await this.judge({
-				stage: DESTRUCTIVE_STAGE,
-				task:
-					"Judge this destructive or irreversible shell command at execution time, before it runs " +
-					"(POLICY-DRAFT destructive-action gate; the plan never covers it).",
-				proposal,
-				options,
-				evidence,
-			});
-		} catch (err) {
-			return {
-				record: { ...base, reasons: [`judge unavailable: ${err instanceof Error ? err.message : String(err)}`] },
-				negative: false,
-			};
-		}
-		const result = normalizeJudgeResult(raw, options, this.minConfidence);
-		const negative =
-			result.verdict === "revise" &&
-			options.some(o => o.id === DESTRUCTIVE_REFUSAL_OPTION) &&
-			!result.reasons.includes(FRAME_ESCAPE_REASON) &&
-			result.confidence !== undefined &&
-			result.confidence >= this.minConfidence &&
-			result.confidence <= 1;
-		return {
-			record: {
-				...base,
-				judged: true,
-				verdict: result.verdict,
-				confidence: result.confidence,
-				reasons: result.reasons,
-			},
-			negative,
-		};
 	}
 
 	/** Unjudged destructive outcome: recorded in state and surfaced, never a block (owner constraint). */
 	private recordDestructiveUncertainty(pattern: string, command: string, note: string): void {
 		this.state.lastDestructive = {
 			pattern,
-			command: cappedQuote(command).quote,
+			command: mechanism.cappedQuote(command).quote,
 			judged: false,
 			reasons: [note],
 			blocked: false,
@@ -1679,6 +1569,9 @@ export class JevController {
 				pendingHandoffs: {},
 				lastHandoff: restoreHandoffRecord(data["lastHandoff"]),
 				lastDestructive: restoreDestructiveRecord(data["lastDestructive"]),
+				// Review records are restored only when they validate; a malformed one is dropped, never
+				// trusted as a result (a restart must not resurrect a fake review).
+				reviews: restoreReviews(data["reviews"]),
 			};
 			return;
 		}
@@ -1764,7 +1657,7 @@ export class JevController {
 	private async submitDecisionCore(raw: unknown): Promise<DecisionOutcome> {
 		// The completion streak is content-bound; every interruption (error, invalid or
 		// rejected submission, revise) breaks it. Helper covers the early failure returns.
-		const stopStageRaw = isRecord(raw) && raw["stage"] === "completion_review";
+		const stopStageRaw = isRecord(raw) && raw["stage"] === this.approvalBoundary().stopStage;
 		const interrupted = (): void => {
 			if (stopStageRaw && this.state.consecutiveCompletionApproves !== undefined) {
 				this.state.consecutiveCompletionApproves = undefined;
@@ -2049,6 +1942,15 @@ export class JevController {
 			return this.guardActivityOutcome(input.stage, preset) ?? preset;
 		}
 
+		// Review activities (business_review, architecture_review, security_review): the controller
+		// runs the review's fixed question set itself and records the per-item results. Advisory by
+		// construction - a review records no gate approval, pushes no blocker and refuses nothing.
+		const reviewDescriptor = mechanism.reviewGateForStage(input.stage);
+		if (reviewDescriptor !== undefined) {
+			const preset = await this.submitReview(reviewDescriptor, input, boundKey, used);
+			return this.guardActivityOutcome(input.stage, preset) ?? preset;
+		}
+
 		let rawResult: DecisionResult;
 		try {
 			rawResult = await this.judge({
@@ -2077,7 +1979,7 @@ export class JevController {
 
 		// Calibration-tolerant completion: normalize with the lowered bar so mid-band
 		// approves survive; the counting block below enforces floor/count/teeth.
-		const stopStage = lookupControlPoint(input.stage, this.extraPoints)?.trigger === "session_stop";
+		const stopStage = input.stage === this.approvalBoundary().stopStage;
 		// F1 policy interaction: the streak path applies ONLY at the POLICY default bar;
 		// a raised threshold keeps a single strict bar (no streak credit).
 		const streakEligible = this.minConfidence === POLICY.minConfidenceToApprove;
@@ -2935,6 +2837,75 @@ export class JevController {
 		};
 	}
 
+	/**
+	 * Review activity (src/reviews.ts): the descriptor's fixed question set goes to the review
+	 * judge in ONE request; the per-item results are recorded in the session state and surfaced.
+	 * Advisory by construction - the submission path here records no approval, pushes no blocker and
+	 * refuses nothing: a confident negative STATEMENT is reported as a finding the executor must
+	 * answer, and an abstention, a judge error, a deadline loss or a frame escape records the
+	 * uncertainty. `claims` carries the declared items (decisions, defects, surfaces) and `options`
+	 * the declared candidates, so the judge can never invent one.
+	 */
+	private async submitReview(
+		gate: mechanism.ReviewGate,
+		input: ValidatedDecisionInput,
+		boundKey: string,
+		used: number,
+	): Promise<DecisionOutcome> {
+		const questions = this.template.stages?.[gate.stage]?.questions ?? gate.consult.questions;
+		const items = input.claims.map((text, i) => ({ id: `item-${i + 1}`, text }));
+		if (this.reviewJudge === undefined) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [`${gate.stage}: review judge not configured in this session`],
+				judged: false,
+				summary: "",
+			};
+		}
+		const outcome = await consultReview({
+			stage: gate.stage,
+			task: `${gate.consult.task}\n\nSubject under review: ${input.task}`,
+			questions,
+			items,
+			candidates: input.options,
+			evidence: input.evidence,
+			judge: this.reviewJudge,
+			deadlineMs: this.reviewDeadlineMs,
+		});
+		const record = reviewRecord(gate.id, gate.stage, outcome, {
+			at: this.now(),
+			taskFingerprint: this.state.taskFingerprint,
+			workRevision: this.state.workRevision,
+		});
+		this.state.reviews[gate.id] = record;
+		if (!outcome.ok) {
+			// A review that could not be judged is real rework: it consumes the bound so a broken
+			// consult cannot loop forever, and it records the uncertainty without blocking anything.
+			this.state.iterations[boundKey] = used + 1;
+			this.persist();
+			this.pushFeedback(`Jev ${gate.stage} not judged: ${outcome.detail}. Nothing is blocked.`);
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [`${gate.stage}: ${outcome.detail}`],
+				judged: false,
+				summary: `${gate.stage}: insufficient_evidence — ${outcome.detail} (recorded; nothing is blocked)`,
+			};
+		}
+		if (record.findings.length > 0) {
+			this.state.iterations[boundKey] = used + 1;
+			this.persist();
+			this.pushFeedback(`Jev ${gate.stage}: finding(s) to answer — ${record.findings.join(", ")}`);
+			return {
+				verdict: "revise",
+				reasons: [`${gate.stage}: findings — ${record.findings.join(", ")}`],
+				judged: true,
+				summary: reviewLine(record),
+			};
+		}
+		this.persist();
+		return { verdict: "approve", reasons: [`${gate.stage}: recorded`], judged: true, summary: reviewLine(record) };
+	}
+
 	/** aspect_coverage three-way marking: missed aspects -> revise; else recorded, no approval. */
 	private async submitAspectCoverage(
 		input: ValidatedDecisionInput,
@@ -3113,13 +3084,20 @@ export class JevController {
 		);
 	}
 
+	/**
+	 * The approval boundary of the plan/mutation descriptor: which stages grant the pre-mutation
+	 * gate and which stage opens the session-stop boundary. Declared once, in src/gates.ts.
+	 */
+	private approvalBoundary(): { grantingStages: readonly DecisionStage[]; stopStage: DecisionStage } {
+		return mechanism.approvalGate("plan_mutation").consult;
+	}
+
 	private planApproval(): ApprovalRecord | undefined {
 		// Undefined current fingerprint means no user task is established yet: no gate credit.
 		if (this.state.taskFingerprint === undefined) return undefined;
+		const granting = this.approvalBoundary().grantingStages;
 		return this.state.approvals.find(
-			a =>
-				lookupControlPoint(a.stage, this.extraPoints)?.trigger === "mutation_gate" &&
-				a.taskFingerprint === this.state.taskFingerprint,
+			a => granting.includes(a.stage) && a.taskFingerprint === this.state.taskFingerprint,
 		);
 	}
 
@@ -3299,7 +3277,7 @@ export class JevController {
 			return formalization.requirements.map(r => ({ id: r.id, quote: r.text }));
 		}
 		const task = this.state.taskPrompt;
-		return task !== undefined ? [{ id: "task", quote: cappedQuote(task).quote }] : [];
+		return task !== undefined ? [{ id: "task", quote: mechanism.cappedQuote(task).quote }] : [];
 	}
 
 	/**
@@ -3323,9 +3301,9 @@ export class JevController {
 		}
 		const evidence: Evidence[] = [];
 		if (this.state.taskPrompt !== undefined) {
-			evidence.push(handoffEvidence("user", "session task prompt (the requirement)", this.state.taskPrompt));
+			evidence.push(mechanism.gateEvidence("user", "session task prompt (the requirement)", this.state.taskPrompt));
 		}
-		for (const r of requirements) evidence.push(handoffEvidence("spec", `requirement ${r.id}`, r.quote));
+		for (const r of requirements) evidence.push(mechanism.gateEvidence("spec", `requirement ${r.id}`, r.quote));
 		let raw: CourseCheckResult;
 		try {
 			raw = await this.courseCheckJudge({
@@ -3420,9 +3398,10 @@ export class JevController {
 		}
 		// Latest approval wins: supersede keeps same-digest records, so the freshest
 		// completion_review must be consulted, not the first.
+		const stopStage = this.approvalBoundary().stopStage;
 		let completion: ApprovalRecord | undefined;
 		for (const a of this.state.approvals) {
-			if (lookupControlPoint(a.stage, this.extraPoints)?.trigger === "session_stop") completion = a;
+			if (a.stage === stopStage) completion = a;
 		}
 		if (completion === undefined) {
 			missing.push("no completion_review approval at all");
@@ -3655,42 +3634,114 @@ function extraPointsFromTemplate(template: JevTemplateConfig): ReadonlyMap<strin
 	return out;
 }
 
-/** Validate a persisted handoff record: malformed entries are dropped, never trusted. */
+/**
+ * Validate a persisted hand-off record: the shared gate fields come from the mechanism's validator
+ * (src/gates.ts), the phase is this record's own field, and a malformed entry is dropped outright.
+ */
 function restoreHandoffRecord(raw: unknown): HandoffRecord | undefined {
-	if (!isRecord(raw)) return undefined;
+	const base = mechanism.restoreGateRecordFields(raw);
+	if (base === undefined || !isRecord(raw)) return undefined;
 	if (raw["phase"] !== "dispatch" && raw["phase"] !== "acceptance") return undefined;
-	if (typeof raw["judged"] !== "boolean" || typeof raw["blocked"] !== "boolean") return undefined;
-	if (typeof raw["at"] !== "number" || !Number.isFinite(raw["at"])) return undefined;
-	const verdict = raw["verdict"];
-	if (verdict !== undefined && (typeof verdict !== "string" || !VERDICTS.has(verdict))) return undefined;
-	return {
-		phase: raw["phase"],
-		verdict: verdict as DecisionVerdict | undefined,
-		judged: raw["judged"],
-		confidence: typeof raw["confidence"] === "number" ? raw["confidence"] : undefined,
-		reasons: Array.isArray(raw["reasons"]) ? raw["reasons"].filter((r): r is string => typeof r === "string") : [],
-		blocked: raw["blocked"],
-		at: raw["at"],
-	};
+	return { phase: raw["phase"], ...base };
 }
 
-/** Validate a persisted destructive-action record: malformed entries are dropped, never trusted. */
+/** Validate a persisted destructive-action record: shared fields + the matched pattern and command. */
 function restoreDestructiveRecord(raw: unknown): DestructiveRecord | undefined {
-	if (!isRecord(raw)) return undefined;
-	if (typeof raw["judged"] !== "boolean" || typeof raw["blocked"] !== "boolean") return undefined;
-	if (typeof raw["at"] !== "number" || !Number.isFinite(raw["at"])) return undefined;
+	const base = mechanism.restoreGateRecordFields(raw);
+	if (base === undefined || !isRecord(raw)) return undefined;
 	if (!nonEmptyString(raw["pattern"]) || typeof raw["command"] !== "string") return undefined;
-	const verdict = raw["verdict"];
-	if (verdict !== undefined && (typeof verdict !== "string" || !VERDICTS.has(verdict))) return undefined;
+	return { pattern: raw["pattern"], command: raw["command"], ...base };
+}
+
+/**
+ * Validate the persisted reviews: every entry must be a review record that validates, keyed by a
+ * review stage. A malformed entry is dropped rather than trusted as a result - a restart must not
+ * resurrect a review that never happened, and one bad entry must not discard the others.
+ */
+function restoreReviews(raw: unknown): Partial<Record<ReviewId, ReviewRecord>> {
+	const out: Partial<Record<ReviewId, ReviewRecord>> = {};
+	if (!isRecord(raw)) return out;
+	for (const [stage, value] of Object.entries(raw)) {
+		if (!isReviewStage(stage)) continue;
+		if (!isRecord(value) || value["stage"] !== stage || typeof value["judged"] !== "boolean") continue;
+		if (typeof value["at"] !== "number" || !Number.isFinite(value["at"])) continue;
+		if (typeof value["workRevision"] !== "number" || !Number.isFinite(value["workRevision"])) continue;
+		const scores: ReviewRecord["scores"] = [];
+		if (!Array.isArray(value["scores"]) || !validScores(value["scores"], scores)) continue;
+		const items: ReviewRecord["items"] = [];
+		if (!Array.isArray(value["items"]) || !validReviewItems(value["items"], items)) continue;
+		const findings = Array.isArray(value["findings"])
+			? value["findings"].filter((f): f is string => typeof f === "string")
+			: undefined;
+		if (findings === undefined) continue;
+		const reasons = Array.isArray(value["reasons"])
+			? value["reasons"].filter((r): r is string => typeof r === "string")
+			: undefined;
+		if (reasons === undefined) continue;
+		const choice = restoreReviewChoice(value["choice"]);
+		if (value["choice"] !== undefined && choice === undefined) continue;
+		out[stage] = {
+			review: stage,
+			stage,
+			judged: value["judged"],
+			scores,
+			...(choice !== undefined ? { choice } : {}),
+			items,
+			findings,
+			reasons,
+			at: value["at"],
+			taskFingerprint: typeof value["taskFingerprint"] === "string" ? value["taskFingerprint"] : undefined,
+			workRevision: value["workRevision"],
+		};
+	}
+	return out;
+}
+
+/** Validate the recorded scores in place; false when any entry is malformed. */
+function validScores(raw: unknown[], out: ReviewRecord["scores"]): boolean {
+	for (const entry of raw) {
+		if (!isRecord(entry) || !nonEmptyString(entry["questionId"])) return false;
+		if (typeof entry["score"] !== "number" || !Number.isFinite(entry["score"])) return false;
+		if (entry["confidence"] !== undefined && typeof entry["confidence"] !== "number") return false;
+		out.push({
+			questionId: entry["questionId"],
+			score: entry["score"],
+			...(typeof entry["confidence"] === "number" ? { confidence: entry["confidence"] } : {}),
+		});
+	}
+	return true;
+}
+
+/** Validate the recorded statement verdicts in place; false when any entry is malformed. */
+function validReviewItems(raw: unknown[], out: ReviewRecord["items"]): boolean {
+	for (const entry of raw) {
+		if (!isRecord(entry) || !nonEmptyString(entry["questionId"]) || typeof entry["item"] !== "string") return false;
+		if (typeof entry["verdict"] !== "boolean" || typeof entry["finding"] !== "boolean") return false;
+		if (typeof entry["noul"] !== "number" || !Number.isFinite(entry["noul"])) return false;
+		if (entry["confidence"] !== undefined && typeof entry["confidence"] !== "number") return false;
+		out.push({
+			questionId: entry["questionId"],
+			item: entry["item"],
+			verdict: entry["verdict"],
+			noul: entry["noul"],
+			...(typeof entry["confidence"] === "number" ? { confidence: entry["confidence"] } : {}),
+			finding: entry["finding"],
+		});
+	}
+	return true;
+}
+
+/** Validate a recorded choice; undefined when the value is present but malformed. */
+function restoreReviewChoice(raw: unknown): ReviewRecord["choice"] {
+	if (raw === undefined) return undefined;
+	if (!isRecord(raw) || !nonEmptyString(raw["questionId"]) || !nonEmptyString(raw["optionId"]) || !nonEmptyString(raw["label"])) {
+		return undefined;
+	}
 	return {
-		pattern: raw["pattern"],
-		command: raw["command"],
-		verdict: verdict as DecisionVerdict | undefined,
-		judged: raw["judged"],
-		confidence: typeof raw["confidence"] === "number" ? raw["confidence"] : undefined,
-		reasons: Array.isArray(raw["reasons"]) ? raw["reasons"].filter((r): r is string => typeof r === "string") : [],
-		blocked: raw["blocked"],
-		at: raw["at"],
+		questionId: raw["questionId"],
+		optionId: raw["optionId"],
+		label: raw["label"],
+		...(typeof raw["confidence"] === "number" ? { confidence: raw["confidence"] } : {}),
 	};
 }
 
@@ -3712,31 +3763,20 @@ function taskWorkOrder(raw: unknown): string | undefined {
 	return parts.length > 0 ? parts.join("\n\n") : undefined;
 }
 
-/** Text blocks of a tool result event, in order (image and other blocks carry no judging material). */
-function resultText(event: Record<string, unknown>): string {
-	const content = event["content"];
+/**
+ * Text blocks of a delivered custom message, in order (image and other blocks carry no text to
+ * judge). The host builds an `async-result` delivery with either a plain string or content blocks,
+ * so both shapes are read; a message with no text yields "" and is recorded as uncertainty.
+ */
+function messageText(message: Record<string, unknown>): string {
+	const content = message["content"];
+	if (typeof content === "string") return content.trim();
 	if (!Array.isArray(content)) return "";
 	return content
 		.filter((b): b is Record<string, unknown> => isRecord(b) && b["type"] === "text" && nonEmptyString(b["text"]))
 		.map(b => (b["text"] as string).trim())
 		.filter(text => text.length > 0)
 		.join("\n");
-}
-
-/** Verbatim prefix of a quote, capped for cost; `truncated` lets the source string report the cut. */
-function cappedQuote(text: string): { quote: string; truncated: boolean } {
-	const trimmed = text.trim();
-	return { quote: trimmed.slice(0, HANDOFF_QUOTE_CAP), truncated: trimmed.length > HANDOFF_QUOTE_CAP };
-}
-
-/** Judge evidence item for a handoff consultation: the quote stays verbatim even when capped. */
-function handoffEvidence(kind: Evidence["kind"], source: string, text: string): Evidence {
-	const { quote, truncated } = cappedQuote(text);
-	return {
-		kind,
-		source: truncated ? `${source} (verbatim prefix, truncated at ${HANDOFF_QUOTE_CAP} characters)` : source,
-		quote,
-	};
 }
 
 /** Claim text in a fixed-template line: the caller's own words, whitespace-joined and capped. */
@@ -3755,7 +3795,7 @@ function requirementQuotes(evidence: Evidence[]): Array<{ id: string; text: stri
 	const seen = new Set<string>();
 	for (const item of evidence) {
 		if (item.kind !== "user" && item.kind !== "spec") continue;
-		const { quote } = cappedQuote(item.quote);
+		const { quote } = mechanism.cappedQuote(item.quote);
 		if (seen.has(quote)) continue;
 		seen.add(quote);
 		out.push({ id: `quote-${out.length + 1}`, text: quote, source: item.source });
@@ -3820,22 +3860,6 @@ function readCourseCheckAnswer(
 		};
 	}
 	return { ok: true, nextAction: nextAction as CourseCheckNextAction, drifted, reasons, confidence };
-}
-
-/** One-line fixed-template summary of a handoff record (no generated prose). */
-function handoffLine(record: HandoffRecord): string {
-	const verdict = record.judged ? (record.verdict ?? "unusable answer") : "not judged";
-	const confidence = record.confidence !== undefined ? `, confidence ${record.confidence}` : "";
-	const reasons = record.reasons.length > 0 ? ` - ${record.reasons.join(" ")}` : "";
-	return `${record.phase}: ${verdict}${confidence}${reasons}`;
-}
-
-/** One-line fixed-template summary of a destructive-action record (no generated prose). */
-function destructiveLine(record: DestructiveRecord): string {
-	const verdict = record.judged ? (record.verdict ?? "unusable answer") : "not judged";
-	const confidence = record.confidence !== undefined ? `, confidence ${record.confidence}` : "";
-	const reasons = record.reasons.length > 0 ? ` - ${record.reasons.join(" ")}` : "";
-	return `command matched "${record.pattern}": ${verdict}${confidence}${reasons}`;
 }
 
 /**

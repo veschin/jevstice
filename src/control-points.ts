@@ -139,6 +139,25 @@ export const CONTROL_POINT_REGISTRY: Readonly<Record<string, ControlPoint>> = {
 		trigger: "on_demand",
 		verdictMapping: "standard",
 	},
+	// Review activities (D5): the controller runs the review's FIXED question set itself when the
+	// executor submits the stage, records the per-item results in session state and surfaces them.
+	// Advisory by construction (on_demand records no gate approval and refuses nothing); the
+	// descriptor of each review lives in src/gates.ts, its question set in src/reviews.ts.
+	business_review: {
+		stage: "business_review",
+		trigger: "on_demand",
+		verdictMapping: "standard",
+	},
+	architecture_review: {
+		stage: "architecture_review",
+		trigger: "on_demand",
+		verdictMapping: "standard",
+	},
+	security_review: {
+		stage: "security_review",
+		trigger: "on_demand",
+		verdictMapping: "standard",
+	},
 };
 
 export { COURSE_CHECK_OPTION_IDS };

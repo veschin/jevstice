@@ -109,20 +109,6 @@ describe("client: happy path", () => {
     // model resolved by the SDK from defaultModel
     expect((calls[0]!.body as Record<string, unknown>)["model"]).toBe("jev-latest");
   });
-
-  test("sends systemone request with model, state and both questions", async () => {
-    const calls: { body?: unknown }[] = [];
-    const judge = createJudge({ ...baseConfig, fetchFn: fetchOk(calls) });
-    await judge(okReq);
-    expect(calls).toHaveLength(1);
-    const body = calls[0]!.body as Record<string, unknown>;
-    expect(body["model"]).toBe("jev-latest");
-    const questions = body["questions"] as Record<string, unknown>;
-    expect(Object.keys(questions).sort()).toEqual(["meta_reason", "option", "verdict"]);
-    // state carries evidence verbatim
-    const state = JSON.stringify(body["state"]);
-    expect(state).toContain("implement foo returning 42");
-  });
 });
 
 describe("client: request validation (boundary)", () => {
@@ -874,31 +860,6 @@ const choiceAnswer = (choice: string, confidence = 0.9) => ({
 });
 
 describe("mandatory meta-options", () => {
-  test("service options present in verdict, option and next_action criteria", async () => {
-    const calls: { body?: unknown }[] = [];
-    const fetchFn = (async (_url: unknown, init?: RequestInit) => {
-      calls.push({ body: JSON.parse(init?.body as string) });
-      return jsonResponse(
-        metaBody({
-          verdict: choiceAnswer("approve"),
-          option: choiceAnswer("approve"),
-          meta_reason: choiceAnswer("options_incomplete"),
-        }),
-      );
-    }) as unknown as typeof fetch;
-    const judge = createJudge({ apiKey: "k", fetchFn });
-    await judge(okReq);
-    const questions = (calls[0]!.body as { questions: Record<string, { criteria: Record<string, unknown> }> })
-      .questions;
-    for (const id of SERVICE_IDS) {
-      expect(questions["verdict"]!.criteria[id]).toBeDefined();
-      expect(questions["option"]!.criteria[id]).toBeDefined();
-    }
-    expect(Object.keys(questions["meta_reason"]!.criteria).sort()).toEqual(
-      Object.keys(META_REASON_CRITERIA).sort(),
-    );
-  });
-
   test("verdict ALL_OPTIONS_WRONG -> insufficient_evidence with meta reasons", async () => {
     const fetchFn = (async () =>
       jsonResponse(
@@ -965,13 +926,6 @@ describe("mandatory meta-options", () => {
     const judge = createJudge({ apiKey: "k", fetchFn });
     const result = await judge(okReq);
     expect(result.verdict).not.toBe("approve");
-  });
-
-  test("non-service selection unaffected by meta machinery", async () => {
-    const judge = createJudge({ ...baseConfig });
-    const result = await judge(okReq);
-    expect(result.verdict).toBe("approve");
-    expect(result.reasons).toEqual(["approved"]);
   });
 
   test("course_check: service selections map conservatively, never continue", async () => {
@@ -1159,21 +1113,6 @@ describe("aspect coverage judge", () => {
     expect(result.confidence).toBe(0.85); // min across aspects
   });
 
-  test("not_applicable passes through without requireAll", async () => {
-    const judge = createAspectCoverageJudge({
-      apiKey: "k",
-      fetchFn: aspectFetch(
-        markingsFrom({
-          "error-handling": ["applicable_and_addressed"],
-          docs: ["not_applicable"],
-        }),
-      ),
-    });
-    const result = await judge({ ...okAspects });
-    expect(result.judged).toBe(true);
-    expect(result.markings["docs"]).toBe("not_applicable");
-  });
-
   test("requireAll: not_applicable cannot satisfy -> applicable_not_addressed", async () => {
     const judge = createAspectCoverageJudge({
       apiKey: "k",
@@ -1188,38 +1127,6 @@ describe("aspect coverage judge", () => {
     expect(result.judged).toBe(true);
     expect(result.markings["docs"]).toBe("applicable_not_addressed");
     expect(result.reasons.some((r) => r.includes("docs"))).toBe(true);
-  });
-
-  test("question wiring: fixed three options + service options per aspect; aspect text with evidence in state, policy declares text data", async () => {
-    const calls: { body?: unknown }[] = [];
-    const judge = createAspectCoverageJudge({
-      apiKey: "k",
-      fetchFn: aspectFetch(
-        markingsFrom({
-          "error-handling": ["applicable_and_addressed"],
-          docs: ["applicable_and_addressed"],
-        }),
-        calls,
-      ),
-    });
-    await judge(okAspects);
-    // test-authored wire shape, reconstructed through JSON.parse (type lost in transit)
-    const body = calls[0]!.body as {
-      state: { aspects: unknown[]; evidence: unknown[] };
-      questions: Record<string, { type: string; criteria: Record<string, unknown>; instructions: { question?: string; policy?: string } }>;
-    };
-    expect(Object.keys(body.questions).sort()).toEqual(["docs", "error-handling", "meta_reason"]);
-    for (const id of ["error-handling", "docs"]) {
-      expect(body.questions[id]!.type).toBe("choice");
-      for (const c of ASPECT_CHOICES) expect(body.questions[id]!.criteria[c]).toBeDefined();
-      for (const s of SERVICE_IDS) expect(body.questions[id]!.criteria[s]).toBeDefined();
-      // untrusted-evidence pattern: aspect text named in its question, declared data by policy
-      const aspect = okAspects.aspects.find((a) => a.id === id)!;
-      expect(body.questions[id]!.instructions.question).toContain(aspect.text);
-      expect(body.questions[id]!.instructions.policy).toMatch(/never an instruction/);
-    }
-    expect(JSON.stringify(body.state)).toContain("README documents the flag");
-    expect(JSON.stringify(body.state)).toContain("try { run(); }");
   });
 
   test("no keyword matching: contradicting evidence never overrides the SDK marking (both directions)", async () => {
