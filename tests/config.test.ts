@@ -263,3 +263,48 @@ describe("jev template config: routing candidates", () => {
 		expect(merged.routing?.skills?.[0]?.id).toBe("user");
 	});
 });
+
+describe("jev template config: automatic course check", () => {
+	test("courseCheck.everyMutations is parsed; absent means the behaviour is exactly as today", () => {
+		expect(validateTemplateConfig(USER_FILE, {}).courseCheck).toBeUndefined();
+		expect(validateTemplateConfig(USER_FILE, { courseCheck: { everyMutations: 2 } }).courseCheck).toEqual({
+			everyMutations: 2,
+		});
+		// 0 is an explicit off: legal, and the controller treats it like an absent key.
+		expect(validateTemplateConfig(USER_FILE, { courseCheck: { everyMutations: 0 } }).courseCheck).toEqual({
+			everyMutations: 0,
+		});
+	});
+
+	test("fail-closed: a malformed courseCheck block names the file and the problem", () => {
+		for (const bad of [
+			{ courseCheck: 2 },
+			{ courseCheck: [] },
+			{ courseCheck: {} },
+			{ courseCheck: { everyMutations: "2" } },
+			{ courseCheck: { everyMutations: -1 } },
+			{ courseCheck: { everyMutations: 1.5 } },
+			{ courseCheck: { everyMutations: null } },
+		]) {
+			try {
+				validateTemplateConfig(PROJECT_FILE, bad);
+				expect.unreachable();
+			} catch (err) {
+				expect(err).toBeInstanceOf(JevConfigError);
+				expect((err as Error).message).toContain(PROJECT_FILE);
+				expect((err as Error).message).toContain("courseCheck.everyMutations");
+			}
+		}
+	});
+
+	test("trust split: the period is user-owned, like the gates", () => {
+		const merged = mergeTemplateConfigs(
+			{ courseCheck: { everyMutations: 3 } },
+			{ courseCheck: { everyMutations: 1 } },
+		);
+		expect(merged.courseCheck).toEqual({ everyMutations: 3 });
+		expect(mergeTemplateConfigs({}, { courseCheck: { everyMutations: 4 } }).courseCheck).toEqual({
+			everyMutations: 4,
+		});
+	});
+});

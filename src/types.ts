@@ -38,7 +38,9 @@ export type DecisionStage =
   | "subagent_handoff" // FR-11: validate dispatch and acceptance
   | "aspect_coverage" // universal engine: forgotten-aspect three-way coverage check + FR-18 course_check (see control-points registry)
   | "destructive_action" // POLICY-DRAFT I: judge a destructive bash command at execution time, fresh (plan never covers it)
-  | "claim_check"; // universal engine: per-claim support marking against quoted evidence (measured decisive per-claim regime)
+  | "claim_check" // universal engine: per-claim support marking against quoted evidence (measured decisive per-claim regime)
+  | "requirements_formalization" // activities framework: numbered requirement list, each item traceable to a verbatim quote + coverage verdict
+  | "plan_mapping"; // activities framework (planning): per-requirement claim that the plan serves it, marked by the claim_check path
 
 /** Fixed option set presented to the judge (FR-08). */
 export interface DecisionOption {
@@ -193,6 +195,42 @@ export interface ClaimCheckResult {
 }
 
 export type ClaimCheckJudge = (request: ClaimCheckRequest) => Promise<ClaimCheckResult>;
+
+// ---------- Requirements formalization (per-item traceability; requirements_formalization stage) ----------
+
+/**
+ * The activity-level primitive behind `requirements_formalization`: the caller submits a
+ * DRAFT numbered requirement list plus the user/spec quotes it was derived from, and the
+ * judge marks, in ONE request, two things per item:
+ *  - every requirement: does a quoted user/spec item state or directly entail it (traceable)?
+ *  - every quote: does at least one formalized requirement capture what it demands (covered)?
+ * A requirement the quotes do not entail is refused (item_untraceable); a quote no
+ * requirement captures is the coverage gap (coverage_missing). Never gate-granting.
+ */
+export interface RequirementsFormalizationRequest {
+  stage: DecisionStage;
+  /** What the formalization is for (context only; items are judged from the quotes). */
+  task: string;
+  /** Draft numbered requirements, >= 1, ids assigned by the caller (numbered list). */
+  requirements: Array<{ id: string; text: string }>;
+  /** The user/spec quotes the list must be traceable to and must cover (>= 1). */
+  quotes: Array<{ id: string; text: string }>;
+  evidence: Evidence[];
+}
+
+export interface RequirementsFormalizationResult {
+  /** Requirement id -> a quoted user/spec item states or directly entails it as written. */
+  traceable: Record<string, boolean>;
+  /** Quote id -> at least one formalized requirement captures what the quote demands. */
+  covered: Record<string, boolean>;
+  reasons: string[];
+  /** False when the judge could not be consulted (fail-closed; never a partial marking). */
+  judged: boolean;
+}
+
+export type RequirementsFormalizationJudge = (
+  request: RequirementsFormalizationRequest,
+) => Promise<RequirementsFormalizationResult>;
 
 // ---------- TypeSafe systemone wire types (S:API, verified from docs.typesafe.ai/api) ----------
 

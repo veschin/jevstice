@@ -13,7 +13,7 @@
 import { createJevController, type ControllerDeps, type JevController, type PiApi } from "./controller.js";
 import { JevConfigError, loadJevTemplateConfig, type JevTemplateConfig } from "./config.js";
 import { isRecord } from "./guards.js";
-import { createAspectCoverageJudge, createClaimCheckJudge, createCourseCheckJudge, createJudge, createMultiLabelJudge } from "./client.js";
+import { createAspectCoverageJudge, createClaimCheckJudge, createCourseCheckJudge, createJudge, createMultiLabelJudge, createRequirementsFormalizationJudge } from "./client.js";
 import { loadTopicCatalog, type CatalogTopic } from "./catalog.js";
 import { memoizedKeyResolver } from "./apikey.js";
 import { POLICY, type Judge } from "./types.js";
@@ -139,6 +139,12 @@ export function createJevExtension(deps: Partial<ControllerDeps> = {}) {
 			claimCheckJudge:
 				deps.claimCheckJudge ??
 				(deps.judge === undefined ? async req => createClaimCheckJudge(await withKey())(req) : undefined),
+			// requirements_formalization: per-item traceability + coverage in one request.
+			requirementsFormalizationJudge:
+				deps.requirementsFormalizationJudge ??
+				(deps.judge === undefined
+					? async req => createRequirementsFormalizationJudge(await withKey())(req)
+					: undefined),
 			catalogIds,
 			// FR-01/FR-04: automatic task-start checks; advisory, they never block.
 			catalog: catalogTopics,

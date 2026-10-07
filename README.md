@@ -123,6 +123,81 @@ in session state and delivered as same-session feedback. The checks are advisory
 the task starts immediately, and an abstention, a judge failure or an unwired catalog records
 uncertainty instead of stopping the work.
 
+## Activities
+
+The control points above (and below, in Stages) are the MECHANISM: each one declares where a
+judge consultation fires and how its verdict acts. The ACTIVITY registry (`src/activities.ts`) is
+the frame that says which mechanism belongs where: the named unit of work, its purpose, its
+entrance boundary, the evidence it needs, its FIXED outcome set, its invariants and the outcome ->
+action map the caller follows.
+
+| Activity | Enters when | Evidence required | Outcomes | Invariants | Course mechanism | Enforcement |
+| --- | --- | --- | --- | --- | --- | --- |
+| `task_definition` | a new task prompt | the user's words verbatim | understood / incomplete / wrong / ask_user | the task is quoted, never paraphrased; an abstention escalates, never blocks | every later activity cites the requirement that authorizes the work | advisory today (plan gate covers it when armed) |
+| `requirements_formalization` | after `task_definition`, before planning | user/spec quotes | formalized / item_untraceable / coverage_missing / ask_user | every formalized requirement carries a verbatim quote; a requirement without a quote is refused | the formalized list becomes the checklist every later activity is judged against | advisory (`on_demand` records no approval) |
+| `planning` | before the first mutation | the requirement list + the plan as a claim | approved / revise / insufficient_evidence / ask_user | no mutation before an approved plan (switchable); an open plan summary is not judgeable | the plan must name, for each requirement, the work that serves it | gate (`gates.mutation`), plus `claim_check` |
+| `development` | after every mutation, at step boundaries | current action + requirement quote + progress artifacts | continue / return_to_requirement / replan / ask_user / verify_before_proceeding | an abstention never records continue; only a judged continue unlocks completion | per-requirement drift marking, deliberately and automatically | advisory (`course_check`), plus the destructive and hand-off gates |
+| `review` | on demand, and before completion | code/diff quotes, execution output | accept / rework / escalate | the judge reads artifacts, not the author's report | the review is per requirement and per capability | advisory (`code_review`, `claim_check`, `aspect_coverage`) |
+| `completion` | session stop | execution/code/log evidence per requirement, capability inventory | complete / incomplete / insufficient_evidence / ask_user | no completion without artifact evidence; a report alone never completes | the requirement list is the completion checklist | gate (`gates.completion`) |
+
+How each activity is armed:
+
+- `task_definition` - nothing to arm. The prompt is captured at `before_agent_start` (the
+  requirement every gate quotes) and classified by the catalog check. Approval is the plan gate's
+  when it is armed; nothing in this activity blocks on its own.
+- `requirements_formalization` - always submittable, never gate-granting. Submit the draft
+  numbered list and the user/spec quotes; the judge marks every item's traceability and every
+  quote's coverage in one request. A completely accepted list is stored as the task's requirement
+  checklist; an item no quote entails comes back as `item_untraceable` and a quoted source no item
+  captures as `coverage_missing` - both name what is missing, and neither becomes the checklist.
+- `planning` - armed by `gates.mutation` (default on) for the plan approval itself. Once a list is
+  formalized, the plan gate additionally demands the per-requirement mapping: `stage=plan_mapping`
+  with `planClaims` (one `{requirementId, claim}` per formalized requirement id, the claim being
+  that the plan serves it), and the claim-check path marks each claim against the quoted evidence.
+  A formalized requirement with no supported claim leaves planning incomplete, the mutation gate
+  names those ids, and the stop boundary names them too. Without a formalization the mapping is not
+  demanded and the gate behaves exactly as before.
+- `development` - `course_check` is always submittable and can additionally run automatically: with
+  `courseCheck.everyMutations` set, the controller consults the judge itself after every N allowed
+  mutating tool calls and feeds the verdict back into the same session. The automatic consult is
+  advisory (it never blocks, never spends the rework budget and never satisfies the completion
+  boundary) and checks against the formalized list when one exists, else the task prompt. The
+  destructive-action gate and the hand-off gate are armed by `gates.destructive.patterns` and
+  `stages.subagent_handoff` respectively.
+- `review` - always submittable, never gate-granting.
+- `completion` - armed by `gates.completion` (default on).
+
+Every activity maps to at least one wired mechanism, every mechanism's stage is a registered
+control point (or a controller-driven consult declared as such), and every declared outcome is
+reachable from one of the activity's edges. An activity declared without a wired mechanism, or a
+registered control point belonging to no activity, fails the test suite (`tests/activities.test.ts`)
+- the spec calls that a defect. Outcome sets are enforced at runtime, not only in tests: an engine
+answer the owning activity cannot express in its declared set fails closed (`insufficient_evidence`,
+`judged: false`, naming the activity and the answer) instead of being recorded.
+
+Use `stage=requirements_formalization` to formalize the task/spec and `stage=plan_mapping` to map
+the plan to the formalized requirements:
+
+```json
+{
+  "stage": "requirements_formalization",
+  "task": "Formalize the requirement list of this task",
+  "proposal": "the numbered list derived from the quoted user requirement",
+  "options": [{ "id": "formalized", "label": "Placeholder (required by the tool schema)",
+                "meaning": "the formalization judge reads task, requirements and evidence" }],
+  "requirements": ["the dashboard shows feature X", "feature X survives a restart"],
+  "evidence": [
+    { "kind": "user", "source": "task prompt", "quote": "the dashboard must show feature X after loading" },
+    { "kind": "spec", "source": "task prompt", "quote": "a restart must not lose feature X" }
+  ]
+}
+```
+
+With mock-free live judging the same submission came back as a numbered list with per-item
+markings plus the coverage verdict naming the uncovered quote (`traceable: req-1 false, req-2 true,
+req-3 false` for a fabricated item; `covered: quote-1 false, quote-2 true, quote-3 true`) - the
+requirement list itself, not only a verdict.
+
 ## Gates
 
 - **plan** (`understanding_review` / `direction_review`, trigger `mutation_gate`): mutating tool
@@ -146,7 +221,12 @@ uncertainty instead of stopping the work.
   before claiming completion; only a judged `continue` recorded for the current task and work
   revision satisfies the completion gate (`verify_before_proceeding` never unlocks). Benign outcomes
   (`continue`, `verify_before_proceeding`) consume no rework; redirects, `ask_user` and failed
-  consultations do.
+  consultations do. The check also runs on its own when the owner sets
+  `courseCheck.everyMutations`: after every N allowed mutating tool calls the controller consults
+  the judge in the background against the formalized requirement list (else the task prompt), records
+  the verdict and feeds it back into the session. That automatic record is advisory - it never
+  blocks, spends no rework budget and does not satisfy the completion boundary, which still needs a
+  deliberate `course_check` with `continue`.
 - **aspect_coverage** (`on_demand`): claimed aspects (catalog topic ids) are three-way marked by the
   judge against the topic catalog; `applicable_not_addressed` blocks completion until a later
   submission clears it. Completion capability coverage uses the same judge with `requireAll`, so a
@@ -202,6 +282,8 @@ submittable `stage` and is shaped by the config key shown:
 | `course_check` | `on_demand` | per-requirement drift + fixed next-action choice | `stages.course_check` |
 | `aspect_coverage` | `on_demand` | three-way aspect marking against the catalog topics | `stages.aspect_coverage` |
 | `claim_check` | `on_demand` | per-claim support marking against the quoted evidence (one request) | `stages.claim_check` |
+| `requirements_formalization` | `on_demand` | numbered requirement list: per-item traceability + coverage verdict (activities framework) | `stages.requirements_formalization` |
+| `plan_mapping` | `on_demand` | per-requirement plan claims, marked by the claim-check path (planning activity) | `stages.plan_mapping` |
 | `skill_routing` | `on_demand` | skill choice from `routing.skills` | `stages.skill_routing` |
 | `model_routing` | `on_demand` | model choice from `routing.models` | `stages.model_routing` |
 | `subagent_handoff` | `on_demand` | FR-11 hand-off check at the task-tool boundary (opt-in) | `stages.subagent_handoff` |
@@ -223,7 +305,9 @@ custom stages are a roadmap item).
 
 Two further judge consultations run automatically at task start and are not submittable stages:
 task classification (`development` / `analytics` / `query`) and plan-topic selection - the catalog
-checks above.
+checks above. A third automatic consultation exists at step boundaries: with
+`courseCheck.everyMutations` set, `course_check` runs by itself after every N allowed mutations (see
+the preset above).
 
 ## Config
 
@@ -238,6 +322,7 @@ the file and the problem.
     "mutation": false,
     "destructive": { "patterns": ["rm -rf", "git push --force", "drop table"] }
   },
+  "courseCheck": { "everyMutations": 5 },
   "confidenceThreshold": 0.9,
   "completion": { "consecutiveApproves": 3, "confidenceFloor": 0.7 },
   "capabilities": ["json-round-trip", "cli-probe"],
@@ -270,6 +355,12 @@ Per key, with its trust rule:
 - `confidenceThreshold` - the approval floor. User-owned and raise-only: the user value wins over a
   project one, and the effective floor is `max(0.8, configured)`, so lowering it has no effect.
   Raising it also disables the mid-band completion streak.
+- `courseCheck` - `everyMutations` (integer >= 0, default off). User-owned like the gates: the user
+  value wins when it sets the key. With N >= 1 the controller submits a `course_check` itself after
+  every N allowed mutating tool calls, records the verdict and feeds it back into the session; 0 or
+  an absent key means the behaviour is exactly as before (the executor submits course checks
+  deliberately). The automatic consult never blocks, never spends the rework budget and never
+  satisfies the completion boundary. A malformed block fails closed naming the file and the key.
 - `gates` - `mutation` and `completion` booleans (both default true) plus the `destructive` block.
   User-owned: when the user file declares `gates`, the project block is ignored. `gates.mutation:
   false` lifts the plan gate (mutating tools are no longer blocked while no plan-stage approval

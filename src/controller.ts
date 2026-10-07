@@ -24,6 +24,17 @@
 import { isRecord, nonEmptyString } from "./guards.js";
 import type { JevTemplateConfig } from "./config.js";
 import {
+	ACTIVITY_REGISTRY,
+	PLAN_MAPPING_APPROVED_OPTION,
+	PLAN_MAPPING_INCOMPLETE_OPTION,
+	PLAN_MAPPING_STAGE,
+	FORMALIZATION_APPROVED_OPTION,
+	FORMALIZATION_COVERAGE_MISSING_OPTION,
+	FORMALIZATION_UNTRACEABLE_OPTION,
+	resolveActivityOutcome,
+	type ActivityRegistry,
+} from "./activities.js";
+import {
 	type ControlPoint,
 	lookupControlPoint,
 	validateDeclaredControlPoint,
@@ -38,8 +49,11 @@ import {
 	type ClaimCheckJudge,
 	type ClaimCheckResult,
 	type CourseCheckJudge,
+	type CourseCheckNextAction,
 	type CourseCheckResult,
 	type MultiLabelJudge,
+	type RequirementsFormalizationJudge,
+	type RequirementsFormalizationResult,
 } from "./types.js";
 import {
 	type DecisionResult,
@@ -72,6 +86,53 @@ export interface ClaimCheckMarking {
 	supported: boolean;
 }
 
+/** One formalized requirement (requirements_formalization activity), with its marking. */
+export interface FormalizedRequirement {
+	id: string;
+	/** The caller's own wording of the requirement (its numbered list item). */
+	text: string;
+	/** True when a quoted user/spec item states or directly entails it. */
+	traceable: boolean;
+}
+
+/**
+ * Latest requirements_formalization result for the current task. `complete` is true only when
+ * the list was accepted (every item traceable and every quoted source covered): an incomplete
+ * record is surfaced but never used as the checklist for planning/development/completion.
+ */
+export interface FormalizationRecord {
+	requirements: FormalizedRequirement[];
+	/** Quoted source texts no formalized requirement captured (the coverage verdict). */
+	uncovered: Array<{ id: string; source: string; excerpt: string }>;
+	outcome: string;
+	complete: boolean;
+	at: number;
+	taskFingerprint: string | undefined;
+	workRevision: number;
+}
+
+/** Latest plan_mapping result (planning activity): the claim that the plan serves each requirement. */
+export interface PlanMappingRecord {
+	requirements: Array<{ id: string; claim: string; supported: boolean }>;
+	/** Formalized requirement ids with no submitted plan claim (planning incomplete). */
+	missing: string[];
+	complete: boolean;
+	at: number;
+	taskFingerprint: string | undefined;
+	workRevision: number;
+}
+
+/** One automatic (periodic) course-check consult. Advisory: it never unlocks anything. */
+export interface AutoCourseCheckRecord {
+	judged: boolean;
+	selectedOption?: string;
+	confidence?: number;
+	reasons: string[];
+	/** Work revision the consult ran at (the mutation count that crossed the period). */
+	workRevision: number;
+	at: number;
+}
+
 export interface JevState {
 	approvals: ApprovalRecord[];
 	/** Judge consultations per `${taskFingerprint}:${stage}` - bounded rework (FR-12). */
@@ -93,6 +154,19 @@ export interface JevState {
 	 * (advisory, never a gate grant). Undefined until a claim_check is marked.
 	 */
 	lastClaimCheck: { claims: ClaimCheckMarking[]; at: number; taskFingerprint: string | undefined; workRevision: number } | undefined;
+	/**
+	 * Latest requirements_formalization result (advisory, never a gate grant). Undefined until
+	 * a formalization is judged; only a `complete` record is used as the requirement checklist.
+	 */
+	lastFormalization: FormalizationRecord | undefined;
+	/** Latest plan_mapping result: the per-requirement plan claims of the planning activity. */
+	lastPlanMapping: PlanMappingRecord | undefined;
+	/**
+	 * Latest automatic (periodic) course-check consult. Advisory record only: it never records a
+	 * gate approval and never satisfies the completion boundary (that needs a deliberate
+	 * course_check with option continue bound to the current revision).
+	 */
+	lastAutoCourseCheck: AutoCourseCheckRecord | undefined;
 	/** Open aspect_coverage drift: missed aspect ids for the current task (completion teeth). */
 	openAspectGaps: { missed: string[]; taskFingerprint: string | undefined } | undefined;
 	/** Calibration-tolerant completion: consecutive mid-band approves, bound to task+work+exact content digest. */
@@ -137,6 +211,9 @@ function freshState(): JevState {
 		routedSkill: undefined,
 		lastCourseCheck: undefined,
 		lastClaimCheck: undefined,
+		lastFormalization: undefined,
+		lastPlanMapping: undefined,
+		lastAutoCourseCheck: undefined,
 		openAspectGaps: undefined,
 		consecutiveCompletionApproves: undefined,
 		submissionDigests: {},
@@ -261,6 +338,36 @@ const CLAIM_CHECK_FIX =
 /** Claim text shown in fixed-template lines: the caller's words, capped for readability. */
 const CLAIM_EXCERPT_CHARS = 80;
 /**
+ * Activities framework (requirements_formalization): the fix named when an item is not
+ * traceable or a quoted source is not covered.
+ */
+const FORMALIZATION_FIX =
+	"quote a user/spec source that states or directly entails each requirement (kind user or spec), and " +
+	"formalize every quoted source into at least one requirement - drop the quote or add the requirement";
+/** Activities framework (planning): the fix named when a requirement has no supported plan claim. */
+const PLAN_MAPPING_FIX =
+	"submit a plan claim for every formalized requirement id, naming the plan work that serves it; a claim the " +
+	"quoted evidence does not support cannot map the requirement";
+/**
+ * Fixed options of the single-claim plan mapping (a formalization with exactly one requirement):
+ * the per-claim marking path starts at two claims, so that one mapping goes through one
+ * claim-shaped decision instead. A `stages.plan_mapping` template may replace them (R3).
+ */
+const PLAN_MAPPING_OPTIONS: DecisionOption[] = [
+	{
+		id: PLAN_MAPPING_APPROVED_OPTION,
+		label: "The plan serves the requirement",
+		meaning:
+			"the plan work named in the claim covers the quoted formalized requirement and nothing in the plan contradicts it",
+	},
+	{
+		id: PLAN_MAPPING_INCOMPLETE_OPTION,
+		label: "Mapping incomplete or unsupported",
+		meaning:
+			"the formalized requirement has no plan work that serves it, or the claim is not supported by the quoted evidence; name what is missing",
+	},
+];
+/**
  * FR-11 handoff options, shared by the dispatch and acceptance sides (a `stages.subagent_handoff`
  * template may replace them, R3). The option ids carry consequence: the controller reads an
  * explicit `revise` verdict as the negative; an `approve` is never required for the work to pass,
@@ -355,6 +462,10 @@ export interface ValidatedDecisionInput {
 	aspects: string[];
 	/** Claim texts for the claim_check preset (each judged separately against the evidence). */
 	claims: string[];
+	/** Draft numbered requirements for the requirements_formalization stage (one per item). */
+	requirements: string[];
+	/** Per-requirement plan claims for the plan_mapping stage (planning activity). */
+	planClaims: Array<{ requirementId: string; claim: string }>;
 }
 
 export interface ValidationResult {
@@ -420,6 +531,22 @@ export function validateDecisionInput(raw: unknown, extraStages: ReadonlySet<str
 	const claims = Array.isArray(raw["claims"])
 		? raw["claims"].filter((c): c is string => typeof c === "string" && c.trim().length > 0)
 		: [];
+	const requirements = Array.isArray(raw["requirements"])
+		? raw["requirements"].filter((r): r is string => typeof r === "string" && r.trim().length > 0)
+		: [];
+	const planClaims: Array<{ requirementId: string; claim: string }> = [];
+	const rawPlanClaims = raw["planClaims"];
+	if (rawPlanClaims !== undefined && !Array.isArray(rawPlanClaims)) {
+		reasons.push("planClaims must be an array of {requirementId, claim}");
+	} else if (Array.isArray(rawPlanClaims)) {
+		rawPlanClaims.forEach((c, i) => {
+			if (!isRecord(c) || !nonEmptyString(c["requirementId"]) || !nonEmptyString(c["claim"])) {
+				reasons.push(`planClaims[${i}] must have non-empty requirementId and claim`);
+				return;
+			}
+			planClaims.push({ requirementId: c["requirementId"] as string, claim: c["claim"] as string });
+		});
+	}
 	if (reasons.length > 0) return { ok: false, reasons };
 	return {
 		ok: true,
@@ -433,6 +560,8 @@ export function validateDecisionInput(raw: unknown, extraStages: ReadonlySet<str
 			capabilities,
 			aspects,
 			claims,
+			requirements,
+			planClaims,
 		},
 	};
 }
@@ -529,6 +658,13 @@ export interface ControllerDeps {
 	aspectCoverageJudge?: AspectCoverageJudge;
 	/** Per-claim support judge: the claim_check preset (N claims, one request, one verdict per claim). */
 	claimCheckJudge?: ClaimCheckJudge;
+	/** Per-item traceability judge: the requirements_formalization stage (one request, per-item marks). */
+	requirementsFormalizationJudge?: RequirementsFormalizationJudge;
+	/**
+	 * Activity registry (src/activities.ts): the frame the controller enforces outcome sets
+	 * against. Tests inject a doctored registry to prove an undeclared outcome fails closed.
+	 */
+	activities?: ActivityRegistry;
 	/** Valid catalog topic ids for the aspects[] pre-check (built in index from the catalog). */
 	catalogIds?: ReadonlySet<string>;
 	/** FR-01/FR-04 wiring: the catalog and the marking judge for the automatic task-start checks. */
@@ -572,6 +708,11 @@ export class JevController {
 	private readonly courseCheckJudge: CourseCheckJudge | undefined;
 	private readonly aspectCoverageJudge: AspectCoverageJudge | undefined;
 	private readonly claimCheckJudge: ClaimCheckJudge | undefined;
+	private readonly requirementsFormalizationJudge: RequirementsFormalizationJudge | undefined;
+	/** Activity registry the outcome-set guard resolves against (default: the product registry). */
+	private readonly activities: ActivityRegistry;
+	/** In-flight automatic (periodic) course-check chain; never awaited by the tool path. */
+	private autoCourseCheck: Promise<void> | undefined;
 	private readonly catalogIds: ReadonlySet<string>;
 	private readonly catalog: CatalogTopic[] | undefined;
 	private readonly multiLabelJudge: MultiLabelJudge | undefined;
@@ -598,6 +739,8 @@ export class JevController {
 		this.courseCheckJudge = deps.courseCheckJudge;
 		this.aspectCoverageJudge = deps.aspectCoverageJudge;
 		this.claimCheckJudge = deps.claimCheckJudge;
+		this.requirementsFormalizationJudge = deps.requirementsFormalizationJudge;
+		this.activities = deps.activities ?? ACTIVITY_REGISTRY;
 		this.catalogIds = deps.catalogIds ?? new Set();
 		this.catalog = deps.catalog;
 		this.multiLabelJudge = deps.multiLabelJudge;
@@ -678,7 +821,19 @@ export class JevController {
 				"judged separately against the quoted evidence in ONE request, returning one verdict per claim; " +
 				"it is advisory (it never unlocks a gate) and a claim the judge cannot mark is named and fails " +
 				"closed. Options and the proposal stay required by the schema but are not judged on claim_check " +
-				"(the claim judge reads `task`, `claims` and `evidence`).",
+				"(the claim judge reads `task`, `claims` and `evidence`). " +
+				"Use stage=requirements_formalization to formalize the task/spec: pass the draft numbered list in " +
+				"`requirements` (one text per numbered requirement) plus the user/spec quotes as evidence; every " +
+				"item comes back marked traceable or not, and the result names the quoted source texts no " +
+				"requirement captures (the coverage verdict). An untraceable item is refused and fails closed; " +
+				"the stage never unlocks a gate, and only a completely formalized list becomes the checklist " +
+				"later stages are judged against. " +
+				"Once a list is formalized, planning needs the per-requirement mapping: submit stage=plan_mapping " +
+				"with `planClaims` (one {requirementId, claim} per formalized requirement, the claim being that " +
+				"the plan serves it); a requirement without a supported claim leaves planning incomplete and " +
+				"mutating work stays blocked until the mapping covers every requirement. " +
+				"(`options` and `proposal` stay required by the tool schema on both stages, but the judges read " +
+				"`task`, `requirements`/`planClaims` and `evidence`.)",
 			parameters: {
 				type: "object",
 				properties: {
@@ -712,6 +867,24 @@ export class JevController {
 						items: { type: "string" },
 						description:
 							"2+ claim texts for stage=claim_check; each is judged separately against the quoted evidence",
+					},
+					requirements: {
+						type: "array",
+						items: { type: "string" },
+						description:
+							"draft numbered requirement list for stage=requirements_formalization; one text per " +
+							"numbered item, each marked traceable to a quoted user/spec item",
+					},
+					planClaims: {
+						type: "array",
+						items: {
+							type: "object",
+							properties: { requirementId: { type: "string" }, claim: { type: "string" } },
+							required: ["requirementId", "claim"],
+						},
+						description:
+							"stage=plan_mapping: one {requirementId, claim} per formalized requirement id, the claim " +
+							"being that the plan serves it; a requirement left out leaves planning incomplete",
 					},
 				},
 				required: ["stage", "task", "proposal", "options", "evidence"],
@@ -801,8 +974,27 @@ export class JevController {
 						"Your next tool call must be jev_decision (a normal registered tool call, exactly like read/write) — not a file write.",
 				};
 			}
+			// Planning is incomplete while a formalized requirement has no supported plan claim
+			// (activities framework, planning activity). Only a task with an accepted
+			// requirements_formalization is affected - without one the gate behaves as before.
+			if (this.template.gates?.mutation !== false) {
+				const planningGap = this.planningGap();
+				if (planningGap !== undefined) {
+					return {
+						block: true,
+						reason:
+							`${planningGap}. Call ${TOOL_NAME} with stage=${PLAN_MAPPING_STAGE} and ` +
+							"`planClaims` naming, for every formalized requirement id, the plan work that serves " +
+							"it (the judge marks each claim against the quoted evidence). Read-only evidence " +
+							"gathering remains available.",
+					};
+				}
+			}
 			this.state.workRevision += 1;
 			this.persist();
+			// Activities framework (development): the automatic course check fires in the
+			// BACKGROUND after every N allowed mutations; it never delays or blocks this call.
+			this.maybeAutomaticCourseCheck();
 		}
 		return undefined;
 	}
@@ -1380,6 +1572,9 @@ export class JevController {
 				routedSkill: typeof data["routedSkill"] === "string" ? data["routedSkill"] : undefined,
 				lastCourseCheck: restoreCourseCheck(data["lastCourseCheck"]),
 				lastClaimCheck: restoreClaimCheck(data["lastClaimCheck"]),
+				lastFormalization: restoreFormalization(data["lastFormalization"]),
+				lastPlanMapping: restorePlanMapping(data["lastPlanMapping"]),
+				lastAutoCourseCheck: restoreAutoCourseCheck(data["lastAutoCourseCheck"]),
 				openAspectGaps: restoreAspectGaps(data["openAspectGaps"]),
 				submissionDigests: restoreDigests(data["submissionDigests"]),
 				taskType: typeof data["taskType"] === "string" ? data["taskType"] : undefined,
@@ -1614,11 +1809,12 @@ export class JevController {
 
 		// C1 wired path: course_check preset consults the dedicated per-requirement judge.
 		if (input.stage === "course_check" && this.courseCheckJudge !== undefined) {
-			return this.submitCourseCheck(input, boundKey, used);
+			const preset = await this.submitCourseCheck(input, boundKey, used);
+			return this.guardActivityOutcome(input.stage, preset) ?? preset;
 		}
 		if (input.stage === "skill_routing" || input.stage === "model_routing") {
 			const routed = await this.submitRouting(input);
-			if (routed !== undefined) return routed;
+			if (routed !== undefined) return this.guardActivityOutcome(input.stage, routed) ?? routed;
 		}
 		// aspect_coverage preset: catalog pre-check + dedicated three-way judge.
 		if (input.stage === "aspect_coverage") {
@@ -1640,7 +1836,8 @@ export class JevController {
 				};
 			}
 			if (this.aspectCoverageJudge !== undefined) {
-				return this.submitAspectCoverage(input, boundKey, used);
+				const preset = await this.submitAspectCoverage(input, boundKey, used);
+				return this.guardActivityOutcome(input.stage, preset) ?? preset;
 			}
 			// No judge wired: keep the pre-check result as a typed correction, fail-closed.
 			return {
@@ -1674,7 +1871,24 @@ export class JevController {
 					summary: "",
 				};
 			}
-			return this.submitClaimCheck(input, boundKey, used);
+			const preset = await this.submitClaimCheck(input, boundKey, used);
+			return this.guardActivityOutcome(input.stage, preset) ?? preset;
+		}
+
+		// Activities framework: requirements_formalization - the draft numbered list is marked
+		// per item against the quoted user/spec sources, with the coverage verdict for what the
+		// quotes do not cover. Advisory by construction (on_demand records no gate approval).
+		if (input.stage === "requirements_formalization") {
+			const preset = await this.submitRequirementsFormalization(input, boundKey, used);
+			return this.guardActivityOutcome(input.stage, preset) ?? preset;
+		}
+
+		// Activities framework: planning - the per-requirement plan mapping. For every formalized
+		// requirement the submitted claim that the plan serves it is marked by the claim_check
+		// path; a requirement without a supported claim leaves planning incomplete.
+		if (input.stage === PLAN_MAPPING_STAGE) {
+			const preset = await this.submitPlanMapping(input, boundKey, used);
+			return this.guardActivityOutcome(input.stage, preset) ?? preset;
 		}
 
 		let rawResult: DecisionResult;
@@ -1846,6 +2060,14 @@ export class JevController {
 					};
 		} else if (stopStage && result.verdict !== "approve") {
 			this.state.consecutiveCompletionApproves = undefined;
+		}
+
+		// Activities framework: an engine answer the owning activity cannot express in its
+		// declared outcome set fails closed HERE, before any approval is recorded.
+		const activityViolation = this.guardActivityOutcome(input.stage, { ...result, judged: true, summary: "" });
+		if (activityViolation !== undefined) {
+			interrupted();
+			return activityViolation;
 		}
 
 		const skipApproval =
@@ -2212,6 +2434,349 @@ export class JevController {
 		};
 	}
 
+	/**
+	 * requirements_formalization activity: the draft numbered list is judged per item against
+	 * the quoted user/spec sources in ONE request. Each item comes back marked traceable (a
+	 * quoted source states or directly entails it) and the coverage verdict names the quoted
+	 * source texts no requirement captures. Advisory by construction (on_demand records no gate
+	 * approval). Fail-closed: an untraceable item is refused and named, an unjudged or
+	 * unmarkable answer keeps no list at all, and only a fully accepted list is stored as
+	 * `complete` (the checklist later activities are judged against).
+	 */
+	private async submitRequirementsFormalization(
+		input: ValidatedDecisionInput,
+		boundKey: string,
+		used: number,
+	): Promise<DecisionOutcome> {
+		const requirements = input.requirements.map((text, i) => ({ id: `req-${i + 1}`, text }));
+		if (requirements.length === 0) {
+			// Invalid submission, not judge rework: refused before any consultation.
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [
+					"requirements_formalization needs the draft numbered list: pass one requirement text per " +
+						"numbered item in `requirements`",
+				],
+				judged: false,
+				summary: "",
+			};
+		}
+		const quotes = requirementQuotes(input.evidence);
+		if (quotes.length === 0) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [
+					"requirements_formalization requires at least one user or spec evidence item: every formalized " +
+						"requirement must be traceable to a quoted source",
+				],
+				judged: false,
+				summary: "",
+			};
+		}
+		if (this.requirementsFormalizationJudge === undefined) {
+			// No wired judge: keep the pre-check result as a typed correction, fail-closed.
+			return {
+				verdict: "insufficient_evidence",
+				reasons: ["requirements_formalization judge not configured in this session"],
+				judged: false,
+				summary: "",
+			};
+		}
+		const consume = (): void => {
+			this.state.iterations[boundKey] = used + 1;
+			this.persist();
+		};
+		const failClosed = (detail: string): DecisionOutcome => {
+			consume();
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [`requirements_formalization: ${detail}`, `fix: ${FORMALIZATION_FIX}`],
+				judged: false,
+				summary: "",
+			};
+		};
+		let raw: RequirementsFormalizationResult;
+		try {
+			raw = await this.requirementsFormalizationJudge({
+				stage: "requirements_formalization",
+				task: input.task,
+				requirements,
+				quotes: quotes.map(q => ({ id: q.id, text: q.text })),
+				evidence: input.evidence,
+			});
+		} catch (err) {
+			return failClosed(`judge unavailable: ${err instanceof Error ? err.message : String(err)}`);
+		}
+		if (!isRecord(raw) || raw["judged"] !== true || !isRecord(raw["traceable"]) || !isRecord(raw["covered"])) {
+			return failClosed("the judge returned an unjudged or malformed result; no requirement list kept");
+		}
+		const traceable = raw["traceable"] as Record<string, unknown>;
+		const covered = raw["covered"] as Record<string, unknown>;
+		const unmarkable = [
+			...requirements.filter(r => typeof traceable[r.id] !== "boolean").map(r => r.id),
+			...quotes.filter(q => typeof covered[q.id] !== "boolean").map(q => q.id),
+		];
+		if (unmarkable.length > 0) {
+			return failClosed(`the judge could not mark ${unmarkable.join(", ")}; an unmarkable item fails closed`);
+		}
+		const expectedIds = [...requirements.map(r => r.id), ...quotes.map(q => q.id)].sort();
+		const actualIds = [...Object.keys(traceable), ...Object.keys(covered)].sort();
+		if (expectedIds.length !== actualIds.length || expectedIds.some((id, i) => id !== actualIds[i])) {
+			return failClosed(
+				`the marked item ids must be exactly the submitted requirements and quotes ` +
+					`(${expectedIds.join(", ")}); got ${actualIds.join(", ")}`,
+			);
+		}
+		const list: FormalizedRequirement[] = requirements.map(r => ({
+			id: r.id,
+			text: r.text,
+			traceable: traceable[r.id] === true,
+		}));
+		const uncovered = quotes
+			.filter(q => covered[q.id] !== true)
+			.map(q => ({ id: q.id, source: q.source, excerpt: claimExcerpt(q.text) }));
+		const untraceable = list.filter(r => !r.traceable);
+		const outcome =
+			untraceable.length > 0
+				? FORMALIZATION_UNTRACEABLE_OPTION
+				: uncovered.length > 0
+					? FORMALIZATION_COVERAGE_MISSING_OPTION
+					: FORMALIZATION_APPROVED_OPTION;
+		this.state.lastFormalization = {
+			requirements: list,
+			uncovered,
+			outcome,
+			complete: outcome === FORMALIZATION_APPROVED_OPTION,
+			at: this.now(),
+			taskFingerprint: this.state.taskFingerprint,
+			workRevision: this.state.workRevision,
+		};
+		if (untraceable.length > 0) {
+			consume();
+			const named = untraceable.map(r => `${r.id} (${claimExcerpt(r.text)})`).join(", ");
+			this.pushFeedback(
+				`Jev requirements_formalization: item(s) not traceable to a quoted source — ${named}`,
+			);
+			return {
+				verdict: "revise",
+				selectedOption: FORMALIZATION_UNTRACEABLE_OPTION,
+				reasons: [
+					`requirements_formalization: no quoted source states or entails ${named}`,
+					`fix: ${FORMALIZATION_FIX}`,
+				],
+				judged: true,
+				summary: `requirements_formalization: revise — item_untraceable: ${named}`,
+			};
+		}
+		if (uncovered.length > 0) {
+			consume();
+			const named = uncovered.map(q => `${q.id} (${q.source}: ${q.excerpt})`).join(", ");
+			this.pushFeedback(`Jev requirements_formalization: quoted source(s) not covered — ${named}`);
+			return {
+				verdict: "revise",
+				selectedOption: FORMALIZATION_COVERAGE_MISSING_OPTION,
+				reasons: [
+					`requirements_formalization: coverage missing — no requirement captures ${named}`,
+					`fix: ${FORMALIZATION_FIX}`,
+				],
+				judged: true,
+				summary: `requirements_formalization: revise — coverage_missing: ${named}`,
+			};
+		}
+		this.persist();
+		return {
+			verdict: "approve",
+			selectedOption: FORMALIZATION_APPROVED_OPTION,
+			reasons: [
+				`requirements_formalization: ${list.length} requirement(s) traceable, ${quotes.length} quoted ` +
+					"source(s) covered",
+			],
+			judged: true,
+			summary:
+				`requirements_formalization: formalized ${list.length} requirement(s) — ` +
+				list.map(r => `${r.id}: ${claimExcerpt(r.text)}`).join("; "),
+		};
+	}
+
+	/**
+	 * planning activity, per-requirement mapping: for every formalized requirement the caller
+	 * submits the claim that the plan serves it, marked by the claim_check path against the
+	 * quoted evidence (one Noul per claim, ONE request). A requirement without a submitted
+	 * claim, or with a claim the evidence does not support, leaves planning incomplete - the
+	 * record says so, the submission comes back as `revise`, and the plan gate stays shut until
+	 * the mapping covers every formalized requirement.
+	 */
+	private async submitPlanMapping(
+		input: ValidatedDecisionInput,
+		boundKey: string,
+		used: number,
+	): Promise<DecisionOutcome> {
+		const formalization = this.currentFormalization();
+		if (formalization === undefined) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [
+					`${PLAN_MAPPING_STAGE} needs a completed requirements_formalization for the current task first ` +
+						"(submit stage=requirements_formalization): there is no formalized requirement list to map",
+				],
+				judged: false,
+				summary: "",
+			};
+		}
+		if (input.planClaims.length === 0) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [
+					`${PLAN_MAPPING_STAGE} needs planClaims: one {requirementId, claim} per formalized requirement, ` +
+						"the claim being that the plan serves it",
+				],
+				judged: false,
+				summary: "",
+			};
+		}
+		const ids = formalization.requirements.map(r => r.id);
+		const unknown = [...new Set(input.planClaims.filter(c => !ids.includes(c.requirementId)).map(c => c.requirementId))];
+		if (unknown.length > 0) {
+			// A claim about a requirement that was never formalized cannot map anything:
+			// refused before any judge call, consuming no rework.
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [
+					`unknown_requirement_id: ${unknown.join(", ")} — the formalized requirement ids are: ${ids.join(", ")}`,
+				],
+				judged: false,
+				summary: "",
+			};
+		}
+		const claims = input.planClaims.map(c => ({ id: c.requirementId, text: c.claim }));
+		const missing = ids.filter(id => !claims.some(c => c.id === id));
+		const consume = (): void => {
+			this.state.iterations[boundKey] = used + 1;
+			this.persist();
+		};
+		const failClosed = (detail: string): DecisionOutcome => {
+			consume();
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [`${PLAN_MAPPING_STAGE}: ${detail}`, `fix: ${PLAN_MAPPING_FIX}`],
+				judged: false,
+				summary: "",
+			};
+		};
+		const supported: Record<string, boolean> = {};
+		if (claims.length < CLAIM_CHECK_MIN_CLAIMS) {
+			// One formalized requirement: the per-claim marking path starts at two claims, so the
+			// single mapping is one claim-shaped decision with fixed options instead.
+			const options = this.template.stages?.[PLAN_MAPPING_STAGE]?.options ?? PLAN_MAPPING_OPTIONS;
+			const requirement = formalization.requirements.find(r => r.id === claims[0]!.id)!;
+			let rawResult: DecisionResult;
+			try {
+				rawResult = await this.judge({
+					stage: PLAN_MAPPING_STAGE,
+					task: input.task,
+					proposal:
+						"Claim under judgment: the plan below serves the formalized requirement, which is quoted " +
+						`verbatim as \`${requirement.text}\`; nothing the requirement asks for is left without work ` +
+						"in the plan, and no part of the plan contradicts it.\n\n" +
+						`Plan claim (verbatim):\n${claims[0]!.text}`,
+					options,
+					evidence: input.evidence,
+				});
+			} catch (err) {
+				return failClosed(`judge unavailable: ${err instanceof Error ? err.message : String(err)}`);
+			}
+			const result = normalizeJudgeResult(rawResult, options, this.minConfidence);
+			if (result.verdict === "ask_user" || result.verdict === "insufficient_evidence") {
+				consume();
+				return {
+					verdict: result.verdict,
+					reasons: [`${PLAN_MAPPING_STAGE}: ${result.reasons.join(" ")}`],
+					confidence: result.confidence,
+					judged: true,
+					summary: "",
+				};
+			}
+			supported[claims[0]!.id] = result.verdict === "approve";
+		} else {
+			if (this.claimCheckJudge === undefined) {
+				return {
+					verdict: "insufficient_evidence",
+					reasons: [
+						`${PLAN_MAPPING_STAGE} with several formalized requirements needs the per-claim marking judge, ` +
+							"which is not configured in this session",
+					],
+					judged: false,
+					summary: "",
+				};
+			}
+			let raw: ClaimCheckResult;
+			try {
+				raw = await this.claimCheckJudge({
+					stage: PLAN_MAPPING_STAGE,
+					task: input.task,
+					claims,
+					evidence: input.evidence,
+				});
+			} catch (err) {
+				return failClosed(`judge unavailable: ${err instanceof Error ? err.message : String(err)}`);
+			}
+			if (!isRecord(raw) || raw["judged"] !== true || !isRecord(raw["supported"])) {
+				return failClosed("the judge returned an unjudged or malformed result; no mapping kept");
+			}
+			const marked = raw["supported"] as Record<string, unknown>;
+			const unmarkable = claims.filter(c => typeof marked[c.id] !== "boolean");
+			if (unmarkable.length > 0) {
+				return failClosed(
+					`the judge could not mark the plan claim(s) for ${unmarkable.map(c => c.id).join(", ")}; ` +
+						"an unmarkable claim fails closed",
+				);
+			}
+			const expectedIds = claims.map(c => c.id).sort();
+			const actualIds = Object.keys(marked).sort();
+			if (expectedIds.length !== actualIds.length || expectedIds.some((id, i) => id !== actualIds[i])) {
+				return failClosed(
+					`marked requirement ids must be exactly the submitted plan claims (${expectedIds.join(", ")}); ` +
+						`got ${actualIds.join(", ")}`,
+				);
+			}
+			for (const claim of claims) supported[claim.id] = marked[claim.id] === true;
+		}
+		const mapped = claims.map(c => ({ id: c.id, claim: c.text, supported: supported[c.id] === true }));
+		const unsupported = mapped.filter(m => !m.supported);
+		const complete = unsupported.length === 0 && missing.length === 0;
+		this.state.lastPlanMapping = {
+			requirements: mapped,
+			missing,
+			complete,
+			at: this.now(),
+			taskFingerprint: this.state.taskFingerprint,
+			workRevision: this.state.workRevision,
+		};
+		if (complete) {
+			this.persist();
+			return {
+				verdict: "approve",
+				selectedOption: PLAN_MAPPING_APPROVED_OPTION,
+				reasons: [`${PLAN_MAPPING_STAGE}: every formalized requirement has a supported plan claim (${mapped.length})`],
+				judged: true,
+				summary: `${PLAN_MAPPING_STAGE}: approve — ${mapped.length}/${ids.length} requirement(s) mapped to plan work`,
+			};
+		}
+		consume();
+		const named = [
+			...unsupported.map(m => `${m.id} (claim not supported: ${claimExcerpt(m.claim)})`),
+			...missing.map(id => `${id} (no plan claim submitted)`),
+		].join(", ");
+		this.pushFeedback(`Jev ${PLAN_MAPPING_STAGE}: planning incomplete — ${named}`);
+		return {
+			verdict: "revise",
+			selectedOption: PLAN_MAPPING_INCOMPLETE_OPTION,
+			reasons: [`${PLAN_MAPPING_STAGE}: planning incomplete — ${named}`, `fix: ${PLAN_MAPPING_FIX}`],
+			judged: true,
+			summary: `${PLAN_MAPPING_STAGE}: revise — planning incomplete: ${named}`,
+		};
+	}
+
 	/** aspect_coverage three-way marking: missed aspects -> revise; else recorded, no approval. */
 	private async submitAspectCoverage(
 		input: ValidatedDecisionInput,
@@ -2322,6 +2887,64 @@ export class JevController {
 		);
 	}
 
+	// ----- activities framework (src/activities.ts): outcome sets, planning completeness -----
+
+	/**
+	 * Activity outcome enforcement: the registry (src/activities.ts) declares the FIXED outcome
+	 * set of every activity, so an engine answer the owning activity cannot express is a defect
+	 * and fails closed - never an approval, never a silent pass. Stages no activity claims
+	 * (config-declared on_demand points) are not guarded: the registry frames the product's own
+	 * stages, not owner-declared extras.
+	 */
+	private guardActivityOutcome(stage: DecisionStage, outcome: DecisionOutcome): DecisionOutcome | undefined {
+		const resolved = resolveActivityOutcome(stage, outcome.verdict, outcome.selectedOption, this.activities);
+		if (resolved === undefined || resolved.declared) return undefined;
+		const declared = this.activities[resolved.activityId]?.outcomes ?? [];
+		return {
+			verdict: "insufficient_evidence",
+			reasons: [
+				`activity_outcome_undeclared: activity "${resolved.activityId}" cannot answer "${resolved.outcome}" ` +
+					`for stage "${stage}" (declared outcomes: ${declared.join(", ")})`,
+			],
+			judged: false,
+			summary:
+				`${stage}: insufficient_evidence — the answer is outside the declared outcome set of activity ` +
+				`"${resolved.activityId}"; the submission is refused (fail-closed)`,
+		};
+	}
+
+	/** The accepted requirement checklist of the current task, or undefined when none exists. */
+	private currentFormalization(): FormalizationRecord | undefined {
+		const record = this.state.lastFormalization;
+		if (record === undefined || !record.complete) return undefined;
+		// A list formalized for another task never authorizes the current one (fail-safe).
+		if (record.taskFingerprint !== this.state.taskFingerprint) return undefined;
+		return record;
+	}
+
+	/**
+	 * Planning incompleteness (activities framework, planning activity): for every formalized
+	 * requirement the plan must carry a claim that the work serves it, marked by the claim_check
+	 * path. Returns the gap naming the requirement ids, or undefined when planning is complete -
+	 * including when the task was never formalized, so the default workflow (no formalization)
+	 * behaves exactly as before.
+	 */
+	private planningGap(): string | undefined {
+		const formalization = this.currentFormalization();
+		if (formalization === undefined) return undefined;
+		const ids = formalization.requirements.map(r => r.id);
+		const mapping = this.state.lastPlanMapping;
+		if (mapping === undefined || mapping.taskFingerprint !== this.state.taskFingerprint) {
+			return (
+				`plan mapping incomplete: no ${PLAN_MAPPING_STAGE} submission covers the ${ids.length} formalized ` +
+				`requirement(s) (${ids.join(", ")})`
+			);
+		}
+		const missing = ids.filter(id => !mapping.requirements.some(r => r.id === id && r.supported));
+		if (missing.length === 0) return undefined;
+		return `plan mapping incomplete: requirement(s) ${missing.join(", ")} have no supported plan claim`;
+	}
+
 	/**
 	 * FR-02/FR-03: route the skill or the model from the owner-held candidate list in the
 	 * template config. The judge sees only those candidates, so it can never invent one; the
@@ -2405,6 +3028,137 @@ export class JevController {
 		);
 	}
 
+	// ----- activities framework: the automatic course check (development) -----
+
+	/**
+	 * Periodic course check (owner switch `courseCheck.everyMutations`, default off). After every
+	 * N allowed mutating tool calls the controller consults the course-check judge itself, so a
+	 * session can ask "am I still on the plan?" without the executor choosing to. The consult runs
+	 * in the BACKGROUND (measured judge latency reaches 33s against a resetting endpoint, so it
+	 * must never hold a turn) and stays advisory: no block, no gate approval, no rework budget.
+	 */
+	private maybeAutomaticCourseCheck(): void {
+		const every = this.template.courseCheck?.everyMutations ?? 0;
+		if (every <= 0) return;
+		const revision = this.state.workRevision;
+		if (revision <= 0 || revision % every !== 0) return;
+		// Chained: consults stay ordered and at most one is in flight at a time.
+		const chain = this.autoCourseCheck ?? Promise.resolve();
+		this.autoCourseCheck = chain.then(() => this.runAutomaticCourseCheck(revision)).catch(() => {});
+	}
+
+	/** Await the in-flight automatic course-check chain (test seam; the tool path never waits). */
+	async automaticCourseChecksSettled(): Promise<void> {
+		await this.autoCourseCheck?.catch(() => {});
+	}
+
+	/**
+	 * The requirements an automatic course check runs against: the accepted formalized list of
+	 * the current task when one exists, else the captured task prompt as the single requirement
+	 * (id "task"). Empty when neither exists - recorded as uncertainty, never invented.
+	 */
+	private courseCheckRequirements(): Array<{ id: string; quote: string }> {
+		const formalization = this.currentFormalization();
+		if (formalization !== undefined && formalization.requirements.length > 0) {
+			return formalization.requirements.map(r => ({ id: r.id, quote: r.text }));
+		}
+		const task = this.state.taskPrompt;
+		return task !== undefined ? [{ id: "task", quote: cappedQuote(task).quote }] : [];
+	}
+
+	/**
+	 * One automatic consultation. Never throws and never blocks: a missing requirement, an
+	 * unwired judge, a judge error, an unusable answer or a sub-floor confidence is RECORDED as
+	 * uncertainty and pushed as feedback; a confident redirect or escalation is pushed back into
+	 * the same session (ask_user additionally as a recorded blocker). Nothing here records a gate
+	 * approval or satisfies the completion boundary - that still needs a deliberate course_check
+	 * with option continue bound to the current revision.
+	 */
+	private async runAutomaticCourseCheck(revision: number): Promise<void> {
+		const requirements = this.courseCheckRequirements();
+		const base: AutoCourseCheckRecord = { judged: false, reasons: [], workRevision: revision, at: this.now() };
+		if (requirements.length === 0) {
+			this.recordAutomaticCourseCheck({ ...base, reasons: ["no requirement captured for this task yet"] }, "no requirement to check against");
+			return;
+		}
+		if (this.courseCheckJudge === undefined) {
+			this.recordAutomaticCourseCheck({ ...base, reasons: ["course_check judge not configured in this session"] }, "judge not wired");
+			return;
+		}
+		const evidence: Evidence[] = [];
+		if (this.state.taskPrompt !== undefined) {
+			evidence.push(handoffEvidence("user", "session task prompt (the requirement)", this.state.taskPrompt));
+		}
+		for (const r of requirements) evidence.push(handoffEvidence("spec", `requirement ${r.id}`, r.quote));
+		let raw: CourseCheckResult;
+		try {
+			raw = await this.courseCheckJudge({
+				requirements,
+				currentAction: `automatic course check after ${revision} allowed mutating tool call(s)`,
+				evidence,
+			});
+		} catch (err) {
+			this.recordAutomaticCourseCheck(
+				{ ...base, reasons: [`judge unavailable: ${err instanceof Error ? err.message : String(err)}`] },
+				"judge unavailable",
+			);
+			return;
+		}
+		const read = readCourseCheckAnswer(raw, requirements, this.completionConfidenceFloor);
+		if (!read.ok) {
+			this.recordAutomaticCourseCheck({ ...base, reasons: [read.detail] }, read.detail);
+			return;
+		}
+		const record: AutoCourseCheckRecord = {
+			judged: true,
+			selectedOption: read.nextAction,
+			confidence: read.confidence,
+			reasons: read.reasons,
+			workRevision: revision,
+			at: this.now(),
+		};
+		if (read.nextAction === "ask_user") {
+			// Judge-chosen escalation: a recorded blocker, exactly like the deliberate path.
+			const blocker = `automatic course_check escalated to the user (ask_user at work revision ${revision}).`;
+			if (!this.state.blockers.includes(blocker)) this.state.blockers.push(blocker);
+			record.reasons = [...record.reasons, blocker];
+		}
+		this.state.lastAutoCourseCheck = record;
+		this.persist();
+		const drifted = read.drifted.length > 0 ? ` (drifted: ${read.drifted.join(", ")})` : "";
+		const why = read.reasons.length > 0 ? ` ${read.reasons.join(" ")}` : "";
+		switch (read.nextAction) {
+			case "continue":
+				this.pushFeedback(
+					`Jev automatic course_check after ${revision} mutation(s): continue — on track for ` +
+						`${requirements.length} requirement(s). The work proceeds.`,
+				);
+				break;
+			case "verify_before_proceeding":
+				this.pushFeedback(
+					`Jev automatic course_check after ${revision} mutation(s): verify_before_proceeding — gather ` +
+						"evidence before proceeding; this record does not satisfy the completion boundary." + why,
+				);
+				break;
+			case "ask_user":
+				this.pushFeedback(`Jev automatic course_check after ${revision} mutation(s): ${record.reasons.join(" ")}`);
+				break;
+			default:
+				// return_to_requirement | replan: the remark goes back into the same session.
+				this.pushFeedback(
+					`Jev automatic course_check after ${revision} mutation(s): ${read.nextAction}${drifted}` +
+						`${why} — return to the quoted requirement before continuing.`,
+				);
+		}
+	}
+
+	/** Uncertainty from an automatic consult: recorded and surfaced, never a block (fail-open). */
+	private recordAutomaticCourseCheck(record: AutoCourseCheckRecord, note: string): void {
+		this.state.lastAutoCourseCheck = record;
+		this.persist();
+		this.pushFeedback(`Jev automatic course_check not judged: ${note}. The work proceeds; nothing is blocked.`);
+	}
+
 	private unmetStopGates(): string[] {
 		// Fail-closed config (R5): corrupted template keeps every gate shut, regardless of
 		// restored approvals - they were granted under defaults that no longer validate.
@@ -2420,6 +3174,13 @@ export class JevController {
 		const missing: string[] = [];
 		if (this.template.gates?.mutation !== false && this.planApproval() === undefined) {
 			missing.push("no plan-stage approval (understanding_review or direction_review) for the current task");
+		}
+		// Activities framework (planning): a formalized requirement with no supported plan claim
+		// leaves planning incomplete, so the plan requirement is not met either. Demanded only
+		// while the plan gate is armed - gates.mutation: false drops it with the gate.
+		if (this.template.gates?.mutation !== false) {
+			const planningGap = this.planningGap();
+			if (planningGap !== undefined) missing.push(planningGap);
 		}
 		// Latest approval wins: supersede keeps same-digest records, so the freshest
 		// completion_review must be consulted, not the first.
@@ -2525,6 +3286,83 @@ function restoreClaimCheck(raw: unknown): JevState["lastClaimCheck"] {
 	};
 }
 
+/** Validate a persisted formalization: malformed entries are dropped, never used as a checklist. */
+function restoreFormalization(raw: unknown): FormalizationRecord | undefined {
+	if (!isRecord(raw) || !Array.isArray(raw["requirements"])) return undefined;
+	if (typeof raw["complete"] !== "boolean" || typeof raw["outcome"] !== "string") return undefined;
+	if (typeof raw["at"] !== "number" || !Number.isFinite(raw["at"])) return undefined;
+	if (typeof raw["workRevision"] !== "number" || !Number.isFinite(raw["workRevision"])) return undefined;
+	const requirements: FormalizedRequirement[] = [];
+	for (const entry of raw["requirements"]) {
+		if (!isRecord(entry) || !nonEmptyString(entry["id"]) || typeof entry["text"] !== "string") return undefined;
+		if (typeof entry["traceable"] !== "boolean") return undefined;
+		requirements.push({ id: entry["id"], text: entry["text"], traceable: entry["traceable"] });
+	}
+	if (requirements.length === 0) return undefined;
+	const uncovered: FormalizationRecord["uncovered"] = [];
+	if (Array.isArray(raw["uncovered"])) {
+		for (const entry of raw["uncovered"]) {
+			if (!isRecord(entry) || !nonEmptyString(entry["id"]) || typeof entry["source"] !== "string") return undefined;
+			uncovered.push({
+				id: entry["id"],
+				source: entry["source"],
+				excerpt: typeof entry["excerpt"] === "string" ? entry["excerpt"] : "",
+			});
+		}
+	}
+	return {
+		requirements,
+		uncovered,
+		outcome: raw["outcome"],
+		// A restored list is a checklist only if it was complete AND every item is traceable.
+		complete: raw["complete"] === true && requirements.every(r => r.traceable),
+		at: raw["at"],
+		taskFingerprint: typeof raw["taskFingerprint"] === "string" ? raw["taskFingerprint"] : undefined,
+		workRevision: raw["workRevision"],
+	};
+}
+
+/** Validate a persisted plan mapping: malformed entries are dropped, never counted as complete. */
+function restorePlanMapping(raw: unknown): PlanMappingRecord | undefined {
+	if (!isRecord(raw) || !Array.isArray(raw["requirements"]) || !Array.isArray(raw["missing"])) return undefined;
+	if (typeof raw["complete"] !== "boolean") return undefined;
+	if (typeof raw["at"] !== "number" || !Number.isFinite(raw["at"])) return undefined;
+	if (typeof raw["workRevision"] !== "number" || !Number.isFinite(raw["workRevision"])) return undefined;
+	const requirements: PlanMappingRecord["requirements"] = [];
+	for (const entry of raw["requirements"]) {
+		if (!isRecord(entry) || !nonEmptyString(entry["id"]) || typeof entry["claim"] !== "string") return undefined;
+		if (typeof entry["supported"] !== "boolean") return undefined;
+		requirements.push({ id: entry["id"], claim: entry["claim"], supported: entry["supported"] });
+	}
+	const missing = raw["missing"].filter((id): id is string => typeof id === "string");
+	return {
+		requirements,
+		missing,
+		// A restored mapping is complete only if it still says so AND nothing is missing.
+		complete: raw["complete"] === true && missing.length === 0 && requirements.every(r => r.supported),
+		at: raw["at"],
+		taskFingerprint: typeof raw["taskFingerprint"] === "string" ? raw["taskFingerprint"] : undefined,
+		workRevision: raw["workRevision"],
+	};
+}
+
+/** Validate a persisted automatic course-check record: malformed entries are dropped. */
+function restoreAutoCourseCheck(raw: unknown): AutoCourseCheckRecord | undefined {
+	if (!isRecord(raw) || typeof raw["judged"] !== "boolean") return undefined;
+	if (typeof raw["at"] !== "number" || !Number.isFinite(raw["at"])) return undefined;
+	if (typeof raw["workRevision"] !== "number" || !Number.isFinite(raw["workRevision"])) return undefined;
+	if (raw["selectedOption"] !== undefined && typeof raw["selectedOption"] !== "string") return undefined;
+	if (raw["confidence"] !== undefined && typeof raw["confidence"] !== "number") return undefined;
+	return {
+		judged: raw["judged"],
+		selectedOption: typeof raw["selectedOption"] === "string" ? raw["selectedOption"] : undefined,
+		confidence: typeof raw["confidence"] === "number" ? raw["confidence"] : undefined,
+		reasons: Array.isArray(raw["reasons"]) ? raw["reasons"].filter((r): r is string => typeof r === "string") : [],
+		workRevision: raw["workRevision"],
+		at: raw["at"],
+	};
+}
+
 function extraPointsFromTemplate(template: JevTemplateConfig): ReadonlyMap<string, ControlPoint> {
 	const out = new Map<string, ControlPoint>();
 	const declared = template.controlPoints;
@@ -2627,6 +3465,83 @@ function handoffEvidence(kind: Evidence["kind"], source: string, text: string): 
 function claimExcerpt(text: string): string {
 	const flat = text.trim().replace(/\s+/g, " ");
 	return flat.length > CLAIM_EXCERPT_CHARS ? `${flat.slice(0, CLAIM_EXCERPT_CHARS)}…` : flat;
+}
+
+/**
+ * The quoted source texts a formalized requirement list must be traceable to and cover: the
+ * user/spec evidence items, de-duplicated by quote (first wins, so the id order mirrors the
+ * submission) and capped verbatim. The judge sees one `quote-N` question per entry.
+ */
+function requirementQuotes(evidence: Evidence[]): Array<{ id: string; text: string; source: string }> {
+	const out: Array<{ id: string; text: string; source: string }> = [];
+	const seen = new Set<string>();
+	for (const item of evidence) {
+		if (item.kind !== "user" && item.kind !== "spec") continue;
+		const { quote } = cappedQuote(item.quote);
+		if (seen.has(quote)) continue;
+		seen.add(quote);
+		out.push({ id: `quote-${out.length + 1}`, text: quote, source: item.source });
+	}
+	return out;
+}
+
+type CourseCheckRead =
+	| { ok: true; nextAction: CourseCheckNextAction; drifted: string[]; reasons: string[]; confidence?: number }
+	| { ok: false; detail: string };
+
+/**
+ * Contract check of a course-check answer, independent of the deliberate submission path on
+ * purpose: the automatic consult is advisory, and a refactor of submitted course checks must
+ * never give it teeth. Same rules, same conservative reading - an unjudged, malformed,
+ * out-of-set, key-mismatched, drift+continue or sub-floor answer is never a usable verdict.
+ */
+function readCourseCheckAnswer(
+	raw: unknown,
+	requirements: Array<{ id: string }>,
+	confidenceFloor: number,
+): CourseCheckRead {
+	if (!isRecord(raw) || raw["judged"] !== true || typeof raw["nextAction"] !== "string") {
+		return { ok: false, detail: "the judge returned an unjudged or malformed course_check result" };
+	}
+	const nextAction = raw["nextAction"];
+	if (!(COURSE_CHECK_NEXT_ACTIONS as readonly string[]).includes(nextAction)) {
+		return { ok: false, detail: `the judge returned an unknown next action: ${nextAction}` };
+	}
+	if (!isRecord(raw["onTrack"])) return { ok: false, detail: "the result carries no onTrack record" };
+	const onTrack = raw["onTrack"] as Record<string, unknown>;
+	const expected = requirements.map(r => r.id).sort();
+	const actual = Object.keys(onTrack).sort();
+	if (expected.length !== actual.length || expected.some((id, i) => id !== actual[i])) {
+		return {
+			ok: false,
+			detail: `onTrack keys must be exactly the requirement ids (${expected.join(", ")}); got ${actual.join(", ")}`,
+		};
+	}
+	const drifted = Object.entries(onTrack)
+		.filter(([, onTrackNow]) => onTrackNow !== true)
+		.map(([id]) => id);
+	if (drifted.length > 0 && nextAction === "continue") {
+		return { ok: false, detail: `drifted requirement(s) ${drifted.join(", ")} cannot yield continue` };
+	}
+	const reasons = Array.isArray(raw["reasons"])
+		? raw["reasons"].filter((r): r is string => typeof r === "string")
+		: [];
+	if (drifted.length > 0) reasons.push(`not on track: ${drifted.join(", ")}`);
+	const rawConfidence = raw["confidence"];
+	const confidence =
+		typeof rawConfidence === "number" && Number.isFinite(rawConfidence) && rawConfidence >= 0 && rawConfidence <= 1
+			? rawConfidence
+			: undefined;
+	if (
+		(nextAction === "continue" || nextAction === "verify_before_proceeding") &&
+		(confidence === undefined || confidence < confidenceFloor)
+	) {
+		return {
+			ok: false,
+			detail: `confidence must be a finite 0..1 number at/above the floor ${confidenceFloor}`,
+		};
+	}
+	return { ok: true, nextAction: nextAction as CourseCheckNextAction, drifted, reasons, confidence };
 }
 
 /** One-line fixed-template summary of a handoff record (no generated prose). */

@@ -12,11 +12,14 @@ import type {
 	AspectCoverageResult,
 	AspectMarking,
 	ClaimCheckRequest,
+	CourseCheckRequest,
 	CourseCheckResult,
 	DecisionRequest,
 	DecisionResult,
 	Evidence,
+	RequirementsFormalizationRequest,
 } from "../src/types.js";
+import { ACTIVITY_REGISTRY, PLAN_MAPPING_APPROVED_OPTION } from "../src/activities.js";
 
 // ---------- fakes ----------
 
@@ -2677,5 +2680,470 @@ describe("jev controller: destructive-action gate (POLICY-DRAFT I)", () => {
 			controller.onSessionStart([{ customType: "jev.state", data: { lastDestructive: malformed } }]);
 			expect(controller.getState().lastDestructive).toBeUndefined();
 		}
+	});
+});
+
+// ---------- activities framework: requirements_formalization, planning, automatic course check ----------
+
+describe("jev controller: activities framework", () => {
+	const QUOTE_1 = "the dashboard must show feature X after loading";
+	const QUOTE_2 = "a restart must not lose feature X";
+	const REQUIREMENT_TEXTS = ["REQ-A: the dashboard shows feature X", "REQ-B: feature X survives a restart"] as const;
+
+	const formalizationInput = (overrides: Record<string, unknown> = {}) => ({
+		stage: "requirements_formalization",
+		task: "Formalize the requirement list of this task",
+		proposal: "the numbered list derived from the two quoted user requirements",
+		options: OPTIONS,
+		evidence: [evidence("user", QUOTE_1), evidence("spec", QUOTE_2)],
+		requirements: [...REQUIREMENT_TEXTS],
+		...overrides,
+	});
+
+	const planMappingInput = (overrides: Record<string, unknown> = {}) => ({
+		stage: "plan_mapping",
+		task: "Map the plan to the formalized requirements",
+		proposal: "the plan work that serves each formalized requirement",
+		options: OPTIONS,
+		evidence: [evidence("user", QUOTE_1), evidence("spec", QUOTE_2)],
+		planClaims: [
+			{ requirementId: "req-1", claim: "the plan adds the dashboard view that renders feature X" },
+			{ requirementId: "req-2", claim: "the plan persists feature X state so a restart keeps it" },
+		],
+		...overrides,
+	});
+
+	const fullMarks = { traceable: { "req-1": true, "req-2": true }, covered: { "quote-1": true, "quote-2": true } };
+	const fullFormalizationJudge = async (): Promise<{
+		traceable: Record<string, boolean>;
+		covered: Record<string, boolean>;
+		reasons: string[];
+		judged: boolean;
+	}> => ({ ...fullMarks, reasons: [], judged: true });
+	const allClaimsSupported = async (req: ClaimCheckRequest) => ({
+		supported: Object.fromEntries(req.claims.map(c => [c.id, true] as const)),
+		reasons: [],
+		judged: true,
+	});
+	/** Plan-gate judge that also answers the single-claim plan_mapping question. */
+	const planStageJudge = (mappingVerdict: DecisionResult) => async (req: DecisionRequest) => {
+		if (req.stage === "plan_mapping") return mappingVerdict;
+		return req.stage === "course_check" ? judgeResult({ selectedOption: "continue" }) : judgeResult({});
+	};
+
+	test("a fully traced list comes back as the numbered list, per-item marked, with the coverage verdict", async () => {
+		const requests: RequirementsFormalizationRequest[] = [];
+		const controller = createJevController({
+			judge: async () => {
+				throw new Error("the standard judge must not be called");
+			},
+			requirementsFormalizationJudge: async req => {
+				requests.push(req);
+				return { ...fullMarks, reasons: [], judged: true };
+			},
+		});
+		const outcome = await controller.submitDecision(formalizationInput());
+		expect(requests).toHaveLength(1);
+		expect(requests[0]?.requirements).toEqual([
+			{ id: "req-1", text: REQUIREMENT_TEXTS[0] },
+			{ id: "req-2", text: REQUIREMENT_TEXTS[1] },
+		]);
+		expect(requests[0]?.quotes).toEqual([
+			{ id: "quote-1", text: QUOTE_1 },
+			{ id: "quote-2", text: QUOTE_2 },
+		]);
+		expect(outcome.verdict).toBe("approve");
+		expect(outcome.selectedOption).toBe("formalized");
+		expect(outcome.summary).toContain("formalized 2 requirement(s)");
+		expect(outcome.summary).toContain("REQ-A");
+		const record = controller.getState().lastFormalization;
+		expect(record?.complete).toBe(true);
+		expect(record?.requirements.map(r => [r.id, r.traceable])).toEqual([
+			["req-1", true],
+			["req-2", true],
+		]);
+		expect(record?.uncovered).toEqual([]);
+		// Advisory by construction: the stage never records a gate approval.
+		expect(controller.getState().approvals).toHaveLength(0);
+	});
+
+	test("an untraceable item is refused, named, and never becomes the checklist", async () => {
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			requirementsFormalizationJudge: async () => ({
+				traceable: { "req-1": true, "req-2": false },
+				covered: { "quote-1": true, "quote-2": true },
+				reasons: [],
+				judged: true,
+			}),
+		});
+		const outcome = await controller.submitDecision(formalizationInput());
+		expect(outcome.verdict).toBe("revise");
+		expect(outcome.selectedOption).toBe("item_untraceable");
+		expect(outcome.reasons.join(" ")).toContain("req-2");
+		expect(outcome.reasons.join(" ")).toContain("REQ-B");
+		expect(controller.getState().lastFormalization?.complete).toBe(false);
+		expect(controller.getState().lastFormalization?.outcome).toBe("item_untraceable");
+	});
+
+	test("a quoted source no requirement captures is named as what the quotes do not cover", async () => {
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			requirementsFormalizationJudge: async () => ({
+				traceable: { "req-1": true, "req-2": true },
+				covered: { "quote-1": true, "quote-2": false },
+				reasons: [],
+				judged: true,
+			}),
+		});
+		const outcome = await controller.submitDecision(formalizationInput());
+		expect(outcome.verdict).toBe("revise");
+		expect(outcome.selectedOption).toBe("coverage_missing");
+		expect(outcome.reasons.join(" ")).toContain("coverage missing");
+		expect(outcome.reasons.join(" ")).toContain("quote-2");
+		expect(controller.getState().lastFormalization?.uncovered).toEqual([
+			{ id: "quote-2", source: "test", excerpt: QUOTE_2 },
+		]);
+		expect(controller.getState().lastFormalization?.complete).toBe(false);
+	});
+
+	test("a judge error keeps no requirement list at all (fail-closed)", async () => {
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			requirementsFormalizationJudge: async () => {
+				throw new Error("endpoint down");
+			},
+		});
+		const outcome = await controller.submitDecision(formalizationInput());
+		expect(outcome.verdict).toBe("insufficient_evidence");
+		expect(outcome.judged).toBe(false);
+		expect(outcome.reasons.join(" ")).toContain("judge unavailable");
+		expect(controller.getState().lastFormalization).toBeUndefined();
+	});
+
+	test("without a quoted source there is nothing to be traceable to: refused before any judge call", async () => {
+		let called = 0;
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			requirementsFormalizationJudge: async () => {
+				called++;
+				return { ...fullMarks, reasons: [], judged: true };
+			},
+		});
+		const outcome = await controller.submitDecision(
+			formalizationInput({ evidence: [evidence("execution", "dry-run output ok, nothing quoted from the user")] }),
+		);
+		expect(called).toBe(0);
+		expect(outcome.judged).toBe(false);
+		expect(outcome.reasons.join(" ")).toContain("user or spec evidence");
+	});
+
+	test("planning: a formalized requirement with no plan claim leaves planning incomplete and the gate shut", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({
+			judge: planStageJudge({ verdict: "revise", reasons: ["no plan work serves the requirement"], confidence: 0.9 }),
+			requirementsFormalizationJudge: fullFormalizationJudge,
+			claimCheckJudge: allClaimsSupported,
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", {
+			type: "before_agent_start",
+			prompt: "work task: implement feature X",
+			systemPrompt: [],
+		});
+		await approvePlan(controller);
+		await controller.submitDecision(formalizationInput());
+		// Plan approved, list formalized: the mapping is now part of the plan gate.
+		const unmapped = blockResult(
+			await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} }),
+		);
+		expect(unmapped?.block).toBe(true);
+		expect(String(unmapped?.reason)).toContain("plan mapping incomplete");
+		expect(String(unmapped?.reason)).toContain("req-1, req-2");
+		// One requirement mapped: req-2 is still missing, so planning is incomplete.
+		const partial = await controller.submitDecision(
+			planMappingInput({
+				planClaims: [{ requirementId: "req-1", claim: "the plan adds the dashboard view for feature X" }],
+			}),
+		);
+		expect(partial.verdict).toBe("revise");
+		expect(partial.selectedOption).toBe("incomplete_mapping");
+		expect(partial.reasons.join(" ")).toContain("req-2");
+		expect(controller.getState().lastPlanMapping).toMatchObject({ missing: ["req-2"], complete: false });
+		expect(
+			blockResult(await harness.emit("tool_call", { type: "tool_call", toolCallId: "2", toolName: "edit", input: {} }))
+				?.block,
+		).toBe(true);
+		// Every formalized requirement mapped and supported: planning is complete.
+		const full = await controller.submitDecision(planMappingInput());
+		expect(full.verdict).toBe("approve");
+		expect(full.summary).toContain("2/2 requirement(s) mapped");
+		expect(controller.getState().lastPlanMapping?.complete).toBe(true);
+		expect(
+			blockResult(await harness.emit("tool_call", { type: "tool_call", toolCallId: "3", toolName: "edit", input: {} }))
+				?.block,
+		).toBeUndefined();
+	});
+
+	test("planning: the stop boundary names the unmapped requirements too", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({
+			judge: gateJudge(),
+			requirementsFormalizationJudge: fullFormalizationJudge,
+			claimCheckJudge: allClaimsSupported,
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", {
+			type: "before_agent_start",
+			prompt: "work task: implement feature X",
+			systemPrompt: [],
+		});
+		await approvePlan(controller);
+		await controller.submitDecision(formalizationInput());
+		const res = await runStop(harness);
+		expect(res?.decision).toBe("block");
+		expect(String(res?.reason)).toContain("plan mapping incomplete");
+	});
+
+	test("planning: a one-requirement list maps through one claim-shaped decision", async () => {
+		const controller = createJevController({
+			judge: planStageJudge(judgeResult({ selectedOption: PLAN_MAPPING_APPROVED_OPTION, confidence: 0.93 })),
+			requirementsFormalizationJudge: async () => ({
+				traceable: { "req-1": true },
+				covered: { "quote-1": true, "quote-2": true },
+				reasons: [],
+				judged: true,
+			}),
+		});
+		await controller.submitDecision(formalizationInput({ requirements: [REQUIREMENT_TEXTS[0]] }));
+		const outcome = await controller.submitDecision(
+			planMappingInput({
+				planClaims: [{ requirementId: "req-1", claim: "the plan adds the dashboard view for feature X" }],
+			}),
+		);
+		expect(outcome.verdict).toBe("approve");
+		expect(outcome.summary).toContain("1/1 requirement(s) mapped");
+		expect(controller.getState().lastPlanMapping?.complete).toBe(true);
+	});
+
+	test("plan_mapping before a formalization is refused (there is no checklist to map)", async () => {
+		let calls = 0;
+		const controller = createJevController({
+			judge: async () => {
+				calls++;
+				return judgeResult({});
+			},
+		});
+		const outcome = await controller.submitDecision(planMappingInput());
+		expect(calls).toBe(0);
+		expect(outcome.judged).toBe(false);
+		expect(outcome.reasons.join(" ")).toContain("completed requirements_formalization");
+	});
+
+	test("plan_mapping names an unknown requirement id instead of silently ignoring it", async () => {
+		let judging = 0;
+		const controller = createJevController({
+			judge: async () => {
+				judging++;
+				return judgeResult({});
+			},
+			requirementsFormalizationJudge: fullFormalizationJudge,
+			claimCheckJudge: allClaimsSupported,
+		});
+		await controller.submitDecision(formalizationInput());
+		const outcome = await controller.submitDecision(
+			planMappingInput({ planClaims: [{ requirementId: "req-7", claim: "a claim about a requirement that does not exist" }] }),
+		);
+		expect(judging).toBe(0);
+		expect(outcome.judged).toBe(false);
+		expect(outcome.reasons.join(" ")).toContain("unknown_requirement_id");
+		expect(outcome.reasons.join(" ")).toContain("req-1, req-2");
+	});
+
+	test("everyMutations: 2 fires one automatic consult after the second allowed mutation and feeds it back", async () => {
+		const harness = makeFakePi();
+		const requests: CourseCheckRequest[] = [];
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			courseCheckJudge: async req => {
+				requests.push(req);
+				return {
+					onTrack: Object.fromEntries(req.requirements.map(r => [r.id, true] as const)),
+					nextAction: "continue",
+					reasons: ["judged"],
+					confidence: 0.9,
+					judged: true,
+				};
+			},
+			template: { gates: { mutation: false }, courseCheck: { everyMutations: 2 } },
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", {
+			type: "before_agent_start",
+			prompt: "work task: implement feature X",
+			systemPrompt: [],
+		});
+		for (const id of ["1", "2", "3"]) {
+			await harness.emit("tool_call", { type: "tool_call", toolCallId: id, toolName: "edit", input: {} });
+		}
+		await controller.automaticCourseChecksSettled();
+		// The third allowed mutation crossed no further multiple: exactly one consult.
+		expect(requests).toHaveLength(1);
+		expect(requests[0]?.requirements).toEqual([{ id: "task", quote: "work task: implement feature X" }]);
+		const record = controller.getState().lastAutoCourseCheck;
+		expect(record?.judged).toBe(true);
+		expect(record?.selectedOption).toBe("continue");
+		expect(record?.workRevision).toBe(2);
+		expect(harness.sentMessages.some(m => JSON.stringify(m.payload).includes("automatic course_check"))).toBe(true);
+		// Advisory: it blocks nothing and satisfies nothing (no gate approval, no fresh record).
+		expect(controller.getState().blockers).toEqual([]);
+		expect(controller.getState().approvals).toHaveLength(0);
+		expect(controller.getState().lastCourseCheck).toBeUndefined();
+		expect(controller.getState().iterations).toEqual({});
+		// The fourth mutation crosses the next multiple.
+		await harness.emit("tool_call", { type: "tool_call", toolCallId: "4", toolName: "edit", input: {} });
+		await controller.automaticCourseChecksSettled();
+		expect(requests).toHaveLength(2);
+	});
+
+	test("with the switch absent no automatic consult happens at all (zero judge calls)", async () => {
+		const harness = makeFakePi();
+		let calls = 0;
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			courseCheckJudge: async () => {
+				calls++;
+				return { onTrack: {}, nextAction: "continue", reasons: [], confidence: 0.9, judged: true };
+			},
+			template: { gates: { mutation: false } },
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", {
+			type: "before_agent_start",
+			prompt: "work task: implement feature X",
+			systemPrompt: [],
+		});
+		for (const id of ["1", "2", "3", "4", "5"]) {
+			await harness.emit("tool_call", { type: "tool_call", toolCallId: id, toolName: "edit", input: {} });
+		}
+		await controller.automaticCourseChecksSettled();
+		expect(calls).toBe(0);
+		expect(controller.getState().lastAutoCourseCheck).toBeUndefined();
+	});
+
+	test("an automatic consult whose judge throws records uncertainty, blocks nothing, spends no rework", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			courseCheckJudge: async () => {
+				throw new Error("endpoint down");
+			},
+			template: { gates: { mutation: false }, courseCheck: { everyMutations: 1 } },
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", {
+			type: "before_agent_start",
+			prompt: "work task: implement feature X",
+			systemPrompt: [],
+		});
+		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
+		await controller.automaticCourseChecksSettled();
+		expect(controller.getState().lastAutoCourseCheck?.judged).toBe(false);
+		expect(controller.getState().lastAutoCourseCheck?.reasons.join(" ")).toContain("judge unavailable");
+		expect(controller.getState().blockers).toEqual([]);
+		expect(controller.getState().iterations).toEqual({});
+	});
+
+	test("with a formalized list the automatic consult checks the formalized requirements", async () => {
+		const harness = makeFakePi();
+		const requests: CourseCheckRequest[] = [];
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			requirementsFormalizationJudge: fullFormalizationJudge,
+			courseCheckJudge: async req => {
+				requests.push(req);
+				return {
+					onTrack: Object.fromEntries(req.requirements.map(r => [r.id, true] as const)),
+					nextAction: "verify_before_proceeding",
+					reasons: ["more evidence needed"],
+					confidence: 0.9,
+					judged: true,
+				};
+			},
+			template: { gates: { mutation: false }, courseCheck: { everyMutations: 1 } },
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", {
+			type: "before_agent_start",
+			prompt: "work task: implement feature X",
+			systemPrompt: [],
+		});
+		await controller.submitDecision(formalizationInput());
+		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
+		await controller.automaticCourseChecksSettled();
+		expect(requests[0]?.requirements).toEqual([
+			{ id: "req-1", quote: REQUIREMENT_TEXTS[0] },
+			{ id: "req-2", quote: REQUIREMENT_TEXTS[1] },
+		]);
+		// verify_before_proceeding is recorded and never unlocks the completion boundary.
+		expect(controller.getState().lastAutoCourseCheck?.selectedOption).toBe("verify_before_proceeding");
+		expect(controller.getState().lastCourseCheck).toBeUndefined();
+		expect(harness.sentMessages.some(m => JSON.stringify(m.payload).includes("verify_before_proceeding"))).toBe(true);
+	});
+
+	test("an engine answer outside the activity's declared outcome set fails closed", async () => {
+		const planning = ACTIVITY_REGISTRY["planning"]!;
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			claimCheckJudge: allClaimsSupported,
+			activities: {
+				...ACTIVITY_REGISTRY,
+				planning: { ...planning, outcomes: ["revise"], verdictActions: { revise: "return_to_activity" } },
+			},
+		});
+		const outcome = await controller.submitDecision({
+			stage: "claim_check",
+			task: "Decide how to wire the per-claim judge",
+			proposal: "the claims of the wiring decision, checked against the quoted measurement",
+			options: OPTIONS,
+			evidence: [evidence("execution", "parallel per-claim questions in ONE request: per-claim yes/no")],
+			claims: ["the marking path judges every claim in one request", "a second claim to be marked"],
+		});
+		expect(outcome.verdict).toBe("insufficient_evidence");
+		expect(outcome.judged).toBe(false);
+		expect(outcome.reasons.join(" ")).toContain("activity_outcome_undeclared");
+		expect(outcome.reasons.join(" ")).toContain("planning");
+		expect(controller.getState().approvals).toHaveLength(0);
+	});
+
+	test("the formalization and plan mapping records restore with the session", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			requirementsFormalizationJudge: fullFormalizationJudge,
+			claimCheckJudge: allClaimsSupported,
+		});
+		controller.register(harness.pi);
+		await controller.submitDecision(formalizationInput());
+		await controller.submitDecision(planMappingInput());
+		const entries = harness.appended.filter(e => e.customType === "jev.state");
+		expect(entries.length).toBeGreaterThan(0);
+		const restored = createJevController({ judge: async () => judgeResult({}) });
+		restored.onSessionStart([{ customType: "jev.state", data: entries[entries.length - 1]?.data }]);
+		expect(restored.getState().lastFormalization?.complete).toBe(true);
+		expect(restored.getState().lastFormalization?.requirements.map(r => r.id)).toEqual(["req-1", "req-2"]);
+		expect(restored.getState().lastPlanMapping?.complete).toBe(true);
+		// A malformed record is dropped, never trusted as a checklist.
+		restored.onSessionStart([
+			{
+				customType: "jev.state",
+				data: {
+					lastFormalization: { requirements: [{ id: "req-1", text: "t", traceable: "yes" }], complete: true },
+					lastPlanMapping: { requirements: [{ id: "req-1", claim: "c" }], missing: [], complete: true },
+				},
+			},
+		]);
+		expect(restored.getState().lastFormalization).toBeUndefined();
+		expect(restored.getState().lastPlanMapping).toBeUndefined();
 	});
 });

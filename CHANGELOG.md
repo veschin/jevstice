@@ -200,3 +200,65 @@ cover them; judge verdict `always_judge` at confidence 0.88, `pol_I` 0.92):
   - Integration shim corrected while adding the second `tool_call` handler: the fake host kept one
     handler per event in a last-wins map, which would silently drop a gate; it now keeps the same
     handler list the real runner does (`ext.handlers.get(event)`, first `block` wins).
+
+## 0.6.0 - 2026-10-08
+
+Activities framework (owner order 2026-10-07): the activity level above the control-point mechanism.
+  - `src/activities.ts` - the registry of the six activities (task_definition,
+    requirements_formalization, planning, development, review, completion, spec
+    `evidence/activities-framework.md`): each declares its purpose, entrance boundary, required
+    evidence, FIXED outcome set, invariants, outcome -> action map (`continue` /
+    `return_to_activity` / `replan` / `escalate` / `block`), enforcement mode with the switch that
+    arms it, the course mechanism, and the wired mechanisms (stage + `gate`/`stage`/`controller`
+    wiring) that implement it. The control-point registry stays the mechanism; the activity registry
+    is the frame that says which mechanism belongs where.
+  - `validateActivityRegistry` reports every way a declaration can be decorative: an activity with
+    no mechanism, a mechanism whose stage the engine does not know, a gate wiring on a non-gate
+    trigger, a controller wiring without a location, an outcome no edge can produce, an edge outside
+    the outcome set, a verdict no edge answers, an outcome without an action. `stagesWithoutActivity`
+    reports the reverse (a registered control point belonging to no activity). `tests/activities.test.ts`
+    fails the suite on any of them - a declared-but-unwired activity is a defect.
+  - Outcome sets are enforced at runtime, not only in tests: an engine answer the owning activity
+    cannot express in its declared set fails closed (`insufficient_evidence`, `judged: false`, naming
+    the activity and the answer) before any approval is recorded. The guard resolves through the
+    controller's `activities` dependency, so a doctored registry is testable.
+  - New `requirements_formalization` control point (`on_demand`, advisory, never gate-granting) and
+    its per-item marking judge (`createRequirementsFormalizationJudge`, one request, Noul per item,
+    sharded at the API limit, exact-id contract, fail-closed): the draft numbered list comes back
+    with each item marked traceable to a quoted user/spec item, plus the coverage verdict naming the
+    quoted source texts no requirement captures. An item no quote entails is refused as
+    `item_untraceable` and named; a quote no item captures is `coverage_missing` and named; only a
+    fully accepted list is stored as `complete` and used as the task's requirement checklist. Two
+    readings were put to the judge live before implementing: "a formalized requirement must be
+    stated or directly entailed by a submitted user/spec quote" (approve, `state_or_entail`, 0.95)
+    and "coverage is judged per submitted quote, not against the task as a whole" (approve,
+    `per_quote`, 0.88).
+  - New `plan_mapping` control point (`on_demand`) - planning's per-requirement mapping: for every
+    formalized requirement, the submitted claim that the plan serves it is marked by the existing
+    claim_check path (one Noul per claim, one request); a formalization with a single requirement
+    goes through one claim-shaped decision instead (the marking path starts at two claims). A
+    requirement with no submitted claim, or with a claim the quoted evidence does not support,
+    leaves planning incomplete: the mutation gate names those requirement ids, the stop boundary
+    names them too, and the gate opens only when every formalized requirement is mapped. Without a
+    formalization nothing changes (no formalization, no mapping demanded).
+  - Automatic course check (owner order during the slice: the agent must be able to consult the
+    judge DURING the session - `courseCheck.everyMutations`, user-owned, default off; PRD 14
+    "периодически и на границах"). After every N allowed mutating tool calls the controller submits
+    `course_check` itself, in the background (judge latency reaches 33s on the resetting endpoint,
+    so it must never hold a turn), against the formalized requirement list when one exists and else
+    the task prompt as the single requirement. The verdict is recorded in session state
+    (`lastAutoCourseCheck`) and fed back into the same session: continue and
+    verify_before_proceeding are recorded, return_to_requirement/replan go back as a remark,
+    ask_user becomes a recorded blocker; a judge error, an unusable answer, a sub-floor confidence
+    or a missing requirement records uncertainty and blocks nothing. It never spends the rework
+    budget (the executor did not choose to spend it) and never satisfies the completion boundary,
+    which still needs a deliberate course_check with `continue`.
+  - Live round-trip of the formalization judge (real client, real endpoint): a 3-item draft list
+    against 3 quoted sources returned `traceable: req-1 false, req-2 true, req-3 false` (the
+    fabricated GPU item refused) and `covered: quote-1 false, quote-2 true, quote-3 true` - the
+    requirement list itself, not only a verdict. The first attempt died with the documented socket
+    reset and needed the transport retry budget.
+  - README gains the "Activities" section (the spec table plus how each activity is armed), the two
+    new stages, the `courseCheck` config key and the automatic-consult sentence.
+  - `bun test` 341/341 (39 new: 14 activities registry, 6 client formalization, 16 controller
+    formalization/planning/periodic-course-check/outcome-guard, 3 config), `tsc --noEmit` clean.

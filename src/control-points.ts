@@ -121,6 +121,24 @@ export const CONTROL_POINT_REGISTRY: Readonly<Record<string, ControlPoint>> = {
 		trigger: "on_demand",
 		verdictMapping: "standard",
 	},
+	// Activities framework: the requirements_formalization activity. The caller submits a
+	// draft numbered requirement list plus the user/spec quotes; the judge marks every item's
+	// traceability and every quote's coverage in one request. Advisory by construction
+	// (on_demand never grants a gate) - its result is the checklist later activities use.
+	requirements_formalization: {
+		stage: "requirements_formalization",
+		trigger: "on_demand",
+		verdictMapping: "standard",
+	},
+	// Activities framework: the planning activity's per-requirement mapping. For every
+	// formalized requirement the caller submits the claim that the plan serves it; the
+	// claim_check path marks each claim against the quoted evidence. A requirement without a
+	// submitted claim leaves planning incomplete and keeps the plan gate shut (gates.mutation).
+	plan_mapping: {
+		stage: "plan_mapping",
+		trigger: "on_demand",
+		verdictMapping: "standard",
+	},
 };
 
 export { COURSE_CHECK_OPTION_IDS };

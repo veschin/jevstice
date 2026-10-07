@@ -1515,3 +1515,108 @@ describe("client: transport retry coverage", () => {
 		expect(calls).toBe(3);
 	});
 });
+
+// ---------- createRequirementsFormalizationJudge (requirements_formalization activity) ----------
+
+import { createRequirementsFormalizationJudge } from "../src/client";
+import type { RequirementsFormalizationRequest } from "../src/types";
+
+const okFormalization: RequirementsFormalizationRequest = {
+	stage: "requirements_formalization",
+	task: "Formalize the requirement list of the dashboard task",
+	requirements: [
+		{ id: "req-1", text: "the dashboard shows feature X" },
+		{ id: "req-2", text: "feature X survives a restart" },
+	],
+	quotes: [
+		{ id: "quote-1", text: "the dashboard must show feature X" },
+		{ id: "quote-2", text: "a restart must not lose feature X" },
+	],
+	evidence: [
+		{ kind: "user", source: "task prompt", quote: "the dashboard must show feature X" },
+		{ kind: "user", source: "task prompt", quote: "a restart must not lose feature X" },
+	],
+};
+
+describe("client: requirements formalization judge", () => {
+	test("one request: every requirement marked for traceability and every quote for coverage", async () => {
+		const calls: { body?: unknown }[] = [];
+		const fetchFn = (async (_url: unknown, init?: RequestInit) => {
+			calls.push({ body: JSON.parse(init?.body as string) });
+			return jsonResponse(noulAnswers({ "req-1": 0.95, "req-2": 0.2, "quote-1": 0.9, "quote-2": 0.4 }));
+		}) as unknown as typeof fetch;
+		const judge = createRequirementsFormalizationJudge({ apiKey: "k", fetchFn });
+		const result = await judge(okFormalization);
+		expect(calls).toHaveLength(1);
+		expect(result.judged).toBe(true);
+		expect(result.traceable).toEqual({ "req-1": true, "req-2": false });
+		expect(result.covered).toEqual({ "quote-1": true, "quote-2": false });
+		const body = calls[0]!.body as { questions: Record<string, unknown>; state: Record<string, unknown> };
+		expect(Object.keys(body.questions).sort()).toEqual(["quote-1", "quote-2", "req-1", "req-2"]);
+		// The quotes are the judgement material and travel in state, never in the question text.
+		expect(body.state["quotedSources"]).toEqual(okFormalization.quotes);
+	});
+
+	test("0.5 noul counts as marked, 0.49 does not (the documented claim-check boundary)", async () => {
+		const judge = createRequirementsFormalizationJudge({
+			apiKey: "k",
+			fetchFn: (async () =>
+				jsonResponse(noulAnswers({ "req-1": 0.5, "req-2": 0.49, "quote-1": 0.5, "quote-2": 0.49 }))) as unknown as typeof fetch,
+		});
+		const result = await judge(okFormalization);
+		expect(result.traceable).toEqual({ "req-1": true, "req-2": false });
+		expect(result.covered).toEqual({ "quote-1": true, "quote-2": false });
+	});
+
+	test("a missing noul for one item fails closed: no partial marking, the item is named", async () => {
+		const judge = createRequirementsFormalizationJudge({
+			apiKey: "k",
+			fetchFn: (async () =>
+				jsonResponse(noulAnswers({ "req-1": 0.9, "quote-1": 0.9, "quote-2": 0.9 }))) as unknown as typeof fetch,
+		});
+		const result = await judge(okFormalization);
+		expect(result.judged).toBe(false);
+		expect(result.traceable).toEqual({});
+		expect(result.covered).toEqual({});
+		expect(result.reasons.join(" ")).toContain("req-2");
+	});
+
+	test("an unknown answer id fails closed (never a partial marking)", async () => {
+		const judge = createRequirementsFormalizationJudge({
+			apiKey: "k",
+			fetchFn: (async () =>
+				jsonResponse(
+					noulAnswers({ "req-1": 0.9, "req-2": 0.9, "quote-1": 0.9, "quote-2": 0.9, hidden: 0.9 }),
+				)) as unknown as typeof fetch,
+		});
+		const result = await judge(okFormalization);
+		expect(result.judged).toBe(false);
+		expect(result.reasons.join(" ")).toContain("hidden");
+	});
+
+	test("invalid input and a missing key are refused before any transport", async () => {
+		let called = 0;
+		const fetchFn = (async () => {
+			called++;
+			return jsonResponse(noulAnswers({}));
+		}) as unknown as typeof fetch;
+		const judge = createRequirementsFormalizationJudge({ apiKey: "k", fetchFn });
+		await expect(judge({ ...okFormalization, requirements: [] })).rejects.toBeInstanceOf(JevApiError);
+		await expect(judge({ ...okFormalization, quotes: [] })).rejects.toBeInstanceOf(JevApiError);
+		await expect(
+			judge({ ...okFormalization, quotes: [{ id: "req-1", text: "an id collision" }] }),
+		).rejects.toBeInstanceOf(JevApiError);
+		await expect(
+			createRequirementsFormalizationJudge({ apiKey: "", fetchFn })(okFormalization),
+		).rejects.toBeInstanceOf(JevApiError);
+		expect(called).toBe(0);
+	});
+
+	test("transport errors surface as typed errors, never as a marking", async () => {
+		const fetchFn = (async () => {
+			throw new Error("ECONNRESET");
+		}) as unknown as typeof fetch;
+		const judge = createRequirementsFormalizationJudge({ apiKey: "k", fetchFn, maxRetries: 0 });
+		await expect(judge(okFormalization)).rejects.toBeInstanceOf(JevApiError);
+	});
+});

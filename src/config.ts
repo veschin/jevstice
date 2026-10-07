@@ -54,6 +54,15 @@ export interface JevTemplateConfig {
 	 * silent no-op.
 	 */
 	routing?: { skills?: RoutingCandidate[]; models?: RoutingCandidate[]; allowlist?: string[] };
+	/**
+	 * Automatic course check (owner-owned, default off). With `everyMutations: N` the
+	 * controller consults the course-check judge on its own after every N allowed mutating
+	 * tool calls and feeds the verdict back into the same session. It never blocks, never
+	 * records a gate approval and never spends the executor's rework budget. Absent or 0
+	 * means no automatic consult: the executor submits course_check deliberately, exactly as
+	 * before.
+	 */
+	courseCheck?: { everyMutations: number };
 	controlPoints?: Record<
 		string,
 		{ trigger: "on_demand"; instructions?: string; options?: Array<{ id: string; label: string; meaning: string }> }
@@ -202,6 +211,23 @@ export function validateTemplateConfig(file: string, raw: unknown): JevTemplateC
 		}
 		out.routing = routing;
 	}
+	if (raw["courseCheck"] !== undefined) {
+		if (!isRecord(raw["courseCheck"])) {
+			throw new JevConfigError(
+				file,
+				"courseCheck.everyMutations must be an integer >= 0 (courseCheck is not an object)",
+			);
+		}
+		const every = raw["courseCheck"]["everyMutations"];
+		if (typeof every !== "number" || !Number.isInteger(every) || every < 0) {
+			throw new JevConfigError(
+				file,
+				"courseCheck.everyMutations must be an integer >= 0 (0 = no automatic course check)",
+			);
+		}
+		// 0 is an explicit off, indistinguishable from an absent key by design.
+		out.courseCheck = { everyMutations: every };
+	}
 	if (raw["gates"] !== undefined) {
 		if (!isRecord(raw["gates"])) throw new JevConfigError(file, "gates must be an object");
 		const gates: JevTemplateConfig["gates"] = {};
@@ -246,6 +272,8 @@ export function mergeTemplateConfigs(user: JevTemplateConfig, project: JevTempla
 		capabilities: project.capabilities ?? user.capabilities,
 		// Trust split like the approval floor: the plan-gate switch is USER-owned.
 		gates: user.gates ?? project.gates,
+		// Trust split like the plan-gate switch: the automatic course-check period is USER-owned.
+		courseCheck: user.courseCheck ?? project.courseCheck,
 		routing: user.routing ?? project.routing,
 		completion:
 			user.completion === undefined && project.completion === undefined
