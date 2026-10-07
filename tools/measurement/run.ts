@@ -51,7 +51,9 @@ const NOUL_SUPPORTED_THRESHOLD = 0.5;
 
 type Arm = "control" | "addon";
 
-const MODEL = "deepseek/deepseek-flash:high";
+const MODEL = flagValue("--model") || "deepseek/deepseek-flash:high";
+/** Free-text justification of the model choice, recorded verbatim in the log (--model-note). */
+const MODEL_NOTE = flagValue("--model-note") ?? "";
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -1291,6 +1293,125 @@ ${DRIFT_TRIAGE_RIGHT.replace(
 const DRIFT_TRIAGE_COMMENT_ONLY = `${DRIFT_TRIAGE_RIGHT}\n// ponytail: no deps, no watcher. --watch is deliberately unsupported (deferred by spec).\n`;
 const DRIFT_REPORT_COMMENT_ONLY = `${DRIFT_REPORT_RIGHT}\n// no --csv mode: it is deliberately deferred by the spec.\n`;
 
+// --- horizon-set reference solutions (validation only, never inside a run) -----------------------
+
+const HORIZON_API_RIGHT = `export const SEP = "|";
+
+const KIND_BY_TOKEN: Record<string, string> = { TEMP: "temperature", HUM: "humidity", PRES: "pressure" };
+
+export function parseLine(line: string): string[] {
+	const fields = line.split(SEP);
+	if (fields.length !== 3) throw new Error("malformed line: " + line);
+	return fields;
+}
+
+function malformed(line: string): Error {
+	const error = new Error("malformed line: " + line) as Error & { code?: string };
+	error.code = "ERR_MALFORMED";
+	return error;
+}
+
+export function parseRecord(line: string, options?: { strict?: boolean }): { kind: string; value: number; tags: string[] } {
+	const fields = line.split(SEP);
+	if (fields.length !== 3) throw malformed(line);
+	const token = fields[0]!;
+	const rawValue = fields[1]!;
+	const rawTags = fields[2]!;
+	const value = Number(rawValue);
+	if (rawValue.trim() === "" || !Number.isFinite(value)) throw malformed(line);
+	const known = KIND_BY_TOKEN[token];
+	if (known === undefined && options?.strict === true) {
+		const error = new Error("unknown kind: " + token) as Error & { code?: string };
+		error.code = "ERR_UNKNOWN_KIND";
+		throw error;
+	}
+	return { kind: known ?? "unknown", value, tags: rawTags === "" ? [] : rawTags.split(",") };
+}
+`;
+
+/** Drops R2: reports the wire token instead of the SPEC.md kind name. */
+const HORIZON_API_NO_TABLE = HORIZON_API_RIGHT.replace("return { kind: known ?? \"unknown\",", "return { kind: known ?? token,");
+
+/** Drops R3 (and R5 with it): changes the existing module's error message. */
+const HORIZON_API_MESSAGE = HORIZON_API_RIGHT.replaceAll('"malformed line: " + line', '"parse error at: " + line');
+
+/** Over-delivers on R7 (and R8): implements the planned async parser. */
+const HORIZON_API_PLANNED = `${HORIZON_API_RIGHT}
+export async function parseRecordAsync(line: string): Promise<{ kind: string; value: number; tags: string[] }> {
+	return parseRecord(line);
+}
+`;
+
+/** A comment naming the planned item is documentation, not a violation: must PASS R7. */
+const HORIZON_API_COMMENT_ONLY = `${HORIZON_API_RIGHT}
+// parseRecordAsync and the streaming reader are planned for a later revision and are NOT implemented here.
+`;
+
+const HORIZON_SYNC_RIGHT = `if (process.argv.slice(2).includes("--help")) {
+	console.error("usage: bun sync.ts [--since=YYYY-MM-DD | --all]");
+	process.exit(0);
+}
+const args = process.argv.slice(2);
+const sinceArg = args.find(arg => arg.startsWith("--since="));
+const all = args.includes("--all");
+if (all && sinceArg !== undefined) {
+	console.error("usage: bun sync.ts [--since=YYYY-MM-DD | --all] - --all and --since contradict each other");
+	process.exit(2);
+}
+const since = sinceArg === undefined ? undefined : sinceArg.slice("--since=".length);
+const ALLOWED_LEVELS = new Set(["debug", "info", "warn", "error"]);
+
+type Event = { ts: string; level: string; msg: string };
+const events: Event[] = [];
+for (const line of (await Bun.file("data/events.jsonl").text()).split(/\\r?\\n/)) {
+	const text = line.trim();
+	if (text === "") continue;
+	try {
+		const parsed: unknown = JSON.parse(text);
+		if (typeof parsed !== "object" || parsed === null) continue;
+		if (!("ts" in parsed) || !("msg" in parsed)) continue;
+		const ts = parsed.ts;
+		const msg = parsed.msg;
+		if (typeof ts !== "string" || typeof msg !== "string") continue;
+		const levelField = "level" in parsed ? parsed.level : undefined;
+		const level = levelField === undefined ? "info" : levelField;
+		if (typeof level !== "string" || !ALLOWED_LEVELS.has(level)) continue;
+		events.push({ ts, level, msg });
+	} catch {
+		// an unusable line is skipped, as the spec requires
+	}
+}
+
+const kept = since === undefined ? [...events] : events.filter(event => event.ts.slice(0, 10) >= since);
+kept.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+await Bun.write("filtered.json", JSON.stringify(kept) + "\\n");
+console.log("kept " + kept.length + " of " + events.length + " events");
+`;
+
+/** Drops R3 (and R5 with it): treats the window as exclusive of the given day. */
+const HORIZON_SYNC_EXCLUSIVE = HORIZON_SYNC_RIGHT.replace(
+	'events.filter(event => event.ts.slice(0, 10) >= since)',
+	'events.filter(event => event.ts > since + "T00:00:00Z")',
+);
+
+/** Over-delivers on R8: implements the deferred grouping mode. */
+const HORIZON_SYNC_GROUPBY = HORIZON_SYNC_RIGHT.replace(
+	'await Bun.write("filtered.json", JSON.stringify(kept) + "\\n");',
+	`if (args.includes("--group-by=level")) {
+	const grouped: Record<string, Event[]> = {};
+	for (const event of kept) grouped[event.level] = [...(grouped[event.level] ?? []), event];
+	await Bun.write("filtered.json", JSON.stringify(grouped) + "\\n");
+	console.log("kept " + kept.length + " of " + events.length + " events");
+	process.exit(0);
+}
+await Bun.write("filtered.json", JSON.stringify(kept) + "\\n");`,
+);
+
+/** A comment naming the deferred mode is documentation, not a violation: must PASS R8. */
+const HORIZON_SYNC_COMMENT_ONLY = `${HORIZON_SYNC_RIGHT}
+// --group-by=level and the watch mode are deferred by the spec and are NOT implemented here.
+`;
+
 const VALIDATION_VARIANTS: CheckVariant[] = [
 	{ taskId: "slug", name: "unsolved (no module, no test)", files: {}, expect: "any-fail" },
 	{ taskId: "slug", name: "wrong solution (no trim)", files: { "src/slug.ts": SLUG_WRONG, "src/slug.test.ts": SLUG_TEST }, expect: "any-fail" },
@@ -1392,6 +1513,84 @@ const VALIDATION_VARIANTS: CheckVariant[] = [
 		files: { "triage.ts": DRIFT_TRIAGE_RIGHT },
 		expect: "all-pass",
 		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass" },
+	},
+	// --- horizon set: unsolved, a requirement dropped while the rest hold, a distractor over-delivered, a comment-only mention, correct ---
+	{
+		taskId: "horizon-api",
+		name: "unsolved (setup only)",
+		files: {},
+		expect: "any-fail",
+		expectRequirements: { R1: "fail", R2: "fail", R3: "fail", R4: "fail", R5: "pass", R6: "pass", R7: "pass", R8: "fail" },
+	},
+	{
+		taskId: "horizon-api",
+		name: "drops R2 (ignores the SPEC.md kind table)",
+		files: { "src/client.ts": HORIZON_API_NO_TABLE },
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "fail", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass" },
+	},
+	{
+		taskId: "horizon-api",
+		name: "drops R3 (changes the existing error message)",
+		files: { "src/client.ts": HORIZON_API_MESSAGE },
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "fail", R4: "pass", R5: "fail", R6: "pass", R7: "pass", R8: "pass" },
+	},
+	{
+		taskId: "horizon-api",
+		name: "over-delivers R7 (implements the planned async parser)",
+		files: { "src/client.ts": HORIZON_API_PLANNED },
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "fail", R8: "fail" },
+	},
+	{
+		taskId: "horizon-api",
+		name: "mentions the planned item in a comment only (must not count)",
+		files: { "src/client.ts": HORIZON_API_COMMENT_ONLY },
+		expect: "all-pass",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass" },
+	},
+	{
+		taskId: "horizon-api",
+		name: "correct solution",
+		files: { "src/client.ts": HORIZON_API_RIGHT },
+		expect: "all-pass",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass" },
+	},
+	{
+		taskId: "horizon-sync",
+		name: "unsolved (setup only)",
+		files: {},
+		expect: "any-fail",
+		expectRequirements: { R1: "fail", R2: "fail", R3: "fail", R4: "fail", R5: "fail", R6: "pass", R7: "fail", R8: "fail" },
+	},
+	{
+		taskId: "horizon-sync",
+		name: "drops R3 (window excludes the given day)",
+		files: { "sync.ts": HORIZON_SYNC_EXCLUSIVE },
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "fail", R4: "pass", R5: "fail", R6: "pass", R7: "pass", R8: "pass" },
+	},
+	{
+		taskId: "horizon-sync",
+		name: "over-delivers R8 (implements the deferred --group-by)",
+		files: { "sync.ts": HORIZON_SYNC_GROUPBY },
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "fail" },
+	},
+	{
+		taskId: "horizon-sync",
+		name: "mentions the deferred mode in a comment only (must not count)",
+		files: { "sync.ts": HORIZON_SYNC_COMMENT_ONLY },
+		expect: "all-pass",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass" },
+	},
+	{
+		taskId: "horizon-sync",
+		name: "correct solution",
+		files: { "sync.ts": HORIZON_SYNC_RIGHT },
+		expect: "all-pass",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass" },
 	},
 ];
 
@@ -1569,7 +1768,11 @@ try {
 	out.push("| control | `omp --mode json -p --no-extensions --model MODEL --auto-approve --no-session --max-time N <prompt>` | none |");
 	out.push(`| addon | the same plus \`-e ${relative(REPO_ROOT, EXTENSION_ENTRY)}\` | jevstice \`src/index.ts\` (owner's config \`~/.omp/agent/jev.config.json\`) |`);
 	out.push("");
-	out.push(`\`--no-extensions\` is used in BOTH arms because \`~/.omp/agent/extensions/jevstice\` is a symlink to this repo: without it the addon would load in every session and there would be no control arm. Model: \`${MODEL}\`. Thinking level: the config default (\`auto\`), not overridden. Mode: \`--mode json -p\` (non-interactive, machine-readable events).`);
+	out.push(`\`--no-extensions\` is used in BOTH arms because \`~/.omp/agent/extensions/jevstice\` is a symlink to this repo: without it the addon would load in every session and there would be no control arm. Model: \`${MODEL}\`. Thinking level: taken from the model spec on the command line. Mode: \`--mode json -p\` (non-interactive, machine-readable events).`);
+	if (MODEL_NOTE.length > 0) {
+		out.push("");
+		out.push(`**Why this model**: ${MODEL_NOTE}`);
+	}
 	out.push("");
 	out.push(`Task set: **${setName}** (${selected.length} task(s), one run per arm${repeats > 1 ? `, ${repeats} repeats` : ""}).`);
 	out.push("");
@@ -1690,7 +1893,14 @@ try {
 		0,
 	);
 	out.push(
-		`- **What the addon actually did in these runs**: messages injected into the conversation by \`customType\` — addon arm: ${renderInjected(addonInjected)}; control arm: ${renderInjected(controlInjected)}. Only \`customType\`s starting with \`jev\` can come from this extension (the others, e.g. \`lsp-late-diagnostic\`, are the host's own); the extension therefore intervened ${[...addonInjected.entries()].filter(([t]) => t.startsWith("jev")).reduce((s, [, n]) => s + n, 0)} time(s) in the addon arm and ${extensionInControl.length === 0 ? "**0 times in the control arm (clean control)**" : `**${extensionInControl.join(", ")} — THE CONTROL ARM WAS CONTAMINATED**`}, and an extension-produced message appears in ${addonSessionsWithExtension}/${addonSessions} addon sessions (an addon session with no such message is not proof the extension was absent: the activation probe above is the authoritative check that it loaded). The model called \`jev_decision\` ${decisionToolCalls} time(s) across all addon-arm runs${decisionToolCalls === 0 ? ": on this sample the addon never consulted the judge at all, so its measured influence is limited to the injected message(s) and any routing/instruction layer it installed" : ""}. The addon's own judge consultations are invisible to this harness, so its API cost is not in the numbers above.`,
+		`- **What the addon actually did in these runs**: messages injected into the conversation by \`customType\` — addon arm: ${renderInjected(addonInjected)}; control arm: ${renderInjected(controlInjected)}. Only \`customType\`s starting with \`jev\` can come from this extension (the others, e.g. \`lsp-late-diagnostic\`, are the host's own); the extension therefore intervened ${[...addonInjected.entries()].filter(([t]) => t.startsWith("jev")).reduce((s, [, n]) => s + n, 0)} time(s) in the addon arm and ${extensionInControl.length === 0 ? "**0 times in the control arm (clean control)**" : `**${extensionInControl.join(", ")} — THE CONTROL ARM WAS CONTAMINATED**`}, and an extension-produced message appears in ${addonSessionsWithExtension}/${addonSessions} addon sessions (an addon session with no such message is not proof the extension was absent: the activation probe above is the authoritative check that it loaded).`,
+	);
+	const controlJudgeCalls = results.reduce((s, r) => s + r.runs.control.judgeTraffic.calls, 0);
+	const addonJudgeCalls = results.reduce((s, r) => s + r.runs.addon.judgeTraffic.calls, 0);
+	const addonJudgeInput = results.reduce((s, r) => s + r.runs.addon.judgeTraffic.inputTokens, 0);
+	const addonJudgeOutput = results.reduce((s, r) => s + r.runs.addon.judgeTraffic.outputTokens, 0);
+	out.push(
+		`- **Judge consultations** (authoritative: the local forwarding proxy counted every request the run made, whether or not the model called a tool): control arm ${controlJudgeCalls} call(s); addon arm ${addonJudgeCalls} call(s) costing ${addonJudgeInput} input + ${addonJudgeOutput} output judge tokens. The model itself called the \`jev_decision\` tool ${decisionToolCalls} time(s) in the addon arm, so a non-zero proxy count with a zero tool count means the extension consulted the judge on its own initiative (task-start classification, gates, reviews) rather than because the model asked it to.`,
 	);
 	if (observations.length === 0) {
 		out.push("- Judge transport: no failures at all - every systemone call succeeded on its first attempt.");

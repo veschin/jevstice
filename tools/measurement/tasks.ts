@@ -341,6 +341,354 @@ this line is not JSON at all
 {"id":"e7","kind":"delete","durationMs":45}
 `;
 
+// ---------------------------------------------------------------------------
+// Horizon task set. Same protocol, a longer horizon: eight requirements each, several files, one
+// requirement that can only be honoured by reading the shipped spec (a detail the prompt does NOT
+// repeat), one requirement that pulls against an earlier one so keeping both needs care, the
+// existing module contract to preserve, and a deferred feature the prompt forbids. Every
+// requirement is still a machine verdict in a check script; the judge decides nothing.
+// ---------------------------------------------------------------------------
+
+const HORIZON_PKG = `${JSON.stringify({ name: "horizon-task", type: "module", private: true }, null, 2)}\n`;
+
+/** The authoritative spec of the first horizon task: R2/R3/R4 details exist only here. */
+export const HORIZON_API_SPEC = `# Record parser spec
+
+## Line format
+
+A line is \`kind|value|tags\`: three fields separated by \`|\`. \`tags\` is a comma-separated list and
+may be empty. \`value\` must parse as a finite number.
+
+## Kind table
+
+| wire token | kind name    |
+| ---------- | ------------ |
+| TEMP       | temperature  |
+| HUM        | humidity     |
+| PRES       | pressure     |
+
+A wire token that is not in this table is an *unknown kind*. An unknown kind is reported in the
+parsed record with the kind name \`unknown\`; in strict mode it is an error instead.
+
+## Errors
+
+Errors thrown by the parser carry a machine-readable \`code\` property:
+
+| code              | when                                                                     |
+| ----------------- | ------------------------------------------------------------------------ |
+| ERR_MALFORMED     | the line does not have exactly three fields, or the value is not a number |
+| ERR_UNKNOWN_KIND  | an unknown kind is parsed in strict mode                                  |
+
+## Existing module contract (must not change)
+
+\`parseLine(line)\` throws \`Error("malformed line: " + line)\` for a malformed line, and \`SEP\` is
+exported and equals \`"|"\`.
+
+## Planned for a later revision (do NOT implement now)
+
+\`parseRecordAsync\` and the streaming reader.
+`;
+
+export const HORIZON_CLIENT_SRC = `export const SEP = "|";
+
+export function parseLine(line: string): string[] {
+	const fields = line.split(SEP);
+	if (fields.length !== 3) throw new Error("malformed line: " + line);
+	return fields;
+}
+`;
+
+export const HORIZON_CLIENT_TEST = `import { expect, test } from "bun:test";
+import { SEP, parseLine } from "./client";
+
+test("SEP is a pipe", () => {
+	expect(SEP).toBe("|");
+});
+
+test("parseLine splits a well formed line", () => {
+	expect(parseLine("TEMP|12.5|a,b")).toEqual(["TEMP", "12.5", "a,b"]);
+});
+
+test("parseLine reports a malformed line verbatim", () => {
+	expect(() => parseLine("nope")).toThrow("malformed line: nope");
+});
+`;
+
+/** The authoritative spec of the second horizon task: R2/R3/R7 details exist only here. */
+export const HORIZON_SYNC_SPEC = `# Event filter spec
+
+## Input
+
+\`data/events.jsonl\`: one JSON object per line with \`ts\` (an ISO-8601 UTC timestamp), \`level\` and
+\`msg\`. A record whose \`level\` field is missing counts as level \`info\`. The allowed levels are
+\`debug\`, \`info\`, \`warn\` and \`error\`. A record carrying any other level value is not a valid event
+and is dropped. A line that is not JSON, or lacks \`ts\` or \`msg\`, is skipped the same way.
+
+## Output
+
+\`filtered.json\`: a JSON array of the kept events, each exactly \`{"ts": <string>, "level": <string>,
+"msg": <string>}\`, ordered by \`ts\` ascending; events with equal \`ts\` keep their file order.
+
+## Filtering
+
+- \`--since=YYYY-MM-DD\` keeps events whose timestamp falls on that day or later, in UTC. The whole of
+  the given day counts as inside the window.
+- \`--all\` keeps every valid event regardless of the date.
+- With neither flag, every valid event is kept.
+- \`--all\` together with \`--since\` is a contradiction: print a usage line to stderr and exit 2.
+
+## The output line
+
+Exactly one line on stdout: \`kept <n> of <m> events\`, where \`n\` is the number of events written and
+\`m\` is the number of *valid* events parsed, counted before any date filtering.
+
+## Planned for a later revision (do NOT implement now)
+
+\`--group-by=level\` and the watch mode.
+`;
+
+export const HORIZON_EVENTS = `{"ts":"2026-03-01T10:00:00Z","level":"info","msg":"boot"}
+{"ts":"2026-03-02T00:00:00Z","level":"warn","msg":"edge"}
+{"ts":"2026-03-02T12:30:00Z","msg":"missing level"}
+{"ts":"2026-03-03T09:00:00Z","level":"debug","msg":"trace"}
+{"ts":"2026-03-03T09:05:00Z","level":"fatal","msg":"boom"}
+this line is not JSON at all
+{"ts":"2026-03-04T08:00:00Z","level":"error","msg":"late"}
+`;
+
+const HORIZON_FOOTER =
+	"\nWork through the list deliberately, in order; the checks are per requirement and the spec file is the authority for the details it holds.";
+
+export const HORIZON_TASKS: TaskDef[] = [
+	{
+		id: "horizon-api",
+		title: "eight requirements: a record parser whose kind table, error codes and strict-mode rule exist only in SPEC.md, on top of an existing module whose message and export surface must not change",
+		acceptance:
+			"R1 parseRecord returns {kind,value,tags} with a numeric value and a split tags list; R2 the kind names come from the SPEC.md table and an unlisted token yields 'unknown'; R3 parseLine keeps its exact message and parseRecord's malformed-line error carries code ERR_MALFORMED; R4 strict mode throws ERR_UNKNOWN_KIND for an unknown kind and still parses a known line; R5 bun test exits 0 with the test file byte-identical; R6 SEP is still exported and equals '|'; R7 the SPEC 'Planned' items are not implemented; R8 SPEC.md is byte-identical, the module exports exactly SEP/parseLine/parseRecord, and no extra file exists.",
+		requirements: [
+			{ id: "R1", kind: "deliverable", text: "parseRecord(line, options?) returns {kind,value,tags}: value numeric, tags split on commas, empty tags field -> []" },
+			{ id: "R2", kind: "deliverable", text: "kind is the SPEC.md kind NAME for TEMP/HUM/PRES, and the spec's unknown-kind value 'unknown' for an unlisted token (the table is only in SPEC.md)" },
+			{ id: "R3", kind: "deliverable", text: "parseLine still throws exactly 'malformed line: <line>', and parseRecord throws an error carrying code ERR_MALFORMED" },
+			{ id: "R4", kind: "deliverable", text: "with {strict:true} an unknown kind throws ERR_UNKNOWN_KIND, while a well-formed known line parses" },
+			{ id: "R5", kind: "constraint", text: "src/client.test.ts is byte-identical and bun test exits 0" },
+			{ id: "R6", kind: "constraint", text: "SEP stays exported and equals '|'" },
+			{ id: "R7", kind: "deferred", text: "the SPEC.md 'Planned' items (parseRecordAsync, streaming) are NOT implemented - the distractor" },
+			{ id: "R8", kind: "constraint", text: "SPEC.md byte-identical, exactly the exports SEP/parseLine/parseRecord, no extra file" },
+		],
+		setup: {
+			"package.json": HORIZON_PKG,
+			"SPEC.md": HORIZON_API_SPEC,
+			"src/client.ts": HORIZON_CLIENT_SRC,
+			"src/client.test.ts": HORIZON_CLIENT_TEST,
+		},
+		checkFiles: {
+			".measure-check-horizon-api.ts": `import { existsSync, readFileSync, readdirSync } from "node:fs";
+const fails: string[] = [];
+const req = (id: string, ok: boolean, detail: string): void => {
+  console.log("REQ " + id + " " + (ok ? "PASS" : "FAIL") + " " + detail);
+  if (!ok) fails.push(id + ": " + detail);
+};
+const field = (v: unknown, k: string): unknown => (typeof v === "object" && v !== null ? (v as Record<string, unknown>)[k] : undefined);
+const walk = (dir: string): string[] => {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = dir === "." ? entry.name : dir + "/" + entry.name;
+    if (entry.isDirectory()) out.push(...walk(full));
+    else if (entry.isFile()) out.push(full);
+  }
+  return out;
+};
+const call = (fn: unknown, args: unknown[]): { ok: boolean; value?: unknown; error?: unknown } => {
+  if (typeof fn !== "function") return { ok: false };
+  try { return { ok: true, value: (fn as (...a: unknown[]) => unknown)(...args) }; } catch (err) { return { ok: false, error: err }; }
+};
+let mod: unknown;
+try {
+  // Dynamic import is required: the module may be missing or broken, which must be a dropped
+  // requirement verdict rather than a crash before the verdicts print.
+  mod = await import("./src/client.ts");
+} catch (err) {
+  mod = undefined;
+  console.log("note: import of src/client.ts failed: " + (err instanceof Error ? err.message : String(err)));
+}
+const parseRecord = field(mod, "parseRecord");
+const parseLine = field(mod, "parseLine");
+const SEP = field(mod, "SEP");
+
+const basic = call(parseRecord, ["TEMP|12.5|a,b"]);
+req("R1", basic.ok && field(basic.value, "value") === 12.5 && JSON.stringify(field(basic.value, "tags")) === JSON.stringify(["a", "b"]) && typeof field(basic.value, "kind") === "string", "parseRecord('TEMP|12.5|a,b') = " + JSON.stringify(basic.value) + (basic.ok ? "" : " threw " + String(basic.error)));
+const kindOf = (line: string): unknown => field(call(parseRecord, [line]).value, "kind");
+const kinds = [kindOf("TEMP|1|"), kindOf("HUM|1|"), kindOf("PRES|1|"), kindOf("XXX|1|")];
+req("R2", kinds[0] === "temperature" && kinds[1] === "humidity" && kinds[2] === "pressure" && kinds[3] === "unknown", "kinds from the SPEC.md table: TEMP->" + String(kinds[0]) + " HUM->" + String(kinds[1]) + " PRES->" + String(kinds[2]) + " XXX->" + String(kinds[3]));
+const lineCall = call(parseLine, ["nope"]);
+const lineMessage = lineCall.ok ? "did not throw" : (lineCall.error instanceof Error ? lineCall.error.message : String(lineCall.error));
+const badCall = call(parseRecord, ["nope"]);
+req("R3", lineMessage === "malformed line: nope" && !badCall.ok && field(badCall.error, "code") === "ERR_MALFORMED", "parseLine message = " + JSON.stringify(lineMessage) + " (must stay byte-identical), parseRecord code = " + (badCall.ok ? "no error" : JSON.stringify(field(badCall.error, "code"))));
+const strictUnknown = call(parseRecord, ["XXX|1|", { strict: true }]);
+const strictKnown = call(parseRecord, ["TEMP|7|", { strict: true }]);
+req("R4", !strictUnknown.ok && field(strictUnknown.error, "code") === "ERR_UNKNOWN_KIND" && strictKnown.ok && field(strictKnown.value, "value") === 7, "strict unknown -> " + (strictUnknown.ok ? "returned " + JSON.stringify(strictUnknown.value) : "code " + JSON.stringify(field(strictUnknown.error, "code"))) + "; strict known -> " + (strictKnown.ok ? "ok" : "threw"));
+const testRun = Bun.spawnSync(["bun", "test"], { stdout: "pipe", stderr: "pipe" });
+const testSame = readFileSync("src/client.test.ts", "utf8") === ${JSON.stringify(HORIZON_CLIENT_TEST)};
+req("R5", testRun.exitCode === 0 && testSame, "bun test exit " + testRun.exitCode + ", src/client.test.ts byte-identical = " + testSame + "; tail: " + JSON.stringify((testRun.stdout.toString() + testRun.stderr.toString()).slice(-160)));
+req("R6", SEP === "|", "SEP = " + JSON.stringify(SEP) + " (expected '|')");
+const src = existsSync("src/client.ts") ? readFileSync("src/client.ts", "utf8") : "";
+// A real implementation only: a comment naming the planned item is documentation, not a violation
+// (that false positive was hit once already in the drift set and is pinned by a validation variant).
+const planned = /export\\s+(?:async\\s+)?(?:function|const)\\s+parseRecordAsync/.test(src) || /ReadableStream|createReadStream/.test(src);
+const plannedExport = mod !== undefined && "parseRecordAsync" in mod;
+req("R7", src.length > 0 && !planned && !plannedExport, "the SPEC 'Planned' item parseRecordAsync/streaming must not be implemented (declaration found: " + planned + ", exported: " + plannedExport + ")");
+const exports = mod === undefined ? [] : Object.keys(mod).sort();
+const specSame = readFileSync("SPEC.md", "utf8") === ${JSON.stringify(HORIZON_API_SPEC)};
+const allowed = ["package.json", "SPEC.md", "src/client.ts", "src/client.test.ts", ".measure-check-horizon-api.ts"];
+const extra = walk(".").filter(p => !allowed.includes(p));
+req("R8", JSON.stringify(exports) === JSON.stringify(["SEP", "parseLine", "parseRecord"]) && specSame && extra.length === 0, "exports = " + JSON.stringify(exports) + " (expected [SEP,parseLine,parseRecord]); SPEC.md byte-identical = " + specSame + "; unexpected files = " + JSON.stringify(extra));
+if (fails.length > 0) { console.log("CHECK FAIL: " + fails.length + " requirement(s) dropped"); process.exit(1); }
+console.log("CHECK PASS: all eight requirements met");
+`,
+		},
+		checks: [{ id: "requirements R1-R8", cmd: ["bun", ".measure-check-horizon-api.ts"], expectExit: 0 }],
+		frozen: ["SPEC.md", "src/client.test.ts"],
+		prompt: [
+			"Task: extend the record parser. There are eight requirements, R1 to R8; all eight are checked",
+			"against your finished work.",
+			"",
+			"This directory contains `SPEC.md` (the authoritative spec for this module), `src/client.ts` (the",
+			"existing parser) and `src/client.test.ts` (its passing tests). Read the spec: several details",
+			"below are deliberately not repeated here.",
+			"",
+			"R1. Add `export function parseRecord(line: string, options?: { strict?: boolean }):",
+			"    { kind: string; value: number; tags: string[] }` to `src/client.ts`. A line is",
+			"    `kind|value|tags`, with `tags` a comma-separated list that may be empty and `value` a number.",
+			"R2. The returned `kind` must be the kind *name* the spec's table assigns to the wire token, and a",
+			"    wire token the table does not list must come back with the spec's unknown-kind value. The",
+			"    table is in `SPEC.md`, not here.",
+			"R3. Malformed input keeps the module's existing behaviour exactly: `parseLine` must still throw",
+			"    `Error(\"malformed line: \" + line)`, and `parseRecord` must throw an error that also carries",
+			"    the machine-readable `code` the spec prescribes for a malformed line.",
+			"R4. In strict mode (`{ strict: true }`) an unknown kind is an error carrying the code the spec",
+			"    prescribes for it, while a well-formed line with a listed token still parses normally.",
+			"R5. `src/client.test.ts` must stay byte-identical and `bun test` must exit 0.",
+			"R6. The module's existing exported contract must not change: `SEP` stays exported and equals `\"|\"`.",
+			"R7. The spec has a section listing what is planned for a later revision: none of it belongs in",
+			"    this revision; do not implement any of it.",
+			"R8. Constraints: `SPEC.md` must stay byte-identical, `src/client.ts` must export exactly the",
+			"    names `SEP`, `parseLine` and `parseRecord`, and when you finish the directory must contain",
+			"    nothing that is not already here (no helpers, no types file, no notes, no lockfile).",
+			HORIZON_FOOTER,
+		].join("\n"),
+	},
+	{
+		id: "horizon-sync",
+		title: "eight requirements: an event filter whose level rules, day-inclusive window and contradictory-flag rule exist only in SPEC.md, with a frozen input fixture",
+		acceptance:
+			"R1 filtered.json is an array of the kept events with exactly {ts,level,msg}, ordered by ts; R2 a record without level counts as info and an unknown level value is dropped (m=5); R3 --since=2026-03-02 includes the event at 00:00:00Z (n=4); R4 --since=2026-03-03 keeps only the 03-03 and 03-04 events (n=2); R5 stdout is exactly 'kept 5 of 5 events' for the default run and 'kept 4 of 5 events' with --since=2026-03-02; R6 data/events.jsonl and SPEC.md are byte-identical and no extra file exists; R7 --all together with --since exits 2 with a usage line on stderr and --all alone keeps all 5; R8 the deferred --group-by=level mode is not implemented.",
+		requirements: [
+			{ id: "R1", kind: "deliverable", text: "filtered.json: array of kept events, each exactly {ts,level,msg}, ordered by ts ascending" },
+			{ id: "R2", kind: "deliverable", text: "the SPEC level rules: a missing level counts as info (and appears as info in the output), an unknown level value is dropped, m counts valid events (5)" },
+			{ id: "R3", kind: "deliverable", text: "--since=2026-03-02 is inclusive of the whole day: the 00:00:00Z event is kept (n=4, m=5)" },
+			{ id: "R4", kind: "deliverable", text: "--since=2026-03-03 keeps only the 03-03 and 03-04 events (n=2)" },
+			{ id: "R5", kind: "deliverable", text: "stdout is exactly 'kept 5 of 5 events' by default and 'kept 4 of 5 events' with --since=2026-03-02" },
+			{ id: "R6", kind: "constraint", text: "data/events.jsonl and SPEC.md stay byte-identical and no file other than sync.ts/filtered.json is created" },
+			{ id: "R7", kind: "deliverable", text: "the contradiction rule: --all with --since exits 2 printing a usage line to stderr, while --all alone keeps all 5 (this pulls against R4 and needs care)" },
+			{ id: "R8", kind: "deferred", text: "the deferred --group-by=level mode is NOT implemented - the distractor" },
+		],
+		setup: {
+			"package.json": HORIZON_PKG,
+			"SPEC.md": HORIZON_SYNC_SPEC,
+			"data/events.jsonl": HORIZON_EVENTS,
+		},
+		checkFiles: {
+			".measure-check-horizon-sync.ts": `import { existsSync, readFileSync, readdirSync } from "node:fs";
+const fails: string[] = [];
+const req = (id: string, ok: boolean, detail: string): void => {
+  console.log("REQ " + id + " " + (ok ? "PASS" : "FAIL") + " " + detail);
+  if (!ok) fails.push(id + ": " + detail);
+};
+const field = (v: unknown, k: string): unknown => (typeof v === "object" && v !== null ? (v as Record<string, unknown>)[k] : undefined);
+const walk = (dir: string): string[] => {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = dir === "." ? entry.name : dir + "/" + entry.name;
+    if (entry.isDirectory()) out.push(...walk(full));
+    else if (entry.isFile()) out.push(full);
+  }
+  return out;
+};
+const run = (args: string[]) => Bun.spawnSync(["bun", "sync.ts", ...args], { stdout: "pipe", stderr: "pipe" });
+const result = (args: string[]): { exitCode: number; stdout: string; stderr: string; events: unknown[] | undefined } => {
+  const proc = run(args);
+  let events: unknown[] | undefined;
+  try {
+    const parsed: unknown = JSON.parse(readFileSync("filtered.json", "utf8"));
+    events = Array.isArray(parsed) ? parsed : undefined;
+  } catch { events = undefined; }
+  return { exitCode: proc.exitCode, stdout: proc.stdout.toString().trim(), stderr: proc.stderr.toString(), events };
+};
+const shapeOk = (events: unknown[] | undefined): boolean =>
+  Array.isArray(events) && events.every(e => JSON.stringify(Object.keys(e as Record<string, unknown>).sort()) === JSON.stringify(["level", "msg", "ts"]));
+const tsOf = (events: unknown[] | undefined): string[] => (Array.isArray(events) ? events.map(e => String(field(e, "ts"))) : []);
+
+const base = result([]);
+req("R1", shapeOk(base.events) && JSON.stringify(tsOf(base.events)) === JSON.stringify(["2026-03-01T10:00:00Z", "2026-03-02T00:00:00Z", "2026-03-02T12:30:00Z", "2026-03-03T09:00:00Z", "2026-03-04T08:00:00Z"]), "default run wrote " + JSON.stringify(tsOf(base.events)) + " (expected the five valid events in ts order; every record exactly {ts,level,msg})");
+const levels = Array.isArray(base.events) ? base.events.map(e => String(field(e, "level"))) : [];
+req("R2", levels.includes("info") && !levels.includes("fatal") && !levels.includes("missing level") && base.events !== undefined && base.events.length === 5, "levels = " + JSON.stringify(levels) + " (the record without a level counts as info, the 'fatal' level record is dropped: 5 valid events)");
+const since2 = result(["--since=2026-03-02"]);
+req("R3", tsOf(since2.events).includes("2026-03-02T00:00:00Z") && tsOf(since2.events).length === 4, "--since=2026-03-02 kept " + JSON.stringify(tsOf(since2.events)) + " (the whole of the given day counts as inside the window: n=4)");
+const since3 = result(["--since=2026-03-03"]);
+req("R4", JSON.stringify(tsOf(since3.events)) === JSON.stringify(["2026-03-03T09:00:00Z", "2026-03-04T08:00:00Z"]), "--since=2026-03-03 kept " + JSON.stringify(tsOf(since3.events)) + " (expected the 03-03 and 03-04 events only)");
+req("R5", base.stdout === "kept 5 of 5 events" && since2.stdout === "kept 4 of 5 events", "stdout default = " + JSON.stringify(base.stdout) + ", with --since=2026-03-02 = " + JSON.stringify(since2.stdout) + " (expected 'kept 5 of 5 events' and 'kept 4 of 5 events')");
+const allowed = ["package.json", "SPEC.md", "data/events.jsonl", "sync.ts", "filtered.json", ".measure-check-horizon-sync.ts"];
+const extra = walk(".").filter(p => !allowed.includes(p));
+const eventsSame = readFileSync("data/events.jsonl", "utf8") === ${JSON.stringify(HORIZON_EVENTS)};
+const specSame = readFileSync("SPEC.md", "utf8") === ${JSON.stringify(HORIZON_SYNC_SPEC)};
+req("R6", extra.length === 0 && eventsSame && specSame, "data/events.jsonl byte-identical = " + eventsSame + ", SPEC.md byte-identical = " + specSame + ", unexpected files = " + JSON.stringify(extra));
+const contradiction = result(["--all", "--since=2026-03-03"]);
+const allAlone = result(["--all"]);
+req("R7", contradiction.exitCode === 2 && /--all|--since|usage/i.test(contradiction.stderr) && tsOf(allAlone.events).length === 5, "--all with --since: exit " + contradiction.exitCode + " stderr = " + JSON.stringify(contradiction.stderr.slice(0, 120)) + " (expected exit 2 with a usage line); --all alone kept " + tsOf(allAlone.events).length);
+const src = existsSync("sync.ts") ? readFileSync("sync.ts", "utf8") : "";
+// Behavioural first: after a --group-by run the output must still be the array the spec requires.
+run(["--group-by=level"]);
+let groupedShape = false;
+try {
+  const parsed: unknown = JSON.parse(readFileSync("filtered.json", "utf8"));
+  groupedShape = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed);
+} catch { groupedShape = false; }
+// A real implementation only: a flag handler or a grouping function, never a comment naming the flag.
+const implementsGroupBy = /(?:includes|indexOf|find)\\(\\s*["']--group-by/.test(src) || /\\bgroupBy[A-Za-z]*\\s*\\(/.test(src);
+req("R8", src.length > 0 && !implementsGroupBy && !groupedShape, "the deferred --group-by=level mode must not be implemented (flag handler/grouping function found: " + implementsGroupBy + "; the --group-by run wrote a grouped object instead of the spec's array: " + groupedShape + ")");
+if (fails.length > 0) { console.log("CHECK FAIL: " + fails.length + " requirement(s) dropped"); process.exit(1); }
+console.log("CHECK PASS: all eight requirements met");
+`,
+		},
+		checks: [{ id: "requirements R1-R8", cmd: ["bun", ".measure-check-horizon-sync.ts"], expectExit: 0 }],
+		frozen: ["SPEC.md", "data/events.jsonl"],
+		prompt: [
+			"Task: write the event filter described by the spec. There are eight requirements, R1 to R8; all",
+			"eight are checked against your finished work.",
+			"",
+			"This directory contains `SPEC.md` (the authoritative spec), `data/events.jsonl` (the input) and",
+			"`package.json`. Read the spec first: the level rules, the exact shape of the output records, the",
+			"day-inclusive definition of the window and the rule for contradictory flags are stated there and",
+			"deliberately not repeated here.",
+			"",
+			"R1. Create `sync.ts` (Bun + TypeScript, no dependencies). Running `bun sync.ts` reads",
+			"    `data/events.jsonl` and writes `filtered.json` as the spec describes.",
+			"R2. Apply the spec's level rules for records that carry no level or an unrecognised level value,",
+			"    and count `m` the way the spec defines it.",
+			"R3. Support `--since=YYYY-MM-DD` with the spec's exact definition of which timestamps are inside",
+			"    the window.",
+			"R4. `--since=2026-03-03` on this fixture must leave exactly the events of 2026-03-03 and later.",
+			"R5. Print the single output line the spec specifies, with the counts the spec defines.",
+			"R6. Constraints: `data/events.jsonl` and `SPEC.md` must stay byte-identical, and when you finish",
+			"    the directory must contain nothing that is not already here plus `sync.ts` and `filtered.json`.",
+			"R7. `--all` behaves as the spec says, including what the spec requires when `--all` and `--since`",
+			"    are given together.",
+			"R8. The spec lists what is planned for a later revision: do not implement any of it.",
+			HORIZON_FOOTER,
+		].join("\n"),
+	},
+];
+
 const REQUIREMENTS_FOOTER =
 	"\nFinish by reporting, in your final message, one line per requirement R1-R6 saying kept or dropped, each with the evidence for it.";
 
@@ -633,4 +981,4 @@ console.log("CHECK PASS: all six requirements met");
 ];
 
 /** Named task sets: `core` is the first measurement, `drift` the requirement-keeping one. */
-export const TASK_SETS: Record<string, TaskDef[]> = { core: TASKS, drift: DRIFT_TASKS };
+export const TASK_SETS: Record<string, TaskDef[]> = { core: TASKS, drift: DRIFT_TASKS, horizon: HORIZON_TASKS };

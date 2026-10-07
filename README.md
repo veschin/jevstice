@@ -645,12 +645,16 @@ Meta options cannot be removed: they are appended to every judge choice regardle
 - The judge abstains on questions that rest on the owner's preference rather than on evidence in the
   request - "should this be built" asked of it returned `insufficient_evidence` (0.35-0.64) three
   times, and the product's fail-closed rule then leaves the decision unmade rather than guessing it.
-- The product's value is not demonstrated in its own favour. Two blind with-or-without runs over 72
-  requirement observations found no outcome difference (both arms kept every requirement) and a real
-  cost difference - 24 judge consultations and 78k judge input tokens on the addon side against none
-  on the control in the second run. The task sets did not make the control arm drift, so the benefit
-  is untested, not disproved; the cost is measured. The harness that produced both runs is
-  `tools/measurement/` (`bun run tools/measurement/run.ts --self-test` validates the checks first).
+- The product's value is not demonstrated in its own favour. Three blind with-or-without runs - a
+  small-task set, a drift-prone set, and a horizon set on a frozen revision with the weakest cheap
+  model the owner's configuration runs - found no outcome difference: across 136 requirement
+  observations both arms kept everything, and the judge called every comparison a tie (in the
+  decisive run, a tie probability of 0.79 and 0.76). The cost is measured: the addon pays judge
+  consultations the control never pays, and in the decisive run about twice the wall time and half
+  again the coding tokens. The weak model also never called the decision tool on its own - every
+  consultation came from the extension's automatic paths. The benefit is untested rather than
+  disproved: no task set has yet made the control arm drop a requirement.
+  `tools/measurement/` reproduces this and its self-test validates the checks first.
 - Completion judging does not guarantee correctness.
 
 ## License
