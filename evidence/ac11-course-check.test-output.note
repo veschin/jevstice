@@ -1,1 +1,0 @@
-AC11 evidence: tests/controller.test.ts course_check cases (mapping, counter burn, ask_user blocker, fail-closed, advisory-no-approval) + tests/client.test.ts createCourseCheckJudge body/fail-closed cases + live round-trip in evidence/ac1-omp-smoke.log (course_check section). Reviewer round-3 covers the changed files.

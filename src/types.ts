@@ -1,5 +1,5 @@
 /**
- * Shared contracts for Jev (PRD: ~/ai/jev/PRD.md).
+ * Shared contracts for Jev.
  * Owned by JevIntegrator; changes only via integrator.
  */
 
