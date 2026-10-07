@@ -72,4 +72,9 @@
   boundary could never be satisfied. `gates.completion` (user-owned, default on) lifts the stop
   gate - completion approval, the fresh course_check and the aspect teeth - while judging, digests
   and bounded rework stay unchanged.
+- Rework bound no longer closes a stage on honest answers. It now counts an identical
+  resubmission; a submission whose content differs is new work and gets a fresh budget. Three
+  honest `revise` answers used to exhaust the stage for the whole task and escalate
+  ("do not continue rework"), which deadlocked the owner, while PRD 1.1 asks for many cheap
+  iterations. Identical repeats are still refused, so the anti-loop property is unchanged.
 - 238/238 tests, `tsc --noEmit` clean.

@@ -313,7 +313,7 @@ describe("jev controller", () => {
 		expect(called).toBe(false);
 	});
 
-	test("exhausted iterations escalate to ask_user without further judge calls", async () => {
+	test("an identical resubmission exhausts the bound; changed content is new work", async () => {
 		let calls = 0;
 		const controller = createJevController({
 			judge: async () => {
@@ -322,15 +322,22 @@ describe("jev controller", () => {
 			},
 			maxReworkIterations: 3,
 		});
+		const submission = validDecisionInput();
 		for (let i = 0; i < 3; i++) {
-			const r = await controller.submitDecision(validDecisionInput({ proposal: `attempt ${i}` }));
+			const r = await controller.submitDecision(submission);
 			expect(r.verdict).toBe("revise");
 		}
 		expect(calls).toBe(3);
-		const r4 = await controller.submitDecision(validDecisionInput({ proposal: "attempt 3" }));
-		expect(r4.verdict).toBe("ask_user");
-		expect(calls).toBe(3); // bound reached, no further judge calls
+		const repeat = await controller.submitDecision(submission);
+		expect(repeat.verdict).toBe("ask_user");
+		expect(calls).toBe(3); // identical repeat refused, no further judge calls
 		expect(controller.getState().blockers.length).toBeGreaterThan(0);
+
+		// PRD 1.1 asks for many cheap iterations: a genuinely different submission is not
+		// rework and must not inherit the exhausted budget (no self-inflicted deadlock).
+		const changed = await controller.submitDecision(validDecisionInput({ proposal: "a different framing entirely" }));
+		expect(changed.verdict).toBe("revise");
+		expect(calls).toBe(4);
 	});
 
 	test("completion capability coverage: coverage judge with requireAll over the union inventory; caller cannot narrow", async () => {
@@ -1180,8 +1187,9 @@ describe("jev controller", () => {
 			judge: async () => ({ verdict: "revise", reasons: ["no"] }),
 			maxReworkIterations: 1,
 		});
-		await bounded.submitDecision(validDecisionInput());
-		const esc = await bounded.submitDecision(validDecisionInput({ proposal: "attempt 2 differs entirely" }));
+		const repeat = validDecisionInput();
+		await bounded.submitDecision(repeat);
+		const esc = await bounded.submitDecision(repeat);
 		expect(esc.verdict).toBe("ask_user");
 		expect(esc.summary).toBe("completion_review: ask_user — escalate to the user");
 

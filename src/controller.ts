@@ -73,6 +73,13 @@ export interface JevState {
 	openAspectGaps: { missed: string[]; taskFingerprint: string | undefined } | undefined;
 	/** Calibration-tolerant completion: consecutive mid-band approves, bound to task+work+exact content digest. */
 	consecutiveCompletionApproves: { count: number; confidences: number[]; taskFingerprint: string | undefined; workRevision: number; revisionHash: string } | undefined;
+	/**
+	 * Last submission digest per `taskFingerprint:stage`. The rework bound limits no-progress
+	 * loops, not consultation: content that differs from the last submission is new work and
+	 * gets a fresh budget, while an identical resubmission keeps consuming (PRD 1.1 asks for
+	 * many cheap iterations; three honest answers must not close a stage forever).
+	 */
+	submissionDigests: Record<string, string>;
 }
 
 function freshState(): JevState {
@@ -87,6 +94,7 @@ function freshState(): JevState {
 		lastCourseCheck: undefined,
 		openAspectGaps: undefined,
 		consecutiveCompletionApproves: undefined,
+		submissionDigests: {},
 	};
 }
 
@@ -649,6 +657,7 @@ export class JevController {
 				routedSkill: typeof data["routedSkill"] === "string" ? data["routedSkill"] : undefined,
 				lastCourseCheck: restoreCourseCheck(data["lastCourseCheck"]),
 				openAspectGaps: restoreAspectGaps(data["openAspectGaps"]),
+				submissionDigests: restoreDigests(data["submissionDigests"]),
 				consecutiveCompletionApproves: undefined,
 			};
 			return;
@@ -786,12 +795,20 @@ export class JevController {
 
 		const taskFp = this.state.taskFingerprint ?? (await fingerprint(input.task));
 		const boundKey = `${taskFp}:${input.stage}`;
+		// A changed submission is new work, not rework: it gets a fresh budget. Only an
+		// identical resubmission keeps consuming the bound.
+		const boundDigest = await revisionHash(input.stage, input.task, input.proposal, input.evidence);
+		if (this.state.submissionDigests[boundKey] !== boundDigest) {
+			this.state.submissionDigests[boundKey] = boundDigest;
+			this.state.iterations[boundKey] = 0;
+			this.persist();
+		}
 		const used = this.state.iterations[boundKey] ?? 0;
 		if (used >= this.maxReworkIterations) {
 			interrupted();
 			const blocker =
-				`Jev rework bound exhausted for stage ${input.stage} (${used} judge consultations). ` +
-				"Escalated to the user; do not continue rework and do not claim completion.";
+				`Jev rework bound exhausted for stage ${input.stage} (${used} consultations of the SAME submission). ` +
+				"Change the submission or escalate to the user; an identical resubmission is refused and completion is not claimed.";
 			if (!this.state.blockers.includes(blocker)) this.state.blockers.push(blocker);
 			this.persist();
 			this.pushFeedback(blocker);
@@ -1504,6 +1521,16 @@ export class JevController {
 	private persist(): void {
 		this.pi?.appendEntry(STATE_ENTRY_TYPE, this.state);
 	}
+}
+
+/** Validate persisted submission digests; malformed entries simply grant a fresh budget. */
+function restoreDigests(raw: unknown): Record<string, string> {
+	if (!isRecord(raw)) return {};
+	const out: Record<string, string> = {};
+	for (const [key, value] of Object.entries(raw)) {
+		if (typeof value === "string" && value.length > 0) out[key] = value;
+	}
+	return out;
 }
 
 /** Validate persisted aspect gaps (D1): a restart must not bypass completion teeth. */
