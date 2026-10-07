@@ -77,7 +77,7 @@ function validDecisionInput(overrides: Record<string, unknown> = {}) {
 		task: "Implement feature X",
 		proposal: "Feature X implemented: module added, tests pass.",
 		options: OPTIONS,
-		evidence: [evidence("execution", "$ bun test\n42 pass"), evidence("code", "export function x() {}")],
+		evidence: [evidence("execution", "$ bun test — 42 passing, 0 failing"), evidence("code", "export function x() {}")],
 		...overrides,
 	};
 }
@@ -683,5 +683,118 @@ describe("jev controller", () => {
 		expect(outcome.verdict).toBe("insufficient_evidence");
 		expect(outcome.judged).toBe(false);
 		expect(outcome.reasons.join(" ")).toContain("fail-closed");
+	});
+
+	test("polish3: directive text present in description, block reason and pre-judge rejection", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({ judge: async () => judgeResult({}) });
+		controller.register(harness.pi);
+		const tool = harness.getTool();
+		expect(String(tool?.description)).toContain("your very next tool call MUST be jev_decision itself");
+		const gate = blockResult(
+			await harness.emit("tool_call", { type: "tool_call", toolCallId: "g", toolName: "edit", input: {} }),
+		);
+		expect(String(gate?.reason)).toContain("a normal registered tool call, exactly like read/write");
+		const rejected = blockResult(
+			await harness.emit("tool_call", {
+				type: "tool_call",
+				toolCallId: "j",
+				toolName: "jev_decision",
+				input: { stage: "completion_review" },
+			}),
+		);
+		expect(String(rejected?.reason)).toContain("Fix the listed problems and call jev_decision again");
+	});
+
+	test("P3: duplicate + short evidence rejected pre-judge without counter burn", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({ judge: async () => judgeResult({}) });
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
+		await approvePlan(controller);
+		const before = Object.values(controller.getState().iterations).reduce((a, b) => a + b, 0);
+		const outcome = await controller.submitDecision(
+			validDecisionInput({
+				evidence: [
+					evidence("execution", "same quote repeated twice here"),
+					evidence("log", "same quote repeated twice here"),
+					evidence("code", "tiny"),
+				],
+			}),
+		);
+		expect(outcome.verdict).toBe("insufficient_evidence");
+		expect(outcome.judged).toBe(false);
+		expect(outcome.reasons.join(" ")).toContain("duplicate_evidence_quote#1");
+		expect(outcome.reasons.join(" ")).toContain("quote_too_short");
+		const after = Object.values(controller.getState().iterations).reduce((a, b) => a + b, 0);
+		expect(after).toBe(before);
+	});
+
+	test("P3: plan stage without requirement evidence rejected", async () => {
+		const controller = createJevController({ judge: async () => judgeResult({}) });
+		const outcome = await controller.submitDecision(
+			validDecisionInput({
+				stage: "understanding_review",
+				proposal: "Plan: implement feature X in module M.",
+				evidence: [evidence("execution", "$ bun test run — 42 passing suites")],
+			}),
+		);
+		expect(outcome.verdict).toBe("insufficient_evidence");
+		expect(outcome.reasons).toContain("no_requirement_evidence");
+	});
+
+	test("P3: single short quote still judged with warnings populated", async () => {
+		const controller = createJevController({ judge: async () => judgeResult({}) });
+		const outcome = await controller.submitDecision(
+			validDecisionInput({ evidence: [evidence("execution", "tiny"), evidence("code", "export function x() {}")] }),
+		);
+		expect(outcome.verdict).toBe("approve");
+		expect(outcome.judged).toBe(true);
+		expect(outcome.warnings?.[0]).toContain("quote_too_short");
+	});
+
+	test("P3: clean request carries no warnings", async () => {
+		const controller = createJevController({ judge: async () => judgeResult({}) });
+		const outcome = await controller.submitDecision(validDecisionInput());
+		expect(outcome.verdict).toBe("approve");
+		expect(outcome.warnings).toBeUndefined();
+	});
+
+	test("P2: summary templates across verdicts, meaning verbatim, tool text parses", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({ judge: async () => judgeResult({}) });
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
+
+		const approve = await controller.submitDecision(validDecisionInput());
+		expect(approve.summary).toBe("completion_review: approve — a: do A");
+
+		const revising = createJevController({ judge: async () => ({ verdict: "revise", reasons: ["no"] }) });
+		const rev = await revising.submitDecision(validDecisionInput());
+		expect(rev.summary).toContain("completion_review: revise — sent back with reasons (iteration 1/3)");
+
+		const bounded = createJevController({
+			judge: async () => ({ verdict: "revise", reasons: ["no"] }),
+			maxReworkIterations: 1,
+		});
+		await bounded.submitDecision(validDecisionInput());
+		const esc = await bounded.submitDecision(validDecisionInput({ proposal: "attempt 2 differs entirely" }));
+		expect(esc.verdict).toBe("ask_user");
+		expect(esc.summary).toBe("completion_review: ask_user — escalate to the user");
+
+		const bad = await controller.submitDecision({ stage: "completion_review" });
+		expect(bad.summary).toContain("insufficient_evidence — judge not consulted");
+
+		const tool = harness.getTool();
+		expect(tool).toBeDefined();
+		const result = (await tool!.execute("id", validDecisionInput(), undefined, undefined, undefined)) as {
+			content: Array<{ type: string; text: string }>;
+		};
+		const text = result.content[0]?.text ?? "";
+		const firstLine = text.split("\n")[0] ?? "";
+		expect(firstLine).toBe("completion_review: approve — a: do A");
+		const parsed = JSON.parse(text.slice(text.indexOf("{"))) as { verdict: string; summary: string };
+		expect(parsed.verdict).toBe("approve");
+		expect(parsed.summary).toBe(firstLine);
 	});
 });

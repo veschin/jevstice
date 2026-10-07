@@ -91,6 +91,8 @@ export interface DecisionOutcome {
 	judged: boolean;
 	/** Non-fatal evidence-quality codes surfaced alongside a judged verdict. */
 	warnings?: string[];
+	/** One-line fixed-template summary for executor readability (no generated prose). */
+	summary: string;
 }
 
 export interface StopGateResult {
@@ -385,6 +387,9 @@ export class JevController {
 			name: TOOL_NAME,
 			label: "Jev decision",
 			description:
+				"If any action is blocked by the plan gate, your very next tool call MUST be jev_decision itself " +
+				"with stage=understanding_review (plan stage) and verbatim quoted evidence — do not write files " +
+				"first, do not report the block to the user. " +
 				"Submit a structured important decision, review or completion claim to the Jev judge. " +
 				"Required before any file-mutating work and before finishing mutated work. Provide fixed options " +
 				"and evidence as {kind, source, quote} items (kind: user|spec|code|execution|log|documentation). " +
@@ -418,7 +423,15 @@ export class JevController {
 			},
 			execute: async (_id: string, params: unknown) => {
 				const outcome = await this.submitDecision(params);
-				return { content: [{ type: "text", text: JSON.stringify(outcome, null, 2) }], details: outcome };
+				return {
+					content: [
+						{
+							type: "text",
+							text: `${outcome.summary}\n${JSON.stringify(outcome, null, 2)}`,
+						},
+					],
+					details: outcome,
+				};
 			},
 		});
 		pi.on("tool_call", (event, ctx) => this.onToolCall(event, ctx));
@@ -440,7 +453,12 @@ export class JevController {
 		if (toolName === TOOL_NAME) {
 			const check = validateDecisionInput(event["input"], this.extraStageSet());
 			if (!check.ok) {
-				return { block: true, reason: `jev_decision rejected before judging: ${check.reasons.join("; ")}` };
+				return {
+					block: true,
+					reason:
+						`jev_decision rejected before judging: ${check.reasons.join("; ")}. ` +
+						`Fix the listed problems and call ${TOOL_NAME} again.`,
+				};
 			}
 			return undefined;
 		}
@@ -455,7 +473,8 @@ export class JevController {
 						"Read-only evidence gathering remains available. " +
 						`Submit decisions with the registered ${TOOL_NAME} TOOL (tool call), not by writing files ` +
 						`(e.g. to xd://${TOOL_NAME}); ` +
-						"the block message you received does not mean the addon is unavailable.",
+						"the block message you received does not mean the addon is unavailable. " +
+						"Your next tool call must be jev_decision (a normal registered tool call, exactly like read/write) — not a file write.",
 				};
 			}
 			this.state.mutationsSeen = true;
@@ -585,23 +604,56 @@ export class JevController {
 
 	// ----- core decision flow -----
 
+	/** Public pipeline: run the core flow, then attach the one-line fixed-template summary. */
+	async submitDecision(raw: unknown): Promise<DecisionOutcome> {
+		const outcome = await this.submitDecisionCore(raw);
+		if (outcome.summary !== "") return outcome;
+		const stage = isRecord(raw) && typeof raw["stage"] === "string" ? raw["stage"] : "unknown";
+		const options =
+			isRecord(raw) && Array.isArray(raw["options"]) ? (raw["options"] as Array<Record<string, unknown>>) : [];
+		const meaningOf = (id: string | undefined): string => {
+			if (id === undefined) return "";
+			const opt = options.find(o => o["id"] === id);
+			return opt && typeof opt["meaning"] === "string" ? `: ${opt["meaning"]}` : "";
+		};
+		const taskText = isRecord(raw) && typeof raw["task"] === "string" ? raw["task"] : "";
+		const fp = this.state.taskFingerprint ?? (taskText.length > 0 ? await fingerprint(taskText) : "");
+		const used = this.state.iterations[`${fp}:${stage}`] ?? 0;
+		let line: string;
+		switch (outcome.verdict) {
+			case "approve":
+				line = `${stage}: approve — ${outcome.selectedOption ?? ""}${meaningOf(outcome.selectedOption)}`;
+				break;
+			case "revise":
+				line = `${stage}: revise — sent back with reasons (iteration ${used}/${this.maxReworkIterations})`;
+				break;
+			case "ask_user":
+				line = `${stage}: ask_user — escalate to the user`;
+				break;
+			default:
+				line = `${stage}: insufficient_evidence — judge not consulted or answer unusable; fix the request`;
+		}
+		return { ...outcome, summary: line };
+	}
+
 	/**
 	 * Full decision pipeline: validate -> coverage -> bound -> judge -> normalize -> record.
 	 * Judge throw/unavailability and any malformed answer can never approve (AC4c/d).
 	 * Approvals bind to the exact content digest (AC5); a new approve for the same stage/task
 	 * with different content supersedes and invalidates the earlier record.
 	 */
-	async submitDecision(raw: unknown): Promise<DecisionOutcome> {
+	private async submitDecisionCore(raw: unknown): Promise<DecisionOutcome> {
 		if (this.templateError !== undefined) {
 			return {
 				verdict: "insufficient_evidence",
 				reasons: [`jev config invalid (fail-closed, defaults NOT applied): ${this.templateError}`],
 				judged: false,
+				summary: "config error: jev refuses to decide; fix the config file",
 			};
 		}
 		const check = validateDecisionInput(raw, this.extraStageSet());
 		if (!check.ok || check.input === undefined) {
-			return { verdict: "insufficient_evidence", reasons: check.reasons, judged: false };
+			return { verdict: "insufficient_evidence", reasons: check.reasons, judged: false, summary: "" };
 		}
 		const input = check.input;
 
@@ -629,7 +681,7 @@ export class JevController {
 			problems.push("no_requirement_evidence");
 		}
 		if (problems.includes("no_requirement_evidence") || problems.length >= 2) {
-			return { verdict: "insufficient_evidence", reasons: problems, judged: false };
+			return { verdict: "insufficient_evidence", reasons: problems, judged: false, summary: "" };
 		}
 
 		const point = lookupControlPoint(input.stage, this.extraPoints);
@@ -642,6 +694,7 @@ export class JevController {
 							"a textual report alone is insufficient",
 					],
 					judged: false,
+					summary: "",
 				};
 			}
 			const effectiveCaps = input.capabilities.length > 0 ? input.capabilities : (this.template.capabilities ?? []);
@@ -654,6 +707,7 @@ export class JevController {
 							`refactor requirement coverage incomplete: no evidence covers capability id(s) ${gaps.join(", ")}`,
 						],
 						judged: false,
+						summary: "",
 					};
 				}
 			}
@@ -669,7 +723,7 @@ export class JevController {
 			if (!this.state.blockers.includes(blocker)) this.state.blockers.push(blocker);
 			this.persist();
 			this.pushFeedback(blocker);
-			return { verdict: "ask_user", reasons: [blocker], judged: false };
+			return { verdict: "ask_user", reasons: [blocker], judged: false, summary: "" };
 		}
 
 		// R3: template options replace the executor's fixed option set for this stage.
@@ -686,6 +740,7 @@ export class JevController {
 							`[...${[...(point.fixedOptionIds ?? [])].join(", ")}] (template override may replace them)`,
 					],
 					judged: false,
+					summary: "",
 				};
 			}
 		}
@@ -719,6 +774,7 @@ export class JevController {
 				verdict: "insufficient_evidence",
 				reasons: [`judge unavailable: ${err instanceof Error ? err.message : String(err)}`],
 				judged: false,
+				summary: "",
 			};
 		}
 
@@ -784,9 +840,9 @@ export class JevController {
 		}
 		this.persist();
 		if (warnings.length > 0) {
-			return { ...result, judged: true, warnings };
+			return { ...result, judged: true, warnings, summary: "" };
 		}
-		return { ...result, judged: true };
+		return { ...result, judged: true, summary: "" };
 	}
 
 	/**
@@ -820,6 +876,7 @@ export class JevController {
 				verdict: "insufficient_evidence",
 				reasons: ["course_check requires at least one user or spec evidence item as the requirement under check"],
 				judged: false,
+				summary: "",
 			};
 		}
 		let raw: CourseCheckResult;
@@ -834,6 +891,7 @@ export class JevController {
 				verdict: "insufficient_evidence",
 				reasons: [`judge unavailable: ${err instanceof Error ? err.message : String(err)}`],
 				judged: false,
+				summary: "",
 			};
 		}
 		if (!isRecord(raw) || raw["judged"] !== true || typeof raw["nextAction"] !== "string") {
@@ -842,6 +900,7 @@ export class JevController {
 				verdict: "insufficient_evidence",
 				reasons: ["course_check judge returned an unjudged or malformed result; no action taken"],
 				judged: false,
+				summary: "",
 			};
 		}
 		const nextAction = raw["nextAction"] as string;
@@ -861,18 +920,25 @@ export class JevController {
 				reasons,
 				confidence: typeof raw["confidence"] === "number" ? raw["confidence"] : undefined,
 				judged: true,
+				summary: "",
 			};
 		}
 		if (nextAction === "return_to_requirement" || nextAction === "replan") {
 			this.pushFeedback(`Jev course_check redirects: ${nextAction}${drifted.length > 0 ? ` (not on track: ${drifted.join(", ")})` : ""}`);
 			this.persist();
-			return { verdict: "revise", selectedOption: nextAction, reasons, judged: true };
+			return { verdict: "revise", selectedOption: nextAction, reasons, judged: true, summary: "" };
 		}
 		// ask_user
 		const blocker = "course_check escalated to the user (ask_user chosen by the judge or rework bound).";
 		if (!this.state.blockers.includes(blocker)) this.state.blockers.push(blocker);
 		this.persist();
-		return { verdict: "ask_user", selectedOption: nextAction, reasons: [...reasons, blocker], judged: true };
+		return {
+			verdict: "ask_user",
+			selectedOption: nextAction,
+			reasons: [...reasons, blocker],
+			judged: true,
+			summary: "",
+		};
 	}
 
 	/** course_check ask_user escalation: recorded blocker, never a gate grant. */
@@ -885,6 +951,7 @@ export class JevController {
 			reasons: [...normalized.reasons, blocker],
 			confidence: normalized.confidence,
 			judged: true,
+			summary: "",
 		};
 	}
 
