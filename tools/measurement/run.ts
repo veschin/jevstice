@@ -39,7 +39,8 @@ import {
 	TypeSafeClient,
 } from "@typesafe-ai/sdk";
 import { isRecord } from "../../src/guards";
-import { MEDIAN_TEST_SRC, TASKS, type TaskDef } from "./tasks";
+import { startJudgeProxy, type JudgeCall } from "./judge-proxy";
+import { ITEMS_SRC, ITEMS_TEST_SRC, MEDIAN_TEST_SRC, TASK_SETS, type TaskDef } from "./tasks";
 
 const REPO_ROOT = resolve(import.meta.dir, "../..");
 const EXTENSION_ENTRY = join(REPO_ROOT, "src/index.ts");
@@ -65,7 +66,12 @@ function flagValue(name: string): string | undefined {
 
 const date = new Date();
 const today = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-const outFile = flagValue("--out") || join(REPO_ROOT, "evidence", `measurement-${today}.log`);
+const setName = flagValue("--set") || "core";
+const allTasks = TASK_SETS[setName];
+if (allTasks === undefined) throw new Error(`--set must be one of ${Object.keys(TASK_SETS).join(", ")} (got "${setName}")`);
+const outFile =
+	flagValue("--out") || join(REPO_ROOT, "evidence", `measurement-${today}${setName === "core" ? "" : `-${setName}`}.log`);
+const rawDir = join(REPO_ROOT, "evidence", `measurement-${today}${setName === "core" ? "" : `-${setName}`}`, "raw");
 const seed = Number.parseInt(flagValue("--seed") ?? `${date.getTime()}`, 10);
 const repeats = Math.max(1, Number.parseInt(flagValue("--repeats") ?? "1", 10));
 const sessionTimeoutSec = Number.parseInt(flagValue("--timeout") ?? "420", 10);
@@ -73,12 +79,11 @@ const dryRun = process.argv.includes("--dry-run");
 const selfTestOnly = process.argv.includes("--self-test");
 const probeEnabled = !process.argv.includes("--no-probe") && !selfTestOnly;
 const only = (flagValue("--only") ?? "").split(",").map(s => s.trim()).filter(s => s.length > 0);
-const selected = only.length > 0 ? TASKS.filter(t => only.includes(t.id)) : TASKS;
-if (selected.length === 0) throw new Error(`--only matched no task; known ids: ${TASKS.map(t => t.id).join(", ")}`);
+const selected = only.length > 0 ? allTasks.filter(t => only.includes(t.id)) : allTasks;
+if (selected.length === 0) throw new Error(`--only matched no task; set "${setName}" has: ${allTasks.map(t => t.id).join(", ")}`);
 
 const stamp = `${today.replace(/-/g, "")}-${String(date.getHours()).padStart(2, "0")}${String(date.getMinutes()).padStart(2, "0")}${String(date.getSeconds()).padStart(2, "0")}`;
 const root = `/tmp/jev-measure-${stamp}`;
-const rawDir = join(REPO_ROOT, "evidence", `measurement-${today}`, "raw");
 
 // ---------------------------------------------------------------------------
 // small helpers
@@ -105,9 +110,25 @@ function mulberry32(a: number): () => number {
 	};
 }
 
+
 // ---------------------------------------------------------------------------
 // process capture
 // ---------------------------------------------------------------------------
+
+/**
+ * Parse machine-readable requirement verdicts from a check's output: `REQ <id> PASS|FAIL ...`.
+ * This is what makes "kept" and "dropped" objective per requirement, without the judge.
+ */
+const REQ_LINE = /^REQ\s+(\S+)\s+(PASS|FAIL)\b.*$/;
+
+function parseRequirementVerdicts(output: string): Record<string, "pass" | "fail"> {
+	const verdicts: Record<string, "pass" | "fail"> = {};
+	for (const line of output.split("\n")) {
+		const match = REQ_LINE.exec(line.trim());
+		if (match !== null) verdicts[match[1]!] = match[2] === "PASS" ? "pass" : "fail";
+	}
+	return verdicts;
+}
 
 interface ProcResult {
 	exitCode: number;
@@ -117,9 +138,14 @@ interface ProcResult {
 	stderr: string;
 }
 
-async function spawnCapture(cmd: string[], cwd: string, timeoutMs: number): Promise<ProcResult> {
+async function spawnCapture(
+	cmd: string[],
+	cwd: string,
+	timeoutMs: number,
+	env: Record<string, string | undefined> = process.env,
+): Promise<ProcResult> {
 	const started = Date.now();
-	const proc = Bun.spawn({ cmd, cwd, stdout: "pipe", stderr: "pipe", env: process.env });
+	const proc = Bun.spawn({ cmd, cwd, stdout: "pipe", stderr: "pipe", env });
 	let timedOut = false;
 	const timer = setTimeout(() => {
 		timedOut = true;
@@ -173,9 +199,15 @@ interface RunCapture {
 	rawStderrPath: string;
 	rawStdoutSha: string;
 	files: CapturedFile[];
-	checks: Array<{ id: string; cmdline: string; exitCode: number; expected: number; output: string; passed: boolean }>;
+	checks: Array<{ id: string; cmdline: string; exitCode: number; expected: number; output: string; passed: boolean; requirementVerdicts: Record<string, "pass" | "fail"> }>;
 	frozenViolations: string[];
 	checkPassed: boolean;
+	/** Declared requirements -> verdict, parsed from the checks' `REQ` lines ("missing" = not reported). */
+	requirements: Record<string, "pass" | "fail" | "missing">;
+	/** Judge traffic this run made, observed by the local forwarding proxy. */
+	judgeTraffic: { calls: number; inputTokens: number; outputTokens: number; rawPath: string; detail: JudgeCall[] };
+	/** Set when the run's two signals disagree (all requirements KEPT but the check verdict FAIL). */
+	instrumentWarning?: string;
 	error?: string;
 }
 
@@ -344,13 +376,21 @@ async function runArm(task: TaskDef, arm: Arm, repeat: number): Promise<RunCaptu
 	for (const rel of task.frozen) frozenBefore.set(rel, sha256(readFileSync(join(dir, rel))));
 
 	const cmd = ompArgv(arm, task.prompt);
-	const proc = await spawnCapture(cmd, dir, (sessionTimeoutSec + 60) * 1000);
+	const label = `${task.id}-${arm}-r${repeat}`;
+	const proxy = await startJudgeProxy(label);
+	const proc = await spawnCapture(cmd, dir, (sessionTimeoutSec + 60) * 1000, {
+		...process.env,
+		TYPESAFE_API_URL: proxy.url,
+	});
+	proxy.stop();
 
 	mkdirSync(rawDir, { recursive: true });
-	const rawStdoutPath = join(rawDir, `${task.id}-${arm}-r${repeat}.stdout.jsonl`);
-	const rawStderrPath = join(rawDir, `${task.id}-${arm}-r${repeat}.stderr.log`);
+	const rawStdoutPath = join(rawDir, `${label}.stdout.jsonl`);
+	const rawStderrPath = join(rawDir, `${label}.stderr.log`);
+	const rawTrafficPath = join(rawDir, `${label}.judge-traffic.jsonl`);
 	writeFileSync(rawStdoutPath, proc.stdout, "utf8");
 	writeFileSync(rawStderrPath, proc.stderr, "utf8");
+	writeFileSync(rawTrafficPath, proxy.record.calls.map(c => JSON.stringify(c)).join("\n"), "utf8");
 
 	const capture: RunCapture = {
 		taskId: task.id,
@@ -373,13 +413,24 @@ async function runArm(task: TaskDef, arm: Arm, repeat: number): Promise<RunCaptu
 		checks: [],
 		frozenViolations: [],
 		checkPassed: false,
+		requirements: {},
+		judgeTraffic: {
+			calls: proxy.record.calls.length,
+			inputTokens: proxy.record.calls.reduce((s, c) => s + c.inputTokens, 0),
+			outputTokens: proxy.record.calls.reduce((s, c) => s + c.outputTokens, 0),
+			rawPath: relative(REPO_ROOT, rawTrafficPath),
+			detail: proxy.record.calls,
+		},
 	};
 
 	// Check files are written only now, so the agent could neither read nor game them.
 	for (const [rel, content] of Object.entries(task.checkFiles)) writeFileSync(join(dir, rel), content, "utf8");
+	const requirementVerdicts: Record<string, "pass" | "fail"> = {};
 	for (const check of task.checks) {
 		const res = await spawnCapture(check.cmd, dir, 120_000);
 		const output = `${res.stdout}${res.stderr}`.trim();
+		const parsed = parseRequirementVerdicts(output);
+		for (const [id, verdict] of Object.entries(parsed)) requirementVerdicts[id] = verdict;
 		capture.checks.push({
 			id: check.id,
 			cmdline: cmdline(check.cmd, dir),
@@ -387,7 +438,11 @@ async function runArm(task: TaskDef, arm: Arm, repeat: number): Promise<RunCaptu
 			expected: check.expectExit,
 			output,
 			passed: res.exitCode === check.expectExit,
+			requirementVerdicts: parsed,
 		});
+	}
+	for (const requirement of task.requirements ?? []) {
+		capture.requirements[requirement.id] = requirementVerdicts[requirement.id] ?? "missing";
 	}
 	// Remove the check files again so the scratch directory shows only what the agent left behind.
 	for (const rel of Object.keys(task.checkFiles)) rmSync(join(dir, rel), { force: true });
@@ -395,6 +450,13 @@ async function runArm(task: TaskDef, arm: Arm, repeat: number): Promise<RunCaptu
 		if (sha256(readFileSync(join(dir, rel))) !== before) capture.frozenViolations.push(rel);
 	}
 	capture.checkPassed = capture.checks.every(c => c.passed) && capture.frozenViolations.length === 0;
+	const declared = task.requirements ?? [];
+	if (declared.length > 0 && declared.every(r => capture.requirements[r.id] === "pass") && !capture.checkPassed) {
+		capture.instrumentWarning =
+			"every declared requirement was reported KEPT, yet the overall check verdict is FAIL " +
+			"(a frozen file changed, or a check exited non-zero): the per-requirement signal and the check signal disagree, " +
+			"so the overall verdict is the one to distrust - check the frozen list and the check exit codes";
+	}
 	return capture;
 }
 
@@ -515,6 +577,8 @@ interface JudgeOutcome {
 interface JudgeEvidence {
 	files: Array<{ path: string; bytes: number; sha256: string; content: string; content_truncated?: boolean; binary?: boolean }>;
 	final_report: string;
+	/** Declared requirements with their machine verdicts, so the judge can see what was kept/dropped. */
+	requirement_verdicts: Array<{ id: string; kind: string; verdict: string; demands: string }>;
 	check: {
 		acceptance_definition: string;
 		commands: Array<{ id: string; exit_code: number; expected_exit: number; output: string }>;
@@ -530,6 +594,8 @@ function judgeEvidenceFor(task: TaskDef, capture: RunCapture): JudgeEvidence {
 	if (capture.timedOut) notes.push("the host killed this run at the harness time limit");
 	if (capture.exitCode !== 0) notes.push(`the agent process exited ${capture.exitCode}`);
 	for (const rel of capture.frozenViolations) notes.push(`${rel} was modified by the run (the task forbade it)`);
+	const dropped = (task.requirements ?? []).filter(r => capture.requirements[r.id] !== "pass");
+	if (dropped.length > 0) notes.push(`machine-checked requirements NOT met: ${dropped.map(r => r.id).join(", ")}`);
 	return {
 		files: capture.files.map(f => {
 			if (f.binary === true || f.text === undefined) {
@@ -545,6 +611,12 @@ function judgeEvidenceFor(task: TaskDef, capture: RunCapture): JudgeEvidence {
 			};
 		}),
 		final_report: capture.finalReport,
+		requirement_verdicts: (task.requirements ?? []).map(r => ({
+			id: r.id,
+			kind: r.kind,
+			verdict: capture.requirements[r.id] ?? "missing",
+			demands: r.text,
+		})),
 		check: {
 			acceptance_definition: task.acceptance,
 			commands: capture.checks.map(c => ({
@@ -732,6 +804,9 @@ function renderRun(task: TaskDef, run: RunCapture): string {
 		}`,
 	);
 	lines.push(`- stdout: ${run.stdoutBytes} bytes (${run.rawStdoutPath}, sha256 ${run.rawStdoutSha}); stderr: ${run.stderrBytes} bytes (${run.rawStderrPath})`);
+	lines.push(
+		`- judge traffic observed by the local forwarding proxy: ${run.judgeTraffic.calls} call(s), ${run.judgeTraffic.inputTokens} input + ${run.judgeTraffic.outputTokens} output tokens (${run.judgeTraffic.rawPath})`,
+	);
 	if (run.nonJsonLines > 0) lines.push(`- non-JSON stdout lines (host noise, not counted as events): ${run.nonJsonLines}`);
 	if (run.error !== undefined) lines.push(`- harness error: ${run.error}`);
 	lines.push("");
@@ -770,7 +845,21 @@ function renderRun(task: TaskDef, run: RunCapture): string {
 	}
 	if (run.frozenViolations.length > 0) lines.push(`- FROZEN FILE MODIFIED: ${run.frozenViolations.join(", ")}`);
 	lines.push(`- overall check verdict: ${run.checkPassed ? "PASS" : "FAIL"}`);
+	if (run.instrumentWarning !== undefined) lines.push(`- **INSTRUMENT WARNING**: ${run.instrumentWarning}`);
 	lines.push("");
+	if (task.requirements !== undefined && task.requirements.length > 0) {
+		lines.push("Per-requirement machine verdicts (parsed from the checks' `REQ` lines; no judge involved):");
+		lines.push("");
+		lines.push("| requirement | kind | verdict | what it demands |");
+		lines.push("| --- | --- | --- | --- |");
+		for (const requirement of task.requirements) {
+			const verdict = run.requirements[requirement.id] ?? "missing";
+			lines.push(
+				`| ${requirement.id} | ${requirement.kind} | ${verdict === "pass" ? "KEPT" : verdict === "fail" ? "**DROPPED**" : "not reported"} | ${requirement.text} |`,
+			);
+		}
+		lines.push("");
+	}
 	for (const c of run.checks) {
 		lines.push(`<details><summary>check output: ${c.id}</summary>`);
 		lines.push("");
@@ -832,9 +921,19 @@ function armOfLabel(result: TaskResult, label: "A" | "B"): Arm {
 
 function buildSummary(results: TaskResult[]): { table: string; conclusion: string } {
 	const rows: string[] = [
-		"| task | A shown as | judge: better | judge: A satisfies | judge: B satisfies | check control | check addon | wall control | wall addon | tokens control (in/out) | tokens addon (in/out) | winner |",
-		"| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+		"| task | A shown as | judge: better | judge: A satisfies | judge: B satisfies | check control | check addon | wall control | wall addon | tokens control (in/out) | tokens addon (in/out) | judge calls control | judge calls addon (in/out tok) | winner |",
+		"| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
 	];
+	const requirementRows: string[] = ["| task | requirement | kind | what it demands | control | addon |", "| --- | --- | --- | --- | --- | --- |"];
+	let requirementsControlKept = 0;
+	let requirementsAddonKept = 0;
+	let requirementsTotal = 0;
+	const addonOnly: string[] = [];
+	const controlOnly: string[] = [];
+	let controlJudgeCalls = 0;
+	let addonJudgeCalls = 0;
+	let addonJudgeInput = 0;
+	let addonJudgeOutput = 0;
 	let controlWins = 0;
 	let addonWins = 0;
 	let ties = 0;
@@ -880,8 +979,29 @@ function buildSummary(results: TaskResult[]): { table: string; conclusion: strin
 				else addonSatisfies++;
 			}
 		}
+		controlJudgeCalls += control.judgeTraffic.calls;
+		addonJudgeCalls += addon.judgeTraffic.calls;
+		addonJudgeInput += addon.judgeTraffic.inputTokens;
+		addonJudgeOutput += addon.judgeTraffic.outputTokens;
+		for (const requirement of r.task.requirements ?? []) {
+			const controlVerdict = control.requirements[requirement.id] ?? "missing";
+			const addonVerdict = addon.requirements[requirement.id] ?? "missing";
+			requirementsTotal++;
+			if (controlVerdict === "pass") requirementsControlKept++;
+			if (addonVerdict === "pass") requirementsAddonKept++;
+			if (controlVerdict !== addonVerdict) {
+				const note = `${r.task.id}/${requirement.id} (control ${controlVerdict}, addon ${addonVerdict})`;
+				if (addonVerdict === "pass") addonOnly.push(note);
+				else if (controlVerdict === "pass") controlOnly.push(note);
+			}
+			const label = (v: "pass" | "fail" | "missing"): string =>
+				v === "pass" ? "KEPT" : v === "fail" ? "**DROPPED**" : "not reported";
+			requirementRows.push(
+				`| ${r.task.id} | ${requirement.id} | ${requirement.kind} | ${requirement.text} | ${label(controlVerdict)} | ${label(addonVerdict)} |`,
+			);
+		}
 		rows.push(
-			`| ${r.task.id} | A=${r.aIs} | ${better ?? "n/a"} | ${satLabel("A")} | ${satLabel("B")} | ${control.checkPassed ? "PASS" : "FAIL"} | ${addon.checkPassed ? "PASS" : "FAIL"} | ${(control.wallMs / 1000).toFixed(1)}s | ${(addon.wallMs / 1000).toFixed(1)}s | ${control.usage.input}/${control.usage.output} | ${addon.usage.input}/${addon.usage.output} | ${winner} |`,
+			`| ${r.task.id} | A=${r.aIs} | ${better ?? "n/a"} | ${satLabel("A")} | ${satLabel("B")} | ${control.checkPassed ? "PASS" : "FAIL"} | ${addon.checkPassed ? "PASS" : "FAIL"} | ${(control.wallMs / 1000).toFixed(1)}s | ${(addon.wallMs / 1000).toFixed(1)}s | ${control.usage.input}/${control.usage.output} | ${addon.usage.input}/${addon.usage.output} | ${control.judgeTraffic.calls} | ${addon.judgeTraffic.calls} (${addon.judgeTraffic.inputTokens}/${addon.judgeTraffic.outputTokens} tok) | ${winner} |`,
 		);
 	}
 	const n = results.length;
@@ -890,6 +1010,18 @@ function buildSummary(results: TaskResult[]): { table: string; conclusion: strin
 	const delta = meanAddon - meanControl;
 	const pct = meanControl > 0 ? (delta / meanControl) * 100 : 0;
 	const conclusions: string[] = [];
+	if (requirementsTotal > 0) {
+		conclusions.push(
+			`**Requirements kept** (machine-checked, per requirement, judge not involved): control ${requirementsControlKept}/${requirementsTotal}, addon ${requirementsAddonKept}/${requirementsTotal}.`,
+		);
+		conclusions.push(
+			`**Where the arms differ**: ${
+				addonOnly.length + controlOnly.length === 0
+					? "nowhere - both arms kept exactly the same requirements"
+					: `kept by the addon arm and dropped by the control arm: ${addonOnly.join(", ") || "none"}; kept by the control arm and dropped by the addon arm: ${controlOnly.join(", ") || "none"}`
+			}.`,
+		);
+	}
 	conclusions.push(
 		`**Objective checks** (independent of the judge): control ${controlPass}/${n} pass, addon ${addonPass}/${n} pass.`,
 	);
@@ -897,14 +1029,14 @@ function buildSummary(results: TaskResult[]): { table: string; conclusion: strin
 		`**Blind judge**: it marked ${controlSatisfies}/${n} control results and ${addonSatisfies}/${n} addon results as satisfying the task as quoted; on "which result is better" it gave ${judgedCount} decisive preference${judgedCount === 1 ? "" : "s"} (control ${controlWins}, addon ${addonWins}) and ${ties} tie${ties === 1 ? "" : "s"}.`,
 	);
 	conclusions.push(
-		`**Cost**: mean wall time per task control ${meanControl.toFixed(1)}s vs addon ${meanAddon.toFixed(1)}s (${delta >= 0 ? "+" : ""}${delta.toFixed(1)}s, ${delta >= 0 ? "+" : ""}${pct.toFixed(0)}%); mean coding-model tokens control ${Math.round(controlTokens / n)} vs addon ${Math.round(addonTokens / n)}.`,
+		`**Cost**: mean wall time per task control ${meanControl.toFixed(1)}s vs addon ${meanAddon.toFixed(1)}s (${delta >= 0 ? "+" : ""}${delta.toFixed(1)}s, ${delta >= 0 ? "+" : ""}${pct.toFixed(0)}%); mean coding-model tokens control ${Math.round(controlTokens / n)} vs addon ${Math.round(addonTokens / n)}; judge consultations observed through the proxy control ${controlJudgeCalls}, addon ${addonJudgeCalls} (addon judge tokens ${addonJudgeInput} in / ${addonJudgeOutput} out).`,
 	);
 	if (n < 10) {
 		conclusions.push(
-			`**Verdict**: with ${n} task${n === 1 ? "" : "s"} and a single run per arm, this sample is far too small to say whether the addon helps: the result is a smoke-level observation on tiny mechanical tasks, not a benchmark, and one task flipping would change the tally.`,
+			`**Sample limit**: with ${n} task${n === 1 ? "" : "s"} and a single run per arm, a difference smaller than a whole requirement would not show up, and one task flipping would change the tally; read the per-requirement table above, not this sentence, for what actually happened.`,
 		);
 	}
-	return { table: rows.join("\n"), conclusion: conclusions.join(" ") };
+	return { table: `${rows.join("\n")}\n\nPer-requirement results (machine verdicts from the check scripts; the judge never sees this table):\n\n${requirementRows.join("\n")}`, conclusion: conclusions.join(" ") };
 }
 
 /** Content digest of the extension under test: every file under src/, sorted, hashed. */
@@ -928,6 +1060,8 @@ interface CheckVariant {
 	/** Commands (each an argv) run before the checks, e.g. running the script the task asks for. */
 	run?: string[][];
 	expect: "all-pass" | "any-fail";
+	/** Exact per-requirement verdicts expected from the checks' REQ lines (drift set only). */
+	expectRequirements?: Record<string, "pass" | "fail">;
 }
 
 const SLUG_RIGHT = `export function slug(input: string): string {
@@ -1000,6 +1134,163 @@ const sorted = Object.fromEntries(Object.entries(totals).sort(([a], [b]) => a.lo
 await Bun.write("out.json", JSON.stringify(sorted) + "\\n");
 `;
 
+// --- drift-set reference solutions (only used to validate the checks, never inside a run) -------
+
+const DRIFT_REPORT_RIGHT = `const args = process.argv.slice(2);
+const sortArg = args.find(a => a.startsWith("--sort="));
+const order = sortArg ? sortArg.slice("--sort=".length) : "asc";
+
+/** Minimal CSV splitter that honours double quotes, so a comma inside a note cannot shift columns. */
+function parseCsvRow(row: string): string[] {
+	const fields: string[] = [];
+	let field = "";
+	let quoted = false;
+	for (let i = 0; i < row.length; i++) {
+		const ch = row[i]!;
+		if (quoted) {
+			if (ch === '"') {
+				if (row[i + 1] === '"') { field += '"'; i++; } else quoted = false;
+			} else field += ch;
+		} else if (ch === '"') quoted = true;
+		else if (ch === ",") { fields.push(field); field = ""; }
+		else field += ch;
+	}
+	fields.push(field);
+	return fields;
+}
+
+const rows = (await Bun.file("data.csv").text()).split(/\\r?\\n/).filter(line => line.trim() !== "");
+const header = parseCsvRow(rows[0]!);
+const categoryIndex = header.indexOf("category");
+const amountIndex = header.indexOf("amount");
+const totals: Record<string, { count: number; total: number }> = {};
+for (const row of rows.slice(1)) {
+	const fields = parseCsvRow(row);
+	const category = fields[categoryIndex];
+	const amountRaw = (fields[amountIndex] ?? "").trim();
+	if (category === undefined || category === "" || amountRaw === "") continue;
+	const entry = totals[category] ?? { count: 0, total: 0 };
+	entry.count += 1;
+	entry.total += Number(amountRaw);
+	totals[category] = entry;
+}
+const keys = Object.keys(totals).sort();
+if (order === "desc") keys.reverse();
+const ordered: Record<string, { count: number; total: number }> = {};
+for (const key of keys) ordered[key] = totals[key]!;
+await Bun.write("summary.json", JSON.stringify(ordered) + "\\n");
+console.log("wrote summary.json for " + keys.length + " categories");
+`;
+
+const DRIFT_REPORT_SORT_LINE = 'const order = sortArg ? sortArg.slice("--sort=".length) : "asc";';
+const DRIFT_REPORT_WRITE_LINE = 'await Bun.write("summary.json", JSON.stringify(ordered) + "\\n");';
+/** Drops R4: ignores --sort. */
+const DRIFT_REPORT_NO_SORT = DRIFT_REPORT_RIGHT.replace(DRIFT_REPORT_SORT_LINE, 'const order = "asc";');
+/** Over-delivers on the deferred distractor: implements the forbidden --csv mode. */
+const DRIFT_REPORT_WITH_CSV = DRIFT_REPORT_RIGHT.replace(
+	DRIFT_REPORT_WRITE_LINE,
+	`${DRIFT_REPORT_WRITE_LINE}\nif (args.includes("--csv")) await Bun.write("summary.csv", "category,count,total\\n");`,
+);
+
+const DRIFT_MERGE_FN = `
+export function mergeItems(a: Item[], b: Item[]): Item[] {
+	const order: string[] = [];
+	const byId = new Map<string, Item>();
+	for (const item of [...a, ...b]) {
+		if (!byId.has(item.id)) order.push(item.id);
+		byId.set(item.id, { ...item });
+	}
+	return order.map(id => byId.get(id)!);
+}
+`;
+
+/** Drops R4: mutates its inputs. */
+const DRIFT_MERGE_MUTATING_FN = `
+export function mergeItems(a: Item[], b: Item[]): Item[] {
+	for (const item of b) {
+		const at = a.findIndex(existing => existing.id === item.id);
+		if (at >= 0) a[at] = item;
+		else a.push(item);
+	}
+	return [...a];
+}
+`;
+
+const DRIFT_MERGE_TEST_BODY = `
+test("merges the two lists in first-seen order", () => {
+	const merged = mergeItems([{ id: "a", label: "A", qty: 1 }], [{ id: "b", label: "B", qty: 2 }]);
+	expect(merged.map(item => item.id)).toEqual(["a", "b"]);
+});
+
+test("an id in both lists keeps the second list's item", () => {
+	const merged = mergeItems([{ id: "a", label: "A", qty: 1 }], [{ id: "a", label: "A2", qty: 9 }]);
+	expect(merged).toHaveLength(1);
+	expect(merged[0]!.label).toBe("A2");
+});
+
+test("does not mutate either input", () => {
+	const first = [{ id: "a", label: "A", qty: 1 }];
+	const second = [{ id: "b", label: "B", qty: 2 }];
+	mergeItems(first, second);
+	expect(first).toHaveLength(1);
+	expect(second).toHaveLength(1);
+});
+`;
+
+const DRIFT_MERGE_TESTS = `${ITEMS_TEST_SRC.replace('import { totalQty } from "./items";', 'import { mergeItems, totalQty } from "./items";')}${DRIFT_MERGE_TEST_BODY}`;
+
+const DRIFT_TRIAGE_RIGHT = `const args = process.argv.slice(2);
+if (args.includes("--help")) {
+	console.error("usage: triage [--min=<ms>]");
+	process.exit(0);
+}
+const minArg = args.find(a => a.startsWith("--min="));
+const min = minArg ? Number(minArg.slice("--min=".length)) : 0;
+
+const events: Array<{ id: string; kind: string; durationMs: number }> = [];
+for (const line of (await Bun.file("events.jsonl").text()).split(/\\r?\\n/)) {
+	const text = line.trim();
+	if (text === "") continue;
+	try {
+		const parsed: unknown = JSON.parse(text);
+		if (typeof parsed !== "object" || parsed === null) continue;
+		const candidate = parsed as Record<string, unknown>;
+		if (typeof candidate["id"] !== "string" || typeof candidate["kind"] !== "string") continue;
+		if (typeof candidate["durationMs"] !== "number") continue;
+		events.push({ id: candidate["id"], kind: candidate["kind"], durationMs: candidate["durationMs"] });
+	} catch {
+		// unusable line: skipped silently, as the task demands
+	}
+}
+
+const kept = events.filter(event => event.durationMs >= min);
+const byKind: Record<string, number> = {};
+for (const event of kept) byKind[event.kind] = (byKind[event.kind] ?? 0) + 1;
+const sortedByKind: Record<string, number> = {};
+for (const kind of Object.keys(byKind).sort()) sortedByKind[kind] = byKind[kind]!;
+const slowest = kept
+	.slice()
+	.sort((x, y) => y.durationMs - x.durationMs || (x.id < y.id ? -1 : 1))
+	.map(event => event.id)[0] ?? null;
+await Bun.write("triage.json", JSON.stringify({ total: kept.length, byKind: sortedByKind, slowest }) + "\\n");
+`;
+
+const DRIFT_TRIAGE_MIN_LINE = 'const min = minArg ? Number(minArg.slice("--min=".length)) : 0;';
+/** Drops R3: ignores --min. */
+const DRIFT_TRIAGE_NO_MIN = DRIFT_TRIAGE_RIGHT.replace(DRIFT_TRIAGE_MIN_LINE, "const min = 0;");
+/** Over-delivers on the deferred distractor: accepts --watch and installs a file watcher. */
+const DRIFT_TRIAGE_WATCH = `import { watch } from "node:fs";
+${DRIFT_TRIAGE_RIGHT.replace(
+	'if (args.includes("--help")) {',
+	'if (args.includes("--watch")) { watch("events.jsonl", () => {}); }\nif (args.includes("--help")) {',
+)}
+`;
+
+// The addon's own R5 false positive in run 1 was triggered by exactly this: a comment naming the
+// deferred flag while nothing is implemented. That must PASS the distractor check.
+const DRIFT_TRIAGE_COMMENT_ONLY = `${DRIFT_TRIAGE_RIGHT}\n// ponytail: no deps, no watcher. --watch is deliberately unsupported (deferred by spec).\n`;
+const DRIFT_REPORT_COMMENT_ONLY = `${DRIFT_REPORT_RIGHT}\n// no --csv mode: it is deliberately deferred by the spec.\n`;
+
 const VALIDATION_VARIANTS: CheckVariant[] = [
 	{ taskId: "slug", name: "unsolved (no module, no test)", files: {}, expect: "any-fail" },
 	{ taskId: "slug", name: "wrong solution (no trim)", files: { "src/slug.ts": SLUG_WRONG, "src/slug.test.ts": SLUG_TEST }, expect: "any-fail" },
@@ -1010,6 +1301,98 @@ const VALIDATION_VARIANTS: CheckVariant[] = [
 	{ taskId: "transform", name: "unsolved (no script, no out.json)", files: {}, expect: "any-fail" },
 	{ taskId: "transform", name: "wrong solution (string amounts)", files: { "transform.ts": TRANSFORM_WRONG }, run: [["bun", "transform.ts"]], expect: "any-fail" },
 	{ taskId: "transform", name: "correct solution", files: { "transform.ts": TRANSFORM_RIGHT }, run: [["bun", "transform.ts"]], expect: "all-pass" },
+	// --- drift set: unsolved, one requirement deliberately dropped, one distractor over-delivered, correct ---
+	{
+		taskId: "drift-report",
+		name: "unsolved (no report.ts)",
+		files: {},
+		expect: "any-fail",
+		expectRequirements: { R1: "fail", R2: "fail", R3: "fail", R4: "fail", R5: "fail", R6: "pass" },
+	},
+	{
+		taskId: "drift-report",
+		name: "drops R4 (ignores --sort)",
+		files: { "report.ts": DRIFT_REPORT_NO_SORT },
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "fail", R5: "pass", R6: "pass" },
+	},
+	{
+		taskId: "drift-report",
+		name: "over-delivers R5 (implements the deferred --csv)",
+		files: { "report.ts": DRIFT_REPORT_WITH_CSV },
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "fail", R6: "fail" },
+	},
+	{
+		taskId: "drift-report",
+		name: "mentions --csv in a comment only (must not count)",
+		files: { "report.ts": DRIFT_REPORT_COMMENT_ONLY },
+		expect: "all-pass",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass" },
+	},
+	{
+		taskId: "drift-report",
+		name: "correct solution",
+		files: { "report.ts": DRIFT_REPORT_RIGHT },
+		expect: "all-pass",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass" },
+	},
+	{
+		taskId: "drift-merge",
+		name: "unsolved (no mergeItems)",
+		files: {},
+		expect: "any-fail",
+		expectRequirements: { R1: "fail", R2: "pass", R3: "fail", R4: "pass", R5: "fail", R6: "pass" },
+	},
+	{
+		taskId: "drift-merge",
+		name: "drops R4 (mutates its inputs)",
+		files: { "src/items.ts": `${ITEMS_SRC}${DRIFT_MERGE_MUTATING_FN}`, "src/items.test.ts": DRIFT_MERGE_TESTS },
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "fail", R4: "fail", R5: "pass", R6: "pass" },
+	},
+	{
+		taskId: "drift-merge",
+		name: "correct solution",
+		files: { "src/items.ts": `${ITEMS_SRC}${DRIFT_MERGE_FN}`, "src/items.test.ts": DRIFT_MERGE_TESTS },
+		expect: "all-pass",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass" },
+	},
+	{
+		taskId: "drift-triage",
+		name: "unsolved (no triage.ts)",
+		files: {},
+		expect: "any-fail",
+		expectRequirements: { R1: "fail", R2: "fail", R3: "fail", R4: "fail", R5: "fail", R6: "pass" },
+	},
+	{
+		taskId: "drift-triage",
+		name: "drops R3 (ignores --min)",
+		files: { "triage.ts": DRIFT_TRIAGE_NO_MIN },
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "fail", R4: "pass", R5: "pass", R6: "pass" },
+	},
+	{
+		taskId: "drift-triage",
+		name: "over-delivers R5 (implements the deferred --watch)",
+		files: { "triage.ts": DRIFT_TRIAGE_WATCH },
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "fail", R6: "pass" },
+	},
+	{
+		taskId: "drift-triage",
+		name: "mentions --watch in a comment only (must not count)",
+		files: { "triage.ts": DRIFT_TRIAGE_COMMENT_ONLY },
+		expect: "all-pass",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass" },
+	},
+	{
+		taskId: "drift-triage",
+		name: "correct solution",
+		files: { "triage.ts": DRIFT_TRIAGE_RIGHT },
+		expect: "all-pass",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass" },
+	},
 ];
 
 interface ValidationRow {
@@ -1019,12 +1402,16 @@ interface ValidationRow {
 	actual: string;
 	ok: boolean;
 	checks: Array<{ id: string; passed: boolean }>;
+	/** Per-requirement verdicts the checks reported, with any mismatch against the expectation. */
+	requirementVerdicts: Record<string, string>;
+	requirementMismatches: string[];
 }
 
 async function validateChecks(): Promise<ValidationRow[]> {
 	const rows: ValidationRow[] = [];
+	const everyTask = Object.values(TASK_SETS).flat();
 	for (const [i, variant] of VALIDATION_VARIANTS.entries()) {
-		const task = TASKS.find(t => t.id === variant.taskId);
+		const task = everyTask.find(t => t.id === variant.taskId);
 		if (task === undefined) throw new Error(`validation variant names unknown task ${variant.taskId}`);
 		const dir = join(root, "checks", `${String(i).padStart(2, "0")}-${variant.taskId}-${variant.name.replace(/[^a-z0-9]+/gi, "-")}`);
 		mkdirSync(dir, { recursive: true });
@@ -1035,13 +1422,33 @@ async function validateChecks(): Promise<ValidationRow[]> {
 		for (const [rel, content] of Object.entries(task.checkFiles)) writeFileSync(join(dir, rel), content, "utf8");
 		for (const cmd of variant.run ?? []) await spawnCapture(cmd, dir, 60_000);
 		const checks: Array<{ id: string; passed: boolean }> = [];
+		const requirementVerdicts: Record<string, string> = {};
 		for (const check of task.checks) {
 			const res = await spawnCapture(check.cmd, dir, 120_000);
 			checks.push({ id: check.id, passed: res.exitCode === check.expectExit });
+			Object.assign(requirementVerdicts, parseRequirementVerdicts(`${res.stdout}${res.stderr}`));
 		}
 		const anyFail = checks.some(c => !c.passed);
 		const actual: "all-pass" | "any-fail" = anyFail ? "any-fail" : "all-pass";
-		rows.push({ taskId: variant.taskId, variant: variant.name, expect: variant.expect, actual, ok: actual === variant.expect, checks });
+		const requirementMismatches: string[] = [];
+		for (const [id, expected] of Object.entries(variant.expectRequirements ?? {})) {
+			const observed = requirementVerdicts[id] ?? "missing";
+			if (observed !== expected) requirementMismatches.push(`${id}: expected ${expected}, observed ${observed}`);
+		}
+		for (const requirement of task.requirements ?? []) {
+			if (variant.expectRequirements === undefined) continue;
+			if (!(requirement.id in (variant.expectRequirements ?? {}))) requirementMismatches.push(`${requirement.id}: not covered by the expectation`);
+		}
+		rows.push({
+			taskId: variant.taskId,
+			variant: variant.name,
+			expect: variant.expect,
+			actual,
+			ok: actual === variant.expect && requirementMismatches.length === 0,
+			checks,
+			requirementVerdicts,
+			requirementMismatches,
+		});
 	}
 	return rows;
 }
@@ -1059,7 +1466,10 @@ if (selfTestOnly) {
 	const rows = await validateChecks();
 	process.stdout.write("check validation (no omp session, no judge involved):\n\n");
 	for (const r of rows) {
-		process.stdout.write(`${r.ok ? "OK    " : "BROKEN"}  ${r.taskId.padEnd(10)} ${r.variant.padEnd(38)} expected ${r.expect.padEnd(9)} observed ${r.actual.padEnd(9)} [${r.checks.map(c => `${c.id}:${c.passed ? "pass" : "fail"}`).join(", ")}]\n`);
+		process.stdout.write(
+			`${r.ok ? "OK    " : "BROKEN"}  ${r.taskId.padEnd(13)} ${r.variant.padEnd(46)} expected ${r.expect.padEnd(9)} observed ${r.actual.padEnd(9)} [${r.checks.map(c => `${c.id}:${c.passed ? "pass" : "fail"}`).join(", ")}]${Object.keys(r.requirementVerdicts).length > 0 ? ` reqs ${Object.entries(r.requirementVerdicts).map(([k, v]) => `${k}=${v}`).join(" ")}` : ""}\n`,
+		);
+		for (const mismatch of r.requirementMismatches) process.stdout.write(`         REQUIREMENT MISMATCH: ${mismatch}\n`);
 	}
 	process.stdout.write(`\n${rows.filter(r => r.ok).length}/${rows.length} variants behaved as expected${rows.some(r => !r.ok) ? " — THE MEASURING INSTRUMENT IS BROKEN" : ""}\n`);
 	process.exit(rows.some(r => !r.ok) ? 1 : 0);
@@ -1067,10 +1477,12 @@ if (selfTestOnly) {
 
 if (dryRun) {
 	process.stdout.write(
-		`dry run: ${selected.length} task(s), ${selected.length * 2 * repeats} omp sessions, out=${outFile}, seed=${seed}\n\n`,
+		`dry run: set=${setName}, ${selected.length} task(s), ${selected.length * 2 * repeats} omp sessions, out=${outFile}, seed=${seed}\n\n`,
 	);
 	for (const t of selected) {
-		process.stdout.write(`- ${t.id}: ${t.title}\n  acceptance: ${t.acceptance}\n  checks: ${t.checks.map(c => c.cmd.join(" ")).join(" | ")}\n  frozen: ${t.frozen.join(", ") || "(none)"}\n  setup: ${Object.keys(t.setup).join(", ")}\n\n`);
+		process.stdout.write(
+			`- ${t.id}: ${t.title}\n  acceptance: ${t.acceptance}\n  checks: ${t.checks.map(c => c.cmd.join(" ")).join(" | ")}\n  frozen: ${t.frozen.join(", ") || "(none)"}\n  setup: ${Object.keys(t.setup).join(", ")}\n${(t.requirements ?? []).map(r => `  ${r.id} (${r.kind}): ${r.text}`).join("\n")}${(t.requirements ?? []).length > 0 ? "\n" : ""}\n`,
+		);
 	}
 	process.exit(0);
 }
@@ -1159,6 +1571,10 @@ try {
 	out.push("");
 	out.push(`\`--no-extensions\` is used in BOTH arms because \`~/.omp/agent/extensions/jevstice\` is a symlink to this repo: without it the addon would load in every session and there would be no control arm. Model: \`${MODEL}\`. Thinking level: the config default (\`auto\`), not overridden. Mode: \`--mode json -p\` (non-interactive, machine-readable events).`);
 	out.push("");
+	out.push(`Task set: **${setName}** (${selected.length} task(s), one run per arm${repeats > 1 ? `, ${repeats} repeats` : ""}).`);
+	out.push("");
+	out.push("**Judge traffic is observed, not inferred.** The extension's own judge consultations are HTTP calls made from inside the extension and are invisible to the host's event stream, so every spawned session is given `TYPESAFE_API_URL` pointing at a throwaway in-process forwarding proxy. The proxy relays each request to the real endpoint unchanged and records one JSONL line per call (path, model, question ids, status, latency, response usage and a compact answer summary); the API key rides in the Authorization header and is never recorded. That turns \"how many judge consultations did the addon make, and what did they cost\" from a guess into a count, per run.");
+	out.push("");
 	out.push(`Judge: TypeSafe systemone \`${JUDGE_MODEL}\`, one request per task with 3 questions (one choice "which of A/B better satisfies the task", one noul per result "does this result satisfy the task as quoted", threshold ${NOUL_SUPPORTED_THRESHOLD}). The A/B labels are randomised per task from seed ${seed}; the judge never sees the command lines, arm names, timings or token usage. Judge key: present in the environment, never printed, never written to this log.`);
 	out.push("");
 	out.push(`**Measured revision of the extension**: \`src/\` content digest \`${revision.digest}\` over ${revision.files} files (sha256 of the sorted \`path:sha256\` manifest), git HEAD \`${gitHead}\`. The digest is taken at the start of the run: if \`src/\` changes afterwards the run is no longer reproducible, so re-check the digest before comparing two runs.`);
@@ -1166,7 +1582,7 @@ try {
 	out.push("## Reproduce");
 	out.push("");
 	out.push("```");
-	out.push(`$ bun run tools/measurement/run.ts --out ${outFile.startsWith(REPO_ROOT) ? relative(REPO_ROOT, outFile) : outFile} --seed ${seed}${repeats > 1 ? ` --repeats ${repeats}` : ""}${only.length > 0 ? ` --only ${only.join(",")}` : ""}`);
+	out.push(`$ bun run tools/measurement/run.ts --set ${setName} --out ${outFile.startsWith(REPO_ROOT) ? relative(REPO_ROOT, outFile) : outFile} --seed ${seed}${repeats > 1 ? ` --repeats ${repeats}` : ""}${only.length > 0 ? ` --only ${only.join(",")}` : ""}`);
 	out.push("```");
 	out.push("");
 	out.push("The task checks can be validated on their own, with no omp session and no judge:");
@@ -1200,10 +1616,12 @@ try {
 		out.push("");
 		out.push("Before any session ran, each task's own check was executed against a known-correct and a known-wrong solution (no omp, no judge — this is pure filesystem + `bun`, so it is reproducible with `bun run tools/measurement/run.ts --self-test`). If a check passed a wrong solution or failed a correct one, the measurement below would be meaningless.");
 		out.push("");
-		out.push("| task | variant | expected | observed | per-check | verdict |");
-		out.push("| --- | --- | --- | --- | --- | --- |");
+		out.push("| task | variant | expected | observed | per-check | per-requirement | verdict |");
+		out.push("| --- | --- | --- | --- | --- | --- | --- |");
 		for (const row of validation) {
-			out.push(`| ${row.taskId} | ${row.variant} | ${row.expect} | ${row.actual} | ${row.checks.map(c => `${c.id}: ${c.passed ? "pass" : "fail"}`).join("; ")} | ${row.ok ? "as expected" : "**BROKEN**"} |`);
+			out.push(
+				`| ${row.taskId} | ${row.variant} | ${row.expect} | ${row.actual} | ${row.checks.map(c => `${c.id}: ${c.passed ? "pass" : "fail"}`).join("; ")} | ${Object.keys(row.requirementVerdicts).length === 0 ? "-" : Object.entries(row.requirementVerdicts).map(([k, v]) => `${k}=${v}`).join(" ")} | ${row.ok ? "as expected" : `**BROKEN**${row.requirementMismatches.length > 0 ? `: ${row.requirementMismatches.join("; ")}` : ""}`} |`,
+			);
 		}
 		out.push("");
 		out.push(`${validation.filter(r => r.ok).length}/${validation.length} variants behaved as expected.`);
