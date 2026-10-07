@@ -26,6 +26,9 @@ TYPESAFE_API_KEY="$(pass show token/jev)" bun ~/.omp/agent/extensions/jevstice/s
 TYPESAFE_API_KEY="$(pass show token/jev)" bun ~/.omp/agent/extensions/jevstice/src/cli.ts request.json
 ```
 
+All submissions to the judge are written in English: the executor's own text (task, proposal,
+option labels and meanings) is English, while quoted evidence keeps its source wording verbatim.
+
 ## Gates
 
 - **plan** (`understanding_review` / `direction_review`): file mutations blocked until the

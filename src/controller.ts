@@ -424,6 +424,8 @@ export class JevController {
 				"Plan-stage proposals read as claims checked against the quoted evidence: state what the plan " +
 				"asserts and which quote supports it. An open plan summary with no quotable anchor is answered " +
 				"insufficient_evidence (live: 0.14-0.26 against 0.79 for the same plan phrased as a claim). " +
+				"Write your own text - task, proposal, option labels and meanings - in English; quoted " +
+				"evidence keeps the original wording of its source verbatim. " +
 				"Provide fixed options " +
 				"and evidence as {kind, source, quote} items (kind: user|spec|code|execution|log|documentation). " +
 				"Completion claims additionally need execution/code/log evidence; pass `capabilities` " +

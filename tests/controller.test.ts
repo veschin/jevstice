@@ -1565,3 +1565,14 @@ describe("jev controller: plan-stage directive text", () => {
 		expect(description).toContain("insufficient_evidence");
 	});
 });
+
+describe("jev controller: submission language rule", () => {
+	test("the tool description requires English submissions and verbatim quotes", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({ judge: async () => judgeResult({}) });
+		controller.register(harness.pi);
+		const description = String(harness.getTool()?.description);
+		expect(description).toContain("in English");
+		expect(description).toContain("verbatim");
+	});
+});

@@ -63,4 +63,7 @@
 - Plan-stage directive in the tool description: file a plan as a claim checked against the quoted
   evidence (what it asserts, which quote supports it), with the measured numbers - an open plan
   summary with no quotable anchor is answered insufficient_evidence.
-- 234/234 tests, `tsc --noEmit` clean.
+- Submissions to the judge are English by rule: the executor's own text (task, proposal, option
+  labels, meanings) is English; quoted evidence keeps its source wording verbatim. Stated in the
+  tool description and in the README, asserted by a test.
+- 235/235 tests, `tsc --noEmit` clean.
