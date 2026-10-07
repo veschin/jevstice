@@ -5,7 +5,10 @@
 # jevstice
 
 Jev (`jev-latest`) as a decision judge for [oh-my-pi](https://github.com/can1357/oh-my-pi):
-the executor validates every important step through fixed-option questions instead of guessing.
+the executor puts its business and architecture decisions, and its finished code reviews, to Jev
+through fixed-option questions and acts on the answer, instead of guessing. Business, architecture
+and opt-in security reviews run as advisory activities; the plan and completion checks are opt-in
+backstops.
 
 ## Install
 
