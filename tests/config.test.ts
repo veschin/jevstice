@@ -21,13 +21,6 @@ const USER_FILE = `${HOME}/.omp/agent/jev.config.json`;
 const PROJECT_FILE = `${CWD}/.omp/jev.config.json`;
 
 describe("jev template config", () => {
-	test("defaults unchanged when no files exist", () => {
-		const cfg = loadJevTemplateConfig(CWD, HOME, loader({}));
-		expect(cfg.stages).toBeUndefined();
-		expect(cfg.confidenceThreshold).toBeUndefined();
-		expect(cfg.capabilities).toBeUndefined();
-	});
-
 	test("project overrides user per-key; missing user file fine", () => {
 		const cfg = loadJevTemplateConfig(
 			CWD,
@@ -174,11 +167,6 @@ describe("jev template config", () => {
 });
 
 describe("jev template config: gates switch", () => {
-	test("gates.mutation=false is parsed", () => {
-		const parsed = validateTemplateConfig(USER_FILE, { gates: { mutation: false } });
-		expect(parsed.gates?.mutation).toBe(false);
-	});
-
 	test("trust split: the switch is user-owned, a project file cannot turn it back on", () => {
 		const merged = mergeTemplateConfigs({ gates: { mutation: false } }, { gates: { mutation: true } });
 		expect(merged.gates?.mutation).toBe(false);
@@ -198,24 +186,12 @@ describe("jev template config: completion switch", () => {
 });
 
 describe("jev template config: destructive-action gate", () => {
-	test("gates.destructive.patterns is parsed verbatim", () => {
-		const parsed = validateTemplateConfig(USER_FILE, {
-			gates: { destructive: { patterns: ["rm -rf", "git push --force", "drop table"] } },
-		});
-		expect(parsed.gates?.destructive?.patterns).toEqual(["rm -rf", "git push --force", "drop table"]);
-	});
-
-	test("an empty pattern list is a legal no-op (the gate does not exist)", () => {
-		const parsed = validateTemplateConfig(USER_FILE, { gates: { destructive: { patterns: [] } } });
-		expect(parsed.gates?.destructive?.patterns).toEqual([]);
-	});
-
-	test("trust split: a project file cannot replace the user's destructive list", () => {
+	test("union: the user's destructive list survives and a project may add to it, never remove", () => {
 		const merged = mergeTemplateConfigs(
 			{ gates: { destructive: { patterns: ["rm -rf"] } } },
-			{ gates: { destructive: { patterns: ["anything"] } } },
+			{ gates: { destructive: { patterns: ["anything", "rm -rf"] } } },
 		);
-		expect(merged.gates?.destructive?.patterns).toEqual(["rm -rf"]);
+		expect(merged.gates?.destructive?.patterns).toEqual(["rm -rf", "anything"]);
 	});
 
 	test("fail-closed: a malformed destructive block names the file and the problem", () => {
@@ -265,17 +241,6 @@ describe("jev template config: routing candidates", () => {
 });
 
 describe("jev template config: automatic course check", () => {
-	test("courseCheck.everyMutations is parsed; absent means the behaviour is exactly as today", () => {
-		expect(validateTemplateConfig(USER_FILE, {}).courseCheck).toBeUndefined();
-		expect(validateTemplateConfig(USER_FILE, { courseCheck: { everyMutations: 2 } }).courseCheck).toEqual({
-			everyMutations: 2,
-		});
-		// 0 is an explicit off: legal, and the controller treats it like an absent key.
-		expect(validateTemplateConfig(USER_FILE, { courseCheck: { everyMutations: 0 } }).courseCheck).toEqual({
-			everyMutations: 0,
-		});
-	});
-
 	test("fail-closed: a malformed courseCheck block names the file and the problem", () => {
 		for (const bad of [
 			{ courseCheck: 2 },

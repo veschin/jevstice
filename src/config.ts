@@ -270,11 +270,40 @@ export function mergeTemplateConfigs(user: JevTemplateConfig, project: JevTempla
 		// (R1 additionally clamps the effective value to max(POLICY.minConfidenceToApprove, x).)
 		confidenceThreshold: user.confidenceThreshold ?? project.confidenceThreshold,
 		capabilities: project.capabilities ?? user.capabilities,
-		// Trust split like the approval floor: the plan-gate switch is USER-owned.
-		gates: user.gates ?? project.gates,
+		// Gates merge PER KEY, never whole-object: a user file that defines only the switches must not
+		// silently drop a project's destructive patterns (live defect 2026-10-08: the gate could not be
+		// armed from a project file because the merge replaced the whole block). The switches stay
+		// user-owned; patterns are a union, so a project may add patterns, never remove the user's.
+		gates:
+			user.gates === undefined && project.gates === undefined
+				? undefined
+				: {
+						mutation: user.gates?.mutation ?? project.gates?.mutation,
+						completion: user.gates?.completion ?? project.gates?.completion,
+						destructive:
+							user.gates?.destructive === undefined && project.gates?.destructive === undefined
+								? undefined
+								: {
+										patterns: [
+											...new Set([
+												...(user.gates?.destructive?.patterns ?? []),
+												...(project.gates?.destructive?.patterns ?? []),
+											]),
+										],
+									},
+					},
 		// Trust split like the plan-gate switch: the automatic course-check period is USER-owned.
 		courseCheck: user.courseCheck ?? project.courseCheck,
-		routing: user.routing ?? project.routing,
+		// Same per-key rule as the gates: a user file defining one routing list must not drop another
+		// list a project supplies. User values win per key.
+		routing:
+			user.routing === undefined && project.routing === undefined
+				? undefined
+				: {
+						skills: user.routing?.skills ?? project.routing?.skills,
+						models: user.routing?.models ?? project.routing?.models,
+						allowlist: user.routing?.allowlist ?? project.routing?.allowlist,
+					},
 		completion:
 			user.completion === undefined && project.completion === undefined
 				? undefined
