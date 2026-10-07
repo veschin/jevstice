@@ -262,3 +262,44 @@ Activities framework (owner order 2026-10-07): the activity level above the cont
     new stages, the `courseCheck` config key and the automatic-consult sentence.
   - `bun test` 341/341 (39 new: 14 activities registry, 6 client formalization, 16 controller
     formalization/planning/periodic-course-check/outcome-guard, 3 config), `tsc --noEmit` clean.
+
+## 0.6.1 - 2026-10-08
+
+Rework loop with approach variation (owner order 2026-10-08, PRD 19 / TASKS "Rules of the loop"):
+"ты должен делать N попыток что то переработать или улучшить. при этом каждый раз меняя подход,
+чтобы не зацикливаться". The bounded rework now carries the approach dimension, not only the digest.
+
+  - `approach` is a new optional submission field (`ValidatedDecisionInput.approach`): a short name of
+    the move this attempt takes, e.g. "tighten the trigger", "split into narrower items". It is
+    validated like the other optional fields (non-empty string, trimmed) and refused pre-judge when
+    malformed. Submissions that name no approach keep the previous digest-bound semantics unchanged.
+  - New per-`taskFingerprint:stage` journal in the session state (`JevState.reworkJournal`,
+    `ReworkAttempt`/`ReworkJournal`): every JUDGED attempt with the approach it named and the judge's
+    own verdict plus verbatim reasons (capped at 240 chars), the exhaustion flag `open`, and the
+    persisted validator `restoreReworkJournal` (malformed entries dropped, attempt numbers re-derived
+    positionally). A restart therefore cannot forget which approaches are spent.
+  - A repeated approach is refused BEFORE any judge call, naming the approaches already spent and the
+    attempt that spent the repeated one; the refusal consumes no consultation and no rework (same
+    pre-judge refusal policy as the grounding pre-check). Comparison folds case and inner whitespace
+    only. The check runs at the head of the pipeline, so it covers every stage including the wired
+    presets (course_check, claim_check, formalization, plan_mapping, aspect_coverage) and capability
+    coverage.
+  - The bound counts ATTEMPTS, not consultations: after N attempts (each with its own approach) the
+    stage escalates with `ask_user`, the blocker carries the journal (which approaches were tried and
+    what the judge answered each), and the exhaustion is recorded as an OPEN item - the wording is
+    never bent until the judge agrees.
+  - The approach is part of the REWORK-BOUND digest only: a new approach is a new attempt even over
+    unchanged wording, while the approval digest (AC5) is byte-for-byte what it was, so restored
+    approvals keep binding.
+  - Rejection feedback names the attempt number, the approaches already spent and what the next
+    attempt must change; the verdict summary line appends `attempt N/M with approach "..."` for
+    approach-carrying submissions. The tool description states the rule (at most N attempts per stage
+    per task, every attempt a different approach, exhaustion as an OPEN item) and the schema exposes
+    `approach`.
+  - Designed with a live judge consultation (one request, claim vs quoted evidence): "an attempt that
+    repeats an approach already spent on the same task+stage must be refused BEFORE the judge is
+    called" - returned `approve`, `refuse_before_judge`, confidence 0.81. The conservative reading was
+    taken on the one point the alternatives left open: an approach-free submission is never counted
+    into the loop bound, so the PRD 1.1 iteration path cannot deadlock.
+  - README gains the "Rework loop" section plus the fail-closed cross-reference; `bun test` 348/348
+    (7 new controller tests), `tsc --noEmit` clean.

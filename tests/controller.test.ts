@@ -1557,6 +1557,178 @@ describe("jev controller", () => {
 	});
 });
 
+describe("jev controller: rework loop with approach variation (PRD 19)", () => {
+	test("a repeated approach is refused before any judge call and names the approaches spent", async () => {
+		let calls = 0;
+		const controller = createJevController({
+			judge: async () => {
+				calls++;
+				return { verdict: "revise", reasons: [`nope ${calls}`] };
+			},
+			maxReworkIterations: 3,
+		});
+		const first = await controller.submitDecision(validDecisionInput({ approach: "tighten the trigger" }));
+		expect(first.verdict).toBe("revise");
+		expect(calls).toBe(1);
+
+		// The same approach in different words is not a new attempt: refused pre-judge, no burn.
+		const repeat = await controller.submitDecision(
+			validDecisionInput({
+				approach: "  Tighten the   trigger ",
+				proposal: "a completely different wording of the very same move",
+			}),
+		);
+		expect(repeat.verdict).toBe("insufficient_evidence");
+		expect(repeat.judged).toBe(false);
+		expect(calls).toBe(1);
+		expect(repeat.reasons.join(" ")).toContain("approach_already_spent");
+		expect(repeat.reasons.join(" ")).toContain('"tighten the trigger"');
+		expect(repeat.summary).toContain("refused before judging");
+
+		// A different approach is a new attempt, even over unchanged wording.
+		const second = await controller.submitDecision(validDecisionInput({ approach: "split into narrower items" }));
+		expect(second.verdict).toBe("revise");
+		expect(calls).toBe(2);
+	});
+
+	test("exhausting the N attempts escalates with ask_user and surfaces the journal as an OPEN item", async () => {
+		let calls = 0;
+		const harness = makeFakePi();
+		const controller = createJevController({
+			judge: async () => {
+				calls++;
+				return { verdict: "revise", reasons: [`judge rejected attempt ${calls}`] };
+			},
+			maxReworkIterations: 3,
+		});
+		controller.register(harness.pi);
+		const approaches = ["tighten the trigger", "split into narrower items", "state the outcome plus the evidence"];
+		for (const approach of approaches) {
+			const outcome = await controller.submitDecision(validDecisionInput({ approach }));
+			expect(outcome.verdict).toBe("revise");
+		}
+		expect(calls).toBe(3);
+
+		const exhausted = await controller.submitDecision(validDecisionInput({ approach: "ask the user instead" }));
+		expect(exhausted.verdict).toBe("ask_user");
+		expect(exhausted.judged).toBe(false);
+		expect(calls).toBe(3); // nothing further is judged once the bound is spent
+		const escalated = exhausted.reasons.join(" ");
+		for (const approach of approaches) expect(escalated).toContain(approach);
+		expect(escalated).toContain("judge rejected attempt 1");
+		expect(escalated).toContain("OPEN item");
+		expect(controller.getState().blockers.join(" ")).toContain("rework bound exhausted");
+		expect(Object.values(controller.getState().reworkJournal).every(j => j.open)).toBe(true);
+		const escalatedFeedback = harness.sentMessages
+			.map(m => (isRecord(m.payload) && typeof m.payload["content"] === "string" ? m.payload["content"] : ""))
+			.join("\n");
+		expect(escalatedFeedback).toContain("rework bound exhausted");
+	});
+
+	test("a rejected attempt lands in the journal and the feedback names the attempt and the next change", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({
+			judge: async () => ({ verdict: "revise", reasons: ["the claim is not supported by the quoted source"] }),
+			maxReworkIterations: 3,
+		});
+		controller.register(harness.pi);
+		const first = await controller.submitDecision(validDecisionInput({ approach: "tighten the trigger" }));
+		expect(first.summary).toContain('attempt 1/3 with approach "tighten the trigger"');
+		const second = await controller.submitDecision(validDecisionInput({ approach: "split into narrower items" }));
+		expect(second.verdict).toBe("revise");
+		expect(second.summary).toContain("attempt 2/3");
+
+		const journal = controller.getState().reworkJournal[Object.keys(controller.getState().reworkJournal)[0]!]!;
+		expect(journal.attempts.map(a => a.attempt)).toEqual([1, 2]);
+		expect(journal.attempts.map(a => a.approach)).toEqual(["tighten the trigger", "split into narrower items"]);
+		expect(journal.attempts.map(a => a.verdict)).toEqual(["revise", "revise"]);
+		expect(journal.attempts[1]!.reasons.join(" ")).toContain("not supported by the quoted source");
+		expect(journal.open).toBe(false);
+
+		const feedback = harness.sentMessages
+			.map(m => (isRecord(m.payload) && typeof m.payload["content"] === "string" ? m.payload["content"] : ""))
+			.filter(t => t.includes("rework attempt 2/3"));
+		expect(feedback.length).toBe(1);
+		expect(feedback[0]).toContain('"tighten the trigger"'); // the approaches already spent
+		expect(feedback[0]).toContain("DIFFERENT approach"); // what the next attempt must change
+	});
+
+	test("the journal survives a session restart: a spent approach stays spent", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({ judge: async () => ({ verdict: "revise", reasons: ["no"] }) });
+		controller.register(harness.pi);
+		await controller.submitDecision(validDecisionInput({ approach: "tighten the trigger" }));
+		const saved = harness.appended.filter(a => a.customType === "jev.state");
+		expect(saved.length).toBeGreaterThan(0);
+
+		let calls = 0;
+		const restarted = createJevController({
+			judge: async () => {
+				calls++;
+				return { verdict: "revise", reasons: ["no"] };
+			},
+		});
+		restarted.onSessionStart(saved.map(a => ({ customType: a.customType, data: a.data as JevState })));
+		expect(Object.keys(restarted.getState().reworkJournal).length).toBe(1);
+		const repeat = await restarted.submitDecision(validDecisionInput({ approach: "Tighten the trigger" }));
+		expect(repeat.verdict).toBe("insufficient_evidence");
+		expect(calls).toBe(0);
+	});
+
+	test("a malformed approach is refused before the judge call", async () => {
+		let called = false;
+		const controller = createJevController({
+			judge: async () => {
+				called = true;
+				return judgeResult({});
+			},
+		});
+		const blank = await controller.submitDecision(validDecisionInput({ approach: "   " }));
+		expect(blank.verdict).toBe("insufficient_evidence");
+		expect(blank.reasons.join(" ")).toContain("approach must be a non-empty string");
+		const wrongType = await controller.submitDecision(validDecisionInput({ approach: 42 }));
+		expect(wrongType.verdict).toBe("insufficient_evidence");
+		expect(called).toBe(false);
+	});
+
+	test("an approach-free submission keeps the digest budget and the loop stays untouched", async () => {
+		let calls = 0;
+		const controller = createJevController({
+			judge: async () => {
+				calls++;
+				return { verdict: "revise", reasons: ["no"] };
+			},
+			maxReworkIterations: 3,
+		});
+		const submission = validDecisionInput();
+		for (let i = 0; i < 3; i++) await controller.submitDecision(submission);
+		const changed = await controller.submitDecision(validDecisionInput({ proposal: "a different framing entirely" }));
+		expect(changed.verdict).toBe("revise");
+		expect(calls).toBe(4);
+		expect(Object.keys(controller.getState().reworkJournal).length).toBe(0);
+	});
+
+	test("the tool description and schema carry the approach rule", () => {
+		const harness = makeFakePi();
+		const controller = createJevController({ judge: gateJudge() });
+		controller.register(harness.pi);
+		const tool = harness.getTool();
+		const description = String(tool?.description);
+		expect(description).toContain("at most 3 attempts per stage per task");
+		expect(description).toContain("every attempt MUST name a DIFFERENT `approach`");
+		expect(description).toContain("refused before any judge call");
+		expect(description).toContain("OPEN item with the journal of approaches");
+		const params = tool?.parameters;
+		const approachSchema =
+			isRecord(params) && isRecord(params["properties"]) ? params["properties"]["approach"] : undefined;
+		const approachDescription =
+			isRecord(approachSchema) && typeof approachSchema["description"] === "string"
+				? approachSchema["description"]
+				: undefined;
+		expect(approachDescription).toContain("repeated approach");
+	});
+});
+
 describe("jev controller: gates.mutation switch", () => {
 	test("gates.mutation=false lifts the plan gate for every mutating tool", async () => {
 		const harness = makeFakePi();

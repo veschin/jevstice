@@ -63,6 +63,42 @@ forces the working shape instead of advising it:
 - **The strongest form is parallel per-claim questions** in one request: the `claim_check` stage
   (see below). Revised submissions get a fresh rework budget; identical repeats do not.
 
+## Rework loop: N attempts, each a different approach
+
+Rework is a loop of at most N attempts per stage per task (`maxReworkIterations`, default 3), and
+every attempt must CHANGE THE APPROACH, not the wording (PRD 19). A submission names the approach it
+takes:
+
+```json
+{
+  "stage": "understanding_review",
+  "task": "Plan the dashboard slice",
+  "approach": "state the outcome plus the evidence that settles it",
+  "proposal": "...",
+  "options": [ { "id": "approve", "label": "...", "meaning": "..." } ],
+  "evidence": [ { "kind": "user", "source": "task prompt", "quote": "..." } ]
+}
+```
+
+- **A spent approach is refused before the judge is called.** The refusal names the approaches
+  already tried on this stage, says which attempt spent the repeated one, consumes no consultation
+  and no rework, and names the difference: the approach must change (tighten the trigger; split the
+  item into narrower, separately checkable items; restate it as an outcome plus the evidence that
+  settles it). The same approach in different words is not a new attempt. Comparison folds case and
+  inner whitespace only.
+- **A different approach is a new attempt**, even over unchanged wording: the approach is part of
+  the rework-bound digest, so the attempt gets a fresh budget. The approval digest is untouched.
+- **The attempts are bounded at N per stage per task.** After N attempts (each with its own
+  approach) the bound is exhausted: the stage escalates to `ask_user` with the journal - which
+  approaches were tried and what the judge answered each - and the exhaustion is recorded as an OPEN
+  item. Jev never bends the wording until the judge agrees.
+- **Every rejection feeds back the loop state**: the attempt number, the approaches already spent,
+  and what the next attempt must change. The journal (attempts, approaches, verdicts with their
+  reasons) lives in the session state (`reworkJournal`) and survives a restart, so a spent approach
+  stays spent.
+- Submissions that name no `approach` are untouched by this dimension and keep the older digest
+  budget: an identical resubmission consumes it, a changed submission starts a fresh one.
+
 ## Claim check
 
 `stage=claim_check` puts several claims in one request and returns one verdict per claim, judged
@@ -265,7 +301,10 @@ meta-option escape says the offered option set was wrong, and the returned reaso
 (replace or restate the options, or reframe the claim) so the next attempt changes the frame instead
 of repeating it. Rework is bounded per stage: an identical resubmission is refused after 3 attempts
 and escalates to `ask_user`, while a changed submission (different task, proposal or evidence) starts
-a fresh budget, so honest iteration cannot deadlock a stage. Approvals bind to a task fingerprint,
+a fresh budget, so honest iteration cannot deadlock a stage. On top of that digest budget runs the
+approach loop (see "Rework loop" above): an approach already spent on the stage is refused before
+the judge is called, a new approach is a new attempt, and N distinct approaches exhaust the stage as
+an OPEN item instead of being re-worded. Approvals bind to a task fingerprint,
 the content digest of the exact submission and the work revision; a new task or later work
 invalidates them.
 

@@ -133,6 +133,36 @@ export interface AutoCourseCheckRecord {
 	at: number;
 }
 
+/**
+ * One judged rework attempt (PRD 19, TASKS "Rules of the loop"): the approach the executor named
+ * and the judge's own answer to it. Only a judged consultation is an attempt - a submission
+ * refused before the judge call spends no approach and never enters the journal.
+ */
+export interface ReworkAttempt {
+	/** 1-based attempt number within this task+stage loop. */
+	attempt: number;
+	/** The approach as submitted (the comparison key folds case and whitespace only). */
+	approach: string;
+	verdict: DecisionVerdict;
+	reasons: string[];
+	confidence?: number;
+	at: number;
+}
+
+/**
+ * The written journal of one `${taskFingerprint}:${stage}` rework loop: every judged attempt with
+ * its approach and the judge's verbatim answer, so a repeated approach is refused instead of judged
+ * again and exhaustion can name what was already tried. `open` marks the exhaustion recorded as an
+ * OPEN item - the loop stops there instead of bending the wording to fit an answer.
+ */
+export interface ReworkJournal {
+	taskFingerprint: string | undefined;
+	stage: string;
+	attempts: ReworkAttempt[];
+	open: boolean;
+	at: number;
+}
+
 export interface JevState {
 	approvals: ApprovalRecord[];
 	/** Judge consultations per `${taskFingerprint}:${stage}` - bounded rework (FR-12). */
@@ -178,6 +208,14 @@ export interface JevState {
 	 * many cheap iterations; three honest answers must not close a stage forever).
 	 */
 	submissionDigests: Record<string, string>;
+	/**
+	 * Approach-varied rework journal per `taskFingerprint:stage` (PRD 19 / TASKS rules of the loop):
+	 * every judged attempt with the approach it named. A submission naming an approach already in the
+	 * journal is refused before any judge call; a new approach is a new attempt; N attempts exhaust the
+	 * bound and the journal is what the escalation surfaces. Submissions that name no approach are not
+	 * touched by this dimension and keep the digest budget above unchanged.
+	 */
+	reworkJournal: Record<string, ReworkJournal>;
 	/** FR-01 record: task type the judge assigned at task start (undefined = not established). */
 	taskType: string | undefined;
 	/** FR-04 record: catalog topic ids the judge marked applicable at task start. */
@@ -217,6 +255,7 @@ function freshState(): JevState {
 		openAspectGaps: undefined,
 		consecutiveCompletionApproves: undefined,
 		submissionDigests: {},
+		reworkJournal: {},
 		taskType: undefined,
 		selectedTopics: undefined,
 		taskPrompt: undefined,
@@ -330,6 +369,11 @@ const GROUNDING_PROBLEM = "proposal_not_grounded_in_evidence";
 const GROUNDING_FIX =
 	`quote at least one submitted evidence item (>= ${GROUNDING_MIN_QUOTE_CHARS} characters) verbatim ` +
 	"inside the proposal and state what it supports, so the plan is a claim checked against evidence";
+/**
+ * Rework journal (PRD 19 rule 5): the judge's reasons are kept verbatim, capped to this many
+ * characters so the journal line, the feedback and the exhaustion message stay readable.
+ */
+const REWORK_REASON_EXCERPT_CHARS = 240;
 /** claim_check preset: N independent decisions in one request start at two claims. */
 const CLAIM_CHECK_MIN_CLAIMS = 2;
 /** Fix named when a claim cannot be marked: it must be answerable from the quoted evidence. */
@@ -455,6 +499,12 @@ export interface ValidatedDecisionInput {
 	stage: DecisionStage;
 	task: string;
 	proposal: string;
+	/**
+	 * Short name of the approach this attempt takes (PRD 19 rework loop). Optional; absent keeps the
+	 * digest-bound rework semantics. A name already spent on the same task+stage is refused before any
+	 * judge call, a new name is a new attempt.
+	 */
+	approach?: string;
 	options: DecisionOption[];
 	evidence: Evidence[];
 	capabilities: string[];
@@ -484,6 +534,18 @@ export function validateDecisionInput(raw: unknown, extraStages: ReadonlySet<str
 	}
 	if (!nonEmptyString(raw["task"])) reasons.push("task must be a non-empty string");
 	if (!nonEmptyString(raw["proposal"])) reasons.push("proposal must be a non-empty string");
+	// Optional loop field (PRD 19): when present it names the approach this attempt takes, so a
+	// repeated approach can be refused before the judge call. A blank or non-string value is a
+	// submission defect - refused pre-judge like every other malformed field.
+	const rawApproach = raw["approach"];
+	let approach: string | undefined;
+	if (rawApproach !== undefined) {
+		if (typeof rawApproach !== "string" || rawApproach.trim().length === 0) {
+			reasons.push("approach must be a non-empty string naming the approach when provided");
+		} else {
+			approach = rawApproach.trim();
+		}
+	}
 	const rawOptions = raw["options"];
 	if (!Array.isArray(rawOptions) || rawOptions.length === 0) {
 		reasons.push("options must be a non-empty array of {id,label,meaning}");
@@ -555,6 +617,7 @@ export function validateDecisionInput(raw: unknown, extraStages: ReadonlySet<str
 			stage: stage as DecisionStage,
 			task: raw["task"] as string,
 			proposal: raw["proposal"] as string,
+			approach,
 			options,
 			evidence,
 			capabilities,
@@ -581,8 +644,20 @@ function toHex(digest: ArrayBuffer, slice?: number): string {
 	return slice === undefined ? hex : hex.slice(0, slice);
 }
 
-async function revisionHash(stage: string, task: string, proposal: string, evidence: Evidence[]): Promise<string> {
-	const material = `${stage}\u0000${task}\u0000${proposal}\u0000${canonicalEvidence(evidence)}`;
+/**
+ * Content digest of a submission. `approach` is passed only by the REWORK-BOUND call site (PRD 19):
+ * a new approach is a new attempt even over unchanged wording - while the approval digest (AC5)
+ * stays byte-for-byte what it was, so persisted approvals keep binding.
+ */
+async function revisionHash(
+	stage: string,
+	task: string,
+	proposal: string,
+	evidence: Evidence[],
+	approach?: string,
+): Promise<string> {
+	let material = `${stage}\u0000${task}\u0000${proposal}\u0000${canonicalEvidence(evidence)}`;
+	if (approach !== undefined) material += `\u0000${approach}`;
 	return toHex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(material)));
 }
 
@@ -804,7 +879,16 @@ export class JevController {
 				"among the evidence, so the plan is a claim checked against the quoted evidence; 2-4 real " +
 				"alternatives whose meanings state what choosing them commits you to. " +
 				"A plan-stage proposal that quotes no evidence is refused before any judge call, consuming no " +
-				"rework, with the fix named. An abstention is not a verdict: insufficient_evidence means better " +
+				"rework, with the fix named. " +
+				`Rework is a bounded loop with a changed approach: at most ${this.maxReworkIterations} attempts per ` +
+				"stage per task, and every attempt MUST name a DIFFERENT `approach` (a short name of the move, e.g. " +
+				'"tighten the trigger", "split into narrower items", "state the outcome plus the evidence that ' +
+				'settles it"). An approach already spent on this stage is refused before any judge call, naming ' +
+				"the approaches already tried and consuming no rework - the same approach in different words is " +
+				`never a new attempt. When the ${this.maxReworkIterations} attempts are exhausted the stage escalates ` +
+				"as an OPEN item with the journal of approaches and the judge's answer to each; the wording is " +
+				"never bent to fit an answer. " +
+				"An abstention is not a verdict: insufficient_evidence means better " +
 				"evidence is needed, not the same request again, and a judge-chosen service option means the " +
 				"offered set was wrong, not that the work failed. " +
 				"Write your own text - task, proposal, option labels and meanings - in English; quoted " +
@@ -840,6 +924,13 @@ export class JevController {
 					stage: { type: "string", description: "which gate this decision belongs to" },
 					task: { type: "string", description: "what is being decided" },
 					proposal: { type: "string", description: "the proposal/result under judgment" },
+					approach: {
+						type: "string",
+						description:
+							"short name of the approach this attempt takes, e.g. \"tighten the trigger\"; it must " +
+							"differ from every approach already spent on this stage - a repeated approach is " +
+							"refused before any judge call",
+					},
 					options: {
 						type: "array",
 						items: {
@@ -1577,6 +1668,7 @@ export class JevController {
 				lastAutoCourseCheck: restoreAutoCourseCheck(data["lastAutoCourseCheck"]),
 				openAspectGaps: restoreAspectGaps(data["openAspectGaps"]),
 				submissionDigests: restoreDigests(data["submissionDigests"]),
+				reworkJournal: restoreReworkJournal(data["reworkJournal"]),
 				taskType: typeof data["taskType"] === "string" ? data["taskType"] : undefined,
 				selectedTopics: Array.isArray(data["selectedTopics"])
 					? (data["selectedTopics"] as unknown[]).filter((t): t is string => typeof t === "string")
@@ -1601,6 +1693,10 @@ export class JevController {
 	/** Public pipeline: run the core flow, then attach the one-line fixed-template summary. */
 	async submitDecision(raw: unknown): Promise<DecisionOutcome> {
 		const outcome = await this.submitDecisionCore(raw);
+		// Rework journal (PRD 19 rule 5): a judged attempt carrying an approach is recorded with the
+		// approach and the judge's own verdict, and a rejection feeds back what the next attempt must
+		// change. Pre-judge refusals (`judged:false`) never spend an approach, so they are never recorded.
+		await this.recordReworkAttempt(raw, outcome);
 		if (outcome.summary !== "") return outcome;
 		const stage = isRecord(raw) && typeof raw["stage"] === "string" ? raw["stage"] : "unknown";
 		const options =
@@ -1613,6 +1709,16 @@ export class JevController {
 		const taskText = isRecord(raw) && typeof raw["task"] === "string" ? raw["task"] : "";
 		const fp = this.state.taskFingerprint ?? (taskText.length > 0 ? await fingerprint(taskText) : "");
 		const used = this.state.iterations[`${fp}:${stage}`] ?? 0;
+		// A judged attempt that named an approach says which number of the loop it was (PRD 19), so the
+		// executor reads the attempt counter and not only the digest-bound iteration counter.
+		const approach = isRecord(raw) && typeof raw["approach"] === "string" ? raw["approach"].trim() : undefined;
+		const attempt = approach === undefined || approach.length === 0
+			? undefined
+			: this.spentApproach(`${fp}:${stage}`, approach);
+		const attemptSuffix =
+			attempt === undefined
+				? ""
+				: ` — attempt ${attempt.attempt}/${this.maxReworkIterations} with approach "${approach}"`;
 		// A frame escape (the judge rejected the offered option set) must surface the fix the
 		// client attached, not only a verdict: the executor has to change the frame, not re-ask.
 		const frameFix = outcome.reasons.includes(FRAME_ESCAPE_REASON)
@@ -1626,11 +1732,13 @@ export class JevController {
 			case "revise":
 				line =
 					`${stage}: revise — sent back with reasons (iteration ${used}/${this.maxReworkIterations})` +
+					attemptSuffix +
 					(frameFix !== undefined ? ` — ${frameFix.slice(FRAME_FIX_PREFIX.length)}` : "");
 				break;
 			case "ask_user":
 				line =
 					`${stage}: ask_user — escalate to the user` +
+					attemptSuffix +
 					(frameFix !== undefined ? ` — ${frameFix.slice(FRAME_FIX_PREFIX.length)}` : "");
 				break;
 			default:
@@ -1678,6 +1786,55 @@ export class JevController {
 			return { verdict: "insufficient_evidence", reasons: check.reasons, judged: false, summary: "" };
 		}
 		const input = check.input;
+		const taskFp = this.state.taskFingerprint ?? (await fingerprint(input.task));
+		const boundKey = `${taskFp}:${input.stage}`;
+
+		// Rework loop (PRD 19, TASKS "Rules of the loop"): a submission that names an approach is an
+		// attempt of the bounded loop, and the loop runs BEFORE everything else - including every
+		// preset's own judge - because the rule is about the attempt, not about its content.
+		//  1. An approach already spent on this task+stage is not a new attempt at all: it is refused
+		//     here, before any judge call and before the counters move, naming what was already tried
+		//     and naming the difference - the approach must change, the wording is irrelevant.
+		//  2. The bound counts ATTEMPTS: once N attempts (each with its own approach) have been judged,
+		//     the stage is an OPEN item with the journal recorded, so the next approach escalates
+		//     instead of being judged - the wording is never bent until the judge agrees.
+		const spent = input.approach === undefined ? undefined : this.spentApproach(boundKey, input.approach);
+		if (input.approach !== undefined) {
+			const journalAttempts = this.state.reworkJournal[boundKey]?.attempts ?? [];
+			if (spent !== undefined) {
+				interrupted();
+				const already = journalAttempts.map(a => `"${a.approach}"`).join(", ");
+				const problem =
+					`approach_already_spent: the approach "${input.approach}" was already judged on attempt ` +
+					`${spent.attempt} of ${input.stage} for this task; every attempt of the loop must change the ` +
+					`approach, and a repeated approach is not a new attempt. Approaches already spent: ${already}. ` +
+					"Change the approach - tighten the trigger, split the item into narrower separately checkable " +
+					"items, or restate it as an outcome plus the evidence that settles it - not the wording.";
+				return {
+					verdict: "insufficient_evidence",
+					reasons: [problem],
+					judged: false,
+					summary:
+						`${input.stage}: insufficient_evidence — refused before judging (no judge call, no rework ` +
+						`consumed): ${problem}`,
+				};
+			}
+			if (journalAttempts.length >= this.maxReworkIterations) {
+				interrupted();
+				const blocker =
+					`Jev rework bound exhausted for stage ${input.stage}: ${journalAttempts.length} attempt(s), each ` +
+					`with a different approach, all rejected — ${this.reworkJournalLine(boundKey)}. ` +
+					"Recorded as an OPEN item: the approaches are spent, their state is written down, and the loop " +
+					"does NOT continue by re-wording a spent approach or bending the wording until the judge " +
+					"agrees. Escalate to the user.";
+				const journal = this.state.reworkJournal[boundKey];
+				if (journal !== undefined) journal.open = true;
+				if (!this.state.blockers.includes(blocker)) this.state.blockers.push(blocker);
+				this.persist();
+				this.pushFeedback(blocker);
+				return { verdict: "ask_user", reasons: [blocker], judged: false, summary: "" };
+			}
+		}
 
 		// P3 evidence pre-check: catch would-be-wasted consultations before burning the
 		// rework counter. >=2 problems (or missing requirement evidence on plan stages)
@@ -1757,11 +1914,12 @@ export class JevController {
 			}
 		}
 
-		const taskFp = this.state.taskFingerprint ?? (await fingerprint(input.task));
-		const boundKey = `${taskFp}:${input.stage}`;
+		// `taskFp`/`boundKey` are computed before the rework-loop checks: the approach journal uses the
+		// same key as the digest budget, so one submission can never be two attempts.
 		// A changed submission is new work, not rework: it gets a fresh budget. Only an
-		// identical resubmission keeps consuming the bound.
-		const boundDigest = await revisionHash(input.stage, input.task, input.proposal, input.evidence);
+		// identical resubmission keeps consuming the bound; naming a new approach counts as a change
+		// too (the approach is part of the bound digest), while the approval digest stays untouched.
+		const boundDigest = await revisionHash(input.stage, input.task, input.proposal, input.evidence, input.approach);
 		if (this.state.submissionDigests[boundKey] !== boundDigest) {
 			this.state.submissionDigests[boundKey] = boundDigest;
 			this.state.iterations[boundKey] = 0;
@@ -2877,6 +3035,84 @@ export class JevController {
 		return { instructions: declared.instructions, options: declared.options };
 	}
 
+	// ----- rework loop: N attempts, each a different approach (PRD 19, TASKS "Rules of the loop") -----
+
+	/**
+	 * The judged attempt that already spent this approach on the same task+stage, if any. Comparison
+	 * folds case and inner whitespace only, so "Tighten the  trigger" cannot buy a second attempt;
+	 * every message quotes the text as submitted. Only judged attempts are in the journal, so a
+	 * submission refused before the judge call never spends its approach.
+	 */
+	private spentApproach(key: string, approach: string): ReworkAttempt | undefined {
+		const normalized = approach.trim().replace(/\s+/g, " ").toLowerCase();
+		return this.state.reworkJournal[key]?.attempts.find(
+			a => a.approach.trim().replace(/\s+/g, " ").toLowerCase() === normalized,
+		);
+	}
+
+	/** The journal as one line: each attempt's approach with the judge's own verbatim answer. */
+	private reworkJournalLine(key: string): string {
+		const attempts = this.state.reworkJournal[key]?.attempts ?? [];
+		if (attempts.length === 0) return "no judged attempt recorded";
+		return attempts
+			.map(a => {
+				const reasons = a.reasons.join(" ").slice(0, REWORK_REASON_EXCERPT_CHARS);
+				return `${a.attempt}. "${a.approach}" — ${a.verdict}${reasons === "" ? "" : `: ${reasons}`}`;
+			})
+			.join("; ");
+	}
+
+	/**
+	 * Record a judged attempt in the journal (PRD 19 rule 5: attempts, approaches, verbatim verdicts)
+	 * and tell the same session what the next attempt must change. Only a judged outcome carrying an
+	 * approach is an attempt: a submission refused before the judge call never spent one, and a judge
+	 * error produced no verdict to record. A repeated approach cannot reach this point - the core
+	 * refuses it before judging - so the journal never holds the same approach twice.
+	 */
+	private async recordReworkAttempt(raw: unknown, outcome: DecisionOutcome): Promise<void> {
+		if (!isRecord(raw) || outcome.judged !== true) return;
+		const stage = typeof raw["stage"] === "string" ? raw["stage"] : undefined;
+		const approach = typeof raw["approach"] === "string" ? raw["approach"].trim() : undefined;
+		if (stage === undefined || approach === undefined || approach.length === 0) return;
+		const taskText = typeof raw["task"] === "string" ? raw["task"] : "";
+		const fp = this.state.taskFingerprint ?? (taskText.length > 0 ? await fingerprint(taskText) : "");
+		if (fp === "") return;
+		const key = `${fp}:${stage}`;
+		const journal: ReworkJournal = this.state.reworkJournal[key] ?? {
+			taskFingerprint: this.state.taskFingerprint,
+			stage,
+			attempts: [],
+			open: false,
+			at: this.now(),
+		};
+		const attempt = journal.attempts.length + 1;
+		const spentBefore = journal.attempts.map(a => `"${a.approach}"`).join(", ");
+		journal.attempts.push({
+			attempt,
+			approach,
+			verdict: outcome.verdict,
+			reasons: [...outcome.reasons],
+			confidence: outcome.confidence,
+			at: this.now(),
+		});
+		journal.at = this.now();
+		this.state.reworkJournal[key] = journal;
+		this.persist();
+		if (outcome.verdict === "approve") return;
+		const reasons = outcome.reasons.join(" ").slice(0, REWORK_REASON_EXCERPT_CHARS);
+		this.pushFeedback(
+			`Jev rework attempt ${attempt}/${this.maxReworkIterations} for ${stage} (approach "${approach}") was ` +
+				`rejected — ${outcome.verdict}${reasons === "" ? "" : `: ${reasons}`}. ` +
+				`Approaches already spent: ${spentBefore === "" ? "none" : spentBefore}. ` +
+				(attempt >= this.maxReworkIterations
+					? "The attempt bound is now exhausted: the next approach escalates as an OPEN item with this " +
+						"journal instead of being judged; re-wording a spent approach is refused outright."
+					: "The next attempt must name a DIFFERENT approach (tighten the trigger; split the item into " +
+						"narrower separately checkable items; restate it as an outcome plus the evidence that " +
+						"settles it) - the same approach in different words is not a new attempt."),
+		);
+	}
+
 	private planApproval(): ApprovalRecord | undefined {
 		// Undefined current fingerprint means no user task is established yet: no gate credit.
 		if (this.state.taskFingerprint === undefined) return undefined;
@@ -3237,6 +3473,48 @@ function restoreDigests(raw: unknown): Record<string, string> {
 	const out: Record<string, string> = {};
 	for (const [key, value] of Object.entries(raw)) {
 		if (typeof value === "string" && value.length > 0) out[key] = value;
+	}
+	return out;
+}
+
+/**
+ * Validate a persisted rework journal: malformed entries are dropped (a corrupt approach list would
+ * otherwise refuse honest work or hide the state of the loop), and a journal for a stage with no
+ * attempt is dropped whole.
+ */
+function restoreReworkJournal(raw: unknown): Record<string, ReworkJournal> {
+	if (!isRecord(raw)) return {};
+	const out: Record<string, ReworkJournal> = {};
+	for (const [key, value] of Object.entries(raw)) {
+		if (!isRecord(value) || typeof value["stage"] !== "string") continue;
+		const attempts: ReworkAttempt[] = Array.isArray(value["attempts"])
+			? value["attempts"].flatMap((a: unknown): ReworkAttempt[] => {
+					if (!isRecord(a)) return [];
+					if (typeof a["approach"] !== "string" || a["approach"].trim().length === 0) return [];
+					if (typeof a["verdict"] !== "string" || !VERDICTS.has(a["verdict"])) return [];
+					return [
+						{
+							// Numbering is positional: the journal is an ordered list of attempts.
+							attempt: 0,
+							approach: a["approach"],
+							verdict: a["verdict"] as DecisionVerdict,
+							reasons: Array.isArray(a["reasons"])
+								? a["reasons"].filter((r): r is string => typeof r === "string")
+								: [],
+							...(typeof a["confidence"] === "number" ? { confidence: a["confidence"] } : {}),
+							at: typeof a["at"] === "number" ? a["at"] : 0,
+						},
+					];
+				})
+			: [];
+		if (attempts.length === 0) continue;
+		out[key] = {
+			taskFingerprint: typeof value["taskFingerprint"] === "string" ? value["taskFingerprint"] : undefined,
+			stage: value["stage"],
+			attempts: attempts.map((a, i) => ({ ...a, attempt: i + 1 })),
+			open: value["open"] === true,
+			at: typeof value["at"] === "number" ? value["at"] : 0,
+		};
 	}
 	return out;
 }
