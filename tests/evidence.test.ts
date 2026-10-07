@@ -117,7 +117,7 @@ describe("evidence: buildRequestBody", () => {
     const body = buildRequestBody(okReq, { apiKey: "k" });
     const optionQ = body.questions.option as { type: string; criteria: Record<string, unknown> };
     expect(optionQ.type).toBe("choice");
-    expect(Object.keys(optionQ.criteria).sort()).toEqual(["approve", "reject"]);
+    for (const opt of okOptions) expect(optionQ.criteria[opt.id]).toBe(opt.meaning);
   });
 
   test("does not include the api key in the request body", () => {
@@ -175,7 +175,9 @@ describe("evidence: buildRequestBody", () => {
       },
     });
     const optionQ = body.questions.option as { criteria: Record<string, unknown> };
-    expect(Object.keys(optionQ.criteria).sort()).toEqual(["hold", "ship"]);
+    expect(optionQ.criteria["ship"]).toBe("merge it");
+    expect(optionQ.criteria["hold"]).toBe("do not merge");
+    expect(optionQ.criteria["approve"]).toBeUndefined();
   });
 
   test("template for another stage is ignored", () => {

@@ -36,9 +36,12 @@ import type {
 import { COURSE_CHECK_NEXT_ACTIONS, POLICY } from "./types";
 import {
   buildRequestBody,
+  META_REASON_CRITERIA,
+  SERVICE_OPTION_CRITERIA,
   STAGE_INSTRUCTIONS_MAX_CHARS,
   validateDecisionRequest,
   validateMultiLabelRequest,
+  withServiceOptions,
   type StageTemplate,
 } from "./evidence";
 
@@ -104,6 +107,39 @@ export interface JevClientConfig {
 /** Canonical record guard for this package (no external schema dep). */
 export function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function isServiceOption(id: string | undefined): boolean {
+  return typeof id === "string" && id in SERVICE_OPTION_CRITERIA;
+}
+
+/** Read the companion reason answer; diagnostic only, never blocks (fail-open). */
+function consumeMetaReason(answers: Record<string, unknown>): string {
+  const answer = answers["meta_reason"];
+  if (
+    isRecord(answer) &&
+    answer["type"] === "choice" &&
+    typeof answer["choice"] === "string" &&
+    answer["choice"] in META_REASON_CRITERIA
+  ) {
+    return `meta_reason:${answer["choice"]}`;
+  }
+  return "meta_reason:unanswered";
+}
+
+/** Map a service-option selection; the judge rejected the frame — NEVER approve. */
+function metaVerdict(
+  serviceId: string,
+  confidence: number,
+  metaReason: string,
+): DecisionResult {
+  const verdict: DecisionVerdict =
+    serviceId === "PARTIALLY_RIGHT_NONE_FULL"
+      ? "revise"
+      : serviceId === "NO_FIT_OTHER_REASON"
+        ? "ask_user"
+        : "insufficient_evidence";
+  return { verdict, reasons: ["meta_option", serviceId, metaReason], confidence };
 }
 
 const VERDICTS = new Set<string>(["approve", "revise", "insufficient_evidence", "ask_user"]);
@@ -255,19 +291,31 @@ export function createJudge(config: JevClientConfig): Judge {
     const verdictAnswer = parsed.answers["verdict"]!;
     const optionAnswer = parsed.answers["option"]!;
 
-    const allowedOptions = new Set(effectiveRequest.options.map((o) => o.id));
+    const allowedOptions = new Set([
+      ...effectiveRequest.options.map((o) => o.id),
+      ...Object.keys(SERVICE_OPTION_CRITERIA),
+    ]);
     if (!allowedOptions.has(optionAnswer.choice!)) {
       throw new JevApiError(
         "bad_payload",
         `option answer "${optionAnswer.choice}" is not one of the offered options`,
       );
     }
+    const metaReason = consumeMetaReason(parsed.answers as Record<string, unknown>);
+    const confidence = verdictAnswer.confidence!;
+
+    // service-option escape: judge rejected the caller's frame — never approve
+    if (isServiceOption(verdictAnswer.choice)) {
+      return metaVerdict(verdictAnswer.choice!, confidence, metaReason);
+    }
+    if (isServiceOption(optionAnswer.choice!)) {
+      return metaVerdict(optionAnswer.choice!, confidence, metaReason);
+    }
     if (!VERDICTS.has(verdictAnswer.choice!)) {
       throw new JevApiError("bad_payload", `unknown verdict "${verdictAnswer.choice}"`);
     }
 
     const rawVerdict = verdictAnswer.choice! as DecisionVerdict;
-    const confidence = verdictAnswer.confidence!;
 
     if (rawVerdict === "approve") {
       if (confidence < minConfidence) {
@@ -458,13 +506,25 @@ export function createCourseCheckJudge(config: JevClientConfig): CourseCheckJudg
           "Given `state.requirements`, `state.currentAction` and `state.evidence`, what should " +
           "the executor do next?",
       },
-      criteria: {
+      criteria: withServiceOptions({
         continue: "On track for every requirement; keep going.",
         return_to_requirement: "Drifted from a quoted requirement; go back to it.",
         replan: "The approach no longer serves the requirements; make a new plan.",
         ask_user: "Only the customer can resolve this.",
         verify_before_proceeding: "Uncertain; gather more evidence before continuing.",
+      }),
+    };
+    questions["meta_reason"] = {
+      type: "choice",
+      id: "meta_reason",
+      instructions: {
+        policy: COURSE_CHECK_POLICY,
+        question:
+          "If you chose one of the service options (ALL_OPTIONS_WRONG, PARTIALLY_RIGHT_NONE_FULL, " +
+          "NO_FIT_OTHER_REASON) in any other question, why? Otherwise answer freely; this answer " +
+          "is only read when a service option was chosen.",
       },
+      criteria: META_REASON_CRITERIA,
     };
 
     const body: JevApiRequest = {
@@ -490,7 +550,10 @@ export function createCourseCheckJudge(config: JevClientConfig): CourseCheckJudg
     ) {
       return courseContractViolation("missing or malformed next_action answer");
     }
-    if (!NEXT_ACTIONS.has(actionAnswer["choice"])) {
+    if (
+      !NEXT_ACTIONS.has(actionAnswer["choice"]) &&
+      !isServiceOption(actionAnswer["choice"])
+    ) {
       return courseContractViolation(`unknown next_action "${String(actionAnswer["choice"])}"`);
     }
 
@@ -507,16 +570,35 @@ export function createCourseCheckJudge(config: JevClientConfig): CourseCheckJudg
       onTrack[r.id] = p >= MULTILABEL_APPLICABLE_THRESHOLD;
     }
     for (const id of Object.keys(answers)) {
-      if (id !== "next_action" && !(id in onTrack)) {
+      if (id !== "next_action" && id !== "meta_reason" && !(id in onTrack)) {
         return courseContractViolation(`unknown answer id ${id}`);
       }
     }
 
-    const nextAction = actionAnswer["choice"] as CourseCheckNextAction;
+    const chosen = actionAnswer["choice"]!;
     const confidence = actionAnswer["confidence"];
     if (confidence < 0 || confidence > 1) {
       return courseContractViolation("next_action confidence out of 0..1 range");
     }
+
+    // judge rejected the caller's frame: map conservatively, never continue
+    if (isServiceOption(chosen)) {
+      const mapped: CourseCheckNextAction =
+        chosen === "PARTIALLY_RIGHT_NONE_FULL"
+          ? "return_to_requirement"
+          : chosen === "NO_FIT_OTHER_REASON"
+            ? "ask_user"
+            : "replan"; // ALL_OPTIONS_WRONG
+      return {
+        onTrack,
+        nextAction: mapped,
+        reasons: ["meta_option", chosen, consumeMetaReason(answers)],
+        confidence,
+        judged: true,
+      };
+    }
+
+    const nextAction = chosen as CourseCheckNextAction;
 
     if (confidence < minConfidence) {
       return {

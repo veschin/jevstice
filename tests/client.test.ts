@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { DecisionRequest, DecisionOption, MultiLabelRequest } from "../src/types";
 import { createJudge, createMultiLabelJudge, JevApiError } from "../src/client";
+import { buildRequestBody, META_REASON_CRITERIA, SERVICE_OPTION_CRITERIA } from "../src/evidence";
 
 const okOptions: DecisionOption[] = [
   { id: "approve", label: "Approve", meaning: "proposal is complete and correct" },
@@ -116,7 +117,7 @@ describe("client: happy path", () => {
     const body = calls[0]!.body as Record<string, unknown>;
     expect(body["model"]).toBe("jev-latest");
     const questions = body["questions"] as Record<string, unknown>;
-    expect(Object.keys(questions).sort()).toEqual(["option", "verdict"]);
+    expect(Object.keys(questions).sort()).toEqual(["meta_reason", "option", "verdict"]);
     // state carries evidence verbatim
     const state = JSON.stringify(body["state"]);
     expect(state).toContain("implement foo returning 42");
@@ -580,7 +581,12 @@ describe("course check judge", () => {
     const result: CourseCheckResult = await judge(okCourse);
     expect(calls).toHaveLength(1);
     const questions = (calls[0]!.body as { questions: Record<string, unknown> }).questions;
-    expect(Object.keys(questions).sort()).toEqual(["next_action", "req-1", "req-2"]);
+    expect(Object.keys(questions).sort()).toEqual([
+      "meta_reason",
+      "next_action",
+      "req-1",
+      "req-2",
+    ]);
     expect(result.judged).toBe(true);
     expect(result.onTrack).toEqual({ "req-1": true, "req-2": false });
     expect(result.nextAction).toBe("continue");
@@ -693,5 +699,151 @@ describe("course check judge", () => {
     });
     const result = await judge(okCourse);
     expect(result.nextAction).toBe("continue");
+  });
+});
+
+// ---------- mandatory meta-options (service options) ----------
+
+const SERVICE_IDS = Object.keys(SERVICE_OPTION_CRITERIA);
+
+function metaBody(answers: Record<string, unknown>) {
+  return {
+    model: "jev-1.13.0",
+    answers,
+    usage: { input_tokens: 1, output_tokens: 1 },
+  };
+}
+
+const choiceAnswer = (choice: string, confidence = 0.9) => ({
+  type: "choice",
+  choice,
+  probabilities: { [choice]: 1 },
+  confidence,
+});
+
+describe("mandatory meta-options", () => {
+  test("service options present in verdict, option and next_action criteria", async () => {
+    const calls: { body?: unknown }[] = [];
+    const fetchFn = (async (_url: unknown, init?: RequestInit) => {
+      calls.push({ body: JSON.parse(init?.body as string) });
+      return jsonResponse(
+        metaBody({
+          verdict: choiceAnswer("approve"),
+          option: choiceAnswer("approve"),
+          meta_reason: choiceAnswer("options_incomplete"),
+        }),
+      );
+    }) as unknown as typeof fetch;
+    const judge = createJudge({ apiKey: "k", fetchFn });
+    await judge(okReq);
+    const questions = (calls[0]!.body as { questions: Record<string, { criteria: Record<string, unknown> }> })
+      .questions;
+    for (const id of SERVICE_IDS) {
+      expect(questions["verdict"]!.criteria[id]).toBeDefined();
+      expect(questions["option"]!.criteria[id]).toBeDefined();
+    }
+    expect(Object.keys(questions["meta_reason"]!.criteria).sort()).toEqual(
+      Object.keys(META_REASON_CRITERIA).sort(),
+    );
+  });
+
+  test("verdict ALL_OPTIONS_WRONG -> insufficient_evidence with meta reasons", async () => {
+    const fetchFn = (async () =>
+      jsonResponse(
+        metaBody({
+          verdict: choiceAnswer("ALL_OPTIONS_WRONG"),
+          option: choiceAnswer("approve"),
+          meta_reason: choiceAnswer("options_wrong_premise"),
+        }),
+      )) as unknown as typeof fetch;
+    const judge = createJudge({ apiKey: "k", fetchFn });
+    const result = await judge(okReq);
+    expect(result.verdict).toBe("insufficient_evidence");
+    expect(result.reasons).toContain("meta_option");
+    expect(result.reasons).toContain("ALL_OPTIONS_WRONG");
+    expect(result.reasons).toContain("meta_reason:options_wrong_premise");
+  });
+
+  test("verdict PARTIALLY_RIGHT_NONE_FULL -> revise; NO_FIT_OTHER_REASON -> ask_user", async () => {
+    for (const [id, expected] of [
+      ["PARTIALLY_RIGHT_NONE_FULL", "revise"],
+      ["NO_FIT_OTHER_REASON", "ask_user"],
+    ] as const) {
+      const fetchFn = (async () =>
+        jsonResponse(
+          metaBody({
+            verdict: choiceAnswer(id),
+            option: choiceAnswer("approve"),
+            meta_reason: choiceAnswer("insufficient_context"),
+          }),
+        )) as unknown as typeof fetch;
+      const judge = createJudge({ apiKey: "k", fetchFn });
+      const result = await judge(okReq);
+      expect(result.verdict).toBe(expected);
+    }
+  });
+
+  test("service option in the option question also never approves", async () => {
+    const fetchFn = (async () =>
+      jsonResponse(
+        metaBody({
+          verdict: choiceAnswer("approve"),
+          option: choiceAnswer("NO_FIT_OTHER_REASON"),
+          meta_reason: choiceAnswer("options_incomplete"),
+        }),
+      )) as unknown as typeof fetch;
+    const judge = createJudge({ apiKey: "k", fetchFn });
+    const result = await judge(okReq);
+    expect(result.verdict).not.toBe("approve");
+  });
+
+  test("non-service selection unaffected by meta machinery", async () => {
+    const judge = createJudge({ ...baseConfig });
+    const result = await judge(okReq);
+    expect(result.verdict).toBe("approve");
+    expect(result.reasons).toEqual(["approved"]);
+  });
+
+  test("course_check: service selections map conservatively, never continue", async () => {
+    const cases: [string, CourseCheckResult["nextAction"]][] = [
+      ["ALL_OPTIONS_WRONG", "replan"],
+      ["PARTIALLY_RIGHT_NONE_FULL", "return_to_requirement"],
+      ["NO_FIT_OTHER_REASON", "ask_user"],
+    ];
+    for (const [service, expected] of cases) {
+      const judge = createCourseCheckJudge({
+        apiKey: "k",
+        fetchFn: (async () =>
+          jsonResponse(
+            courseBody(
+              { "req-1": 0.95, "req-2": 0.95 },
+              service,
+              0.9,
+            ),
+          )) as unknown as typeof fetch,
+      });
+      const result = await judge(okCourse);
+      expect(result.judged).toBe(true);
+      expect(result.nextAction).toBe(expected);
+    }
+  });
+
+  test("template options cannot remove service options (builder always appends)", () => {
+    const body = buildRequestBody(
+      { ...okReq, stage: "code_review" },
+      {
+        apiKey: "k",
+        stages: {
+          code_review: {
+            options: [
+              { id: "ship", label: "Ship", meaning: "merge" },
+              { id: "hold", label: "Hold", meaning: "wait" },
+            ],
+          },
+        },
+      },
+    );
+    const criteria = (body.questions.option as { criteria: Record<string, unknown> }).criteria;
+    for (const id of SERVICE_IDS) expect(criteria[id]).toBeDefined();
   });
 });
