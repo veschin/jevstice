@@ -171,3 +171,32 @@ FR-11 sub-agent hand-off gate (Jev sits in the lead-agent -> task-agent delegati
     carries no toolCallId, so the spawn is not judged at all.
   - `bun test` 283/283 (12 of them this slice), `tsc --noEmit` clean, no API key in logs.
 - Release totals: 283/283 tests (+22 consultation forcing, +12 FR-11 hand-off), `tsc --noEmit` clean.
+
+## 0.5.1 - 2026-10-07
+
+Execution-time destructive-action gate (POLICY-DRAFT class I: destructive actions - `rm -rf`, force
+push, schema drop - must ALWAYS be judged, fresh decision at execution time, the plan does not
+cover them; judge verdict `always_judge` at confidence 0.88, `pol_I` 0.92):
+  - New `destructive_action` control point (`on_demand`, `verdictMapping: standard`), consulted by
+    the controller itself from the `tool_call` boundary. It is armed only by a non-empty
+    `gates.destructive.patterns` list (user-owned, default off): absent or empty means the gate does
+    not exist, and an invalid block fails closed naming the file and the problem. A `bash` command
+    matching any pattern is judged before it runs, with the command and the session task as evidence.
+  - Blocking is deliberately narrow, the same condition as the FR-11 hand-off gate: only a judged
+    `revise` at or above the confidence floor, with the offered option set naming the refusal and no
+    frame-escape marker, refuses the call. An abstention, a judge error, a low confidence, a frame
+    escape or a verdict past the 25s internal deadline records the uncertainty in session state and
+    lets the command run - an abstention never blocks (blocking on one becomes a permanent block, as
+    measured). The internal deadline sits under the host's 30s `tool_call` handler bound, whose
+    on-timeout policy is fail-closed, so it fires first and takes the fail-open path; a verdict that
+    lands later is never read, so a late answer can never pin a refusal that was not applied.
+  - Matching semantics (Jev consulted; the judge abstained at 0.29, so the conservative reading was
+    taken): patterns are case-insensitive literal substrings with whitespace collapsed - the pattern
+    text is data, cannot be malformed and cannot turn an owner typo into a different match.
+  - A separate `tool_call` handler (same shape as the FR-11 dispatch side) keeps the plan gate's
+    result deterministic: a plan-gate block short-circuits the event, so an already-blocked command
+    never spends a consultation.
+  - `bun test` 302/302 (14 of them this slice: 4 config, 10 controller), `tsc --noEmit` clean.
+  - Integration shim corrected while adding the second `tool_call` handler: the fake host kept one
+    handler per event in a last-wins map, which would silently drop a gate; it now keeps the same
+    handler list the real runner does (`ext.handlers.get(event)`, first `block` wins).

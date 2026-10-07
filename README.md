@@ -164,6 +164,15 @@ uncertainty instead of stopping the work.
   cannot refuse a tool result (that host hook only rewrites it), so a confident negative is recorded
   as an unresolved blocker and fed back into the session. Undeclared, the stage is still submittable
   through the tool but no hand-off check runs - the PRD marks this policy unconfirmed (GAP:3).
+- **destructive_action** (`on_demand`, opt-in): when the config sets a non-empty
+  `gates.destructive.patterns` list, a `bash` command matching any pattern is judged before it runs,
+  with the command and the session task as evidence - a fresh execution-time decision the plan never
+  covers (POLICY-DRAFT class I, `always_judge` 0.88). Only a judged `revise` at or above the
+  confidence floor refuses the call; an abstention, a judge error, a low confidence, a frame escape
+  or a verdict past the 25s internal deadline records the uncertainty and lets the command run.
+  Patterns are case-insensitive literal substrings (whitespace collapsed), so pattern text is data and
+  never a regular expression. An absent or empty list means the gate does not exist (default off); a
+  `stages.destructive_action` template may still replace its option set.
 
 Confidence floors: an approve is recorded only at or above `confidenceThreshold` (default 0.8). At
 that default bar a completion approve in [0.6, 0.8) counts toward
@@ -196,6 +205,7 @@ submittable `stage` and is shaped by the config key shown:
 | `skill_routing` | `on_demand` | skill choice from `routing.skills` | `stages.skill_routing` |
 | `model_routing` | `on_demand` | model choice from `routing.models` | `stages.model_routing` |
 | `subagent_handoff` | `on_demand` | FR-11 hand-off check at the task-tool boundary (opt-in) | `stages.subagent_handoff` |
+| `destructive_action` | `on_demand` | execution-time judge of a destructive `bash` command (opt-in) | `stages.destructive_action` |
 | `important_decision` | `on_demand` | FR-10: an important decision put to the judge through fixed options | `stages.important_decision` |
 | `code_review` | `on_demand` | FR-10: a finished code review put to the judge | `stages.code_review` |
 
@@ -224,7 +234,10 @@ the file and the problem.
 
 ```json
 {
-  "gates": { "mutation": false },
+  "gates": {
+    "mutation": false,
+    "destructive": { "patterns": ["rm -rf", "git push --force", "drop table"] }
+  },
   "confidenceThreshold": 0.9,
   "completion": { "consecutiveApproves": 3, "confidenceFloor": 0.7 },
   "capabilities": ["json-round-trip", "cli-probe"],
@@ -257,12 +270,14 @@ Per key, with its trust rule:
 - `confidenceThreshold` - the approval floor. User-owned and raise-only: the user value wins over a
   project one, and the effective floor is `max(0.8, configured)`, so lowering it has no effect.
   Raising it also disables the mid-band completion streak.
-- `gates` - `mutation` and `completion` booleans, both default true. User-owned: when the user file
-  declares `gates`, the project block is ignored. `gates.mutation: false` lifts the plan gate
-  (mutating tools are no longer blocked while no plan-stage approval exists) and
-  `gates.completion: false` lifts the stop gate. Both switch block decisions only: judging, content
-  digests and bounded rework are unchanged. The FR-11 hand-off gate is not a `gates` switch: it runs
-  only when the config declares `stages.subagent_handoff` (see the preset above).
+- `gates` - `mutation` and `completion` booleans (both default true) plus the `destructive` block.
+  User-owned: when the user file declares `gates`, the project block is ignored. `gates.mutation:
+  false` lifts the plan gate (mutating tools are no longer blocked while no plan-stage approval
+  exists) and `gates.completion: false` lifts the stop gate; both switch block decisions only:
+  judging, content digests and bounded rework are unchanged. `gates.destructive.patterns` (an array
+  of non-empty strings) arms the execution-time destructive-action gate; an absent or empty list
+  means the gate does not exist. The FR-11 hand-off gate is not a `gates` switch: it runs only when
+  the config declares `stages.subagent_handoff` (see the preset above).
 
 Meta options cannot be removed: they are appended to every judge choice regardless of any template.
 
@@ -270,6 +285,9 @@ Meta options cannot be removed: they are appended to every judge choice regardle
 
 - The mutation gate covers the builtin tools `edit`, `write`, `ast_edit`, `bash`, `memory_edit`,
   `manage_skill` and `eval`; custom/MCP/xdev tools are outside it.
+- The destructive-action gate covers `bash` only, reading the command from the tool call's `command`
+  field, and matches the owner's patterns as case-insensitive literal substrings - a pattern is data,
+  never a regular expression, so an owner typo cannot silently change what matches.
 - Gates are per session: each subagent session gets its own controller (own gates, approvals and
   state), and the parent's controller does not see the subagent's tool calls - the one cross-session
   hook is `before_subagent_spawn`, where the routed model is enforced. `session_stop` never fires for

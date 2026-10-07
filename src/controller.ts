@@ -122,6 +122,8 @@ export interface JevState {
 	pendingHandoffs: Record<string, { text: string; at: number; usedBySpawn: boolean }>;
 	/** FR-11: last handoff judgement (dispatch or acceptance) - recorded, never a silent no-op. */
 	lastHandoff: HandoffRecord | undefined;
+	/** POLICY-DRAFT I: last destructive-action judgement - recorded, never a silent no-op. */
+	lastDestructive: DestructiveRecord | undefined;
 }
 
 function freshState(): JevState {
@@ -143,6 +145,7 @@ function freshState(): JevState {
 		taskPrompt: undefined,
 		pendingHandoffs: {},
 		lastHandoff: undefined,
+		lastDestructive: undefined,
 	};
 }
 
@@ -183,6 +186,23 @@ export interface HandoffRecord {
 	confidence?: number;
 	reasons: string[];
 	/** A spawn was refused on this record (dispatch only; the acceptance hook cannot refuse). */
+	blocked: boolean;
+	at: number;
+}
+
+/** POLICY-DRAFT I record of one execution-time destructive-action consultation. */
+export interface DestructiveRecord {
+	/** The owner pattern that matched, verbatim from the config. */
+	pattern: string;
+	/** The bash command that was judged (verbatim prefix, capped for readability). */
+	command: string;
+	/** Judge verdict when a consultation happened; absent when it never did. */
+	verdict?: DecisionVerdict;
+	/** True when the judge answered (an unusable answer is still a consultation, not a failure). */
+	judged: boolean;
+	confidence?: number;
+	reasons: string[];
+	/** The command was refused before execution (only a confident explicit negative does this). */
 	blocked: boolean;
 	at: number;
 }
@@ -287,6 +307,40 @@ const HANDOFF_DISPATCH_DEADLINE_MS = 25_000;
 const HANDOFF_ORDER_MAX_AGE_MS = 120_000;
 /** Evidence quotes are capped for cost; the kept prefix stays verbatim and the source says it was capped. */
 const HANDOFF_QUOTE_CAP = 4000;
+/**
+ * POLICY-DRAFT I (always_judge, 0.88): destructive actions are judged fresh at execution time.
+ * The stage is the registry point the controller consults; the gate is armed only by a non-empty
+ * `gates.destructive.patterns`. Options mirror the handoff set - the refusal is an explicit
+ * `revise` verdict, an `approve` is never required for the command to run, and the offered set
+ * must name the refusal for the gate to have teeth.
+ */
+const DESTRUCTIVE_STAGE: DecisionStage = "destructive_action";
+const DESTRUCTIVE_OPTIONS: DecisionOption[] = [
+	{
+		id: "approve",
+		label: "Safe to execute",
+		meaning:
+			"the command is not destructive or irreversible, or it is scoped so that running it is clearly intended",
+	},
+	{
+		id: "revise",
+		label: "Destructive or irreversible",
+		meaning:
+			"the command deletes or overwrites data, rewrites history, drops schema or is otherwise hard to " +
+			"reverse; do not run it without a fresh explicit decision - name the hazard",
+	},
+];
+/** Option id that expresses the refusal: the offered set must name it for the gate to have teeth. */
+const DESTRUCTIVE_REFUSAL_OPTION = "revise";
+/**
+ * Internal deadline for the destructive-action consult. The host bounds every `tool_call` handler
+ * at 30s and its on-timeout policy is fail-CLOSED (`{ block: true }`, runner.ts emitToolCall), so
+ * a slow judge would otherwise become a block this gate never decided. The deadline fires first
+ * and takes the fail-open path: the uncertainty is recorded and the command proceeds. A verdict
+ * landing after the deadline is never read - a late answer must not pin a refusal that never
+ * applied.
+ */
+const DESTRUCTIVE_DEADLINE_MS = 25_000;
 const STATE_ENTRY_TYPE = "jev.state";
 const TOOL_NAME = "jev_decision";
 
@@ -485,6 +539,11 @@ export interface ControllerDeps {
 	 * (HANDOFF_DISPATCH_DEADLINE_MS). Exposed for tests only.
 	 */
 	handoffDispatchDeadlineMs?: number;
+	/**
+	 * Destructive-action consult deadline; must stay under the host's 30s `tool_call` handler
+	 * timeout, whose on-timeout policy is fail-closed (DESTRUCTIVE_DEADLINE_MS). Tests only.
+	 */
+	destructiveDeadlineMs?: number;
 }
 
 /** Minimal structural surface of the omp ExtensionAPI the controller needs. */
@@ -531,6 +590,8 @@ export class JevController {
 	private completionConfidenceFloor!: number;
 	/** FR-11 dispatch consult deadline (under the host's 30s handler timeout). */
 	private readonly handoffDispatchDeadlineMs: number;
+	/** Destructive-action consult deadline (under the host's fail-closed 30s tool_call timeout). */
+	private readonly destructiveDeadlineMs: number;
 
 	constructor(deps: ControllerDeps) {
 		this.judge = deps.judge;
@@ -542,6 +603,7 @@ export class JevController {
 		this.multiLabelJudge = deps.multiLabelJudge;
 		this.maxReworkIterations = deps.maxReworkIterations ?? POLICY.maxReworkIterations;
 		this.handoffDispatchDeadlineMs = deps.handoffDispatchDeadlineMs ?? HANDOFF_DISPATCH_DEADLINE_MS;
+		this.destructiveDeadlineMs = deps.destructiveDeadlineMs ?? DESTRUCTIVE_DEADLINE_MS;
 		// R1: a confidenceThreshold override may only RAISE the bar above POLICY.
 		this.minConfidence = Math.max(
 			deps.minConfidence ?? POLICY.minConfidenceToApprove,
@@ -668,6 +730,10 @@ export class JevController {
 			},
 		});
 		pi.on("tool_call", (event, ctx) => this.onToolCall(event, ctx));
+		// POLICY-DRAFT I: a separate handler (same shape as the FR-11 dispatch side) so the plan
+		// gate's result stays deterministic when the destructive consult runs long; a plan-gate
+		// block short-circuits the event and this consult never happens.
+		pi.on("tool_call", (event, ctx) => this.onDestructiveCall(event, ctx));
 		pi.on("before_agent_start", event => this.onBeforeAgentStart(event));
 		pi.on("session_stop", event => this.onSessionStop(event));
 		pi.on("before_subagent_spawn", (event, ctx) => this.onBeforeSubagentSpawn(event, ctx));
@@ -1121,6 +1187,155 @@ export class JevController {
 		this.pushFeedback(reason);
 	}
 
+	// ----- POLICY-DRAFT I: destructive-action gate -----
+
+	/**
+	 * Destructive-action gate (POLICY-DRAFT class I, always_judge 0.88). A bash command matching an
+	 * owner pattern is judged before it runs, with the command and the session task as evidence. The
+	 * call is refused ONLY on a judged explicit negative at or above the confidence floor - the same
+	 * condition as the FR-11 handoff gate - so an abstention, a judge error, a low confidence, a frame
+	 * escape, a deadline loss or an unwired pattern list lets the command run and records the
+	 * uncertainty (the owner measured that blocking on an abstention becomes a permanent block).
+	 */
+	async onDestructiveCall(event: unknown, _ctx?: unknown): Promise<{ block?: boolean; reason?: string } | undefined> {
+		if (!isRecord(event) || event["toolName"] !== "bash") return undefined;
+		// An invalid config is already blocked fail-closed by the mutation gate; never judge on it.
+		if (this.templateError !== undefined) return undefined;
+		// Absent or empty list means the gate does not exist (default off).
+		const patterns = this.template.gates?.destructive?.patterns ?? [];
+		if (patterns.length === 0) return undefined;
+		const input = event["input"];
+		const command = isRecord(input) && nonEmptyString(input["command"]) ? input["command"] : undefined;
+		if (command === undefined) return undefined;
+		const matched = destructivePatternMatch(command, patterns);
+		if (matched === undefined) return undefined;
+		const proposal =
+			"Claim under judgment: this shell command is destructive or irreversible enough that running it " +
+			"now is not safe without a fresh explicit decision - it deletes or overwrites data, rewrites " +
+			"history, drops schema, or is otherwise hard to reverse.\n\n" +
+			`Command about to run (verbatim):\n${cappedQuote(command).quote}`;
+		const evidence: Evidence[] = [handoffEvidence("spec", "bash tool call command (about to run)", command)];
+		const task = this.state.taskPrompt;
+		if (task !== undefined) evidence.push(handoffEvidence("user", "session task prompt", task));
+		// A late answer must never block: the host's own tool_call timeout is fail-closed, so this
+		// deadline must fire first and take the fail-open path (see DESTRUCTIVE_DEADLINE_MS).
+		let settled: { record: DestructiveRecord; negative: boolean } | undefined;
+		let deadline: Timer | undefined;
+		try {
+			settled = await Promise.race([
+				this.judgeDestructive(matched, command, proposal, evidence),
+				new Promise<undefined>(resolve => {
+					deadline = setTimeout(() => resolve(undefined), this.destructiveDeadlineMs);
+				}),
+			]);
+		} finally {
+			clearTimeout(deadline);
+		}
+		if (settled === undefined) {
+			this.recordDestructiveUncertainty(
+				matched,
+				command,
+				`the judge did not answer before the destructive-gate deadline (${this.destructiveDeadlineMs}ms)`,
+			);
+			return undefined;
+		}
+		const { record, negative } = settled;
+		if (negative) {
+			const reason =
+				`Jev destructive-action gate refused this command before execution: ${record.reasons.join(" ")} ` +
+				`(judge revise at confidence ${record.confidence}, matched pattern "${record.pattern}"). ` +
+				"Confirm the destructive action with the user or replace it with a reversible step, then run it again.";
+			this.blockDestructive(record, reason);
+			return { block: true, reason };
+		}
+		this.state.lastDestructive = record;
+		this.pushFeedback(`Jev destructive-action gate (${destructiveLine(record)}). The command proceeds.`);
+		this.persist();
+		return undefined;
+	}
+
+	/**
+	 * One destructive-action consultation. Never throws: a judge error is an unjudged record (it
+	 * approves nothing and blocks nothing). The negative is read from the verdict and is only
+	 * decisive when the offered option set names the refusal, the judge did not reject the frame
+	 * instead and the confidence is a real number at or above the floor and inside 0..1
+	 * (normalizeJudgeResult range-checks confidence on the approve branch only, so a malformed 1.5
+	 * revise must not count).
+	 */
+	private async judgeDestructive(
+		pattern: string,
+		command: string,
+		proposal: string,
+		evidence: Evidence[],
+	): Promise<{ record: DestructiveRecord; negative: boolean }> {
+		const options = this.template.stages?.[DESTRUCTIVE_STAGE]?.options ?? DESTRUCTIVE_OPTIONS;
+		const base: DestructiveRecord = {
+			pattern,
+			command: cappedQuote(command).quote,
+			judged: false,
+			reasons: [],
+			blocked: false,
+			at: this.now(),
+		};
+		let raw: unknown;
+		try {
+			raw = await this.judge({
+				stage: DESTRUCTIVE_STAGE,
+				task:
+					"Judge this destructive or irreversible shell command at execution time, before it runs " +
+					"(POLICY-DRAFT destructive-action gate; the plan never covers it).",
+				proposal,
+				options,
+				evidence,
+			});
+		} catch (err) {
+			return {
+				record: { ...base, reasons: [`judge unavailable: ${err instanceof Error ? err.message : String(err)}`] },
+				negative: false,
+			};
+		}
+		const result = normalizeJudgeResult(raw, options, this.minConfidence);
+		const negative =
+			result.verdict === "revise" &&
+			options.some(o => o.id === DESTRUCTIVE_REFUSAL_OPTION) &&
+			!result.reasons.includes(FRAME_ESCAPE_REASON) &&
+			result.confidence !== undefined &&
+			result.confidence >= this.minConfidence &&
+			result.confidence <= 1;
+		return {
+			record: {
+				...base,
+				judged: true,
+				verdict: result.verdict,
+				confidence: result.confidence,
+				reasons: result.reasons,
+			},
+			negative,
+		};
+	}
+
+	/** Unjudged destructive outcome: recorded in state and surfaced, never a block (owner constraint). */
+	private recordDestructiveUncertainty(pattern: string, command: string, note: string): void {
+		this.state.lastDestructive = {
+			pattern,
+			command: cappedQuote(command).quote,
+			judged: false,
+			reasons: [note],
+			blocked: false,
+			at: this.now(),
+		};
+		this.persist();
+		this.pushFeedback(`Jev destructive-action gate not judged: ${note}. The command proceeds.`);
+	}
+
+	/** Confident negative: recorded as an explicit unresolved blocker (same shape as the gate blockers). */
+	private blockDestructive(record: DestructiveRecord, reason: string): void {
+		this.state.lastDestructive = { ...record, blocked: true };
+		if (!this.state.blockers.includes(reason)) this.state.blockers.push(reason);
+		this.persist();
+		this.pushFeedback(reason);
+	}
+
 	/** Restore persisted state from session custom entries (session continuity, no cache claims). */
 	onSessionStart(entries: ReadonlyArray<{ customType?: unknown; data?: unknown }>): void {
 		for (let i = entries.length - 1; i >= 0; i--) {
@@ -1176,6 +1391,7 @@ export class JevController {
 				// Transient by nature: a restart mid-call loses the captured orders, nothing else.
 				pendingHandoffs: {},
 				lastHandoff: restoreHandoffRecord(data["lastHandoff"]),
+				lastDestructive: restoreDestructiveRecord(data["lastDestructive"]),
 			};
 			return;
 		}
@@ -2342,6 +2558,26 @@ function restoreHandoffRecord(raw: unknown): HandoffRecord | undefined {
 	};
 }
 
+/** Validate a persisted destructive-action record: malformed entries are dropped, never trusted. */
+function restoreDestructiveRecord(raw: unknown): DestructiveRecord | undefined {
+	if (!isRecord(raw)) return undefined;
+	if (typeof raw["judged"] !== "boolean" || typeof raw["blocked"] !== "boolean") return undefined;
+	if (typeof raw["at"] !== "number" || !Number.isFinite(raw["at"])) return undefined;
+	if (!nonEmptyString(raw["pattern"]) || typeof raw["command"] !== "string") return undefined;
+	const verdict = raw["verdict"];
+	if (verdict !== undefined && (typeof verdict !== "string" || !VERDICTS.has(verdict))) return undefined;
+	return {
+		pattern: raw["pattern"],
+		command: raw["command"],
+		verdict: verdict as DecisionVerdict | undefined,
+		judged: raw["judged"],
+		confidence: typeof raw["confidence"] === "number" ? raw["confidence"] : undefined,
+		reasons: Array.isArray(raw["reasons"]) ? raw["reasons"].filter((r): r is string => typeof r === "string") : [],
+		blocked: raw["blocked"],
+		at: raw["at"],
+	};
+}
+
 /**
  * Work-order text of a `task` tool call, verbatim: the flat `task`, the batch `tasks[].task`
  * items and the shared `context` (omp 18.6.3 task/agent contract).
@@ -2399,6 +2635,31 @@ function handoffLine(record: HandoffRecord): string {
 	const confidence = record.confidence !== undefined ? `, confidence ${record.confidence}` : "";
 	const reasons = record.reasons.length > 0 ? ` - ${record.reasons.join(" ")}` : "";
 	return `${record.phase}: ${verdict}${confidence}${reasons}`;
+}
+
+/** One-line fixed-template summary of a destructive-action record (no generated prose). */
+function destructiveLine(record: DestructiveRecord): string {
+	const verdict = record.judged ? (record.verdict ?? "unusable answer") : "not judged";
+	const confidence = record.confidence !== undefined ? `, confidence ${record.confidence}` : "";
+	const reasons = record.reasons.length > 0 ? ` - ${record.reasons.join(" ")}` : "";
+	return `command matched "${record.pattern}": ${verdict}${confidence}${reasons}`;
+}
+
+/**
+ * Match the owner's pattern list against a bash command: case-insensitive literal substrings with
+ * whitespace collapsed, so a pattern split across a line break still matches. Pattern text is data,
+ * never syntax: this cannot throw and no pattern can be malformed (a live consultation abstained on
+ * literal-vs-regex, 0.29 - the conservative reading is the one where an owner typo cannot silently
+ * change what matches and no pattern can fail the config load). First match wins; returns the
+ * pattern verbatim, or undefined.
+ */
+function destructivePatternMatch(command: string, patterns: readonly string[]): string | undefined {
+	const haystack = command.replace(/\s+/g, " ").toLowerCase();
+	for (const pattern of patterns) {
+		const needle = pattern.replace(/\s+/g, " ").trim().toLowerCase();
+		if (needle.length > 0 && haystack.includes(needle)) return pattern;
+	}
+	return undefined;
 }
 
 function hostModelIds(ctxOrList: unknown): string[] {

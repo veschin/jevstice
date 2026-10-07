@@ -37,6 +37,7 @@ export type DecisionStage =
   | "code_review" // FR-10: code review gate
   | "subagent_handoff" // FR-11: validate dispatch and acceptance
   | "aspect_coverage" // universal engine: forgotten-aspect three-way coverage check + FR-18 course_check (see control-points registry)
+  | "destructive_action" // POLICY-DRAFT I: judge a destructive bash command at execution time, fresh (plan never covers it)
   | "claim_check"; // universal engine: per-claim support marking against quoted evidence (measured decisive per-claim regime)
 
 /** Fixed option set presented to the judge (FR-08). */

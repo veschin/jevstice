@@ -99,6 +99,15 @@ export const CONTROL_POINT_REGISTRY: Readonly<Record<string, ControlPoint>> = {
 		trigger: "on_demand",
 		verdictMapping: "standard",
 	},
+	// POLICY-DRAFT I (always_judge, 0.88): a destructive bash command (rm -rf, force push, schema
+	// drop) is judged fresh at execution time, the plan never covering it. The controller consults
+	// this point itself from the tool_call boundary, only while the owner configures
+	// `gates.destructive.patterns`; it blocks the call only on a judged explicit negative.
+	destructive_action: {
+		stage: "destructive_action",
+		trigger: "on_demand",
+		verdictMapping: "standard",
+	},
 	aspect_coverage: {
 		stage: "aspect_coverage",
 		trigger: "on_demand",

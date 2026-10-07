@@ -78,18 +78,30 @@ describe("extension configuration safety (FR-17)", () => {
       const entry = new URL("../src/index.ts", import.meta.url).pathname;
       const script = `
         import { createJevExtension } from ${JSON.stringify(entry)};
-        const hooks = new Map();
+        const hooks = {};
+        // omp keeps a LIST of handlers per event (runner.ts ext.handlers.get(event)); the
+        // extension registers two tool_call and two before_subagent_spawn handlers, so a
+        // last-wins registry would silently drop a gate. Merge like the host: first block wins.
+        const emit = async (name, event) => {
+          let merged;
+          for (const handler of hooks[name] ?? []) {
+            const result = await handler(event);
+            if (result && result.block === true) return result;
+            if (result !== undefined) merged = { ...(merged ?? {}), ...result };
+          }
+          return merged;
+        };
         let decision;
         createJevExtension({ judge: async () => { throw new Error("must not consult"); } })({
-          on: (name, handler) => hooks.set(name, handler),
+          on: (name, handler) => { hooks[name] = [...(hooks[name] ?? []), handler]; },
           registerTool: tool => { decision = tool; },
           appendEntry() {},
           sendMessage() {},
         });
-        await hooks.get("before_agent_start")?.({prompt:"Inspect a project without changing its files"});
-        const mutation = await hooks.get("tool_call")?.({toolName:"write",input:{}});
-        const read = await hooks.get("tool_call")?.({toolName:"read",input:{}});
-        const stop = await hooks.get("session_stop")?.({stop_hook_active:false});
+        await emit("before_agent_start", {prompt:"Inspect a project without changing its files"});
+        const mutation = await emit("tool_call", {toolName:"write",input:{}});
+        const read = await emit("tool_call", {toolName:"read",input:{}});
+        const stop = await emit("session_stop", {stop_hook_active:false});
         const outcome = await decision?.execute("invalid-config", {
           stage:"direction_review", task:"Inspect the project",
           proposal:"Inspect the project without changing any files",

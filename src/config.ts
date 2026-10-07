@@ -38,10 +38,16 @@ export interface JevTemplateConfig {
 	completion?: { consecutiveApproves?: number; confidenceFloor?: number };
 	/**
 	 * Gate switches (user-owned). `mutation: false` lifts the plan gate: mutating tools are
-	 * no longer blocked while no plan-stage approval exists. Fail-closed judging, digests,
-	 * bounded rework and completion binding are unchanged.
+	 * no longer blocked while no plan-stage approval exists. `destructive.patterns` arms the
+	 * execution-time destructive-action gate: a bash command matching any pattern is judged
+	 * before it runs; an absent or empty list means the gate does not exist. Fail-closed
+	 * judging, digests, bounded rework and completion binding are unchanged.
 	 */
-	gates?: { mutation?: boolean; completion?: boolean };
+	gates?: {
+		mutation?: boolean;
+		completion?: boolean;
+		destructive?: { patterns: string[] };
+	};
 	/**
 	 * FR-02/FR-03 candidate lists, held by the owner. The judge chooses only from these,
 	 * so it can never invent a skill or a model. An empty list is a load error, not a
@@ -198,12 +204,29 @@ export function validateTemplateConfig(file: string, raw: unknown): JevTemplateC
 	}
 	if (raw["gates"] !== undefined) {
 		if (!isRecord(raw["gates"])) throw new JevConfigError(file, "gates must be an object");
-		const gates: { mutation?: boolean; completion?: boolean } = {};
+		const gates: JevTemplateConfig["gates"] = {};
 		for (const key of ["mutation", "completion"] as const) {
 			const value = raw["gates"][key];
 			if (value === undefined) continue;
 			if (typeof value !== "boolean") throw new JevConfigError(file, `gates.${key} must be a boolean`);
 			gates[key] = value;
+		}
+		const destructive = raw["gates"]["destructive"];
+		if (destructive !== undefined) {
+			if (!isRecord(destructive)) {
+				throw new JevConfigError(file, "gates.destructive must be an object with a patterns array");
+			}
+			const patterns = destructive["patterns"];
+			if (!Array.isArray(patterns)) {
+				throw new JevConfigError(file, "gates.destructive.patterns must be an array of non-empty strings");
+			}
+			patterns.forEach((p, i) => {
+				if (!nonEmptyString(p)) {
+					throw new JevConfigError(file, `gates.destructive.patterns[${i}] must be a non-empty string`);
+				}
+			});
+			// An empty list is a legal no-op: the gate does not exist (default off).
+			gates.destructive = { patterns: patterns as string[] };
 		}
 		out.gates = gates;
 	}

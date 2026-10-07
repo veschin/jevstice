@@ -3,8 +3,9 @@
  * Drafted before implementation (TDD); runs under `bun test`.
  */
 import { describe, expect, test } from "bun:test";
-import { createJevController, type HandoffRecord, type JevState } from "../src/controller.js";
+import { createJevController, type DestructiveRecord, type HandoffRecord, type JevState } from "../src/controller.js";
 import { FRAME_FIX_PREFIX, SERVICE_OPTION_FIX } from "../src/client.js";
+import type { JevTemplateConfig } from "../src/config.js";
 import { isRecord } from "../src/guards.js";
 import type {
 	AspectCoverageRequest,
@@ -2432,5 +2433,249 @@ describe("jev controller: FR-10 stages", () => {
 		expect(out.verdict).toBe("insufficient_evidence");
 		expect(out.judged).toBe(false);
 		expect(out.reasons.join(" ")).toContain("stage must be one of");
+	});
+});
+
+describe("jev controller: destructive-action gate (POLICY-DRAFT I)", () => {
+	const COMMAND = "rm -rf /var/lib/dashboard-cache";
+	const TASK = "Clean up the dashboard project and keep the existing export working.";
+	/** Owner-armed gate, plan gate lifted so the tests exercise the destructive consult alone. */
+	const WIRED: JevTemplateConfig = {
+		gates: { mutation: false, destructive: { patterns: ["rm -rf", "git push --force", "drop table"] } },
+	};
+
+	function destructiveHarness(
+		respond: (req: DecisionRequest) => DecisionResult | Promise<DecisionResult>,
+		template: JevTemplateConfig = WIRED,
+	) {
+		const calls: DecisionRequest[] = [];
+		const harness = makeFakePi();
+		const controller = createJevController({
+			template,
+			judge: async req => {
+				calls.push(req);
+				return respond(req);
+			},
+		});
+		controller.register(harness.pi);
+		return { harness, controller, calls };
+	}
+
+	async function runBash(harness: FakePiHarness, command: string): Promise<BlockResult> {
+		return blockResult(
+			await harness.emit("tool_call", {
+				type: "tool_call",
+				toolCallId: "b1",
+				toolName: "bash",
+				input: { command },
+			}),
+		);
+	}
+
+	test("a matching command judged explicitly negative is refused before it runs", async () => {
+		const { harness, controller, calls } = destructiveHarness(() => ({
+			verdict: "revise",
+			reasons: ["recursive force-delete of a system path is irreversible"],
+			confidence: 0.93,
+		}));
+		await harness.emit("before_agent_start", {
+			type: "before_agent_start",
+			prompt: TASK,
+			systemPrompt: [],
+		});
+		const res = await runBash(harness, COMMAND);
+		expect(res.block).toBe(true);
+		expect(String(res.reason)).toContain("irreversible");
+		const record = controller.getState().lastDestructive;
+		expect(record?.judged).toBe(true);
+		expect(record?.verdict).toBe("revise");
+		expect(record?.blocked).toBe(true);
+		expect(record?.pattern).toBe("rm -rf");
+		expect(controller.getState().blockers.join(" ")).toContain("destructive-action gate refused");
+		// the judge saw the destructive stage, with the command and the session task as evidence
+		expect(calls.length).toBe(1);
+		expect(calls[0]?.stage).toBe("destructive_action");
+		expect(calls[0]?.evidence.some(e => e.quote.includes(COMMAND))).toBe(true);
+		expect(calls[0]?.evidence.some(e => e.quote.includes("keep the existing export working"))).toBe(true);
+	});
+
+	test("an abstention, a judge error and a low-confidence negative all let the command run", async () => {
+		const abstain = destructiveHarness(() => ({
+			verdict: "insufficient_evidence",
+			reasons: ["insufficient_evidence"],
+			confidence: 0.31,
+		}));
+		expect((await runBash(abstain.harness, COMMAND)).block).toBeUndefined();
+		expect(abstain.controller.getState().lastDestructive?.judged).toBe(true);
+		expect(abstain.controller.getState().lastDestructive?.blocked).toBe(false);
+		expect(abstain.controller.getState().blockers).toEqual([]);
+		expect(abstain.harness.sentMessages.some(m => JSON.stringify(m.payload).includes("destructive"))).toBe(true);
+
+		const throwing = destructiveHarness(() => {
+			throw new Error("socket connection was closed unexpectedly");
+		});
+		expect((await runBash(throwing.harness, COMMAND)).block).toBeUndefined();
+		expect(throwing.controller.getState().lastDestructive?.judged).toBe(false);
+		expect(throwing.controller.getState().lastDestructive?.reasons.join(" ")).toContain(
+			"socket connection was closed",
+		);
+		expect(throwing.controller.getState().blockers).toEqual([]);
+
+		for (const confidence of [0.35, undefined]) {
+			const low = destructiveHarness(() => ({
+				verdict: "revise",
+				reasons: ["maybe"],
+				...(confidence !== undefined ? { confidence } : {}),
+			}));
+			expect((await runBash(low.harness, COMMAND)).block).toBeUndefined();
+			expect(low.controller.getState().lastDestructive?.verdict).toBe("revise");
+			expect(low.controller.getState().lastDestructive?.blocked).toBe(false);
+			expect(low.controller.getState().blockers).toEqual([]);
+		}
+	});
+
+	test("a non-matching command is never judged (no judge call)", async () => {
+		const { harness, controller, calls } = destructiveHarness(() => ({
+			verdict: "revise",
+			reasons: ["should not be asked"],
+			confidence: 0.99,
+		}));
+		expect((await runBash(harness, "bun test")).block).toBeUndefined();
+		expect(calls.length).toBe(0);
+		expect(controller.getState().lastDestructive).toBeUndefined();
+	});
+
+	test("an absent or empty pattern list means the gate does not exist", async () => {
+		const templates: JevTemplateConfig[] = [
+			{ gates: { mutation: false } },
+			{ gates: { mutation: false, destructive: { patterns: [] } } },
+		];
+		for (const template of templates) {
+			const { harness, controller, calls } = destructiveHarness(
+				() => ({ verdict: "revise", reasons: ["no"], confidence: 0.99 }),
+				template,
+			);
+			expect((await runBash(harness, COMMAND)).block).toBeUndefined();
+			expect(calls.length).toBe(0);
+			expect(controller.getState().lastDestructive).toBeUndefined();
+		}
+	});
+
+	test("matching is literal, case-insensitive and whitespace-normalized; pattern text is never syntax", async () => {
+		const upper = destructiveHarness(() =>
+			judgeResult({ selectedOption: "approve", confidence: 0.9 }),
+		);
+		expect((await runBash(upper.harness, "sudo RM -RF /tmp/x")).block).toBeUndefined();
+		expect(upper.calls.length).toBe(1);
+
+		const literal = destructiveHarness(() => judgeResult({ selectedOption: "approve", confidence: 0.9 }), {
+			gates: { mutation: false, destructive: { patterns: ["drop table"] } },
+		});
+		expect((await runBash(literal.harness, "psql -c 'drop  table users'")).block).toBeUndefined();
+		expect(literal.calls.length).toBe(1);
+		// a metacharacter-free pattern matches its literal text only
+		expect((await runBash(literal.harness, "psql -c 'dropXtable users'")).block).toBeUndefined();
+		expect(literal.calls.length).toBe(1);
+	});
+
+	test("the plan gate still short-circuits first: an already-blocked bash call is not judged", async () => {
+		const { harness, controller, calls } = destructiveHarness(
+			() => ({ verdict: "revise", reasons: ["no"], confidence: 0.99 }),
+			{ gates: { destructive: { patterns: ["rm -rf"] } } },
+		);
+		const res = await runBash(harness, COMMAND);
+		expect(res.block).toBe(true);
+		expect(String(res.reason)).toContain("plan gate");
+		expect(calls.length).toBe(0);
+		expect(controller.getState().lastDestructive).toBeUndefined();
+	});
+
+	test("a plan approval never covers a destructive command: it is still judged fresh", async () => {
+		const { harness, controller, calls } = destructiveHarness(
+			req =>
+				req.stage === "destructive_action"
+					? { verdict: "revise", reasons: ["force-push rewrites shared history"], confidence: 0.91 }
+					: judgeResult({ selectedOption: "a", confidence: 0.95 }),
+			{ gates: { destructive: { patterns: ["git push --force"] } } },
+		);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: TASK, systemPrompt: [] });
+		await approvePlan(controller);
+		const res = await runBash(harness, "git push --force origin main");
+		expect(res.block).toBe(true);
+		expect(String(res.reason)).toContain("rewrites shared history");
+		expect(calls.filter(c => c.stage === "destructive_action").length).toBe(1);
+	});
+
+	test("an invalid config blocks the call fail-closed naming the problem, without consulting the judge", async () => {
+		const harness = makeFakePi();
+		const calls: DecisionRequest[] = [];
+		const controller = createJevController({
+			judge: async req => {
+				calls.push(req);
+				return judgeResult({});
+			},
+			templateError:
+				"/work/project/.omp/jev.config.json: gates.destructive.patterns must be an array of non-empty strings",
+		});
+		controller.register(harness.pi);
+		const res = await runBash(harness, COMMAND);
+		expect(res.block).toBe(true);
+		expect(String(res.reason)).toContain("gates.destructive.patterns");
+		expect(calls.length).toBe(0);
+	});
+
+	test("an answer after the deadline never blocks and never pins a refusal", async () => {
+		const harness = makeFakePi();
+		let answer: ((result: DecisionResult) => void) | undefined;
+		// Deadline 0: the timer fires on the next tick while the judge stays pending, so the
+		// deadline wins deterministically - no wall-clock sleep and no fake clock to leak.
+		const controller = createJevController({
+			template: WIRED,
+			destructiveDeadlineMs: 0,
+			judge: () =>
+				new Promise<DecisionResult>(resolve => {
+					answer = resolve;
+				}),
+		});
+		controller.register(harness.pi);
+		const res = await runBash(harness, COMMAND);
+		expect(res.block).toBeUndefined();
+		expect(controller.getState().lastDestructive?.judged).toBe(false);
+		expect(controller.getState().lastDestructive?.reasons.join(" ")).toContain(
+			"did not answer before the destructive-gate deadline",
+		);
+		// the host's own tool_call timeout is fail-closed, so this deadline must have taken the
+		// fail-open path; the late negative must not be recorded as a refusal that applied
+		answer?.({ verdict: "revise", reasons: ["too late"], confidence: 0.99 });
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(controller.getState().blockers).toEqual([]);
+		expect(controller.getState().lastDestructive?.blocked).toBe(false);
+	});
+
+	test("a persisted destructive record survives only when well-formed", () => {
+		const harness = makeFakePi();
+		const controller = createJevController({ judge: async () => judgeResult({}) });
+		controller.register(harness.pi);
+		const valid: DestructiveRecord = {
+			pattern: "rm -rf",
+			command: COMMAND,
+			verdict: "revise",
+			judged: true,
+			confidence: 0.93,
+			reasons: ["irreversible"],
+			blocked: true,
+			at: 1,
+		};
+		controller.onSessionStart([{ customType: "jev.state", data: { lastDestructive: valid } }]);
+		expect(controller.getState().lastDestructive).toEqual(valid);
+		for (const malformed of [
+			{ command: COMMAND, judged: true, blocked: false, at: 1 },
+			{ pattern: "rm -rf", command: COMMAND, judged: "yes", blocked: false, at: 1 },
+			{ pattern: "rm -rf", command: COMMAND, judged: true, blocked: false, verdict: "bogus", at: 1 },
+		]) {
+			controller.onSessionStart([{ customType: "jev.state", data: { lastDestructive: malformed } }]);
+			expect(controller.getState().lastDestructive).toBeUndefined();
+		}
 	});
 });

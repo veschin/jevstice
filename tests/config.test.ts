@@ -197,6 +197,48 @@ describe("jev template config: completion switch", () => {
 	});
 });
 
+describe("jev template config: destructive-action gate", () => {
+	test("gates.destructive.patterns is parsed verbatim", () => {
+		const parsed = validateTemplateConfig(USER_FILE, {
+			gates: { destructive: { patterns: ["rm -rf", "git push --force", "drop table"] } },
+		});
+		expect(parsed.gates?.destructive?.patterns).toEqual(["rm -rf", "git push --force", "drop table"]);
+	});
+
+	test("an empty pattern list is a legal no-op (the gate does not exist)", () => {
+		const parsed = validateTemplateConfig(USER_FILE, { gates: { destructive: { patterns: [] } } });
+		expect(parsed.gates?.destructive?.patterns).toEqual([]);
+	});
+
+	test("trust split: a project file cannot replace the user's destructive list", () => {
+		const merged = mergeTemplateConfigs(
+			{ gates: { destructive: { patterns: ["rm -rf"] } } },
+			{ gates: { destructive: { patterns: ["anything"] } } },
+		);
+		expect(merged.gates?.destructive?.patterns).toEqual(["rm -rf"]);
+	});
+
+	test("fail-closed: a malformed destructive block names the file and the problem", () => {
+		for (const bad of [
+			{ destructive: [] },
+			{ destructive: "rm -rf" },
+			{ destructive: {} },
+			{ destructive: { patterns: "rm -rf" } },
+			{ destructive: { patterns: ["rm -rf", ""] } },
+			{ destructive: { patterns: [1] } },
+		]) {
+			try {
+				validateTemplateConfig(PROJECT_FILE, { gates: bad });
+				expect.unreachable();
+			} catch (err) {
+				expect(err).toBeInstanceOf(JevConfigError);
+				expect((err as Error).message).toContain(PROJECT_FILE);
+				expect((err as Error).message).toContain("gates.destructive");
+			}
+		}
+	});
+});
+
 describe("jev template config: routing candidates", () => {
 	test("routing lists are parsed; empty or malformed lists fail closed", () => {
 		const parsed = validateTemplateConfig(USER_FILE, {
