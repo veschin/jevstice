@@ -139,4 +139,51 @@ describe("evidence: buildRequestBody", () => {
     const state = body.state as { evidence: { quote: string }[] };
     expect(state.evidence.map((e) => e.quote)).toEqual(quotes);
   });
+
+  test("template absent -> body identical to defaults", () => {
+    const without = buildRequestBody(okReq, { apiKey: "k" });
+    const withEmpty = buildRequestBody(okReq, { apiKey: "k", stages: {} });
+    expect(JSON.stringify(withEmpty)).toBe(JSON.stringify(without));
+  });
+
+  test("template stage instructions appended after policy, policy stays first", () => {
+    const body = buildRequestBody(okReq, {
+      apiKey: "k",
+      stages: { code_review: { instructions: "Custom review question for this repo." } },
+    });
+    const instructions = body.questions.verdict!.instructions as {
+      policy: string;
+      question: string;
+      stage_instructions: string;
+    };
+    expect(instructions.policy.indexOf("untrusted data")).toBeLessThan(
+      String(JSON.stringify(instructions)).indexOf("Custom review question"),
+    );
+    expect(instructions.stage_instructions).toBe("Custom review question for this repo.");
+  });
+
+  test("template options override the option criteria", () => {
+    const body = buildRequestBody(okReq, {
+      apiKey: "k",
+      stages: {
+        code_review: {
+          options: [
+            { id: "ship", label: "Ship", meaning: "merge it" },
+            { id: "hold", label: "Hold", meaning: "do not merge" },
+          ],
+        },
+      },
+    });
+    const optionQ = body.questions.option as { criteria: Record<string, unknown> };
+    expect(Object.keys(optionQ.criteria).sort()).toEqual(["hold", "ship"]);
+  });
+
+  test("template for another stage is ignored", () => {
+    const body = buildRequestBody(okReq, {
+      apiKey: "k",
+      stages: { completion_review: { instructions: "not this stage" } },
+    });
+    const instructions = body.questions.verdict!.instructions as { question: string };
+    expect(instructions.question).not.toContain("not this stage");
+  });
 });

@@ -1,8 +1,21 @@
 /**
- * Real TypeSafe systemone client (S:API, docs.typesafe.ai/api, verified 2026-10-07).
- * Transport injectable for tests; production path is the same code.
- * Judge failure/uncertainty NEVER maps to approve (POLICY.failureNeverApproves).
+ * TypeSafe systemone judge client. Official SDK (@typesafe-ai/sdk) is the
+ * transport; wire types in ./types.ts stay the parse/validate boundary.
+ * Product guarantees: fail-closed (malformed/unknown/confidence-less/
+ * low-confidence NEVER approve), key never persisted, evidence verbatim in
+ * state only, no Jev-side caching layer.
  */
+import {
+  APIConnectionError,
+  APIError,
+  APITimeoutError,
+  APIUserAbortError,
+  AuthenticationError,
+  RateLimitError,
+  TypeSafeClient,
+  TypeSafeError,
+  UnprocessableEntityError,
+} from "@typesafe-ai/sdk";
 import type {
   DecisionRequest,
   DecisionResult,
@@ -19,8 +32,10 @@ import type {
 import { POLICY } from "./types";
 import {
   buildRequestBody,
+  STAGE_INSTRUCTIONS_MAX_CHARS,
   validateDecisionRequest,
   validateMultiLabelRequest,
+  type StageTemplate,
 } from "./evidence";
 
 /** Fixed reason codes; no generated prose. */
@@ -41,9 +56,9 @@ export type JevErrorCode =
   | "invalid_request" // HTTP 422
   | "rate_limited" // HTTP 429/529 after retries
   | "transport" // network failure after retries
-  | "timeout" // request aborted by timeout
-  | "unexpected_status" // ok-shape HTTP status outside the documented set
-  | "bad_payload"; // non-JSON body or schema-invalid answer
+  | "timeout" // request timed out (SDK APITimeoutError/APIUserAbortError)
+  | "unexpected_status" // HTTP status outside the documented set
+  | "bad_payload"; // schema-invalid answer
 
 export class JevApiError extends Error {
   readonly code: JevErrorCode;
@@ -59,38 +74,92 @@ export class JevApiError extends Error {
 
 export interface JevClientConfig {
   apiKey: string;
-  /** Full endpoint URL; default POLICY.defaultApiUrl. */
+  /**
+   * Full endpoint URL (POLICY.defaultApiUrl shape, .../v1/systemone); the SDK
+   * gets its API root with the /v1/systemone suffix stripped.
+   */
   apiUrl?: string;
   model?: string;
   timeoutMs?: number;
-  /** Extra attempts after the first; only for 429/529 and network resets. */
+  /** Extra attempts after the first; delegated to the SDK retry policy. */
   maxRetries?: number;
   /** Below this the verdict demotes to insufficient_evidence. Default POLICY. */
   minConfidence?: number;
-  /** Base delay for exponential backoff between retryable failures, ms. */
+  /** SDK backoff initial delay in ms (doubles up to the SDK's 5s cap). */
   retryDelayMs?: number;
-  /** Injectable transport for tests; default global fetch. */
+  /** Injectable transport for tests; handed to the SDK client as its fetch. */
   fetchFn?: typeof fetch;
-  /** Injectable delay for backoff tests. */
-  sleepFn?: (ms: number) => Promise<void>;
+  /**
+   * Per-stage template overrides (jev.config.json `stages` block; loader is
+   * the extension's). instructions appended after built-in policy (<=4000
+   * chars); options replace the stage option set, same validation.
+   */
+  stages?: Record<string, StageTemplate>;
 }
-
-const RETRYABLE_STATUS = new Set([429, 529]);
 
 /** Canonical record guard for this package (no external schema dep). */
 export function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-const VERDICTS = new Set(["approve", "revise", "insufficient_evidence", "ask_user"]);
+const VERDICTS = new Set<string>(["approve", "revise", "insufficient_evidence", "ask_user"]);
 
-function parseResponse(raw: string): JevApiResponse {
-  let body: unknown;
-  try {
-    body = JSON.parse(raw);
-  } catch {
-    throw new JevApiError("bad_payload", "response body is not JSON");
+const SDK_BASE_FALLBACK = "https://api.typesafe.ai";
+
+/** POLICY.defaultApiUrl carries the full endpoint; the SDK wants the API root. */
+function sdkBaseURL(apiUrl: string): string {
+  return apiUrl.replace(/\/v1\/systemone\/?$/, "") || SDK_BASE_FALLBACK;
+}
+
+export function createSDKClient(config: JevClientConfig): TypeSafeClient {
+  return new TypeSafeClient({
+    apiKey: config.apiKey,
+    baseURL: sdkBaseURL(config.apiUrl ?? POLICY.defaultApiUrl),
+    defaultModel: config.model ?? POLICY.defaultModel,
+    timeout: config.timeoutMs ?? 30000,
+    retry: {
+      maxRetries: config.maxRetries ?? 4,
+      backoffInitialMs: config.retryDelayMs ?? 500,
+    },
+    logLevel: "off",
+    ...(config.fetchFn ? { fetch: config.fetchFn } : {}),
+  });
+}
+
+function toJevApiError(err: unknown): JevApiError {
+  if (err instanceof JevApiError) return err;
+  if (err instanceof APITimeoutError || err instanceof APIUserAbortError) {
+    return new JevApiError("timeout", err.message);
   }
+  if (err instanceof AuthenticationError) {
+    return new JevApiError("auth", "api rejected the key (401)", 401);
+  }
+  if (err instanceof UnprocessableEntityError) {
+    return new JevApiError("invalid_request", err.message, 422);
+  }
+  if (err instanceof RateLimitError) {
+    return new JevApiError("rate_limited", `rate limited after retries: ${err.message}`, 429);
+  }
+  if (err instanceof APIError) {
+    // 429/529 exhaust the SDK retry budget (500-599 retried) as InternalServerError
+    if (err.status === 429 || err.status === 529) {
+      return new JevApiError("rate_limited", err.message, err.status);
+    }
+    return new JevApiError("unexpected_status", err.message, err.status);
+  }
+  if (err instanceof APIConnectionError) {
+    return new JevApiError("transport", err.message);
+  }
+  if (err instanceof APIError) {
+    return new JevApiError("unexpected_status", err.message, err.status);
+  }
+  if (err instanceof TypeSafeError) {
+    return new JevApiError("config", err.message);
+  }
+  return new JevApiError("transport", err instanceof Error ? err.message : String(err));
+}
+
+function validateAnswers(body: unknown): JevApiResponse {
   if (!isRecord(body) || !isRecord(body["answers"])) {
     throw new JevApiError("bad_payload", "response missing answers map");
   }
@@ -106,7 +175,7 @@ function parseResponse(raw: string): JevApiResponse {
       // confidence-less answers can never carry an approval
       throw new JevApiError("bad_payload", `answer ${id} has no confidence`);
     }
-    if ((a["confidence"] as number) < 0 || (a["confidence"] as number) > 1) {
+    if (a["confidence"] < 0 || a["confidence"] > 1) {
       throw new JevApiError("bad_payload", `answer ${id} confidence out of 0..1 range`);
     }
     if (!isRecord(a["probabilities"])) {
@@ -116,49 +185,23 @@ function parseResponse(raw: string): JevApiResponse {
   return body as unknown as JevApiResponse;
 }
 
-async function fetchWithPolicy(
-  body: unknown,
-  config: Required<Pick<JevClientConfig, "apiKey" | "apiUrl" | "timeoutMs" | "maxRetries" | "retryDelayMs">> & {
-    fetchFn: typeof fetch;
-    sleepFn: (ms: number) => Promise<void>;
-  },
-): Promise<Response> {
-  let lastError: JevApiError | undefined;
-  for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
-    if (attempt > 0) await config.sleepFn(config.retryDelayMs * 2 ** (attempt - 1));
-    try {
-      const response = await config.fetchFn(config.apiUrl, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${config.apiKey}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(config.timeoutMs),
-      });
-      if (response.ok) return response;
-      const status = response.status;
-      const text = await response.text();
-      if (status === 401) throw new JevApiError("auth", "api rejected the key (401)", 401);
-      if (status === 422) throw new JevApiError("invalid_request", text || "422", 422);
-      if (RETRYABLE_STATUS.has(status)) {
-        lastError = new JevApiError("rate_limited", `status ${status} after retries`, status);
-        continue;
-      }
-      throw new JevApiError("unexpected_status", `unexpected status ${status}: ${text.slice(0, 200)}`, status);
-    } catch (err) {
-      if (err instanceof JevApiError) throw err;
-      if (err instanceof DOMException && (err.name === "AbortError" || err.name === "TimeoutError")) {
-        throw new JevApiError("timeout", `request timed out after ${config.timeoutMs}ms`);
-      }
-      // connection resets and other transport failures: retryable (observed live)
-      lastError = new JevApiError(
-        "transport",
-        err instanceof Error ? err.message : String(err),
-      );
+async function systemOne(
+  client: TypeSafeClient,
+  body: JevApiRequest,
+): Promise<JevApiResponse> {
+  try {
+    const result = await client.systemOne({
+      state: body.state as never,
+      ...(body.model ? { model: body.model } : {}),
+      questions: body.questions as never,
+    });
+    if (!isRecord(result) || !isRecord(result["answers"])) {
+      throw new JevApiError("bad_payload", "response missing answers map");
     }
+    return result as unknown as JevApiResponse;
+  } catch (err) {
+    throw toJevApiError(err);
   }
-  throw lastError ?? new JevApiError("transport", "request failed");
 }
 
 /**
@@ -167,9 +210,8 @@ async function fetchWithPolicy(
  * judge answer, demoted to insufficient_evidence when confidence is low.
  */
 export function createJudge(config: JevClientConfig): Judge {
-  const minConfidence = config.minConfidence ?? POLICY.minConfidenceToApprove;
-  const sleepFn =
-    config.sleepFn ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  // R1: overrides may only RAISE the bar, never lower it below policy floor
+  const minConfidence = Math.max(POLICY.minConfidenceToApprove, config.minConfidence ?? 0);
 
   return async (request: DecisionRequest): Promise<DecisionResult> => {
     if (typeof config.apiKey !== "string" || config.apiKey.length === 0) {
@@ -178,7 +220,25 @@ export function createJudge(config: JevClientConfig): Judge {
         `api key missing: set ${POLICY.apiKeyEnv} or TYPESAFE_API_KEY_COMMAND (e.g. 'pass show token/jev')`,
       );
     }
-    const problems = validateDecisionRequest(request);
+    // stage template shape is fail-closed: bad instructions refuse the call (R5)
+    const tpl = config.stages?.[request.stage];
+    if (tpl?.instructions !== undefined) {
+      const s = tpl.instructions;
+      if (typeof s !== "string" || s.trim().length === 0) {
+        throw new JevApiError("invalid_input", `stage template instructions must be a non-empty string`);
+      }
+      if (s.length > STAGE_INSTRUCTIONS_MAX_CHARS) {
+        throw new JevApiError(
+          "invalid_input",
+          `stage template instructions exceed ${STAGE_INSTRUCTIONS_MAX_CHARS} chars`,
+        );
+      }
+    }
+    // template options replace the request options and pass the same validator (R3)
+    const effectiveRequest: DecisionRequest = tpl?.options
+      ? { ...request, options: tpl.options }
+      : request;
+    const problems = validateDecisionRequest(effectiveRequest);
     if (problems.length > 0) {
       throw new JevApiError(
         "invalid_input",
@@ -186,22 +246,12 @@ export function createJudge(config: JevClientConfig): Judge {
       );
     }
 
-    const response = await fetchWithPolicy(buildRequestBody(request, config), {
-      apiKey: config.apiKey,
-      apiUrl: config.apiUrl ?? POLICY.defaultApiUrl,
-      timeoutMs: config.timeoutMs ?? 30000,
-      maxRetries: config.maxRetries ?? 4,
-      retryDelayMs: config.retryDelayMs ?? 500,
-      fetchFn: config.fetchFn ?? fetch,
-      sleepFn,
-    });
-
-    const text = await response.text();
-    const parsed = parseResponse(text);
+    const client = createSDKClient(config);
+    const parsed = validateAnswers(await systemOne(client, buildRequestBody(effectiveRequest, config)));
     const verdictAnswer = parsed.answers["verdict"]!;
     const optionAnswer = parsed.answers["option"]!;
 
-    const allowedOptions = new Set(request.options.map((o) => o.id));
+    const allowedOptions = new Set(effectiveRequest.options.map((o) => o.id));
     if (!allowedOptions.has(optionAnswer.choice!)) {
       throw new JevApiError(
         "bad_payload",
@@ -236,7 +286,7 @@ export function createJudge(config: JevClientConfig): Judge {
   };
 }
 
-// ---------- Multi-label marking (FR-04 topic selection) ----------
+// ---------- Multi-label marking (FR-04 topic selection; DEFERRED MVP scope, kept as tested library) ----------
 
 /** noul >= this => item applicable; documented, single source of truth. */
 export const MULTILABEL_APPLICABLE_THRESHOLD = 0.5;
@@ -251,25 +301,12 @@ function shard<T>(items: T[], size: number): T[][] {
   return out;
 }
 
-function multiLabelConfig(config: JevClientConfig) {
-  return {
-    apiKey: config.apiKey,
-    apiUrl: config.apiUrl ?? POLICY.defaultApiUrl,
-    timeoutMs: config.timeoutMs ?? 30000,
-    maxRetries: config.maxRetries ?? 4,
-    retryDelayMs: config.retryDelayMs ?? 500,
-    fetchFn: config.fetchFn ?? fetch,
-    sleepFn: config.sleepFn ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))),
-    model: config.model ?? POLICY.defaultModel,
-  };
-}
-
 /**
  * Mark each item id as applicable or not: one Noul question per item, sharded
  * into systemone requests of <=255 questions (S:API limit), shards sequential.
  * Noul carries no confidence, so verdict "approve" means the marking completed.
  * Any contract violation (missing id, unknown id, non-noul answer) fails closed
- * to insufficient_evidence with reason "bad_payload" — never a partial marking.
+ * to insufficient_evidence with reason "bad_payload" - never a partial marking.
  */
 export function createMultiLabelJudge(config: JevClientConfig): MultiLabelJudge {
   return async (request: MultiLabelRequest): Promise<MultiLabelResult> => {
@@ -290,7 +327,7 @@ export function createMultiLabelJudge(config: JevClientConfig): MultiLabelJudge 
       return { verdict: "approve", applicable: {}, reasons: [] };
     }
 
-    const cfg = multiLabelConfig(config);
+    const client = createSDKClient(config);
     const applicable: Record<string, boolean> = {};
 
     for (const items of shard(request.items, 255)) {
@@ -311,38 +348,33 @@ export function createMultiLabelJudge(config: JevClientConfig): MultiLabelJudge 
       }
       const body: JevApiRequest = {
         state: { stage: request.stage, task: request.task, evidence: request.evidence },
-        model: cfg.model,
+        model: config.model ?? POLICY.defaultModel,
         questions,
       };
-      const response = await fetchWithPolicy(body, cfg);
-      const text = await response.text();
-      let parsed: unknown;
+      let parsed: JevApiResponse;
       try {
-        parsed = JSON.parse(text);
-      } catch {
-        return failClosed("response body is not JSON");
+        parsed = await systemOne(client, body);
+      } catch (err) {
+        if (err instanceof JevApiError && err.code !== "bad_payload") throw err;
+        return failClosed("contract violation");
       }
-      const answers = isRecord(parsed) ? parsed["answers"] : undefined;
-      if (!isRecord(answers)) return failClosed("response missing answers map");
+      const answers = parsed.answers as Record<string, unknown>;
       for (const item of items) {
         const answer = answers[item.id];
-        if (!isRecord(answer) || answer["type"] !== "noul") {
-          return failClosed(`missing or non-noul answer for ${item.id}`);
-        }
+        if (!isRecord(answer) || answer["type"] !== "noul") return failClosed(`missing noul ${item.id}`);
         const p = answer["noul"];
-        if (typeof p !== "number" || !Number.isFinite(p)) {
-          return failClosed(`answer ${item.id} has no finite noul probability`);
-        }
+        if (typeof p !== "number" || !Number.isFinite(p)) return failClosed(`no noul ${item.id}`);
         applicable[item.id] = p >= MULTILABEL_APPLICABLE_THRESHOLD;
       }
       for (const id of Object.keys(answers)) {
-        if (!(id in applicable)) return failClosed(`unknown answer id ${id}`);
+        if (!(id in applicable)) return failClosed(`unknown id ${id}`);
       }
     }
     return { verdict: "approve", applicable, reasons: [] };
   };
 }
 
-function failClosed(_detail: string): MultiLabelResult {
-  return { verdict: "insufficient_evidence", applicable: {}, reasons: ["bad_payload"] };
+function failClosed(detail: string): MultiLabelResult {
+  // fixed code + diagnostic detail (B6)
+  return { verdict: "insufficient_evidence", applicable: {}, reasons: ["bad_payload", detail] };
 }

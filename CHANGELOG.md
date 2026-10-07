@@ -4,4 +4,12 @@
 
 - Baseline: PRD, PLAN.md, package config, shared types contract (DecisionRequest/DecisionResult/Judge/MultiLabelJudge, TypeSafe systemone wire types, POLICY defaults).
 - Live API unblocked: official key (`pass token/jev`) verified against direct TypeSafe endpoint - HTTP 200, jev-1.13.0, ~0.5s latency, usage returned. Synthetic live proof: noul, classification, topic relevance, code-review pair (approve 0.96 / revise 1.0 with task context in state), completion evidence gating (report-only -> insufficient_evidence 0.94). Intermittent transport resets observed -> client retry must cover resets.
-- Slices: catalog/classification/routing (done), client+evidence+CLI (in flight), omp extension controller (in flight).
+- Slices: catalog/classification/routing (done, deferred-scope library per MVP cut), client+evidence+CLI (done), omp extension controller (done).
+- Integration (2026-10-07): 111/111 tests green, `tsc --noEmit` clean, `guard.py --deep` clean. Live proof in real omp (explicit `-e` path, no global changes): plan gate blocks mutations until approved plan; missing key fails closed (`judged:false`, never approve); full round-trip through official api.typesafe.ai returns real verdicts (`judged:true`) inside the session. Evidence: `evidence/`.
+- MVP per user focus: same-executor evidence-backed decision → live Jev verdict → correction → review/completion gates. Deferred: auto skill/model routing, large topic selection, provider cache measurement (AC7 sub-criterion), full refactor inventory stays test-backed.
+- Review loop: round 1 findings (code 5, behavior B1-B7) all fixed and verified; round 2 both reviewers CLEAR (behavior incl. SDK supply-chain check).
+- Official SDK transport adopted (@typesafe-ai/sdk 0.6.0, project-local) under unchanged signatures; hand-rolled wire removed.
+- Template overrides implemented per R1-R6 (fail-closed load, only-raise threshold clamp, split precedence, policy-first instructions).
+- Live-Jev dev consultations: gating-policy draft (POLICY-DRAFT.md), PRD gap review, implementation satisfaction review (evidence/).
+- AC9 dogfood executed: whole-project final review through the addon in real omp; live verdict insufficient_evidence (0.41, judged=true) — fail-closed held; completion remains a user decision.
+- Final state: 128/128 tests, tsc clean, guard --deep clean, both reviews CLEAR, AC observed statuses recorded in ACCEPTANCE.md.

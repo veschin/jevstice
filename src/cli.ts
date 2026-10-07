@@ -52,7 +52,7 @@ async function readKey(env: Record<string, string | undefined>): Promise<string 
 }
 
 const USAGE =
-  "usage: jev decide <request.json | - | '{...json...}'>\n" +
+  "usage: jev <request.json | - | '{...json...}'>\n" +
   "       jev probe\n" +
   "env: TYPESAFE_API_KEY | TYPESAFE_API_KEY_COMMAND (e.g. 'pass show token/jev'), TYPESAFE_API_URL";
 

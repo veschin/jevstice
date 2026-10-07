@@ -9,13 +9,15 @@ plan/types -> parallel client/catalog/extension -> integration proof -> parallel
 | # | Task | Owner | Status | Acceptance |
 |---|------|-------|--------|-----------|
 | 0 | Baseline: PRD+PLAN+package+src/types.ts commit | JevIntegrator | DONE - commit `f32d1c2` | PLAN.md lists all FR acceptance + conservative gate policy; types exact |
-| 1 | TypeSafe client + evidence builder + CLI | JevClientWorker | IN FLIGHT | real POST /v1/systemone, Bearer env key never persisted; schema validation; retries incl. transport resets (429/529 + ECONNRESET); exit 0/2/4 contract; typed errors |
-| 2 | Catalog/classification/topic+skill+model routing | JevCatalogWorker | DONE (untested mid-flight) | selection ⊆ catalog, provenance resolvable, judge failure -> no default pick, 255-shard boundaries; tests in tests/catalog.test.ts |
-| 3 | omp extension controller + entry | JevExtensionWorker | IN FLIGHT | tool_call gate, session_stop completion enforcement (evidence-backed), before_subagent_spawn routing, appendEntry bounded rework (max 3), same-session feedback via pi.sendMessage |
-| 4 | Integration proof | JevIntegrator | PENDING | bun tests green, tsc --noEmit clean, guard.py --deep, LIVE CLI probe/decide against api.typesafe.ai (key via pass, never printed), actual installed omp extension load smoke |
-| 5 | Independent reviews | JevCodeReview + JevBehaviorReview | PARKED - send READY_FOR_REVIEW after #4 | findings -> routed to owning worker; FIXES_READY loop until CLEAR from both |
-| 6 | Docs + final implementation commit | JevIntegrator | PENDING | README/CHANGELOG/PRD updated with observed coverage + blockers; commit only after both CLEAR; no push |
-| 7 | AC9 dogfooding | JevIntegrator | PENDING | genuine correction routed through addon in real omp + live Jev; same-session execution; sanitized evidence/ac9-dogfood.md; PASS required before "finished" |
+| 1 | TypeSafe client + evidence builder + CLI | JevClientWorker | DONE — commit 8b4c8ff | incl. MultiLabel judge library; F3/F5/F6 fixed |
+| 2 | Catalog/classification/topic+skill+model routing | JevCatalogWorker | DONE (library, DEFERRED from MVP runtime) — commit 8b4c8ff | tsc clean, 34/34 |
+| 3 | omp extension controller + entry | JevExtensionWorker | DONE — commit pending with integration | 18/18; live-smoked |
+| 4 | Integration proof | JevIntegrator | DONE 2026-10-07 (superseded runs: final 128/128, tsc clean, guard clean, live probe ok) | evidence/ |
+| 5 | Independent reviews | JevCodeReview + JevBehaviorReview | ROUND 2 RUNNING — FIXES_READY sent | B1-B7 + code findings 1-5 + overrides R1-R6 + SDK transport landed → CLEAR both |
+| 6 | Docs + final implementation commit | JevIntegrator | PENDING | after both CLEAR |
+| 7 | AC9 dogfooding | JevIntegrator | PENDING — after CLEAR; genuine corrections consumed by fix round → whole-project final review through addon (distinguished from rework loop) | evidence/ac9-dogfood.md |
+| 8 | Live-Jev dev consultations (user order) | JevIntegrator | DONE | POLICY-DRAFT.md; evidence/jev-prd-review.md; evidence/jev-impl-review.md; 5 requests |
+| 9 | Template overrides (user-approved in-scope) | Extension+Client workers | DONE — awaiting round-2 review | AC10; R1-R6 implemented |
 
 ## API status
 
@@ -24,3 +26,8 @@ plan/types -> parallel client/catalog/extension -> integration proof -> parallel
 ## FR coverage map
 
 See PLAN.md §"FR acceptance" (FR-01..FR-16). Gate policy: failure/low-confidence never approves; bounded rework; ask_user preserved.
+
+## Post-MVP backlog (user-ordered, not implemented)
+
+- FR-17 interaction templates (default templates versioned/tested; project-level override file; invalid override = fail-closed error; template inventory in README).
+- POLICY-DRAFT.md post-approval items: high-risk bash pattern gate, spawn budget gate, destructive-action detector, memory/skill class policy, judge-every-edit vs plan+completion decision.

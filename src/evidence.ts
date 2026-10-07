@@ -4,6 +4,7 @@
  * placed only in `state`; question instructions carry only Jev-side policy.
  */
 import type {
+  DecisionOption,
   DecisionRequest,
   Evidence,
   EvidenceKind,
@@ -45,6 +46,9 @@ export function validateDecisionRequest(req: DecisionRequest): ValidationProblem
       if (seen.has(opt.id)) push("duplicate_option_ids", `options[${i}].id`);
       seen.add(opt.id);
       if (typeof opt.id !== "string" || opt.id.length === 0) push("empty_option_id", `options[${i}].id`);
+      if (typeof opt.label !== "string" || opt.label.trim().length === 0) {
+        push("empty_option_label", `options[${i}].label`);
+      }
       if (typeof opt.meaning !== "string" || opt.meaning.trim().length === 0) {
         push("empty_option_meaning", `options[${i}].meaning`);
       }
@@ -112,6 +116,21 @@ const EVIDENCE_POLICY =
   "belongs to the customer, answer ask_user.";
 
 /**
+ * Optional per-stage template overrides (jev.config.json `stages` block).
+ * instructions (non-empty, <=4000 chars) is appended AFTER the built-in
+ * EVIDENCE_POLICY — policy always first; options replaces the DecisionRequest
+ * option set for that stage and must pass the same validation as requests.
+ * Merged per-key; absent keys keep code defaults.
+ */
+export interface StageTemplate {
+  instructions?: string;
+  options?: DecisionOption[];
+}
+
+/** Stage-template override hard cap (R2). */
+export const STAGE_INSTRUCTIONS_MAX_CHARS = 4000;
+
+/**
  * Build the systemone request body. Two independent Choice questions, evaluated
  * in parallel from one state (S:API): the verdict gate and the option pick.
  * The apiKey is accepted for signature symmetry with the caller and never
@@ -119,13 +138,20 @@ const EVIDENCE_POLICY =
  */
 export function buildRequestBody(
   req: DecisionRequest,
-  _config: { apiKey: string; model?: string },
+  _config: {
+    apiKey: string;
+    model?: string;
+    stages?: Record<string, StageTemplate>;
+  },
 ): JevApiRequest {
+  const tpl = _config.stages?.[req.stage];
+  const options = tpl?.options ?? req.options;
+
   const state = {
     stage: req.stage,
     task: req.task,
     proposal: req.proposal,
-    options: req.options.map((o) => ({ id: o.id, label: o.label, meaning: o.meaning })),
+    options: options.map((o) => ({ id: o.id, label: o.label, meaning: o.meaning })),
     evidence: req.evidence.map((e, i) => ({
       index: i,
       kind: e.kind,
@@ -145,7 +171,8 @@ export function buildRequestBody(
           policy: EVIDENCE_POLICY,
           question:
             "For task `state.task` at stage `state.stage`, does the evidence in `state.evidence` " +
-            "support `state.proposal`? Choose one verdict.",
+              "support `state.proposal`? Choose one verdict.",
+          ...(tpl?.instructions ? { stage_instructions: tpl.instructions } : {}),
         },
         criteria: VERDICT_CRITERIA,
       },
@@ -158,7 +185,7 @@ export function buildRequestBody(
             "Which option in `state.options` is the right choice for task `state.task`, judging " +
             "only from `state.evidence`? Answer with the option id.",
         },
-        criteria: Object.fromEntries(req.options.map((o) => [o.id, o.meaning])),
+        criteria: Object.fromEntries(options.map((o) => [o.id, o.meaning])),
       },
     },
   };

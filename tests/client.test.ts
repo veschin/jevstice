@@ -85,6 +85,29 @@ describe("client: happy path", () => {
     expect(result.verdict).toBe("revise");
   });
 
+  test("SDK transport construction: URL root derived, bearer key in header only", async () => {
+    const calls: { url?: unknown; headers?: unknown; body?: unknown }[] = [];
+    const fetchFn = (async (url: unknown, init?: RequestInit) => {
+      calls.push({
+        url,
+        headers: init?.headers,
+        body: init?.body ? JSON.parse(init.body as string) : undefined,
+      });
+      return okResponse();
+    }) as unknown as typeof fetch;
+    const judge = createJudge({
+      apiKey: "k-test",
+      apiUrl: "https://api.example.test/v1/systemone",
+      fetchFn,
+    });
+    await judge(okReq);
+    expect(calls[0]!.url).toBe("https://api.example.test/v1/systemone");
+    const headers = calls[0]!.headers as Record<string, string>;
+    expect(headers["Authorization"]).toBe("Bearer k-test");
+    // model resolved by the SDK from defaultModel
+    expect((calls[0]!.body as Record<string, unknown>)["model"]).toBe("jev-latest");
+  });
+
   test("sends systemone request with model, state and both questions", async () => {
     const calls: { body?: unknown }[] = [];
     const judge = createJudge({ ...baseConfig, fetchFn: fetchOk(calls) });
@@ -256,6 +279,42 @@ describe("client: malformed and uncertain responses", () => {
     const result = await judge(okReq);
     expect(result.verdict).not.toBe("approve");
     expect(result.verdict).toBe("insufficient_evidence");
+  });
+  test("template options become the accepted selectedOption set", async () => {
+    const fetchFn = (async () => {
+      const body = judgeVerdictBody("approve", 0.9);
+      body.answers.option.choice = "ship";
+      return jsonResponse(body);
+    }) as unknown as typeof fetch;
+    const judge = createJudge({
+      ...baseConfig,
+      fetchFn,
+      stages: {
+        completion_review: {
+          options: [
+            { id: "ship", label: "Ship", meaning: "merge it" },
+            { id: "hold", label: "Hold", meaning: "do not merge" },
+          ],
+        },
+      },
+    });
+    const result = await judge(okReq);
+    expect(result.selectedOption).toBe("ship");
+  });
+
+  test("invalid template options fail closed with validation codes", async () => {
+    let called = 0;
+    const fetchFn = (async () => {
+      called++;
+      return okResponse();
+    }) as unknown as typeof fetch;
+    const judge = createJudge({
+      ...baseConfig,
+      fetchFn,
+      stages: { completion_review: { options: [{ id: "only", label: "Only", meaning: "" }] } },
+    });
+    await expect(judge(okReq)).rejects.toBeInstanceOf(JevApiError);
+    expect(called).toBe(0);
   });
 });
 
