@@ -139,6 +139,26 @@ export const CONTROL_POINT_REGISTRY: Readonly<Record<string, ControlPoint>> = {
 		trigger: "on_demand",
 		verdictMapping: "standard",
 	},
+	// FR-20: the acceptance criteria of the accepted requirement list. The caller submits, per
+	// criterion, the accepted requirement id it checks; a criterion naming no requirement, or an
+	// id outside the accepted list, is refused before any judge call, and the judge marks every
+	// criterion in one request. Advisory by construction (on_demand never grants a gate); the
+	// completion boundary is what names a criterion the judge did not accept.
+	acceptance_criteria: {
+		stage: "acceptance_criteria",
+		trigger: "on_demand",
+		verdictMapping: "standard",
+	},
+	// FR-21: the judge's order over the accepted requirements. The controller supplies the
+	// accepted list itself (the judge may not invent an item), the judge assigns a priority
+	// class to every item in one request, and the controller derives the order from those marks
+	// with a documented deterministic tie-break. Advisory by construction; the plan gate and the
+	// stop boundary name an order that no longer ranks the accepted batch.
+	requirement_priorities: {
+		stage: "requirement_priorities",
+		trigger: "on_demand",
+		verdictMapping: "standard",
+	},
 	// Review activities (D5): the controller runs the review's FIXED question set itself when the
 	// executor submits the stage, records the per-item results in session state and surfaces them.
 	// Advisory by construction (on_demand records no gate approval and refuses nothing); the
@@ -179,13 +199,6 @@ export const CONTROL_POINT_REGISTRY: Readonly<Record<string, ControlPoint>> = {
 		verdictMapping: "standard",
 	},
 };
-
-export { COURSE_CHECK_OPTION_IDS };
-
-/** Stage is submittable iff known to the registry (built-in or config-declared on_demand). */
-export function isKnownStage(stage: string, extra: ReadonlyMap<string, ControlPoint>): boolean {
-	return stage in CONTROL_POINT_REGISTRY || extra.has(stage);
-}
 
 /** Registry lookup across built-ins and config-declared points. */
 export function lookupControlPoint(stage: string, extra: ReadonlyMap<string, ControlPoint>): ControlPoint | undefined {

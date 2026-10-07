@@ -325,6 +325,34 @@ describe("review activities: the recorded result and the advisory rule", () => {
 		).toThrow(/business_review\.questions/);
 	});
 
+	test("an owner's template options replace the executor's candidates for the review's choice", async () => {
+		const harness = makeFakePi();
+		const asked: ReviewQuestionWire[][] = [];
+		const template = validateTemplateConfig("test.json", {
+			stages: {
+				business_review: {
+					options: [
+						{ id: "tpl_risk", label: "Template risk", meaning: "the risk the owner declared" },
+						{ id: "tpl_second", label: "Template second", meaning: "the owner's other declared risk" },
+					],
+				},
+			},
+		});
+		const controller = createJevController({
+			template,
+			judge: async () => {
+				throw new Error("not used");
+			},
+			reviewJudge: reviewJudge({}, asked),
+		});
+		controller.register(harness.pi);
+		await controller.submitDecision(businessReviewInput());
+		// The template's candidates reach the judge; the executor's declared list no longer applies.
+		const choice = asked[0]?.find(q => q.kind === "choice");
+		expect(Object.keys(choice?.options ?? {})).toContain("tpl_risk");
+		expect(Object.keys(choice?.options ?? {})).not.toContain("judge_reliability");
+	});
+
 	test("a malformed persisted review is dropped on restore; a well-formed one is restored", () => {
 		const controller = createJevController({ judge: async () => ({ verdict: "revise", reasons: [], confidence: 0.9 }) });
 		const valid: ReviewRecord = {

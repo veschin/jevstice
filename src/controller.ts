@@ -41,6 +41,10 @@ import {
 	FORMALIZATION_APPROVED_OPTION,
 	FORMALIZATION_COVERAGE_MISSING_OPTION,
 	FORMALIZATION_UNTRACEABLE_OPTION,
+	CRITERIA_ACCEPTED_OPTION,
+	CRITERIA_UNBACKED_OPTION,
+	PRIORITIES_RANKED_OPTION,
+	PRIORITIES_STALE_OPTION,
 	resolveActivityOutcome,
 	type ActivityRegistry,
 } from "./activities.js";
@@ -54,6 +58,9 @@ import { STAGES } from "./stages.js";
 import {
 	POLICY,
 	COURSE_CHECK_NEXT_ACTIONS,
+	PRIORITY_CLASSES,
+	type AcceptanceCriteriaJudge,
+	type AcceptanceCriteriaResult,
 	type AspectCoverageJudge,
 	type AspectCoverageResult,
 	type ClaimCheckJudge,
@@ -62,6 +69,9 @@ import {
 	type CourseCheckNextAction,
 	type CourseCheckResult,
 	type MultiLabelJudge,
+	type PriorityClass,
+	type PriorityJudge,
+	type PriorityResult,
 	type RefactorInventoryItem,
 	type RefactorMarkingJudge,
 	type RefactorMarkingOutcome,
@@ -106,6 +116,10 @@ export interface FormalizedRequirement {
 	id: string;
 	/** The caller's own wording of the requirement (its numbered list item). */
 	text: string;
+	/** FR-19: the submitted quote id this item names as its source. */
+	quoteId: string;
+	/** That quote's verbatim text, so an observer reads a quote beside every numbered item. */
+	quote: string;
 	/** True when a quoted user/spec item states or directly entails it. */
 	traceable: boolean;
 }
@@ -121,6 +135,8 @@ export interface FormalizationRecord {
 	uncovered: Array<{ id: string; source: string; excerpt: string }>;
 	outcome: string;
 	complete: boolean;
+	/** Content digest of the accepted items: the identity of this accepted batch (FR-21). */
+	batchDigest: string;
 	at: number;
 	taskFingerprint: string | undefined;
 	workRevision: number;
@@ -137,12 +153,91 @@ export interface PlanMappingRecord {
 	workRevision: number;
 }
 
+/**
+ * Identity of an accepted requirement batch: the task plus a digest of the accepted list's items
+ * (numbers, wording, named quotes and their verbatim text). Content, not a timestamp: re-accepting
+ * the SAME list keeps an order valid, while a genuinely new portion (different items or quotes)
+ * makes it a different batch - which is exactly what "re-ranked after the next accepted batch" needs.
+ */
+export interface AcceptedBatch {
+	taskFingerprint: string | undefined;
+	digest: string;
+}
+
+/**
+ * FR-20: one acceptance criterion with the ACCEPTED requirement it references, that
+ * requirement's verbatim quote, and the judge's own mark. A criterion the judge did not mark is
+ * never accepted and is named at the completion boundary.
+ */
+export interface AcceptanceCriterion {
+	id: string;
+	requirementId: string;
+	text: string;
+	/** The referenced accepted requirement's verbatim quote, so the criterion is readable alone. */
+	requirementQuote: string;
+	/** The judge's mark: the referenced requirement states or entails this criterion as written. */
+	marked: boolean;
+}
+
+/**
+ * Latest acceptance_criteria result for the current task (FR-20), bound to the accepted batch its
+ * criteria were formalized from. `complete` is true only when every criterion is marked; an
+ * incomplete record names the unaccepted criterion ids.
+ */
+export interface AcceptanceCriteriaRecord {
+	criteria: AcceptanceCriterion[];
+	/** Criterion ids the judge did not accept - named at the stop boundary, never used as criteria. */
+	unaccepted: string[];
+	complete: boolean;
+	batch: AcceptedBatch;
+	at: number;
+	workRevision: number;
+}
+
+/** FR-21: one ranked accepted requirement with its number, its verbatim quote and the judge's class. */
+export interface PriorityOrderItem {
+	requirementId: string;
+	/** 1-based rank in the order derived from the judge's own class marks. */
+	rank: number;
+	text: string;
+	/** The accepted requirement's verbatim quote (FR-21 requires the quotes in this record). */
+	quote: string;
+	priorityClass: PriorityClass;
+	confidence?: number;
+}
+
+/**
+ * Latest requirement_priorities result for the current task (FR-21): the order over the accepted
+ * batch it ranks, the judge's per-item class marks with their confidences, and each ranked item's
+ * verbatim requirement quote. A later accepted batch retires the record (stale + reason); the next
+ * judged consultation replaces it and records the batch it superseded.
+ */
+export interface PriorityRecord {
+	items: PriorityOrderItem[];
+	/** The accepted batch this order ranks. */
+	batch: AcceptedBatch;
+	stale: boolean;
+	staleReason?: string;
+	/** The batch a later judged consultation superseded, when this record replaced an older order. */
+	supersedes?: AcceptedBatch;
+	/** FR-21 naming: work started on an item the order ranked later; recorded when observed. */
+	outOfOrder?: { started: string; expectedFirst: string };
+	at: number;
+}
+
 /** One automatic (periodic) course-check consult. Advisory: it never unlocks anything. */
 export interface AutoCourseCheckRecord {
+	/** True when the judge answered; false only when it could not be consulted or answered unusably. */
 	judged: boolean;
 	selectedOption?: string;
 	confidence?: number;
 	reasons: string[];
+	/**
+	 * F3: true when the judge DID answer and the answer was recorded as uncertainty instead of a
+	 * verdict (a redirect at a confidence below the floor). The record must read as uncertainty -
+	 * never as "not judged" - because the judge's own answer is what is being recorded.
+	 */
+	belowFloor?: boolean;
 	/** Work revision the consult ran at (the mutation count that crossed the period). */
 	workRevision: number;
 	at: number;
@@ -246,6 +341,10 @@ export interface JevState {
 	lastFormalization: FormalizationRecord | undefined;
 	/** Latest plan_mapping result: the per-requirement plan claims of the planning activity. */
 	lastPlanMapping: PlanMappingRecord | undefined;
+	/** FR-20: latest acceptance_criteria result, bound to the accepted batch its criteria came from. */
+	lastAcceptanceCriteria: AcceptanceCriteriaRecord | undefined;
+	/** FR-21: latest requirement_priorities order over an accepted batch (undefined = none recorded). */
+	lastPriorities: PriorityRecord | undefined;
 	/**
 	 * Latest automatic (periodic) course-check consult. Advisory record only: it never records a
 	 * gate approval and never satisfies the completion boundary (that needs a deliberate
@@ -316,6 +415,8 @@ function freshState(): JevState {
 		lastClaimCheck: undefined,
 		lastFormalization: undefined,
 		lastPlanMapping: undefined,
+		lastAcceptanceCriteria: undefined,
+		lastPriorities: undefined,
 		lastAutoCourseCheck: undefined,
 		openAspectGaps: undefined,
 		consecutiveCompletionApproves: undefined,
@@ -449,6 +550,14 @@ const FORMALIZATION_FIX =
 const PLAN_MAPPING_FIX =
 	"submit a plan claim for every formalized requirement id, naming the plan work that serves it; a claim the " +
 	"quoted evidence does not support cannot map the requirement";
+/** FR-20: the fix named when a criterion is not backed by the accepted requirement it references. */
+const CRITERIA_FIX =
+	"reference an accepted requirement id and state a checkable criterion of that requirement; a criterion the " +
+	"referenced requirement does not state or entail is not accepted";
+/** FR-21: the fix named when no order could be recorded. */
+const PRIORITIES_FIX =
+	"resubmit stage=requirement_priorities so the judge can rank the accepted requirement list; no order is " +
+	"recorded from a partial, escaped or low-confidence answer";
 /**
  * Fixed options of the single-claim plan mapping (a formalization with exactly one requirement):
  * the per-claim marking path starts at two claims, so that one mapping goes through one
@@ -504,10 +613,12 @@ export interface ValidatedDecisionInput {
 	aspects: string[];
 	/** Claim texts for the claim_check preset (each judged separately against the evidence). */
 	claims: string[];
-	/** Draft numbered requirements for the requirements_formalization stage (one per item). */
-	requirements: string[];
+	/** Draft numbered requirements for the requirements_formalization stage, each naming its quote. */
+	requirements: Array<{ text: string; quoteId: string }>;
 	/** Per-requirement plan claims for the plan_mapping stage (planning activity). */
 	planClaims: Array<{ requirementId: string; claim: string }>;
+	/** FR-20: acceptance criteria for the acceptance_criteria stage, each referencing an accepted id. */
+	criteria: Array<{ requirementId: string; text: string }>;
 	/** FR-13 part (1): the old-function inventory submitted to the refactor_inventory stage. */
 	inventory: RefactorInventoryItem[];
 	/** FR-13 part (2): the artifact material attached to each inventory item for refactor_marking. */
@@ -599,9 +710,41 @@ export function validateDecisionInput(raw: unknown, extraStages: ReadonlySet<str
 	const claims = Array.isArray(raw["claims"])
 		? raw["claims"].filter((c): c is string => typeof c === "string" && c.trim().length > 0)
 		: [];
-	const requirements = Array.isArray(raw["requirements"])
-		? raw["requirements"].filter((r): r is string => typeof r === "string" && r.trim().length > 0)
-		: [];
+	const requirementItems: Array<{ text: string; quoteId: string }> = [];
+	const rawRequirements = raw["requirements"];
+	if (rawRequirements !== undefined && !Array.isArray(rawRequirements)) {
+		reasons.push("requirements must be an array of {text, quoteId}");
+	} else if (Array.isArray(rawRequirements)) {
+		rawRequirements.forEach((r, i) => {
+			if (!isRecord(r) || !nonEmptyString(r["text"]) || !nonEmptyString(r["quoteId"])) {
+				// FR-19: an item without a number and a named verbatim quote is not a formalized
+				// requirement, so it is refused here - before any judge call.
+				reasons.push(
+					`requirements[${i}] must be {text, quoteId}: the item's own wording and the id of the ` +
+						"submitted user/spec quote it derives from (an item without a quote is refused)",
+				);
+				return;
+			}
+			requirementItems.push({ text: r["text"] as string, quoteId: r["quoteId"] as string });
+		});
+	}
+	const criteria: Array<{ requirementId: string; text: string }> = [];
+	const rawCriteria = raw["criteria"];
+	if (rawCriteria !== undefined && !Array.isArray(rawCriteria)) {
+		reasons.push("criteria must be an array of {requirementId, text}");
+	} else if (Array.isArray(rawCriteria)) {
+		rawCriteria.forEach((c, i) => {
+			if (!isRecord(c) || !nonEmptyString(c["requirementId"]) || !nonEmptyString(c["text"])) {
+				// FR-20: a criterion that references no requirement is refused before any judge call.
+				reasons.push(
+					`criteria[${i}] must be {requirementId, text}: the criterion and the id of the accepted ` +
+						"formalized requirement it checks (a criterion referencing no requirement is refused)",
+				);
+				return;
+			}
+			criteria.push({ requirementId: c["requirementId"] as string, text: c["text"] as string });
+		});
+	}
 	const planClaims: Array<{ requirementId: string; claim: string }> = [];
 	const rawPlanClaims = raw["planClaims"];
 	if (rawPlanClaims !== undefined && !Array.isArray(rawPlanClaims)) {
@@ -696,8 +839,9 @@ export function validateDecisionInput(raw: unknown, extraStages: ReadonlySet<str
 			capabilities,
 			aspects,
 			claims,
-			requirements,
+			requirements: requirementItems,
 			planClaims,
+			criteria,
 			inventory,
 			inventoryMarks,
 		},
@@ -770,6 +914,10 @@ export interface ControllerDeps {
 	claimCheckJudge?: ClaimCheckJudge;
 	/** Per-item traceability judge: the requirements_formalization stage (one request, per-item marks). */
 	requirementsFormalizationJudge?: RequirementsFormalizationJudge;
+	/** FR-20 per-criterion judge: the acceptance_criteria stage (one request, one mark per criterion). */
+	acceptanceCriteriaJudge?: AcceptanceCriteriaJudge;
+	/** FR-21 ranking judge: the requirement_priorities stage (one priority class per accepted item). */
+	priorityJudge?: PriorityJudge;
 	/**
 	 * FR-13 per-item marking judge: the refactor_marking stage (one request, one preserved/lost
 	 * marking per inventory item, judged from the material attached to that item).
@@ -828,6 +976,8 @@ export class JevController {
 	private readonly aspectCoverageJudge: AspectCoverageJudge | undefined;
 	private readonly claimCheckJudge: ClaimCheckJudge | undefined;
 	private readonly requirementsFormalizationJudge: RequirementsFormalizationJudge | undefined;
+	private readonly acceptanceCriteriaJudge: AcceptanceCriteriaJudge | undefined;
+	private readonly priorityJudge: PriorityJudge | undefined;
 	private readonly refactorMarkingJudge: RefactorMarkingJudge | undefined;
 	/** Activity registry the outcome-set guard resolves against (default: the product registry). */
 	private readonly activities: ActivityRegistry;
@@ -864,6 +1014,8 @@ export class JevController {
 		this.aspectCoverageJudge = deps.aspectCoverageJudge;
 		this.claimCheckJudge = deps.claimCheckJudge;
 		this.requirementsFormalizationJudge = deps.requirementsFormalizationJudge;
+		this.acceptanceCriteriaJudge = deps.acceptanceCriteriaJudge;
+		this.priorityJudge = deps.priorityJudge;
 		this.refactorMarkingJudge = deps.refactorMarkingJudge;
 		this.activities = deps.activities ?? ACTIVITY_REGISTRY;
 		this.catalogIds = deps.catalogIds ?? new Set();
@@ -968,8 +1120,16 @@ export class JevController {
 				"with `planClaims` (one {requirementId, claim} per formalized requirement, the claim being that " +
 				"the plan serves it); a requirement without a supported claim leaves planning incomplete and " +
 				"mutating work stays blocked until the mapping covers every requirement. " +
-				"(`options` and `proposal` stay required by the tool schema on both stages, but the judges read " +
-				"`task`, `requirements`/`planClaims` and `evidence`.) " +
+				"Submit stage=requirement_priorities (no list to supply: the accepted requirements are used) so " +
+				"the judge sets the build order over them; the order is recorded with each item's own quote and " +
+				"the session works by it, and mutating work stays blocked until the accepted batch has a fresh " +
+				"order - a new accepted batch retires the previous order by name. " +
+				"Submit stage=acceptance_criteria with `criteria` (one {requirementId, text} per criterion, the " +
+				"id being an ACCEPTED formalized requirement) so the judge marks every criterion against the " +
+				"referenced requirement; a criterion referencing no accepted requirement is refused before any " +
+				"judge call, and a criterion the judge does not accept is named at the completion boundary. " +
+				"(`options` and `proposal` stay required by the tool schema on all four stages, but the judges read " +
+				"`task`, `requirements`/`planClaims`/`criteria` and `evidence`.) " +
 				"Use stage=business_review, stage=architecture_review or stage=security_review for the review " +
 				"activities: pass the material as quoted evidence, the declared items (decisions, defects or " +
 				"surfaces) in `claims` and the declared candidates for the review's choice question in `options`. " +
@@ -1031,10 +1191,27 @@ export class JevController {
 					},
 					requirements: {
 						type: "array",
-						items: { type: "string" },
+						items: {
+							type: "object",
+							properties: { text: { type: "string" }, quoteId: { type: "string" } },
+							required: ["text", "quoteId"],
+						},
 						description:
-							"draft numbered requirement list for stage=requirements_formalization; one text per " +
-							"numbered item, each marked traceable to a quoted user/spec item",
+							"draft numbered requirement list for stage=requirements_formalization; one {text, " +
+							"quoteId} per numbered item, where quoteId names one of the submitted user/spec " +
+							"evidence quotes it derives from (an item naming no quote is refused before any judge call)",
+					},
+					criteria: {
+						type: "array",
+						items: {
+							type: "object",
+							properties: { requirementId: { type: "string" }, text: { type: "string" } },
+							required: ["requirementId", "text"],
+						},
+						description:
+							"stage=acceptance_criteria: one {requirementId, text} per acceptance criterion, the " +
+							"id being an ACCEPTED formalized requirement the criterion checks; a criterion " +
+							"referencing no accepted requirement is refused before any judge call",
 					},
 					planClaims: {
 						type: "array",
@@ -1184,18 +1361,31 @@ export class JevController {
 				};
 			}
 			// Planning is incomplete while a formalized requirement has no supported plan claim
-			// (activities framework, planning activity). Only a task with an accepted
+			// (activities framework, planning activity) or while the judged priority order does not
+			// rank the accepted batch (FR-21). Only a task with an accepted
 			// requirements_formalization is affected - without one the gate behaves as before.
 			if (this.template.gates?.mutation !== false) {
-				const planningGap = this.planningGap();
-				if (planningGap !== undefined) {
+				const mappingGap = this.planMappingGap();
+				const orderGap = this.prioritiesGap();
+				if (mappingGap !== undefined || orderGap !== undefined) {
+					const fixes: string[] = [];
+					if (mappingGap !== undefined) {
+						fixes.push(
+							`${mappingGap}. Call ${TOOL_NAME} with stage=${PLAN_MAPPING_STAGE} and ` +
+								"`planClaims` naming, for every formalized requirement id, the plan work that " +
+								"serves it (the judge marks each claim against the quoted evidence)",
+						);
+					}
+					if (orderGap !== undefined) {
+						fixes.push(
+							`${orderGap}. Call ${TOOL_NAME} with stage=requirement_priorities so the judge sets ` +
+								"the order over the accepted requirement list; the order is re-ranked after every " +
+								"accepted batch",
+						);
+					}
 					return {
 						block: true,
-						reason:
-							`${planningGap}. Call ${TOOL_NAME} with stage=${PLAN_MAPPING_STAGE} and ` +
-							"`planClaims` naming, for every formalized requirement id, the plan work that serves " +
-							"it (the judge marks each claim against the quoted evidence). Read-only evidence " +
-							"gathering remains available.",
+						reason: `${fixes.join(". ")}. Read-only evidence gathering remains available.`,
 					};
 				}
 			}
@@ -1420,14 +1610,17 @@ export class JevController {
 		// eval spawns (agent() calls) carry no captured work order: nothing judgeable here.
 		if (event["invocationKind"] !== "task") return undefined;
 		this.pruneStaleHandoffOrders();
-		const ids = Object.keys(this.state.pendingHandoffs);
-		const id = ids.length === 1 ? ids[0] : undefined;
-		const order = id !== undefined ? this.state.pendingHandoffs[id] : undefined;
-		if (id === undefined || order === undefined || order.usedBySpawn) {
+		// Only orders no spawn has consumed are attributable: a consumed entry is a sibling spawn's
+		// order, not something "in flight", so it must not turn a single live order into "several".
+		const all = Object.entries(this.state.pendingHandoffs);
+		const available = all.filter(([, entry]) => !entry.usedBySpawn);
+		const id = available.length === 1 ? available[0]![0] : undefined;
+		const order = id !== undefined ? available[0]![1] : undefined;
+		if (id === undefined || order === undefined) {
 			const gap =
-				ids.length === 0
+				all.length === 0
 					? "no work order captured from the task tool call"
-					: order?.usedBySpawn === true
+					: available.length === 0
 						? "the captured work order was already used by a sibling spawn of the same task call"
 						: "several task calls are in flight and the spawn event carries no toolCallId to " +
 							"attribute one work order to this spawn";
@@ -1780,6 +1973,8 @@ export class JevController {
 				lastClaimCheck: restoreClaimCheck(data["lastClaimCheck"]),
 				lastFormalization: restoreFormalization(data["lastFormalization"]),
 				lastPlanMapping: restorePlanMapping(data["lastPlanMapping"]),
+				lastAcceptanceCriteria: restoreAcceptanceCriteria(data["lastAcceptanceCriteria"]),
+				lastPriorities: restorePriorities(data["lastPriorities"]),
 				lastAutoCourseCheck: restoreAutoCourseCheck(data["lastAutoCourseCheck"]),
 				openAspectGaps: restoreAspectGaps(data["openAspectGaps"]),
 				submissionDigests: restoreDigests(data["submissionDigests"]),
@@ -1918,14 +2113,17 @@ export class JevController {
 		//     instead of being judged - the wording is never bent until the judge agrees.
 		const spent = input.approach === undefined ? undefined : this.spentApproach(boundKey, input.approach);
 		if (input.approach !== undefined) {
-			const journalAttempts = this.state.reworkJournal[boundKey]?.attempts ?? [];
+			// The bound counts REJECTED attempts only: an approved attempt closed its loop, so it
+			// neither spends the bound nor refuses a later consultation of the same stage.
+			const rejected = this.rejectedAttempts(boundKey);
 			if (spent !== undefined) {
 				interrupted();
-				const already = journalAttempts.map(a => `"${a.approach}"`).join(", ");
+				const already = rejected.map(a => `"${a.approach}"`).join(", ");
 				const problem =
-					`approach_already_spent: the approach "${input.approach}" was already judged on attempt ` +
-					`${spent.attempt} of ${input.stage} for this task; every attempt of the loop must change the ` +
-					`approach, and a repeated approach is not a new attempt. Approaches already spent: ${already}. ` +
+					`approach_already_spent: the approach "${input.approach}" was already rejected on attempt ` +
+					`${spent.attempt} of ${input.stage} for this task and stays spent; every rejected attempt of ` +
+					`the loop must change the approach, and a repeated approach is not a new attempt. Approaches ` +
+					`already rejected: ${already}. ` +
 					"Change the approach - tighten the trigger, split the item into narrower separately checkable " +
 					"items, or restate it as an outcome plus the evidence that settles it - not the wording.";
 				return {
@@ -1937,11 +2135,11 @@ export class JevController {
 						`consumed): ${problem}`,
 				};
 			}
-			if (journalAttempts.length >= this.maxReworkIterations) {
+			if (rejected.length >= this.maxReworkIterations) {
 				interrupted();
 				const blocker =
-					`Jev rework bound exhausted for stage ${input.stage}: ${journalAttempts.length} attempt(s), each ` +
-					`with a different approach, all rejected — ${this.reworkJournalLine(boundKey)}. ` +
+					`Jev rework bound exhausted for stage ${input.stage}: ${rejected.length} attempt(s), each ` +
+					`with a different approach, all rejected — ${this.reworkJournalLine(rejected)}. ` +
 					"Recorded as an OPEN item: the approaches are spent, their state is written down, and the loop " +
 					"does NOT continue by re-wording a spent approach or bending the wording until the judge " +
 					"agrees. Escalate to the user.";
@@ -2175,6 +2373,20 @@ export class JevController {
 		// path; a requirement without a supported claim leaves planning incomplete.
 		if (input.stage === PLAN_MAPPING_STAGE) {
 			const preset = await this.submitPlanMapping(input, boundKey, used);
+			return this.guardActivityOutcome(input.stage, preset) ?? preset;
+		}
+
+		// FR-20: the acceptance criteria of the accepted requirement list. A criterion naming no
+		// accepted requirement is refused before the judge call; the judge marks every criterion.
+		if (input.stage === "acceptance_criteria") {
+			const preset = await this.submitAcceptanceCriteria(input, boundKey, used);
+			return this.guardActivityOutcome(input.stage, preset) ?? preset;
+		}
+
+		// FR-21: the judge sets the order over the accepted requirement list; the controller
+		// derives and records it. A new accepted batch retires the recorded order (stale + named).
+		if (input.stage === "requirement_priorities") {
+			const preset = await this.submitPriorities(input, boundKey, used);
 			return this.guardActivityOutcome(input.stage, preset) ?? preset;
 		}
 
@@ -2744,13 +2956,17 @@ export class JevController {
 		boundKey: string,
 		used: number,
 	): Promise<DecisionOutcome> {
-		const requirements = input.requirements.map((text, i) => ({ id: `req-${i + 1}`, text }));
+		const requirements = input.requirements.map((item, i) => ({
+			id: `req-${i + 1}`,
+			text: item.text,
+			quoteId: item.quoteId,
+		}));
 		if (requirements.length === 0) {
 			// Invalid submission, not judge rework: refused before any consultation.
 			return {
 				verdict: "insufficient_evidence",
 				reasons: [
-					"requirements_formalization needs the draft numbered list: pass one requirement text per " +
+					"requirements_formalization needs the draft numbered list: pass one {text, quoteId} per " +
 						"numbered item in `requirements`",
 				],
 				judged: false,
@@ -2764,6 +2980,22 @@ export class JevController {
 				reasons: [
 					"requirements_formalization requires at least one user or spec evidence item: every formalized " +
 						"requirement must be traceable to a quoted source",
+				],
+				judged: false,
+				summary: "",
+			};
+		}
+		// FR-19: an item that names no submitted quote has nothing to be traceable to. Refused
+		// BEFORE the judge call (the row's violation is an item without a verbatim quote entering
+		// development), naming the quote ids that do exist.
+		const unknownQuote = [...new Set(requirements.filter(r => !quotes.some(q => q.id === r.quoteId)).map(r => `${r.id}→${r.quoteId}`))];
+		if (unknownQuote.length > 0) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [
+					`unknown_quote_id: ${unknownQuote.join(", ")} — every numbered item must name one of the ` +
+						`submitted user/spec quotes (${quotes.map(q => q.id).join(", ")}); an item without a ` +
+						"verbatim source quote is refused before any judge call",
 				],
 				judged: false,
 				summary: "",
@@ -2826,6 +3058,10 @@ export class JevController {
 		const list: FormalizedRequirement[] = requirements.map(r => ({
 			id: r.id,
 			text: r.text,
+			quoteId: r.quoteId,
+			// FR-19: the item's named quote is stored verbatim beside it, so the accepted list is
+			// itself the requirement list with a number and a verbatim quote per item.
+			quote: quotes.find(q => q.id === r.quoteId)?.text ?? "",
 			traceable: traceable[r.id] === true,
 		}));
 		const uncovered = quotes
@@ -2843,10 +3079,16 @@ export class JevController {
 			uncovered,
 			outcome,
 			complete: outcome === FORMALIZATION_APPROVED_OPTION,
+			// FR-21: the identity of this accepted batch - content, so the SAME accepted list stays
+			// the same batch while a new portion is a different one.
+			batchDigest: await fingerprint(
+				JSON.stringify(list.map(r => [r.id, r.text, r.quoteId, r.quote])),
+			),
 			at: this.now(),
 			taskFingerprint: this.state.taskFingerprint,
 			workRevision: this.state.workRevision,
 		};
+		if (outcome === FORMALIZATION_APPROVED_OPTION) this.retireSupersededOrders();
 		if (untraceable.length > 0) {
 			consume();
 			const named = untraceable.map(r => `${r.id} (${claimExcerpt(r.text)})`).join(", ");
@@ -3048,6 +3290,11 @@ export class JevController {
 			taskFingerprint: this.state.taskFingerprint,
 			workRevision: this.state.workRevision,
 		};
+		// FR-21: the plan claims name the requirements the work serves, in the executor's own
+		// declared order, so starting an item the judge's order ranked later than an item with no
+		// supported claim yet is readable from two records. NAMED, never blocked (the row's own
+		// wording is only "последовательности работы сессии", and an abstention never blocks work).
+		this.noteOutOfOrderStart(mapped);
 		if (complete) {
 			this.persist();
 			return {
@@ -3071,6 +3318,343 @@ export class JevController {
 			judged: true,
 			summary: `${PLAN_MAPPING_STAGE}: revise — planning incomplete: ${named}`,
 		};
+	}
+
+	/**
+	 * FR-20: acceptance criteria of the ACCEPTED requirement list. Each submitted criterion names
+	 * the accepted requirement it checks; a criterion naming no requirement, or an id outside the
+	 * accepted list, is refused BEFORE any judge call (the row's violation is a criterion that
+	 * references nothing, and it can only be prevented where the reference is read). The judge then
+	 * marks EVERY criterion in one request against the referenced requirement's verbatim quote; an
+	 * unmarkable or partial answer fails closed with no record, so a criterion without a judge mark
+	 * is never recorded and never usable. The record names the unaccepted criteria and the
+	 * completion boundary names them too.
+	 */
+	private async submitAcceptanceCriteria(
+		input: ValidatedDecisionInput,
+		boundKey: string,
+		used: number,
+	): Promise<DecisionOutcome> {
+		const formalization = this.currentFormalization();
+		if (formalization === undefined) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [
+					"acceptance_criteria needs an ACCEPTED requirements list for the current task first " +
+						"(submit stage=requirements_formalization): criteria are formalized from accepted requirements",
+				],
+				judged: false,
+				summary: "",
+			};
+		}
+		if (input.criteria.length === 0) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [
+					"acceptance_criteria needs criteria: one {requirementId, text} per criterion, the reference " +
+						"being the accepted formalized requirement the criterion checks",
+				],
+				judged: false,
+				summary: "",
+			};
+		}
+		const ids = formalization.requirements.map(r => r.id);
+		const unreferenced = input.criteria.filter(c => !ids.includes(c.requirementId)).map(c => c.requirementId);
+		if (unreferenced.length > 0) {
+			// Refused before any judge call: a criterion referencing no ACCEPTED requirement cannot
+			// be judged against one, and letting it through would be exactly the row's violation.
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [
+					`unknown_requirement_id: ${[...new Set(unreferenced)].join(", ")} — every criterion must ` +
+						`reference an accepted requirement (${ids.join(", ")})`,
+				],
+				judged: false,
+				summary: "",
+			};
+		}
+		if (this.acceptanceCriteriaJudge === undefined) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: ["acceptance_criteria judge not configured in this session"],
+				judged: false,
+				summary: "",
+			};
+		}
+		const criteria = input.criteria.map((c, i) => ({ id: `crit-${i + 1}`, ...c }));
+		const consume = (): void => {
+			this.state.iterations[boundKey] = used + 1;
+			this.persist();
+		};
+		const failClosed = (detail: string): DecisionOutcome => {
+			consume();
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [`acceptance_criteria: ${detail}`, `fix: ${CRITERIA_FIX}`],
+				judged: false,
+				summary: "",
+			};
+		};
+		const accepted = formalization.requirements.map(r => ({ id: r.id, text: r.text, quote: r.quote }));
+		let raw: AcceptanceCriteriaResult;
+		try {
+			raw = await this.acceptanceCriteriaJudge({
+				stage: "acceptance_criteria",
+				task: input.task,
+				criteria: criteria.map(c => ({ id: c.id, requirementId: c.requirementId, text: c.text })),
+				requirements: accepted,
+				evidence: input.evidence,
+			});
+		} catch (err) {
+			return failClosed(`judge unavailable: ${err instanceof Error ? err.message : String(err)}`);
+		}
+		if (!isRecord(raw) || raw["judged"] !== true || !isRecord(raw["marked"])) {
+			return failClosed("the judge returned an unjudged or malformed result; no criterion is accepted");
+		}
+		const marks = raw["marked"] as Record<string, unknown>;
+		const unmarkable = criteria.filter(c => typeof marks[c.id] !== "boolean").map(c => c.id);
+		if (unmarkable.length > 0) {
+			return failClosed(`the judge could not mark ${unmarkable.join(", ")}; an unmarkable criterion fails closed`);
+		}
+		const expectedIds = criteria.map(c => c.id).sort();
+		const actualIds = Object.keys(marks).sort();
+		if (expectedIds.length !== actualIds.length || expectedIds.some((id, i) => id !== actualIds[i])) {
+			return failClosed(
+				`the marked criterion ids must be exactly the submitted criteria (${expectedIds.join(", ")}); ` +
+					`got ${actualIds.join(", ")}`,
+			);
+		}
+		const record: AcceptanceCriteriaRecord = {
+			criteria: criteria.map(c => ({
+				id: c.id,
+				requirementId: c.requirementId,
+				text: c.text,
+				requirementQuote: accepted.find(r => r.id === c.requirementId)?.quote ?? "",
+				marked: marks[c.id] === true,
+			})),
+			unaccepted: criteria.filter(c => marks[c.id] !== true).map(c => c.id),
+			complete: criteria.every(c => marks[c.id] === true),
+			batch: this.acceptedBatch(),
+			at: this.now(),
+			workRevision: this.state.workRevision,
+		};
+		this.state.lastAcceptanceCriteria = record;
+		if (!record.complete) {
+			consume();
+			const named = record.criteria
+				.filter(c => !c.marked)
+				.map(c => `${c.id} (${c.requirementId}: ${claimExcerpt(c.text)})`)
+				.join(", ");
+			this.pushFeedback(`Jev acceptance_criteria: criterion(s) without a requirement basis — ${named}`);
+			return {
+				verdict: "revise",
+				selectedOption: CRITERIA_UNBACKED_OPTION,
+				reasons: [
+					`acceptance_criteria: the referenced requirement does not state or entail ${named}`,
+					`fix: ${CRITERIA_FIX}`,
+				],
+				judged: true,
+				summary: `acceptance_criteria: revise — criterion_without_requirement_basis: ${named}`,
+			};
+		}
+		this.persist();
+		return {
+			verdict: "approve",
+			selectedOption: CRITERIA_ACCEPTED_OPTION,
+			reasons: [`acceptance_criteria: ${record.criteria.length} criterion/criteria accepted, each referencing an accepted requirement`],
+			judged: true,
+			summary:
+				`acceptance_criteria: accepted ${record.criteria.length} criterion/criteria — ` +
+				record.criteria.map(c => `${c.id}→${c.requirementId}: ${claimExcerpt(c.text)}`).join("; "),
+		};
+	}
+
+	/**
+	 * FR-21: the judge sets the order over the ACCEPTED requirement list. The controller supplies
+	 * the list itself (the judge can never invent an item), the judge assigns a priority class to
+	 * every item in ONE request, and the order is derived from those marks with the item's position
+	 * in the accepted list as the documented tie-break - so the executor generates no text that
+	 * orders anything. The record carries the order, each item's number and verbatim quote, and the
+	 * batch it ranks; a record that replaced an earlier order keeps the superseded batch identity.
+	 */
+	private async submitPriorities(
+		input: ValidatedDecisionInput,
+		boundKey: string,
+		used: number,
+	): Promise<DecisionOutcome> {
+		const formalization = this.currentFormalization();
+		if (formalization === undefined) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [
+					"requirement_priorities needs an ACCEPTED requirements list for the current task first " +
+						"(submit stage=requirements_formalization): there is nothing to rank",
+				],
+				judged: false,
+				summary: "",
+			};
+		}
+		if (this.priorityJudge === undefined) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: ["requirement_priorities judge not configured in this session"],
+				judged: false,
+				summary: "",
+			};
+		}
+		const consume = (): void => {
+			this.state.iterations[boundKey] = used + 1;
+			this.persist();
+		};
+		const failClosed = (detail: string): DecisionOutcome => {
+			consume();
+			// Fail-closed and named: no order is recorded, the previous record (if any) stands as it
+			// is, and the planning gap keeps naming the accepted batch that has no fresh order.
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [`requirement_priorities: ${detail}`, `fix: ${PRIORITIES_FIX}`],
+				judged: false,
+				summary: "",
+			};
+		};
+		const accepted = formalization.requirements.map(r => ({ id: r.id, text: r.text, quote: r.quote }));
+		let raw: PriorityResult;
+		try {
+			raw = await this.priorityJudge({
+				stage: "requirement_priorities",
+				task: input.task,
+				requirements: accepted,
+				evidence: input.evidence,
+			});
+		} catch (err) {
+			return failClosed(`judge unavailable: ${err instanceof Error ? err.message : String(err)}`);
+		}
+		if (!isRecord(raw) || raw["judged"] !== true || !isRecord(raw["classes"])) {
+			return failClosed("the judge returned an unjudged or malformed result; no order was recorded");
+		}
+		const classes = raw["classes"] as Record<string, unknown>;
+		const confidences = isRecord(raw["confidences"]) ? (raw["confidences"] as Record<string, unknown>) : {};
+		const unranked = accepted.filter(r => typeof classes[r.id] !== "string").map(r => r.id);
+		if (unranked.length > 0) {
+			return failClosed(`the judge ranked no class for ${unranked.join(", ")}; a partial ranking is not an order`);
+		}
+		const wrongClass = accepted
+			.filter(r => !(PRIORITY_CLASSES as readonly string[]).includes(classes[r.id] as string))
+			.map(r => `${r.id}→${String(classes[r.id])}`);
+		if (wrongClass.length > 0) {
+			return failClosed(`the judge returned a class outside the fixed set for ${wrongClass.join(", ")}`);
+		}
+		const expectedIds = accepted.map(r => r.id).sort();
+		const actualIds = Object.keys(classes).sort();
+		if (expectedIds.length !== actualIds.length || expectedIds.some((id, i) => id !== actualIds[i])) {
+			return failClosed(
+				`the ranked ids must be exactly the accepted requirement ids (${expectedIds.join(", ")}); ` +
+					`got ${actualIds.join(", ")}`,
+			);
+		}
+		// The order: the fixed class sequence, ties broken by the item's position in the accepted
+		// list (documented and deterministic, so the same marks always produce the same order).
+		const items: PriorityOrderItem[] = accepted
+			.map((r, position) => ({
+				position,
+				requirement: r,
+				priorityClass: classes[r.id] as PriorityClass,
+				confidence: typeof confidences[r.id] === "number" ? (confidences[r.id] as number) : undefined,
+			}))
+			.sort((a, b) => {
+				const byClass = PRIORITY_CLASSES.indexOf(a.priorityClass) - PRIORITY_CLASSES.indexOf(b.priorityClass);
+				return byClass !== 0 ? byClass : a.position - b.position;
+			})
+			.map((entry, i) => ({
+				requirementId: entry.requirement.id,
+				rank: i + 1,
+				text: entry.requirement.text,
+				quote: entry.requirement.quote,
+				priorityClass: entry.priorityClass,
+				confidence: entry.confidence,
+			}));
+		const previous = this.state.lastPriorities;
+		this.state.lastPriorities = {
+			items,
+			batch: this.acceptedBatch(),
+			stale: false,
+			supersedes: previous?.batch,
+			at: this.now(),
+		};
+		this.persist();
+		return {
+			verdict: "approve",
+			selectedOption: PRIORITIES_RANKED_OPTION,
+			reasons: [
+				`requirement_priorities: the judge set the order over ${items.length} accepted requirement(s): ` +
+					items.map(i => i.requirementId).join(" → "),
+			],
+			judged: true,
+			summary:
+				`requirement_priorities: order set by the judge — ` +
+				items.map(i => `${i.rank}. ${i.requirementId} (${i.priorityClass}): via "${i.quote}"`).join("; "),
+		};
+	}
+
+	/**
+	 * The identity of the accepted requirement batch: the current task plus the content digest the
+	 * accepted list carries. Two records with the same identity rank the same list, so comparing
+	 * identities is what makes "the order was not re-ranked after the accepted batch" visible.
+	 */
+	private acceptedBatch(): AcceptedBatch {
+		return {
+			taskFingerprint: this.state.taskFingerprint,
+			digest: this.currentFormalization()?.batchDigest ?? "",
+		};
+	}
+
+	/**
+	 * FR-21: a NEW accepted batch retires the order that ranked the previous one. Recorded on the
+	 * order itself (stale + the reason naming both batches) so the state says the re-rank is owed,
+	 * and pushed into the session at the moment it happens.
+	 */
+	private retireSupersededOrders(): void {
+		const batch = this.acceptedBatch();
+		const order = this.state.lastPriorities;
+		if (order === undefined || order.stale) return;
+		if (order.batch.taskFingerprint === batch.taskFingerprint && order.batch.digest === batch.digest) {
+			return;
+		}
+		order.stale = true;
+		order.staleReason =
+			`the accepted requirement list changed, so the recorded priority order no longer ranks it ` +
+			`(the order ranks batch ${order.batch.digest.slice(0, 8)}, the accepted list is batch ` +
+			`${batch.digest.slice(0, 8)}): re-rank with stage=requirement_priorities`;
+		this.persist();
+		this.pushFeedback(`Jev requirement_priorities: ${order.staleReason}`);
+	}
+
+	/**
+	 * FR-21 naming: the plan mapping's claims arrive in the executor's declared work order, so the
+	 * first supported claim is the first item the work serves. When the judge's order ranks another
+	 * item first and that item carries no supported claim yet, the session record says so: the item
+	 * that was started and the item the order asked for first. Naming only - it blocks nothing.
+	 */
+	private noteOutOfOrderStart(mapped: Array<{ id: string; supported: boolean }>): void {
+		const order = this.state.lastPriorities;
+		if (order === undefined || order.stale) return;
+		const batch = this.acceptedBatch();
+		if (order.batch.taskFingerprint !== batch.taskFingerprint || order.batch.digest !== batch.digest) return;
+		const declaredFirst = mapped.find(m => m.supported);
+		if (declaredFirst === undefined) return;
+		const declaredItem = order.items.find(i => i.requirementId === declaredFirst.id);
+		if (declaredItem === undefined || declaredItem.rank <= 1) return;
+		const earlier = order.items
+			.filter(i => i.rank < declaredItem.rank && !mapped.some(m => m.id === i.requirementId && m.supported))
+			.sort((a, b) => a.rank - b.rank)[0];
+		if (earlier === undefined) return;
+		order.outOfOrder = { started: declaredItem.requirementId, expectedFirst: earlier.requirementId };
+		this.persist();
+		const line =
+			`Jev requirement_priorities: the work order starts at ${declaredItem.requirementId} while the judge's ` +
+			`order ranks ${earlier.requirementId} first and no supported plan claim covers it. The order: ` +
+			order.items.map(i => `${i.rank}. ${i.requirementId}`).join(" → ");
+		this.pushFeedback(line);
 	}
 
 	/**
@@ -3103,7 +3687,9 @@ export class JevController {
 			task: `${gate.consult.task}\n\nSubject under review: ${input.task}`,
 			questions,
 			items,
-			candidates: input.options,
+			// The template may replace the review's declared candidate set exactly as it may replace
+			// its question set; without an override the executor's declared candidates are used.
+			candidates: this.template.stages?.[gate.stage]?.options ?? input.options,
 			evidence: input.evidence,
 			judge: this.reviewJudge,
 			deadlineMs: this.reviewDeadlineMs,
@@ -3245,22 +3831,34 @@ export class JevController {
 	// ----- rework loop: N attempts, each a different approach (PRD 19, TASKS "Rules of the loop") -----
 
 	/**
-	 * The judged attempt that already spent this approach on the same task+stage, if any. Comparison
-	 * folds case and inner whitespace only, so "Tighten the  trigger" cannot buy a second attempt;
-	 * every message quotes the text as submitted. Only judged attempts are in the journal, so a
-	 * submission refused before the judge call never spends its approach.
+	 * The rejected attempt that already spent this approach on the same task+stage, if any. An
+	 * APPROVED attempt is not a spent approach: its loop ended with the judge's agreement, so
+	 * naming that approach again later is a fresh consultation, not a re-wording of a rejection.
+	 * Comparison folds case and inner whitespace only, so "Tighten the  trigger" cannot buy a
+	 * second attempt; every message quotes the text as submitted. Only judged attempts are in the
+	 * journal, so a submission refused before the judge call never spends its approach.
 	 */
 	private spentApproach(key: string, approach: string): ReworkAttempt | undefined {
 		const normalized = approach.trim().replace(/\s+/g, " ").toLowerCase();
-		return this.state.reworkJournal[key]?.attempts.find(
+		return this.rejectedAttempts(key).find(
 			a => a.approach.trim().replace(/\s+/g, " ").toLowerCase() === normalized,
 		);
 	}
 
-	/** The journal as one line: each attempt's approach with the judge's own verbatim answer. */
-	private reworkJournalLine(key: string): string {
-		const attempts = this.state.reworkJournal[key]?.attempts ?? [];
-		if (attempts.length === 0) return "no judged attempt recorded";
+	/**
+	 * The judged attempts the bound counts: those the judge did NOT approve. An approved attempt
+	 * ended its loop successfully, so it neither consumes the bound nor blocks a later consultation
+	 * of the same stage (the executor is told to run course_check after every mutation, and three
+	 * benign `continue` verdicts must never exhaust a rework bound - the journal would then assert
+	 * "all rejected" against its own record).
+	 */
+	private rejectedAttempts(key: string): ReworkAttempt[] {
+		return (this.state.reworkJournal[key]?.attempts ?? []).filter(a => a.verdict !== "approve");
+	}
+
+	/** The rejected attempts as one line: each approach with the judge's own verbatim answer. */
+	private reworkJournalLine(attempts: readonly ReworkAttempt[]): string {
+		if (attempts.length === 0) return "no rejected attempt recorded";
 		return attempts
 			.map(a => {
 				const reasons = a.reasons.join(" ").slice(0, REWORK_REASON_EXCERPT_CHARS);
@@ -3293,7 +3891,7 @@ export class JevController {
 			at: this.now(),
 		};
 		const attempt = journal.attempts.length + 1;
-		const spentBefore = journal.attempts.map(a => `"${a.approach}"`).join(", ");
+		const rejectedBefore = journal.attempts.filter(a => a.verdict !== "approve").map(a => `"${a.approach}"`);
 		journal.attempts.push({
 			attempt,
 			approach,
@@ -3306,12 +3904,15 @@ export class JevController {
 		this.state.reworkJournal[key] = journal;
 		this.persist();
 		if (outcome.verdict === "approve") return;
+		// The bound is the count of REJECTED attempts (see rejectedAttempts): an approved attempt
+		// earlier in the same journal does not count toward it.
+		const rejectedNow = rejectedBefore.length + 1;
 		const reasons = outcome.reasons.join(" ").slice(0, REWORK_REASON_EXCERPT_CHARS);
 		this.pushFeedback(
-			`Jev rework attempt ${attempt}/${this.maxReworkIterations} for ${stage} (approach "${approach}") was ` +
+			`Jev rework attempt ${rejectedNow}/${this.maxReworkIterations} for ${stage} (approach "${approach}") was ` +
 				`rejected — ${outcome.verdict}${reasons === "" ? "" : `: ${reasons}`}. ` +
-				`Approaches already spent: ${spentBefore === "" ? "none" : spentBefore}. ` +
-				(attempt >= this.maxReworkIterations
+				`Approaches already rejected: ${rejectedBefore.length === 0 ? "none" : rejectedBefore.join(", ")}. ` +
+				(rejectedNow >= this.maxReworkIterations
 					? "The attempt bound is now exhausted: the next approach escalates as an OPEN item with this " +
 						"journal instead of being judged; re-wording a spent approach is refused outright."
 					: "The next attempt must name a DIFFERENT approach (tighten the trigger; split the item into " +
@@ -3375,24 +3976,92 @@ export class JevController {
 	/**
 	 * Planning incompleteness (activities framework, planning activity): for every formalized
 	 * requirement the plan must carry a claim that the work serves it, marked by the claim_check
-	 * path. Returns the gap naming the requirement ids, or undefined when planning is complete -
-	 * including when the task was never formalized, so the default workflow (no formalization)
-	 * behaves exactly as before.
+	 * path, and the judged priority order must rank the SAME accepted batch (FR-21: the order is
+	 * re-ranked after the next accepted batch, so an order that ranks a retired batch leaves
+	 * planning incomplete by name). Returns the gap, or undefined when planning is complete -
+	 * including when the task was never formalized, so the default workflow behaves as before.
 	 */
 	private planningGap(): string | undefined {
+		const gaps = [this.planMappingGap(), this.prioritiesGap()].filter((g): g is string => g !== undefined);
+		return gaps.length === 0 ? undefined : gaps.join("; ");
+	}
+
+	/** The plan-mapping half of the planning gap: no submission, or a requirement with no supported claim. */
+	private planMappingGap(): string | undefined {
 		const formalization = this.currentFormalization();
 		if (formalization === undefined) return undefined;
-		const ids = formalization.requirements.map(r => r.id);
 		const mapping = this.state.lastPlanMapping;
+		const ids = formalization.requirements.map(r => r.id);
 		if (mapping === undefined || mapping.taskFingerprint !== this.state.taskFingerprint) {
 			return (
 				`plan mapping incomplete: no ${PLAN_MAPPING_STAGE} submission covers the ${ids.length} formalized ` +
 				`requirement(s) (${ids.join(", ")})`
 			);
 		}
-		const missing = ids.filter(id => !mapping.requirements.some(r => r.id === id && r.supported));
-		if (missing.length === 0) return undefined;
-		return `plan mapping incomplete: requirement(s) ${missing.join(", ")} have no supported plan claim`;
+		const unmapped = ids.filter(id => !mapping.requirements.some(r => r.id === id && r.supported));
+		if (unmapped.length === 0) return undefined;
+		return `plan mapping incomplete: requirement(s) ${unmapped.join(", ")} have no supported plan claim`;
+	}
+
+	/**
+	 * FR-21: the judged order must rank the accepted batch that is current. An absent order, an
+	 * order that ranks a retired batch (recorded as stale the moment the new batch was accepted) or
+	 * an order that leaves an accepted item unranked is a named planning gap - the row's violation
+	 * is "порядок не пересмотрен после принятой порции", and this is what makes it impossible to
+	 * work through silently. Undefined when no list was accepted (FR-21 is not engaged).
+	 */
+	private prioritiesGap(): string | undefined {
+		const formalization = this.currentFormalization();
+		if (formalization === undefined) return undefined;
+		const ids = formalization.requirements.map(r => r.id);
+		const order = this.state.lastPriorities;
+		if (order === undefined || order.batch.taskFingerprint !== this.state.taskFingerprint) {
+			return (
+				`priority order missing: the accepted requirement(s) (${ids.join(", ")}) have no ` +
+				"requirement_priorities order from the judge"
+			);
+		}
+		if (order.stale) {
+			return order.staleReason ?? "the priority order does not rank the accepted requirement list";
+		}
+		if (order.batch.digest !== formalization.batchDigest) {
+			return (
+				`priority order ranks a retired batch (the order ranks batch ${order.batch.digest.slice(0, 8)}, ` +
+				`the accepted list is batch ${formalization.batchDigest.slice(0, 8)}): re-rank with ` +
+				"stage=requirement_priorities"
+			);
+		}
+		const unranked = ids.filter(id => !order.items.some(i => i.requirementId === id));
+		if (unranked.length > 0) {
+			return `priority order leaves accepted requirement(s) ${unranked.join(", ")} unranked`;
+		}
+		return undefined;
+	}
+
+	/**
+	 * FR-20 teeth: a submitted criteria list the judge did not fully accept names its unaccepted
+	 * criterion ids, and the completion boundary names them - work never completes by a criterion
+	 * that carries no judge mark. Criteria formalized from a retired batch are stale the same way
+	 * (a new accepted list needs its own criteria). Undefined when no criteria were submitted.
+	 */
+	private criteriaGap(): string | undefined {
+		const record = this.state.lastAcceptanceCriteria;
+		if (record === undefined || record.batch.taskFingerprint !== this.state.taskFingerprint) return undefined;
+		if (!record.complete) {
+			return (
+				`acceptance criteria not accepted: criterion(s) ${record.unaccepted.join(", ")} are not backed by ` +
+				`their referenced requirement (resubmit stage=acceptance_criteria)`
+			);
+		}
+		const formalization = this.currentFormalization();
+		if (formalization !== undefined && record.batch.digest !== formalization.batchDigest) {
+			return (
+				`acceptance criteria describe a retired requirement batch (criteria rank batch ` +
+				`${record.batch.digest.slice(0, 8)}, the accepted list is batch ` +
+				`${formalization.batchDigest.slice(0, 8)}): resubmit stage=acceptance_criteria`
+			);
+		}
+		return undefined;
 	}
 
 	/**
@@ -3754,13 +4423,14 @@ export class JevController {
 
 	/**
 	 * The requirements an automatic course check runs against: the accepted formalized list of
-	 * the current task when one exists, else the captured task prompt as the single requirement
-	 * (id "task"). Empty when neither exists - recorded as uncertainty, never invented.
+	 * the current task when one exists, each item's own number AND the verbatim source quote it
+	 * names (FR-19 keeps the quote beside every item), else the captured task prompt as the single
+	 * requirement (id "task"). Empty when neither exists - recorded as uncertainty, never invented.
 	 */
 	private courseCheckRequirements(): Array<{ id: string; quote: string }> {
 		const formalization = this.currentFormalization();
 		if (formalization !== undefined && formalization.requirements.length > 0) {
-			return formalization.requirements.map(r => ({ id: r.id, quote: r.text }));
+			return formalization.requirements.map(r => ({ id: r.id, quote: r.quote }));
 		}
 		const task = this.state.taskPrompt;
 		return task !== undefined ? [{ id: "task", quote: mechanism.cappedQuote(task).quote }] : [];
@@ -3805,8 +4475,34 @@ export class JevController {
 			return;
 		}
 		const read = readCourseCheckAnswer(raw, requirements, this.completionConfidenceFloor);
-		if (!read.ok) {
+		if (read.kind === "unjudged") {
+			// The judge could not be consulted, or its body carried nothing usable: not judged.
 			this.recordAutomaticCourseCheck({ ...base, reasons: [read.detail] }, read.detail);
+			return;
+		}
+		if (read.kind === "uncertain") {
+			// F3: the judge DID answer - only its confidence (or the answer's own inconsistency)
+			// kept that answer from being acted on. That is recorded uncertainty, never a
+			// "not judged" message: the record keeps the answer, the confidence and the reasons.
+			this.state.lastAutoCourseCheck = {
+				judged: true,
+				selectedOption: read.nextAction,
+				confidence: read.confidence,
+				reasons: [...read.reasons, read.detail],
+				belowFloor: read.belowFloor,
+				workRevision: revision,
+				at: this.now(),
+			};
+			this.persist();
+			const what = read.belowFloor
+				? `the judge answered ${read.nextAction ?? "nothing usable"} at confidence ` +
+					`${read.confidence ?? "unknown"}, below the floor ${this.completionConfidenceFloor}`
+				: `the judge's answer${read.nextAction === undefined ? "" : ` (${read.nextAction})`} cannot be acted on`;
+			const why = read.reasons.length > 0 ? ` ${read.reasons.join(" ")}` : "";
+			this.pushFeedback(
+				`Jev automatic course_check after ${revision} mutation(s): recorded uncertainty — ${what}; no ` +
+					`action is taken from it and nothing is blocked.${why}`,
+			);
 			return;
 		}
 		const record: AutoCourseCheckRecord = {
@@ -3882,6 +4578,11 @@ export class JevController {
 			const planningGap = this.planningGap();
 			if (planningGap !== undefined) missing.push(planningGap);
 		}
+		// FR-20: a criterion the judge did not accept, or criteria formalized from a retired
+		// batch, keeps the completion boundary shut by name - completion is by the acceptance
+		// criteria (PRD 18 step 7), so an unaccepted criterion is what it must not complete through.
+		const criteriaGap = this.criteriaGap();
+		if (criteriaGap !== undefined) missing.push(criteriaGap);
 		// Latest approval wins: supersede keeps same-digest records, so the freshest
 		// completion_review must be consulted, not the first.
 		const stopStage = this.approvalBoundary().stopStage;
@@ -4099,7 +4800,18 @@ function restoreFormalization(raw: unknown): FormalizationRecord | undefined {
 	for (const entry of raw["requirements"]) {
 		if (!isRecord(entry) || !nonEmptyString(entry["id"]) || typeof entry["text"] !== "string") return undefined;
 		if (typeof entry["traceable"] !== "boolean") return undefined;
-		requirements.push({ id: entry["id"], text: entry["text"], traceable: entry["traceable"] });
+		// FR-19: an item without its number and its verbatim quote is not the record the row
+		// describes, so a malformed one is dropped rather than restored as a checklist.
+		if (!nonEmptyString(entry["quoteId"]) || typeof entry["quote"] !== "string" || entry["quote"].length === 0) {
+			return undefined;
+		}
+		requirements.push({
+			id: entry["id"],
+			text: entry["text"],
+			quoteId: entry["quoteId"],
+			quote: entry["quote"],
+			traceable: entry["traceable"],
+		});
 	}
 	if (requirements.length === 0) return undefined;
 	const uncovered: FormalizationRecord["uncovered"] = [];
@@ -4113,12 +4825,16 @@ function restoreFormalization(raw: unknown): FormalizationRecord | undefined {
 			});
 		}
 	}
+	// FR-21: without its batch identity a list cannot be compared against a recorded order, and an
+	// unidentifiable checklist is dropped rather than trusted.
+	if (!nonEmptyString(raw["batchDigest"])) return undefined;
 	return {
 		requirements,
 		uncovered,
 		outcome: raw["outcome"],
 		// A restored list is a checklist only if it was complete AND every item is traceable.
 		complete: raw["complete"] === true && requirements.every(r => r.traceable),
+		batchDigest: raw["batchDigest"],
 		at: raw["at"],
 		taskFingerprint: typeof raw["taskFingerprint"] === "string" ? raw["taskFingerprint"] : undefined,
 		workRevision: raw["workRevision"],
@@ -4156,12 +4872,105 @@ function restoreAutoCourseCheck(raw: unknown): AutoCourseCheckRecord | undefined
 	if (typeof raw["workRevision"] !== "number" || !Number.isFinite(raw["workRevision"])) return undefined;
 	if (raw["selectedOption"] !== undefined && typeof raw["selectedOption"] !== "string") return undefined;
 	if (raw["confidence"] !== undefined && typeof raw["confidence"] !== "number") return undefined;
+	if (raw["belowFloor"] !== undefined && typeof raw["belowFloor"] !== "boolean") return undefined;
 	return {
 		judged: raw["judged"],
 		selectedOption: typeof raw["selectedOption"] === "string" ? raw["selectedOption"] : undefined,
 		confidence: typeof raw["confidence"] === "number" ? raw["confidence"] : undefined,
 		reasons: Array.isArray(raw["reasons"]) ? raw["reasons"].filter((r): r is string => typeof r === "string") : [],
+		belowFloor: raw["belowFloor"] === true,
 		workRevision: raw["workRevision"],
+		at: raw["at"],
+	};
+}
+
+/** Identity of an accepted batch as persisted: the digest must be present to compare anything. */
+function restoreBatch(raw: unknown): AcceptedBatch | undefined {
+	if (!isRecord(raw)) return undefined;
+	if (!nonEmptyString(raw["digest"])) return undefined;
+	if (raw["taskFingerprint"] !== undefined && typeof raw["taskFingerprint"] !== "string") return undefined;
+	return {
+		taskFingerprint: typeof raw["taskFingerprint"] === "string" ? raw["taskFingerprint"] : undefined,
+		digest: raw["digest"],
+	};
+}
+
+/** Validate a persisted acceptance-criteria record (FR-20): malformed entries are dropped. */
+function restoreAcceptanceCriteria(raw: unknown): AcceptanceCriteriaRecord | undefined {
+	if (!isRecord(raw) || !Array.isArray(raw["criteria"]) || !Array.isArray(raw["unaccepted"])) return undefined;
+	if (typeof raw["complete"] !== "boolean") return undefined;
+	if (typeof raw["at"] !== "number" || !Number.isFinite(raw["at"])) return undefined;
+	if (typeof raw["workRevision"] !== "number" || !Number.isFinite(raw["workRevision"])) return undefined;
+	const batch = restoreBatch(raw["batch"]);
+	if (batch === undefined) return undefined;
+	const criteria: AcceptanceCriterion[] = [];
+	for (const entry of raw["criteria"]) {
+		if (!isRecord(entry) || !nonEmptyString(entry["id"]) || !nonEmptyString(entry["requirementId"])) return undefined;
+		if (typeof entry["text"] !== "string") return undefined;
+		if (typeof entry["requirementQuote"] !== "string") return undefined;
+		if (typeof entry["marked"] !== "boolean") return undefined;
+		criteria.push({
+			id: entry["id"],
+			requirementId: entry["requirementId"],
+			text: entry["text"],
+			requirementQuote: entry["requirementQuote"],
+			marked: entry["marked"],
+		});
+	}
+	if (criteria.length === 0) return undefined;
+	const unaccepted = raw["unaccepted"].filter((id): id is string => typeof id === "string");
+	return {
+		criteria,
+		unaccepted: unaccepted.length > 0 ? unaccepted : criteria.filter(c => !c.marked).map(c => c.id),
+		// A restored record is accepted only if it still says so AND every criterion carries its mark.
+		complete: raw["complete"] === true && criteria.every(c => c.marked),
+		batch,
+		at: raw["at"],
+		workRevision: raw["workRevision"],
+	};
+}
+
+/** Validate a persisted priority order (FR-21): malformed entries are dropped, never a half order. */
+function restorePriorities(raw: unknown): PriorityRecord | undefined {
+	if (!isRecord(raw) || !Array.isArray(raw["items"])) return undefined;
+	if (typeof raw["stale"] !== "boolean") return undefined;
+	if (typeof raw["at"] !== "number" || !Number.isFinite(raw["at"])) return undefined;
+	const batch = restoreBatch(raw["batch"]);
+	if (batch === undefined) return undefined;
+	const items: PriorityOrderItem[] = [];
+	for (const entry of raw["items"]) {
+		if (!isRecord(entry) || !nonEmptyString(entry["requirementId"])) return undefined;
+		if (typeof entry["rank"] !== "number" || !Number.isFinite(entry["rank"])) return undefined;
+		if (typeof entry["text"] !== "string" || typeof entry["quote"] !== "string" || entry["quote"].length === 0) {
+			return undefined;
+		}
+		const priorityClass = entry["priorityClass"];
+		if (typeof priorityClass !== "string" || !(PRIORITY_CLASSES as readonly string[]).includes(priorityClass)) {
+			return undefined;
+		}
+		items.push({
+			requirementId: entry["requirementId"],
+			rank: entry["rank"],
+			text: entry["text"],
+			quote: entry["quote"],
+			priorityClass: priorityClass as PriorityClass,
+			confidence: typeof entry["confidence"] === "number" ? entry["confidence"] : undefined,
+		});
+	}
+	if (items.length === 0) return undefined;
+	// FR-21 naming is a recorded finding, so it survives with the record; a malformed one is dropped.
+	const rawOutOfOrder = raw["outOfOrder"];
+	const outOfOrder =
+		isRecord(rawOutOfOrder) && nonEmptyString(rawOutOfOrder["started"]) && nonEmptyString(rawOutOfOrder["expectedFirst"])
+			? { started: rawOutOfOrder["started"] as string, expectedFirst: rawOutOfOrder["expectedFirst"] as string }
+			: undefined;
+	return {
+		items: items.sort((a, b) => a.rank - b.rank),
+		batch,
+		stale: raw["stale"],
+		staleReason: typeof raw["staleReason"] === "string" ? raw["staleReason"] : undefined,
+		supersedes: restoreBatch(raw["supersedes"]),
+		outOfOrder,
 		at: raw["at"],
 	};
 }
@@ -4349,44 +5158,61 @@ function requirementQuotes(evidence: Evidence[]): Array<{ id: string; text: stri
 	return out;
 }
 
-type CourseCheckRead =
-	| { ok: true; nextAction: CourseCheckNextAction; drifted: string[]; reasons: string[]; confidence?: number }
-	| { ok: false; detail: string };
-
 /**
- * Contract check of a course-check answer, independent of the deliberate submission path on
- * purpose: the automatic consult is advisory, and a refactor of submitted course checks must
- * never give it teeth. Same rules, same conservative reading - an unjudged, malformed,
- * out-of-set, key-mismatched, drift+continue or sub-floor answer is never a usable verdict.
+ * The three readings of a course-check answer, independent of the deliberate submission path on
+ * purpose: the automatic consult is advisory, and a refactor of submitted course checks must never
+ * give it teeth. Same rules, same conservative reading, but the three cases are kept apart (F3):
+ *  - "unjudged": the judge could not be consulted, or the body carried no answer at all;
+ *  - "uncertain": the judge answered and the answer cannot be acted on - a redirect below the
+ *    confidence floor, or an answer inconsistent with its own per-requirement markings. Recorded
+ *    as uncertainty, never as a verdict and never as "not judged";
+ *  - "usable": a well-formed answer inside the option set, used exactly as before.
  */
+type CourseCheckRead =
+	| { kind: "unjudged"; detail: string }
+	| {
+			kind: "uncertain";
+			judged: true;
+			nextAction?: CourseCheckNextAction;
+			drifted: string[];
+			reasons: string[];
+			confidence?: number;
+			belowFloor: boolean;
+			detail: string;
+	  }
+	| {
+			kind: "usable";
+			nextAction: CourseCheckNextAction;
+			drifted: string[];
+			reasons: string[];
+			confidence?: number;
+	  };
+
 function readCourseCheckAnswer(
 	raw: unknown,
 	requirements: Array<{ id: string }>,
 	confidenceFloor: number,
 ): CourseCheckRead {
 	if (!isRecord(raw) || raw["judged"] !== true || typeof raw["nextAction"] !== "string") {
-		return { ok: false, detail: "the judge returned an unjudged or malformed course_check result" };
+		return { kind: "unjudged", detail: "the judge returned an unjudged or malformed course_check result" };
 	}
 	const nextAction = raw["nextAction"];
 	if (!(COURSE_CHECK_NEXT_ACTIONS as readonly string[]).includes(nextAction)) {
-		return { ok: false, detail: `the judge returned an unknown next action: ${nextAction}` };
+		return { kind: "unjudged", detail: `the judge returned an unknown next action: ${nextAction}` };
 	}
-	if (!isRecord(raw["onTrack"])) return { ok: false, detail: "the result carries no onTrack record" };
+	if (!isRecord(raw["onTrack"])) return { kind: "unjudged", detail: "the result carries no onTrack record" };
 	const onTrack = raw["onTrack"] as Record<string, unknown>;
 	const expected = requirements.map(r => r.id).sort();
 	const actual = Object.keys(onTrack).sort();
 	if (expected.length !== actual.length || expected.some((id, i) => id !== actual[i])) {
 		return {
-			ok: false,
+			kind: "unjudged",
 			detail: `onTrack keys must be exactly the requirement ids (${expected.join(", ")}); got ${actual.join(", ")}`,
 		};
 	}
 	const drifted = Object.entries(onTrack)
 		.filter(([, onTrackNow]) => onTrackNow !== true)
 		.map(([id]) => id);
-	if (drifted.length > 0 && nextAction === "continue") {
-		return { ok: false, detail: `drifted requirement(s) ${drifted.join(", ")} cannot yield continue` };
-	}
 	const reasons = Array.isArray(raw["reasons"])
 		? raw["reasons"].filter((r): r is string => typeof r === "string")
 		: [];
@@ -4396,16 +5222,37 @@ function readCourseCheckAnswer(
 		typeof rawConfidence === "number" && Number.isFinite(rawConfidence) && rawConfidence >= 0 && rawConfidence <= 1
 			? rawConfidence
 			: undefined;
+	if (drifted.length > 0 && nextAction === "continue") {
+		// The judge answered, and its own markings contradict that answer: recorded uncertainty.
+		return {
+			kind: "uncertain",
+			judged: true,
+			nextAction: "continue",
+			drifted,
+			reasons,
+			confidence,
+			belowFloor: false,
+			detail: `drifted requirement(s) ${drifted.join(", ")} cannot yield continue`,
+		};
+	}
 	if (
 		(nextAction === "continue" || nextAction === "verify_before_proceeding") &&
 		(confidence === undefined || confidence < confidenceFloor)
 	) {
 		return {
-			ok: false,
-			detail: `confidence must be a finite 0..1 number at/above the floor ${confidenceFloor}`,
+			kind: "uncertain",
+			judged: true,
+			nextAction: nextAction as CourseCheckNextAction,
+			drifted,
+			reasons,
+			confidence,
+			belowFloor: true,
+			detail:
+				`confidence ${confidence === undefined ? "absent" : String(confidence)} is below the floor ` +
+				`${confidenceFloor}`,
 		};
 	}
-	return { ok: true, nextAction: nextAction as CourseCheckNextAction, drifted, reasons, confidence };
+	return { kind: "usable", nextAction: nextAction as CourseCheckNextAction, drifted, reasons, confidence };
 }
 
 /**

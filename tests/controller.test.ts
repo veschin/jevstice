@@ -8,6 +8,8 @@ import { FRAME_FIX_PREFIX, SERVICE_OPTION_FIX } from "../src/client.js";
 import type { JevTemplateConfig } from "../src/config.js";
 import { isRecord } from "../src/guards.js";
 import type {
+	AcceptanceCriteriaRequest,
+	AcceptanceCriteriaResult,
 	AspectCoverageRequest,
 	AspectCoverageResult,
 	AspectMarking,
@@ -17,6 +19,9 @@ import type {
 	DecisionRequest,
 	DecisionResult,
 	Evidence,
+	PriorityClass,
+	PriorityRequest,
+	PriorityResult,
 	RequirementsFormalizationRequest,
 } from "../src/types.js";
 import { ACTIVITY_REGISTRY, PLAN_MAPPING_APPROVED_OPTION } from "../src/activities.js";
@@ -2664,7 +2669,11 @@ describe("jev controller: activities framework", () => {
 		proposal: "the numbered list derived from the two quoted user requirements",
 		options: OPTIONS,
 		evidence: [evidence("user", QUOTE_1), evidence("spec", QUOTE_2)],
-		requirements: [...REQUIREMENT_TEXTS],
+		// FR-19: every item names the submitted quote it derives from.
+		requirements: [
+			{ text: REQUIREMENT_TEXTS[0], quoteId: "quote-1" },
+			{ text: REQUIREMENT_TEXTS[1], quoteId: "quote-2" },
+		],
 		...overrides,
 	});
 
@@ -2680,6 +2689,49 @@ describe("jev controller: activities framework", () => {
 		],
 		...overrides,
 	});
+
+	const prioritiesInput = (overrides: Record<string, unknown> = {}) => ({
+		stage: "requirement_priorities",
+		task: "Let the judge set the build order over the accepted requirements",
+		proposal: "the accepted requirement list, to be ordered by the judge",
+		options: OPTIONS,
+		evidence: [evidence("user", QUOTE_1), evidence("spec", QUOTE_2)],
+		...overrides,
+	});
+
+	/** Priority judge: one class per accepted requirement, all confidences above the floor. */
+	const rankJudge =
+		(classes: Record<string, PriorityClass> = {}) =>
+		async (req: PriorityRequest): Promise<PriorityResult> => ({
+			classes: Object.fromEntries(
+				req.requirements.map((r, i) => [r.id, classes[r.id] ?? (i === 0 ? "must_be_first" : "later")]),
+			),
+			confidences: Object.fromEntries(req.requirements.map(r => [r.id, 0.9])),
+			reasons: [],
+			judged: true,
+		});
+
+	const criteriaInput = (overrides: Record<string, unknown> = {}) => ({
+		stage: "acceptance_criteria",
+		task: "Formalize the acceptance criteria of the accepted requirements",
+		proposal: "the criteria derived from the accepted requirement list",
+		options: OPTIONS,
+		evidence: [evidence("user", QUOTE_1), evidence("spec", QUOTE_2)],
+		criteria: [
+			{ requirementId: "req-1", text: "loading the dashboard renders feature X" },
+			{ requirementId: "req-2", text: "restarting the session keeps feature X" },
+		],
+		...overrides,
+	});
+
+	/** Criteria judge: one mark per criterion, all accepted unless the map says otherwise. */
+	const criteriaJudge =
+		(marks: Record<string, boolean> = {}) =>
+		async (req: AcceptanceCriteriaRequest): Promise<AcceptanceCriteriaResult> => ({
+			marked: Object.fromEntries(req.criteria.map(c => [c.id, marks[c.id] ?? true])),
+			reasons: [],
+			judged: true,
+		});
 
 	const fullMarks = { traceable: { "req-1": true, "req-2": true }, covered: { "quote-1": true, "quote-2": true } };
 	const fullFormalizationJudge = async (): Promise<{
@@ -2713,8 +2765,8 @@ describe("jev controller: activities framework", () => {
 		const outcome = await controller.submitDecision(formalizationInput());
 		expect(requests).toHaveLength(1);
 		expect(requests[0]?.requirements).toEqual([
-			{ id: "req-1", text: REQUIREMENT_TEXTS[0] },
-			{ id: "req-2", text: REQUIREMENT_TEXTS[1] },
+			{ id: "req-1", text: REQUIREMENT_TEXTS[0], quoteId: "quote-1" },
+			{ id: "req-2", text: REQUIREMENT_TEXTS[1], quoteId: "quote-2" },
 		]);
 		expect(requests[0]?.quotes).toEqual([
 			{ id: "quote-1", text: QUOTE_1 },
@@ -2726,9 +2778,10 @@ describe("jev controller: activities framework", () => {
 		expect(outcome.summary).toContain("REQ-A");
 		const record = controller.getState().lastFormalization;
 		expect(record?.complete).toBe(true);
-		expect(record?.requirements.map(r => [r.id, r.traceable])).toEqual([
-			["req-1", true],
-			["req-2", true],
+		// FR-19: every numbered item carries its number AND the verbatim source quote beside it.
+		expect(record?.requirements.map(r => [r.id, r.quoteId, r.quote, r.traceable])).toEqual([
+			["req-1", "quote-1", QUOTE_1, true],
+			["req-2", "quote-2", QUOTE_2, true],
 		]);
 		expect(record?.uncovered).toEqual([]);
 		// Advisory by construction: the stage never records a gate approval.
@@ -2812,6 +2865,7 @@ describe("jev controller: activities framework", () => {
 			judge: planStageJudge({ verdict: "revise", reasons: ["no plan work serves the requirement"], confidence: 0.9 }),
 			requirementsFormalizationJudge: fullFormalizationJudge,
 			claimCheckJudge: allClaimsSupported,
+			priorityJudge: rankJudge(),
 		});
 		controller.register(harness.pi);
 		await harness.emit("before_agent_start", {
@@ -2842,13 +2896,23 @@ describe("jev controller: activities framework", () => {
 			blockResult(await harness.emit("tool_call", { type: "tool_call", toolCallId: "2", toolName: "edit", input: {} }))
 				?.block,
 		).toBe(true);
-		// Every formalized requirement mapped and supported: planning is complete.
+		// Every formalized requirement mapped and supported: the mapping is complete, but FR-21
+		// still requires the judge's order over the accepted batch before mutating work.
 		const full = await controller.submitDecision(planMappingInput());
 		expect(full.verdict).toBe("approve");
 		expect(full.summary).toContain("2/2 requirement(s) mapped");
 		expect(controller.getState().lastPlanMapping?.complete).toBe(true);
+		const noOrder = blockResult(
+			await harness.emit("tool_call", { type: "tool_call", toolCallId: "3", toolName: "edit", input: {} }),
+		);
+		expect(noOrder?.block).toBe(true);
+		expect(String(noOrder?.reason)).toContain("priority order missing");
+		// The judge sets the order over the accepted batch: the plan gate opens.
+		const ranked = await controller.submitDecision(prioritiesInput());
+		expect(ranked.verdict).toBe("approve");
+		expect(ranked.selectedOption).toBe("ranked");
 		expect(
-			blockResult(await harness.emit("tool_call", { type: "tool_call", toolCallId: "3", toolName: "edit", input: {} }))
+			blockResult(await harness.emit("tool_call", { type: "tool_call", toolCallId: "4", toolName: "edit", input: {} }))
 				?.block,
 		).toBeUndefined();
 	});
@@ -2883,7 +2947,9 @@ describe("jev controller: activities framework", () => {
 				judged: true,
 			}),
 		});
-		await controller.submitDecision(formalizationInput({ requirements: [REQUIREMENT_TEXTS[0]] }));
+		await controller.submitDecision(
+			formalizationInput({ requirements: [{ text: REQUIREMENT_TEXTS[0], quoteId: "quote-1" }] }),
+		);
 		const outcome = await controller.submitDecision(
 			planMappingInput({
 				planClaims: [{ requirementId: "req-1", claim: "the plan adds the dashboard view for feature X" }],
@@ -3050,8 +3116,8 @@ describe("jev controller: activities framework", () => {
 		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
 		await controller.automaticCourseChecksSettled();
 		expect(requests[0]?.requirements).toEqual([
-			{ id: "req-1", quote: REQUIREMENT_TEXTS[0] },
-			{ id: "req-2", quote: REQUIREMENT_TEXTS[1] },
+			{ id: "req-1", quote: QUOTE_1 },
+			{ id: "req-2", quote: QUOTE_2 },
 		]);
 		// verify_before_proceeding is recorded and never unlocks the completion boundary.
 		expect(controller.getState().lastAutoCourseCheck?.selectedOption).toBe("verify_before_proceeding");
@@ -3113,5 +3179,524 @@ describe("jev controller: activities framework", () => {
 		]);
 		expect(restored.getState().lastFormalization).toBeUndefined();
 		expect(restored.getState().lastPlanMapping).toBeUndefined();
+	});
+});
+
+// ---------- FR-19/FR-20/FR-21: the accepted requirement list, its criteria and the judge's order ----------
+
+/**
+ * These tests exist because they fail when the behaviour breaks: an item or criterion with no
+ * reference is refused BEFORE the judge call, a criterion the judge does not accept is never
+ * usable and is named at the completion boundary, the order is a function of the judge's own marks
+ * and is recorded with each item's verbatim quote, a new accepted batch retires it by name and a
+ * second judged call replaces it, and work started out of order is named.
+ */
+describe("jev controller: acceptance criteria and priorities (FR-20, FR-21)", () => {
+	const Q1 = "the dashboard must show feature X after loading";
+	const Q2 = "a restart must not lose feature X";
+	const Q3 = "the export must keep working after the change";
+	const TEXTS = ["R1: the dashboard shows feature X", "R2: feature X survives a restart"] as const;
+	const EVIDENCE: Evidence[] = [evidence("user", Q1), evidence("spec", Q2)];
+
+	const traceable = (marks: Record<string, boolean> = {}) =>
+		async (req: RequirementsFormalizationRequest) => ({
+			traceable: Object.fromEntries(req.requirements.map(r => [r.id, marks[r.id] ?? true])),
+			covered: Object.fromEntries(req.quotes.map(q => [q.id, true])),
+			reasons: [],
+			judged: true,
+		});
+
+	const formalize = (overrides: Record<string, unknown> = {}) => ({
+		stage: "requirements_formalization",
+		task: "Formalize the requirements of this task",
+		proposal: "the numbered list derived from the quoted user requirements",
+		options: OPTIONS,
+		evidence: EVIDENCE,
+		requirements: [
+			{ text: TEXTS[0], quoteId: "quote-1" },
+			{ text: TEXTS[1], quoteId: "quote-2" },
+		],
+		...overrides,
+	});
+
+	const criteriaInput = (overrides: Record<string, unknown> = {}) => ({
+		stage: "acceptance_criteria",
+		task: "Formalize the acceptance criteria of the accepted requirements",
+		proposal: "the criteria derived from the accepted requirement list",
+		options: OPTIONS,
+		evidence: EVIDENCE,
+		criteria: [
+			{ requirementId: "req-1", text: "loading the dashboard renders feature X" },
+			{ requirementId: "req-2", text: "restarting the session keeps feature X" },
+		],
+		...overrides,
+	});
+
+	const marks = (m: Record<string, boolean> = {}) =>
+		async (req: AcceptanceCriteriaRequest): Promise<AcceptanceCriteriaResult> => ({
+			marked: Object.fromEntries(req.criteria.map(c => [c.id, m[c.id] ?? true])),
+			reasons: [],
+			judged: true,
+		});
+
+	const prioritiesInput = (overrides: Record<string, unknown> = {}) => ({
+		stage: "requirement_priorities",
+		task: "Let the judge set the build order over the accepted requirements",
+		proposal: "the accepted requirement list, to be ordered by the judge",
+		options: OPTIONS,
+		evidence: EVIDENCE,
+		...overrides,
+	});
+
+	const classes = (c: Record<string, PriorityClass> = {}) =>
+		async (req: PriorityRequest): Promise<PriorityResult> => ({
+			classes: Object.fromEntries(
+				req.requirements.map((r, i) => [r.id, c[r.id] ?? (i === 0 ? "must_be_first" : "later")]),
+			),
+			confidences: Object.fromEntries(req.requirements.map(r => [r.id, 0.9])),
+			reasons: [],
+			judged: true,
+		});
+
+	const allClaimsSupported = async (req: ClaimCheckRequest) => ({
+		supported: Object.fromEntries(req.claims.map(c => [c.id, true] as const)),
+		reasons: [],
+		judged: true,
+	});
+
+	const planInput = (overrides: Record<string, unknown> = {}) => ({
+		stage: "plan_mapping",
+		task: "Map the plan to the formalized requirements",
+		proposal: "the plan work that serves each formalized requirement",
+		options: OPTIONS,
+		evidence: EVIDENCE,
+		planClaims: [
+			{ requirementId: "req-1", claim: "the plan adds the dashboard view that renders feature X" },
+			{ requirementId: "req-2", claim: "the plan persists feature X so a restart keeps it" },
+		],
+		...overrides,
+	});
+
+	test("FR-19: an item naming no quote, or an unknown one, is refused before any judge call", async () => {
+		let calls = 0;
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			requirementsFormalizationJudge: async req => {
+				calls++;
+				return traceable()(req);
+			},
+		});
+		const unknown = await controller.submitDecision(
+			formalize({ requirements: [{ text: TEXTS[0], quoteId: "quote-9" }] }),
+		);
+		expect(calls).toBe(0);
+		expect(unknown.judged).toBe(false);
+		expect(unknown.reasons.join(" ")).toContain("unknown_quote_id");
+		expect(unknown.reasons.join(" ")).toContain("req-1→quote-9");
+		expect(unknown.reasons.join(" ")).toContain("quote-1, quote-2");
+
+		// A bare string item carries no reference at all: refused by the submission validator.
+		const bare = await controller.submitDecision(formalize({ requirements: [TEXTS[0]] }));
+		expect(bare.judged).toBe(false);
+		expect(bare.reasons.join(" ")).toContain("must be {text, quoteId}");
+		expect(calls).toBe(0);
+		expect(controller.getState().lastFormalization).toBeUndefined();
+	});
+
+	test("FR-20: a criterion referencing a requirement that was never accepted is refused before any judge call", async () => {
+		let calls = 0;
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			requirementsFormalizationJudge: traceable(),
+			acceptanceCriteriaJudge: async () => {
+				calls++;
+				return { marked: {}, reasons: [], judged: true };
+			},
+		});
+		await controller.submitDecision(formalize());
+		const outcome = await controller.submitDecision(
+			criteriaInput({ criteria: [{ requirementId: "req-7", text: "a criterion of nothing" }] }),
+		);
+		expect(calls).toBe(0);
+		expect(outcome.judged).toBe(false);
+		expect(outcome.reasons.join(" ")).toContain("unknown_requirement_id");
+		expect(outcome.reasons.join(" ")).toContain("req-1, req-2");
+
+		// Without an accepted list there is nothing a criterion could reference.
+		const fresh = createJevController({
+			judge: async () => judgeResult({}),
+			acceptanceCriteriaJudge: async () => {
+				calls++;
+				return { marked: {}, reasons: [], judged: true };
+			},
+		});
+		const nothingAccepted = await fresh.submitDecision(criteriaInput());
+		expect(calls).toBe(0);
+		expect(nothingAccepted.judged).toBe(false);
+		expect(nothingAccepted.reasons.join(" ")).toContain("ACCEPTED requirements list");
+	});
+
+	test("FR-20: the judge marks every criterion and the record carries each criterion with its requirement's quote", async () => {
+		const requests: AcceptanceCriteriaRequest[] = [];
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			requirementsFormalizationJudge: traceable(),
+			acceptanceCriteriaJudge: async req => {
+				requests.push(req);
+				return marks()(req);
+			},
+		});
+		await controller.submitDecision(formalize());
+		const outcome = await controller.submitDecision(criteriaInput());
+		expect(requests).toHaveLength(1);
+		expect(requests[0]?.criteria.map(c => [c.id, c.requirementId])).toEqual([
+			["crit-1", "req-1"],
+			["crit-2", "req-2"],
+		]);
+		// The judge read the accepted requirements themselves, quotes included.
+		expect(requests[0]?.requirements.map(r => [r.id, r.quote])).toEqual([
+			["req-1", Q1],
+			["req-2", Q2],
+		]);
+		expect(outcome.verdict).toBe("approve");
+		expect(outcome.selectedOption).toBe("criteria_accepted");
+		const record = controller.getState().lastAcceptanceCriteria;
+		expect(record?.complete).toBe(true);
+		expect(record?.criteria.map(c => [c.id, c.requirementId, c.requirementQuote, c.marked])).toEqual([
+			["crit-1", "req-1", Q1, true],
+			["crit-2", "req-2", Q2, true],
+		]);
+		// A criterion is never a gate grant of its own.
+		expect(controller.getState().approvals).toHaveLength(0);
+	});
+
+	test("FR-20: a criterion the judge does not accept is refused by name and keeps the completion boundary shut", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({
+			judge: gateJudge(),
+			requirementsFormalizationJudge: traceable(),
+			acceptanceCriteriaJudge: marks({ "crit-2": false }),
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", {
+			type: "before_agent_start",
+			prompt: "work task: implement feature X",
+			systemPrompt: [],
+		});
+		await approvePlan(controller);
+		await controller.submitDecision(formalize());
+		const outcome = await controller.submitDecision(criteriaInput());
+		expect(outcome.verdict).toBe("revise");
+		expect(outcome.selectedOption).toBe("criterion_without_requirement_basis");
+		expect(outcome.reasons.join(" ")).toContain("crit-2");
+		const record = controller.getState().lastAcceptanceCriteria;
+		expect(record?.complete).toBe(false);
+		expect(record?.unaccepted).toEqual(["crit-2"]);
+		// The unaccepted criterion is never usable, and the stop boundary names it.
+		const res = await runStop(harness);
+		expect(res?.decision).toBe("block");
+		expect(String(res?.reason)).toContain("acceptance criteria not accepted");
+		expect(String(res?.reason)).toContain("crit-2");
+	});
+
+	test("FR-20: a partial judge answer fails closed and no criteria record is written at all", async () => {
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			requirementsFormalizationJudge: traceable(),
+			acceptanceCriteriaJudge: async () => ({ marked: { "crit-1": true }, reasons: [], judged: true }),
+		});
+		await controller.submitDecision(formalize());
+		const outcome = await controller.submitDecision(criteriaInput());
+		expect(outcome.verdict).toBe("insufficient_evidence");
+		expect(outcome.judged).toBe(false);
+		expect(outcome.reasons.join(" ")).toContain("could not mark crit-2");
+		expect(controller.getState().lastAcceptanceCriteria).toBeUndefined();
+	});
+
+	test("FR-21: the judge sets the order and the record carries it with each item's verbatim quote", async () => {
+		const requests: PriorityRequest[] = [];
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			requirementsFormalizationJudge: traceable(),
+			priorityJudge: async req => {
+				requests.push(req);
+				return classes({ "req-1": "later", "req-2": "must_be_first" })(req);
+			},
+		});
+		await controller.submitDecision(formalize());
+		const outcome = await controller.submitDecision(prioritiesInput());
+		// The judge never invents an item: it ranks exactly the accepted list, quotes included.
+		expect(requests[0]?.requirements.map(r => [r.id, r.quote])).toEqual([
+			["req-1", Q1],
+			["req-2", Q2],
+		]);
+		expect(outcome.verdict).toBe("approve");
+		expect(outcome.selectedOption).toBe("ranked");
+		const order = controller.getState().lastPriorities;
+		expect(order?.stale).toBe(false);
+		expect(order?.items.map(i => [i.rank, i.requirementId, i.priorityClass, i.quote])).toEqual([
+			[1, "req-2", "must_be_first", Q2],
+			[2, "req-1", "later", Q1],
+		]);
+		// The order ranks the accepted batch and says which one.
+		expect(order?.batch.digest).toBe(controller.getState().lastFormalization?.batchDigest);
+		expect(order?.batch.taskFingerprint).toBe(controller.getState().taskFingerprint);
+		expect(outcome.summary).toContain("1. req-2");
+	});
+
+	test("FR-21: a partial ranking and an unaccepted-batch submission record no order", async () => {
+		let calls = 0;
+		const partial = createJevController({
+			judge: async () => judgeResult({}),
+			requirementsFormalizationJudge: traceable(),
+			priorityJudge: async () => {
+				calls++;
+				return { classes: { "req-1": "early" }, confidences: { "req-1": 0.9 }, reasons: [], judged: true };
+			},
+		});
+		await partial.submitDecision(formalize());
+		const refused = await partial.submitDecision(prioritiesInput());
+		expect(calls).toBe(1);
+		expect(refused.verdict).toBe("insufficient_evidence");
+		expect(refused.judged).toBe(false);
+		expect(refused.reasons.join(" ")).toContain("ranked no class for req-2");
+		expect(partial.getState().lastPriorities).toBeUndefined();
+
+		// Nothing accepted means nothing to rank, and the judge is never asked.
+		const fresh = createJevController({
+			judge: async () => judgeResult({}),
+			priorityJudge: async req => {
+				calls++;
+				return classes()(req);
+			},
+		});
+		const nothing = await fresh.submitDecision(prioritiesInput());
+		expect(nothing.judged).toBe(false);
+		expect(nothing.reasons.join(" ")).toContain("ACCEPTED requirements list");
+	});
+
+	test("FR-21: a new accepted batch retires the order by name and the second judged call replaces it", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({
+			judge: gateJudge(),
+			requirementsFormalizationJudge: traceable(),
+			priorityJudge: classes({ "req-1": "later", "req-2": "must_be_first" }),
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", {
+			type: "before_agent_start",
+			prompt: "work task: implement feature X",
+			systemPrompt: [],
+		});
+		await approvePlan(controller);
+		await controller.submitDecision(formalize());
+		await controller.submitDecision(prioritiesInput());
+		const first = controller.getState().lastPriorities;
+		expect(first?.stale).toBe(false);
+
+		// A NEW portion of requirements is accepted: the recorded order no longer ranks it.
+		await controller.submitDecision(
+			formalize({
+				requirements: [{ text: "R3: the export keeps working", quoteId: "quote-3" }],
+				evidence: [...EVIDENCE, evidence("user", Q3)],
+			}),
+		);
+		const retired = controller.getState().lastPriorities;
+		expect(retired?.stale).toBe(true);
+		expect(retired?.staleReason).toContain("re-rank");
+		const feedback = harness.sentMessages
+			.map(m => (isRecord(m.payload) && typeof m.payload["content"] === "string" ? m.payload["content"] : ""))
+			.join("\n");
+		expect(feedback).toContain("requirement_priorities");
+		expect(feedback).toContain("re-rank");
+		// Mutating work does not proceed on the retired order: the gate names the re-rank.
+		const blocked = blockResult(
+			await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} }),
+		);
+		expect(blocked.block).toBe(true);
+		expect(String(blocked.reason)).toContain("requirement_priorities");
+
+		// The second judged call replaces the record and names the batch it superseded.
+		const second = await controller.submitDecision(prioritiesInput());
+		expect(second.verdict).toBe("approve");
+		const replaced = controller.getState().lastPriorities;
+		expect(replaced?.stale).toBe(false);
+		expect(replaced?.supersedes?.digest).toBe(first?.batch.digest);
+		expect(replaced?.batch.digest).toBe(controller.getState().lastFormalization?.batchDigest);
+		expect(replaced?.batch.digest).not.toBe(first?.batch.digest);
+	});
+
+	test("FR-21: work started on an item the order ranks later is named and recorded", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({
+			// The plan-mapping question (single claim) answers with its approved option; the gates
+			// answer the happy path.
+			judge: async req =>
+				req.stage === "plan_mapping"
+					? judgeResult({ selectedOption: PLAN_MAPPING_APPROVED_OPTION, confidence: 0.93 })
+					: gateJudge()(req),
+			claimCheckJudge: allClaimsSupported,
+			requirementsFormalizationJudge: traceable(),
+			priorityJudge: classes({ "req-2": "must_be_first", "req-1": "later" }),
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", {
+			type: "before_agent_start",
+			prompt: "work task: implement feature X",
+			systemPrompt: [],
+		});
+		await approvePlan(controller);
+		await controller.submitDecision(formalize());
+		await controller.submitDecision(prioritiesInput());
+		// The plan starts at req-1, which the judge's order ranked second.
+		await controller.submitDecision(
+			planInput({ planClaims: [{ requirementId: "req-1", claim: "the plan adds the dashboard view" }] }),
+		);
+		const order = controller.getState().lastPriorities;
+		expect(order?.outOfOrder).toEqual({ started: "req-1", expectedFirst: "req-2" });
+		const feedback = harness.sentMessages
+			.map(m => (isRecord(m.payload) && typeof m.payload["content"] === "string" ? m.payload["content"] : ""))
+			.join("\n");
+		expect(feedback).toContain("work order starts at req-1");
+		expect(feedback).toContain("ranks req-2 first");
+	});
+
+	test("F3: a sub-floor automatic course check is recorded as uncertainty, never as not-judged", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			courseCheckJudge: async req => ({
+				onTrack: Object.fromEntries(req.requirements.map(r => [r.id, true] as const)),
+				nextAction: "verify_before_proceeding",
+				reasons: ["more evidence is needed before this continues"],
+				confidence: 0.3,
+				judged: true,
+			}),
+			template: { gates: { mutation: false }, courseCheck: { everyMutations: 1 } },
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", {
+			type: "before_agent_start",
+			prompt: "work task: implement feature X",
+			systemPrompt: [],
+		});
+		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
+		await controller.automaticCourseChecksSettled();
+		const record = controller.getState().lastAutoCourseCheck;
+		expect(record?.judged).toBe(true);
+		expect(record?.belowFloor).toBe(true);
+		expect(record?.selectedOption).toBe("verify_before_proceeding");
+		expect(record?.confidence).toBe(0.3);
+		expect(record?.reasons.join(" ")).toContain("more evidence is needed");
+		const feedback = harness.sentMessages
+			.map(m => (isRecord(m.payload) && typeof m.payload["content"] === "string" ? m.payload["content"] : ""))
+			.join("\n");
+		expect(feedback).toContain("recorded uncertainty");
+		expect(feedback).toContain("below the floor");
+		expect(feedback).not.toContain("not judged");
+		// Advisory still: nothing blocked, no gate credit, no rework spent.
+		expect(controller.getState().blockers).toEqual([]);
+		expect(controller.getState().iterations).toEqual({});
+		expect(controller.getState().lastCourseCheck).toBeUndefined();
+	});
+});
+
+// ---------- review findings closed in this slice (see the slice report) ----------
+
+describe("jev controller: findings from the independent review of HEAD 35b4d76", () => {
+	test("an approved attempt never consumes the rework bound and never spends its approach", async () => {
+		const harness = makeFakePi();
+		let calls = 0;
+		const controller = createJevController({
+			judge: async () => {
+				calls++;
+				return calls <= 3
+					? judgeResult({ selectedOption: "a", confidence: 0.95 })
+					: { verdict: "revise", reasons: ["the claim is not supported by the quoted source"], confidence: 0.9 };
+			},
+			maxReworkIterations: 3,
+		});
+		controller.register(harness.pi);
+		for (const approach of [
+			"verify after the first mutation",
+			"verify after the second mutation",
+			"verify after the third mutation",
+		]) {
+			const approved = await controller.submitDecision(validDecisionInput({ approach }));
+			expect(approved.verdict).toBe("approve");
+		}
+		// Three benign approvals must not close the stage: a real rejection is still judged.
+		const rejected = await controller.submitDecision(
+			validDecisionInput({ approach: "state the outcome plus the evidence that settles it" }),
+		);
+		expect(calls).toBe(4);
+		expect(rejected.verdict).toBe("revise");
+		expect(controller.getState().blockers.join(" ")).not.toContain("rework bound exhausted");
+		// An APPROVED approach is not a spent approach: naming it again later is a new consultation.
+		const again = await controller.submitDecision(
+			validDecisionInput({ approach: "verify after the first mutation", proposal: "the same move, later work" }),
+		);
+		expect(calls).toBe(5);
+		expect(again.verdict).toBe("revise");
+		expect(again.reasons.join(" ")).not.toContain("approach_already_spent");
+	});
+
+	test("a consumed work order is not counted as in flight: the next spawn judges the live order", async () => {
+		const ORDER_1 = "Add module M implementing feature X and run the dashboard test suite.";
+		const ORDER_2 = "Add module N carrying the dashboard export and run the export test suite.";
+		const calls: DecisionRequest[] = [];
+		const harness = makeFakePi();
+		const controller = createJevController({
+			template: {
+				stages: { subagent_handoff: { instructions: "Judge the hand-off only from the quoted material." } },
+				// The acceptance side keeps a judged order in the session until the delivered result,
+				// which is exactly the state that used to make the next spawn look unattributable.
+				gates: { handoffAcceptance: true },
+			} as JevTemplateConfig,
+			judge: async req => {
+				calls.push(req);
+				return { verdict: "insufficient_evidence", reasons: ["insufficient_evidence"], confidence: 0.31 };
+			},
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", {
+			type: "before_agent_start",
+			prompt: "Implement feature X for the dashboard and keep the existing export working.",
+			systemPrompt: [],
+		});
+		// The host's real sequence: capture a work order, spawn, then capture the next one. A
+		// consumed order must not make the single live order look like "several in flight".
+		const spawn = async (spawnKey: string): Promise<void> => {
+			await harness.emit("before_subagent_spawn", {
+				type: "before_subagent_spawn",
+				agent: "task",
+				invocationKind: "task",
+				patterns: ["@task"],
+				spawnKey,
+			});
+		};
+		await harness.emit("tool_call", {
+			type: "tool_call",
+			toolCallId: "t1",
+			toolName: "task",
+			input: { task: ORDER_1, agent: "task" },
+		});
+		await spawn("t1:0");
+		expect(calls).toHaveLength(1);
+		await harness.emit("tool_call", {
+			type: "tool_call",
+			toolCallId: "t2",
+			toolName: "task",
+			input: { task: ORDER_2, agent: "task" },
+		});
+		await spawn("t2:0");
+		// The second spawn was judged against the SECOND work order, not discarded as "several in flight".
+		expect(calls).toHaveLength(2);
+		expect(calls[1]?.evidence.some(e => e.quote.includes(ORDER_2))).toBe(true);
+		expect(controller.getState().lastHandoff?.judged).toBe(true);
+		// A third spawn has no live order left, and the record says exactly that.
+		await spawn("t3:0");
+		expect(controller.getState().lastHandoff?.judged).toBe(false);
+		expect(controller.getState().lastHandoff?.reasons.join(" ")).toContain("already used");
 	});
 });

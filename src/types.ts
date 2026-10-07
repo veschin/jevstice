@@ -40,6 +40,8 @@ export type DecisionStage =
   | "destructive_action" // POLICY-DRAFT I: judge a destructive bash command at execution time, fresh (plan never covers it)
   | "claim_check" // universal engine: per-claim support marking against quoted evidence (measured decisive per-claim regime)
   | "requirements_formalization" // activities framework: numbered requirement list, each item traceable to a verbatim quote + coverage verdict
+  | "acceptance_criteria" // FR-20: acceptance criteria, each referencing an accepted requirement, every criterion judged
+  | "requirement_priorities" // FR-21: the judge's order over the accepted requirements, recorded with their quotes
   | "plan_mapping" // activities framework (planning): per-requirement claim that the plan serves it, marked by the claim_check path
   | "business_review" // review activity (advisory): the product as it stands against the customer's promised outcome
   | "architecture_review" // review activity (advisory): how well the implementation absorbs the next change
@@ -253,13 +255,17 @@ export type ClaimCheckJudge = (request: ClaimCheckRequest) => Promise<ClaimCheck
  *  - every quote: does at least one formalized requirement capture what it demands (covered)?
  * A requirement the quotes do not entail is refused (item_untraceable); a quote no
  * requirement captures is the coverage gap (coverage_missing). Never gate-granting.
+ *
+ * Each submitted item also NAMES the quote id it derives from (FR-19: every item carries a
+ * number and a verbatim quote). An item naming no quote, or an id that is not among the
+ * submitted quotes, is refused before the judge call: there is nothing to be traceable to.
  */
 export interface RequirementsFormalizationRequest {
   stage: DecisionStage;
   /** What the formalization is for (context only; items are judged from the quotes). */
   task: string;
   /** Draft numbered requirements, >= 1, ids assigned by the caller (numbered list). */
-  requirements: Array<{ id: string; text: string }>;
+  requirements: Array<{ id: string; text: string; quoteId: string }>;
   /** The user/spec quotes the list must be traceable to and must cover (>= 1). */
   quotes: Array<{ id: string; text: string }>;
   evidence: Evidence[];
@@ -278,6 +284,66 @@ export interface RequirementsFormalizationResult {
 export type RequirementsFormalizationJudge = (
   request: RequirementsFormalizationRequest,
 ) => Promise<RequirementsFormalizationResult>;
+
+// ---------- Acceptance criteria (FR-20: each criterion references an accepted requirement) ----------
+
+/**
+ * The primitive behind the `acceptance_criteria` stage: the caller submits, per criterion, the
+ * accepted formalized requirement id it checks, and the judge marks EVERY criterion in ONE
+ * request against that requirement's verbatim quote. A criterion that names no requirement, or an
+ * id outside the accepted list, never reaches the judge (the controller refuses it first); a
+ * partial or unmarkable answer fails closed, so no criterion without a judge mark is recorded.
+ */
+export interface AcceptanceCriteriaRequest {
+  stage: DecisionStage;
+  task: string;
+  /** Criteria, >= 1, ids assigned by the caller; each names the accepted requirement it checks. */
+  criteria: Array<{ id: string; requirementId: string; text: string }>;
+  /** The accepted requirements, so the judge reads the referenced quote instead of guessing it. */
+  requirements: Array<{ id: string; text: string; quote: string }>;
+  evidence: Evidence[];
+}
+
+export interface AcceptanceCriteriaResult {
+  /** Criterion id -> the referenced accepted requirement states or entails this criterion as written. */
+  marked: Record<string, boolean>;
+  reasons: string[];
+  /** False when the judge could not be consulted (fail-closed; never a partial marking). */
+  judged: boolean;
+}
+
+export type AcceptanceCriteriaJudge = (request: AcceptanceCriteriaRequest) => Promise<AcceptanceCriteriaResult>;
+
+// ---------- Priorities (FR-21: the judge sets the order over the accepted requirements) ----------
+
+/**
+ * The fixed ordinal classes the judge chooses among, per accepted requirement. The controller
+ * derives the order by sorting on this sequence, so the order is a function of the judge's marks
+ * alone; the tie-break is the item's own position in the accepted list (documented, deterministic).
+ */
+export const PRIORITY_CLASSES = ["must_be_first", "early", "later", "last"] as const;
+
+export type PriorityClass = (typeof PRIORITY_CLASSES)[number];
+
+export interface PriorityRequest {
+  stage: DecisionStage;
+  task: string;
+  /** The accepted requirements the order must cover, each with its number and verbatim quote. */
+  requirements: Array<{ id: string; text: string; quote: string }>;
+  evidence: Evidence[];
+}
+
+export interface PriorityResult {
+  /** Requirement id -> the class the judge assigned; one entry per requested id or judged is false. */
+  classes: Record<string, PriorityClass>;
+  /** Per-requirement confidence of that answer, when the API returns one. */
+  confidences: Record<string, number>;
+  reasons: string[];
+  /** False when the judge could not be consulted (fail-closed; never a partial order). */
+  judged: boolean;
+}
+
+export type PriorityJudge = (request: PriorityRequest) => Promise<PriorityResult>;
 
 // ---------- Reviews (business / architecture / security; advisory activities) ----------
 

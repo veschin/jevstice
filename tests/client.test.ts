@@ -1432,8 +1432,8 @@ const okFormalization: RequirementsFormalizationRequest = {
 	stage: "requirements_formalization",
 	task: "Formalize the requirement list of the dashboard task",
 	requirements: [
-		{ id: "req-1", text: "the dashboard shows feature X" },
-		{ id: "req-2", text: "feature X survives a restart" },
+		{ id: "req-1", text: "the dashboard shows feature X", quoteId: "quote-1" },
+		{ id: "req-2", text: "feature X survives a restart", quoteId: "quote-2" },
 	],
 	quotes: [
 		{ id: "quote-1", text: "the dashboard must show feature X" },

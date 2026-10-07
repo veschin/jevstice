@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.9.0 - 2026-10-08
+
+FR-20 and FR-21 end to end, FR-19 verified against its own checked-by clause, and the automatic
+course check's sub-floor read (finding F3) closed. Every design decision below went to the live judge
+BEFORE it was built (one claim plus the supporting quotes, fixed options, at most three attempts each
+with a changed approach); the requests, the verbatim verdicts and the OPEN items are in
+`evidence/criteria-priorities-consultations.md`.
+
+- **FR-19 - every formalized item now carries its number AND a verbatim quote.** The submission names
+  the quote id each item derives from; an item naming no quote, or an id that is not among the
+  submitted user/spec quotes, is refused BEFORE any judge call (judge verdict on the gap: noul 0.86;
+  vehicle `executor_names_quote_id`, confidence 0.90). The accepted record keeps `quoteId` and the
+  quote's verbatim text beside the item.
+- **FR-20 - `acceptance_criteria` (new `on_demand` control point).** Criteria are `{requirementId,
+  text}`; a criterion referencing no requirement, or an id outside the ACCEPTED list, is refused
+  before any judge call; the judge marks every criterion in one request against the referenced
+  requirement's verbatim quote; a partial or unmarkable answer fails closed with no record at all. A
+  criterion the judge does not accept is refused by name and the completion boundary names it
+  (judge verdict on the vehicle: `dedicated_stage_pre_judge_reference`, confidence 0.98; the teeth
+  reading stayed sub-floor and is recorded OPEN, built as the product's invariants force).
+- **FR-21 - `requirement_priorities` (new `on_demand` control point).** The controller supplies the
+  accepted list (the judge can never invent an item); the judge assigns every item a priority class in
+  one request and the controller derives the order from those marks (fixed class sequence, tie-break:
+  the item's position in the accepted list). The record carries the order, each ranked item's number
+  and verbatim quote, the class marks with their confidences and the identity of the batch it ranks
+  (verdict on the record reading: `quotes_in_priority_record`, REQUIRED, confidence 0.71; the class
+  marks use the product's 0.5 MARKING boundary, not the 0.8 approval floor - measured live, a four-way
+  class Choice answers at 0.5-0.82, so the approval floor recorded no order at all and FR-21 would
+  have blocked the plan gate forever: evidence/criteria-priorities-live.log). A new
+  accepted batch retires the order by name (content digest identity hidden), the mutation gate and the
+  stop boundary name the re-rank until a second judged call replaces the record (which then names the
+  batch it superseded), and work started on an item the order ranks later than an unclaimed earlier
+  item is named in the session and recorded (`outOfOrder`). Vehicle verdict:
+  `per_item_class_derived_order`, confidence 0.98; the re-rank and work-sequence readings stayed
+  sub-floor and are recorded OPEN.
+- **F3 - the automatic course check.** It already read the accepted list; it now reads each item's
+  VERBATIM source quote (the FR-19 fix), and its three outcomes stay apart: a judged answer that
+  cannot be acted on (below the confidence floor, or contradicting its own per-requirement markings)
+  is stored as recorded uncertainty (`belowFloor: true`, answer, confidence and reasons kept) and
+  surfaced as uncertainty; only an unconsultable judge reads as not judged.
+- **Four findings from the independent review of HEAD 35b4d76, all closed.** (1) BLOCKING: the rework
+  bound counted APPROVED attempts, so three benign `continue` verdicts escalated the fourth
+  consultation as exhausted and the message asserted "all rejected" against its own journal - the
+  bound and the spent-approach rule now count rejected attempts only, and the journal keeps every
+  attempt. (2) A review's `stages.<review>.options` override was ignored (the executor's candidates
+  were used); the template's candidates now win. (3) Hand-off attribution counted consumed orders, so
+  a live order looked like "several task calls in flight" while the acceptance side kept a used one -
+  consumed entries are filtered out. (4) Dead code: `isKnownStage` (no callers) and the redundant
+  `COURSE_CHECK_OPTION_IDS` re-export removed.
+
+Test count: 350 before this slice (HEAD da03692), 363 after (+13: 1 FR-19, 4 FR-20, 4 FR-21, 1 F3,
+1 review candidates, 1 hand-off attribution, 1 rework bound), every one failing when its behaviour
+breaks - 8 verified by mutation (removals of the two pre-judge refusals, the class-derived sort, the
+stale-order retirement, the sub-floor uncertainty record, the rejected-only bound, the template
+candidates and the consumed-order filter).
+
+What could NOT be settled: the judge's evidence-based questions on FR-20/FR-21 came back sub-floor
+(the quoted material describes other stages, and it does not extrapolate to a stage that does not
+exist yet), so three sub-questions are OPEN with their state written down - FR-20's record-on-refusal
+reading (weak lead `named_in_record` 0.52 at confidence 0.36, built as the product's invariants
+force), and FR-21's re-rank and work-sequence readings (leading answers 0.42/0.51 at confidence
+0.28/0.35). No wording was bent to fit an answer. The two new judge clients were round-tripped against the live
+endpoint afterwards (evidence/criteria-priorities-live.log): the per-criterion marking discriminates
+(crit-2, entailed by nothing, refused), the class marks produce the order, and one run died on the
+known transport reset and was retried.
+
+
 ## 0.1.0 - 2026-10-07
 
 - Baseline: PRD, PLAN.md, package config, shared types contract (DecisionRequest/DecisionResult/Judge/MultiLabelJudge, TypeSafe systemone wire types, POLICY defaults).

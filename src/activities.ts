@@ -125,6 +125,12 @@ export const PLAN_MAPPING_INCOMPLETE_OPTION = "incomplete_mapping";
 export const FORMALIZATION_APPROVED_OPTION = "formalized";
 export const FORMALIZATION_UNTRACEABLE_OPTION = "item_untraceable";
 export const FORMALIZATION_COVERAGE_MISSING_OPTION = "coverage_missing";
+/** Option ids the acceptance-criteria preset selects (FR-20). */
+export const CRITERIA_ACCEPTED_OPTION = "criteria_accepted";
+export const CRITERIA_UNBACKED_OPTION = "criterion_without_requirement_basis";
+/** Option ids the priority preset selects (FR-21). */
+export const PRIORITIES_RANKED_OPTION = "ranked";
+export const PRIORITIES_STALE_OPTION = "stale_batch";
 
 /**
  * The six activities. Verbatim from the framework spec (evidence/activities-framework.md);
@@ -191,12 +197,14 @@ export const ACTIVITY_REGISTRY: Readonly<Record<string, Activity>> = {
 	},
 	requirements_formalization: {
 		id: "requirements_formalization",
-		purpose: "Turn the quoted task/spec into a numbered requirement list, each item traceable to a verbatim quote.",
+		purpose:
+			"Turn the quoted task/spec into a numbered requirement list, each item traceable to a verbatim quote, and formalize the acceptance criteria of the accepted items.",
 		entersWhen: "after task_definition, before planning (submitted with stage=requirements_formalization)",
 		evidenceRequired: "user/spec quotes (kind user or spec) that state or entail the formalized requirements",
 		outcomes: ["formalized", "item_untraceable", "coverage_missing", "ask_user"],
 		invariants: [
 			"every formalized requirement carries a verbatim quote; a requirement without a quote is refused",
+			"every acceptance criterion references an accepted requirement; a criterion without one is refused",
 			"the formalized list becomes the checklist every later activity is judged against",
 			"never gate-granting by itself (on_demand records no approval)",
 		],
@@ -227,18 +235,36 @@ export const ACTIVITY_REGISTRY: Readonly<Record<string, Activity>> = {
 					{ verdict: "ask_user", outcome: "ask_user" },
 				],
 			},
+			// FR-20: the acceptance criteria of the accepted list. A criterion the judge does not
+			// accept is an item with no requirement basis behind it, so it resolves to the same
+			// outcome an untraceable requirement does: the list is not accepted and the item is named.
+			{
+				stage: "acceptance_criteria",
+				wiring: ["stage"],
+				outcomeEdges: [
+					{ verdict: "approve", option: CRITERIA_ACCEPTED_OPTION, outcome: "formalized" },
+					{ verdict: "approve", outcome: "formalized" },
+					{ verdict: "revise", option: CRITERIA_UNBACKED_OPTION, outcome: "item_untraceable" },
+					{ verdict: "revise", outcome: "item_untraceable" },
+					{ verdict: "insufficient_evidence", outcome: "ask_user" },
+					{ verdict: "ask_user", outcome: "ask_user" },
+				],
+			},
 		],
 	},
 	planning: {
 		id: "planning",
-		purpose: "Establish, before the first mutation, a plan in which every formalized requirement has work that serves it.",
-		entersWhen: "before the first mutation (mutation_gate) and after requirements_formalization",
+		purpose:
+			"Establish, before the first mutation, a plan in which every formalized requirement has work that serves it, in the order the judge sets.",
+		entersWhen:
+			"before the first mutation (mutation_gate) and after requirements_formalization; re-entered when a new accepted batch retires the plan mapping or the priority order",
 		evidenceRequired: "the requirement list (verbatim quotes) plus the plan as a claim",
 		outcomes: ["approved", "revise", "insufficient_evidence", "ask_user"],
 		invariants: [
 			"no mutation before an approved plan (switchable with gates.mutation)",
 			"an open plan summary is not judgeable - the plan must be a claim checked against quotes",
 			"a formalized requirement with no plan claim leaves planning incomplete",
+			"the judge sets the order over the accepted items; the executor's work order is named against it",
 		],
 		verdictActions: {
 			approved: "continue",
@@ -279,6 +305,21 @@ export const ACTIVITY_REGISTRY: Readonly<Record<string, Activity>> = {
 					{ verdict: "approve", option: PLAN_MAPPING_APPROVED_OPTION, outcome: "approved" },
 					{ verdict: "approve", outcome: "approved" },
 					{ verdict: "revise", option: PLAN_MAPPING_INCOMPLETE_OPTION, outcome: "revise" },
+					{ verdict: "revise", outcome: "revise" },
+					{ verdict: "insufficient_evidence", outcome: "insufficient_evidence" },
+					{ verdict: "ask_user", outcome: "ask_user" },
+				],
+			},
+			// FR-21: the judge sets the order over the accepted requirement list; the controller
+			// derives it from the judge's per-item class marks and records it with each item's
+			// verbatim quote. A stale order (one that ranks a retired batch) is a planning gap.
+			{
+				stage: "requirement_priorities",
+				wiring: ["stage"],
+				outcomeEdges: [
+					{ verdict: "approve", option: PRIORITIES_RANKED_OPTION, outcome: "approved" },
+					{ verdict: "approve", outcome: "approved" },
+					{ verdict: "revise", option: PRIORITIES_STALE_OPTION, outcome: "revise" },
 					{ verdict: "revise", outcome: "revise" },
 					{ verdict: "insufficient_evidence", outcome: "insufficient_evidence" },
 					{ verdict: "ask_user", outcome: "ask_user" },
