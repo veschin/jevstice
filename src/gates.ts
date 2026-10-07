@@ -28,7 +28,6 @@
 import type { ControlPointTrigger } from "./control-points.js";
 import { HOST_HANDLER_TIMEOUT_MS, withDeadline } from "./deadline.js";
 import {
-	REVIEW_DEADLINE_MS,
 	REVIEW_QUESTIONS,
 	parseReviewQuestions,
 	type ReviewId,
@@ -401,7 +400,9 @@ export function normalizeJudgeResult(raw: unknown, options: readonly DecisionOpt
 				reasons: ["judge approved without naming one of the offered options"],
 			};
 		}
-		if (confidence !== undefined && (confidence < 0 || confidence > 1)) {
+		// Written as a positive test on purpose: `confidence < 0 || confidence > 1` is false for NaN,
+		// which let a malformed answer keep the approve verdict (found by the 2026-10-08 review).
+		if (confidence !== undefined && !(confidence >= 0 && confidence <= 1)) {
 			return {
 				verdict: "insufficient_evidence",
 				reasons: [`judge confidence ${confidence} outside 0..1 is malformed`],
@@ -607,7 +608,15 @@ export function restoreGateRecordFields(raw: unknown): GateRecordFields | undefi
 	return {
 		judged: record["judged"],
 		verdict: verdict as DecisionVerdict | undefined,
-		confidence: typeof record["confidence"] === "number" ? record["confidence"] : undefined,
+		// Read back from disk, a confidence is checked the way the live path checks it: a non-finite
+		// or out-of-range value is dropped rather than carried into a displayed record (review N4).
+		confidence:
+			typeof record["confidence"] === "number" &&
+			Number.isFinite(record["confidence"]) &&
+			record["confidence"] >= 0 &&
+			record["confidence"] <= 1
+				? record["confidence"]
+				: undefined,
 		reasons: Array.isArray(record["reasons"])
 			? record["reasons"].filter((r): r is string => typeof r === "string")
 			: [],

@@ -519,6 +519,9 @@ export async function consultReview(request: ReviewConsultRequest): Promise<Revi
 		if (question.wire.kind === "score") {
 			const levels = question.wire.rubric ?? [];
 			const score = answer["score"];
+			// Fractional scores are the norm, not an accident: the repository's own review runner asks
+			// for a 0..9 score and the judge answers 2.58. A review note proposed pinning integers; the
+			// product's measured usage and tests/reviews.test.ts contradict it, so the range stands.
 			if (typeof score !== "number" || !Number.isFinite(score) || score < 0 || score > levels.length - 1) {
 				return failClosed(
 					`the score for ${question.wire.id} must be a finite number within the rubric ` +
