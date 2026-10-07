@@ -923,10 +923,17 @@ export class JevController {
 				summary: "",
 			};
 		}
+		const driftSuffix = drifted.length > 0 ? ` (drifted: ${drifted.join(", ")})` : "";
 		if (nextAction === "return_to_requirement" || nextAction === "replan") {
-			this.pushFeedback(`Jev course_check redirects: ${nextAction}${drifted.length > 0 ? ` (not on track: ${drifted.join(", ")})` : ""}`);
+			this.pushFeedback(`Jev course_check redirects: ${nextAction}${driftSuffix}`);
 			this.persist();
-			return { verdict: "revise", selectedOption: nextAction, reasons, judged: true, summary: "" };
+			return {
+				verdict: "revise",
+				selectedOption: nextAction,
+				reasons,
+				judged: true,
+				summary: `course_check: revise — ${nextAction}: back to requirement${driftSuffix}`,
+			};
 		}
 		// ask_user
 		const blocker = "course_check escalated to the user (ask_user chosen by the judge or rework bound).";

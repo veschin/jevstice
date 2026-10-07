@@ -612,6 +612,42 @@ describe("jev controller", () => {
 		expect(seen[1]?.quote).toContain("session expiry");
 	});
 
+	test("polish5: drift ids named in summary; zero-drift summary unchanged", async () => {
+		let onTrack: Record<string, boolean> = { REQ1: false, REQ2: false };
+		const controller = createJevController({
+			judge: async () => {
+				throw new Error("must not be called");
+			},
+			courseCheckJudge: async () => ({
+				onTrack,
+				nextAction: "return_to_requirement",
+				reasons: [],
+				judged: true,
+			}),
+		});
+		const drifted = await controller.submitDecision(
+			courseInput({
+				evidence: [
+					evidence("user", "REQ1 user quote: login sessions persist"),
+					evidence("spec", "REQ2 spec quote: csv export columns"),
+					evidence("execution", "dry-run output: all checks green"),
+				],
+			}),
+		);
+		expect(drifted.summary).toBe("course_check: revise — return_to_requirement: back to requirement (drifted: REQ1, REQ2)");
+
+		onTrack = { REQ1: true };
+		const redirect = { ...courseInput(), proposal: "second look, everything aligned" };
+		const zero = await controller.submitDecision({
+			...redirect,
+			evidence: [
+				evidence("user", "REQ1 user quote: login sessions persist"),
+				evidence("execution", "dry-run output: all checks green"),
+			],
+		});
+		expect(zero.summary).toBe("course_check: revise — return_to_requirement: back to requirement");
+	});
+
 	test("C1 wired course_check: fail-closed on judge throw and unjudged result", async () => {
 		let mode: "throw" | "unjudged" = "throw";
 		const controller = createJevController({
