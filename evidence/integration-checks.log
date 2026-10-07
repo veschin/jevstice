@@ -1,0 +1,13 @@
+# code-guard --deep (2026-10-07)
+note: jsts: prettier skipped (no prettier config found)
+note: jsts: no eslint config found, eslint skipped
+note: 376 file(s) outside the analyzer set: .mdx x333, .json x22, .md x8, .log x3, LICENSE x3, .txt x2, tsc x2, tsserver x2, +1 more
+summary: clean
+
+# typecheck
+bun x tsc --noEmit: 0 errors
+
+# tests
+ 0 fail
+ 378 expect() calls
+Ran 111 tests across 6 files. [15.14s]

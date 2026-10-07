@@ -1,0 +1,8 @@
+# AC1 live CLI via official API (2026-10-07, key via pass, never printed)
+$ bun run src/cli.ts /tmp/jev_req.json  # live
+{"verdict":"insufficient_evidence","reasons":["low_confidence"],"confidence":0.48} exit=0 (real judge answer; policy downgrade, no approve)
+$ bun run src/cli.ts probe  # live
+{"ok":true,"verdict":"insufficient_evidence","latencyMs":469} exit=0
+# flakiness: 2 of 3 probe invocations hit TLS/socket resets; retries exhausted at maxRetries=2 -> exit 4; 3rd invocation OK 469ms
+# direct curl suite earlier: HTTP 200 jev-1.13.0 ~0.5s, noul 0.98 arithmetic, review pair approve 0.96/revise 1.0, report-only completion insufficient_evidence 0.94
+# after maxRetries 2->4: 3/3 consecutive live probes OK, 444-528ms, exit 0 (2026-10-07)

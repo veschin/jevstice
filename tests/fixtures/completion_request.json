@@ -1,0 +1,1 @@
+{"stage":"completion_review","task":"Verify slice","proposal":"Executor reports done","options":[{"id":"approve","label":"Approve","meaning":"accept"},{"id":"revise","label":"Revise","meaning":"rework"}],"evidence":[{"kind":"execution","source":"bun test","quote":"42 pass, 0 fail"}]}

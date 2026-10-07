@@ -1,0 +1,7 @@
+# AC4 fail-closed offline probes (2026-10-07)
+$ bun run src/cli.ts probe   # no key
+{"error":"config","message":"api key missing: set TYPESAFE_API_KEY"} exit=4
+$ echo garbage | bun run src/cli.ts -
+invalid JSON input exit=2
+$ TYPESAFE_API_KEY=dummy TYPESAFE_API_URL=http://127.0.0.1:1/v1/systemone bun run src/cli.ts /tmp/jev_req.json
+{"error":"transport","message":"Unable to connect. Is the computer able to access the url?"} exit=4
