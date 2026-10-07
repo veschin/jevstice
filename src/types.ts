@@ -75,6 +75,15 @@ export interface DecisionResult {
   confidence?: number;
   /** Pre-judge evidence-quality notices (duplicate/short quotes); advisory only. */
   warnings?: string[];
+  /**
+   * Typed mid-band completion candidate: raw judge verdict was approve on a
+   * valid non-meta option with completionConfidenceFloor <= confidence <
+   * minConfidenceToApprove, stage completion_review only, and the configured
+   * bar not raised. verdict stays insufficient_evidence for every other
+   * consumer; only the completion controller may honor this candidate. Never
+   * inferred from reason strings.
+   */
+  completionCandidate?: { selectedOption: string };
 }
 
 // ---------- Judge dependency ----------
@@ -135,6 +144,33 @@ export interface CourseCheckResult {
 }
 
 export type CourseCheckJudge = (request: CourseCheckRequest) => Promise<CourseCheckResult>;
+
+// ---------- Aspect coverage (three-way per-aspect marking; aspect_coverage preset) ----------
+
+export type AspectMarking =
+  | "applicable_and_addressed"
+  | "applicable_not_addressed"
+  | "not_applicable";
+
+export interface AspectCoverageRequest {
+  aspects: Array<{ id: string; text: string }>;
+  currentAction: string;
+  evidence: Evidence[];
+  /** Capabilities declared required: not_applicable cannot satisfy (reported as applicable_not_addressed). */
+  requireAll?: boolean;
+}
+
+export interface AspectCoverageResult {
+  markings: Record<string, AspectMarking>;
+  reasons: string[];
+  confidence?: number;
+  /** False when the judge could not be consulted (fail-closed; never a mapping). */
+  judged: boolean;
+  /** Meta-option escape: judge cannot mark this batch -> insufficient_evidence. */
+  escape?: boolean;
+}
+
+export type AspectCoverageJudge = (request: AspectCoverageRequest) => Promise<AspectCoverageResult>;
 
 // ---------- TypeSafe systemone wire types (S:API, verified from docs.typesafe.ai/api) ----------
 

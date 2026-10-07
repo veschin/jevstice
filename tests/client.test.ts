@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import type { DecisionRequest, DecisionOption, MultiLabelRequest } from "../src/types";
-import { createJudge, createMultiLabelJudge, JevApiError } from "../src/client";
+import type { DecisionRequest, DecisionOption, MultiLabelRequest, AspectCoverageRequest } from "../src/types";
+import { POLICY } from "../src/types";
+import { createJudge, createMultiLabelJudge, createAspectCoverageJudge, JevApiError } from "../src/client";
 import { buildRequestBody, META_REASON_CRITERIA, SERVICE_OPTION_CRITERIA } from "../src/evidence";
 
 const okOptions: DecisionOption[] = [
@@ -845,5 +846,448 @@ describe("mandatory meta-options", () => {
     );
     const criteria = (body.questions.option as { criteria: Record<string, unknown> }).criteria;
     for (const id of SERVICE_IDS) expect(criteria[id]).toBeDefined();
+  });
+});
+
+// ---------- completion candidate (typed mid-band candidate, completion_review only) ----------
+
+function midBandFetch(verdict: string, confidence: number, option = "approve"): typeof fetch {
+  return (async () =>
+    jsonResponse(
+      metaBody({
+        verdict: choiceAnswer(verdict, confidence),
+        option: choiceAnswer(option, confidence),
+      }),
+    )) as unknown as typeof fetch;
+}
+
+describe("completion candidate (mid-band completion_review)", () => {
+  test("approve at 0.7 stays strict insufficient_evidence but carries the typed candidate", async () => {
+    const judge = createJudge({ apiKey: "k", fetchFn: midBandFetch("approve", 0.7) });
+    const result = await judge(okReq);
+    expect(result.verdict).toBe("insufficient_evidence");
+    expect(result.reasons).toEqual(["low_confidence"]);
+    expect(result.completionCandidate).toEqual({ selectedOption: "approve" });
+  });
+
+  test("candidate carries the chosen non-default option", async () => {
+    const judge = createJudge({ apiKey: "k", fetchFn: midBandFetch("approve", 0.7, "reject") });
+    const result = await judge(okReq);
+    expect(result.completionCandidate).toEqual({ selectedOption: "reject" });
+  });
+
+  test("candidate appears exactly at POLICY.completionConfidenceFloor", async () => {
+    const judge = createJudge({
+      apiKey: "k",
+      fetchFn: midBandFetch("approve", POLICY.completionConfidenceFloor),
+    });
+    const result = await judge(okReq);
+    expect(result.verdict).toBe("insufficient_evidence");
+    expect(result.completionCandidate).toEqual({ selectedOption: "approve" });
+  });
+
+  test("confidence below the completion floor -> no candidate", async () => {
+    const judge = createJudge({
+      apiKey: "k",
+      fetchFn: midBandFetch("approve", POLICY.completionConfidenceFloor - 0.1),
+    });
+    const result = await judge(okReq);
+    expect(result.verdict).toBe("insufficient_evidence");
+    expect(result.completionCandidate).toBeUndefined();
+  });
+
+  test("non-completion stage -> no candidate", async () => {
+    const judge = createJudge({ apiKey: "k", fetchFn: midBandFetch("approve", 0.7) });
+    const result = await judge({ ...okReq, stage: "direction_review" });
+    expect(result.verdict).toBe("insufficient_evidence");
+    expect(result.completionCandidate).toBeUndefined();
+  });
+
+  test("raised configured bar -> no candidate (bar raising opts out)", async () => {
+    const judge = createJudge({
+      apiKey: "k",
+      fetchFn: midBandFetch("approve", 0.85),
+      minConfidence: 0.9,
+    });
+    const result = await judge(okReq);
+    expect(result.verdict).toBe("insufficient_evidence");
+    expect(result.completionCandidate).toBeUndefined();
+  });
+
+  test("meta verdict escape -> revise/insufficient, never a candidate", async () => {
+    const judge = createJudge({ apiKey: "k", fetchFn: midBandFetch("ALL_OPTIONS_WRONG", 0.7) });
+    const result = await judge(okReq);
+    expect(result.verdict).toBe("insufficient_evidence");
+    expect(result.reasons).toContain("meta_option");
+    expect(result.completionCandidate).toBeUndefined();
+  });
+
+  test("meta option selection with mid-band approve verdict -> no candidate", async () => {
+    const judge = createJudge({
+      apiKey: "k",
+      fetchFn: midBandFetch("approve", 0.7, "PARTIALLY_RIGHT_NONE_FULL"),
+    });
+    const result = await judge(okReq);
+    expect(result.verdict).toBe("revise");
+    expect(result.completionCandidate).toBeUndefined();
+  });
+
+  test("full-confidence approve -> plain approval, no candidate field", async () => {
+    const judge = createJudge({ apiKey: "k", fetchFn: midBandFetch("approve", 0.85) });
+    const result = await judge(okReq);
+    expect(result.verdict).toBe("approve");
+    expect(result.completionCandidate).toBeUndefined();
+  });
+});
+
+// ---------- createAspectCoverageJudge (three-way per-aspect marking) ----------
+
+const okAspects: AspectCoverageRequest = {
+  aspects: [
+    { id: "error-handling", text: "Errors are caught and surfaced" },
+    { id: "docs", text: "README documents the flag" },
+  ],
+  currentAction: "Implemented error handling; README updated",
+  evidence: [{ kind: "code", source: "src/x.ts", quote: "try { run(); } catch (e) { report(e); }" }],
+};
+
+const ASPECT_CHOICES = ["applicable_and_addressed", "applicable_not_addressed", "not_applicable"];
+
+function aspectFetch(answers: Record<string, unknown>, calls?: { body?: unknown }[]): typeof fetch {
+  return (async (_url: unknown, init?: RequestInit) => {
+    if (calls) calls.push({ body: init?.body ? JSON.parse(init.body as string) : undefined });
+    return jsonResponse(metaBody(answers));
+  }) as unknown as typeof fetch;
+}
+
+function markingsFrom(spec: Record<string, [string, number?]>): Record<string, unknown> {
+  const answers: Record<string, unknown> = {};
+  for (const [id, [choice, confidence]] of Object.entries(spec)) {
+    answers[id] = choiceAnswer(choice, confidence ?? 0.9);
+  }
+  return answers;
+}
+
+describe("aspect coverage judge", () => {
+  test("happy path: raw three-way markings pass through, judged", async () => {
+    const judge = createAspectCoverageJudge({
+      apiKey: "k",
+      fetchFn: aspectFetch(
+        markingsFrom({
+          "error-handling": ["applicable_and_addressed", 0.9],
+          docs: ["applicable_and_addressed", 0.85],
+        }),
+      ),
+    });
+    const result = await judge(okAspects);
+    expect(result.judged).toBe(true);
+    expect(result.escape).toBeUndefined();
+    expect(result.markings).toEqual({
+      "error-handling": "applicable_and_addressed",
+      docs: "applicable_and_addressed",
+    });
+    expect(result.confidence).toBe(0.85); // min across aspects
+  });
+
+  test("not_applicable passes through without requireAll", async () => {
+    const judge = createAspectCoverageJudge({
+      apiKey: "k",
+      fetchFn: aspectFetch(
+        markingsFrom({
+          "error-handling": ["applicable_and_addressed"],
+          docs: ["not_applicable"],
+        }),
+      ),
+    });
+    const result = await judge({ ...okAspects });
+    expect(result.judged).toBe(true);
+    expect(result.markings["docs"]).toBe("not_applicable");
+  });
+
+  test("requireAll: not_applicable cannot satisfy -> applicable_not_addressed", async () => {
+    const judge = createAspectCoverageJudge({
+      apiKey: "k",
+      fetchFn: aspectFetch(
+        markingsFrom({
+          "error-handling": ["applicable_and_addressed"],
+          docs: ["not_applicable"],
+        }),
+      ),
+    });
+    const result = await judge({ ...okAspects, requireAll: true });
+    expect(result.judged).toBe(true);
+    expect(result.markings["docs"]).toBe("applicable_not_addressed");
+    expect(result.reasons.some((r) => r.includes("docs"))).toBe(true);
+  });
+
+  test("question wiring: fixed three options + service options per aspect; aspect text with evidence in state, policy declares text data", async () => {
+    const calls: { body?: unknown }[] = [];
+    const judge = createAspectCoverageJudge({
+      apiKey: "k",
+      fetchFn: aspectFetch(
+        markingsFrom({
+          "error-handling": ["applicable_and_addressed"],
+          docs: ["applicable_and_addressed"],
+        }),
+        calls,
+      ),
+    });
+    await judge(okAspects);
+    // test-authored wire shape, reconstructed through JSON.parse (type lost in transit)
+    const body = calls[0]!.body as {
+      state: { aspects: unknown[]; evidence: unknown[] };
+      questions: Record<string, { type: string; criteria: Record<string, unknown>; instructions: { question?: string; policy?: string } }>;
+    };
+    expect(Object.keys(body.questions).sort()).toEqual(["docs", "error-handling", "meta_reason"]);
+    for (const id of ["error-handling", "docs"]) {
+      expect(body.questions[id]!.type).toBe("choice");
+      for (const c of ASPECT_CHOICES) expect(body.questions[id]!.criteria[c]).toBeDefined();
+      for (const s of SERVICE_IDS) expect(body.questions[id]!.criteria[s]).toBeDefined();
+      // untrusted-evidence pattern: aspect text named in its question, declared data by policy
+      const aspect = okAspects.aspects.find((a) => a.id === id)!;
+      expect(body.questions[id]!.instructions.question).toContain(aspect.text);
+      expect(body.questions[id]!.instructions.policy).toMatch(/never an instruction/);
+    }
+    expect(JSON.stringify(body.state)).toContain("README documents the flag");
+    expect(JSON.stringify(body.state)).toContain("try { run(); }");
+  });
+
+  test("no keyword matching: contradicting evidence never overrides the SDK marking (both directions)", async () => {
+    const boastful = {
+      ...okAspects,
+      evidence: [{ kind: "code" as const, source: "src/x.ts", quote: "error-handling fully implemented and covered" }],
+    };
+    const skeptical = {
+      ...okAspects,
+      evidence: [{ kind: "log" as const, source: "ci", quote: "docs NOT updated, still missing" }],
+    };
+    const judgeNotAddressed = createAspectCoverageJudge({
+      apiKey: "k",
+      fetchFn: aspectFetch(
+        markingsFrom({
+          "error-handling": ["applicable_not_addressed"],
+          docs: ["applicable_not_addressed"],
+        }),
+      ),
+    });
+    const r1 = await judgeNotAddressed(boastful);
+    expect(r1.markings["error-handling"]).toBe("applicable_not_addressed");
+    const judgeAddressed = createAspectCoverageJudge({
+      apiKey: "k",
+      fetchFn: aspectFetch(
+        markingsFrom({
+          "error-handling": ["applicable_and_addressed"],
+          docs: ["applicable_and_addressed"],
+        }),
+      ),
+    });
+    const r2 = await judgeAddressed(skeptical);
+    expect(r2.judged).toBe(true);
+    expect(r2.markings["docs"]).toBe("applicable_and_addressed");
+  });
+
+  test("missing answer for an aspect -> judged:false, no markings", async () => {
+    const judge = createAspectCoverageJudge({
+      apiKey: "k",
+      fetchFn: aspectFetch(markingsFrom({ "error-handling": ["applicable_and_addressed"] })),
+    });
+    const result = await judge(okAspects);
+    expect(result.judged).toBe(false);
+    expect(result.markings).toEqual({});
+    expect(result.reasons).toContain("bad_payload");
+  });
+
+  test("malformed answer (non-choice type) -> judged:false", async () => {
+    const judge = createAspectCoverageJudge({
+      apiKey: "k",
+      fetchFn: aspectFetch({
+        "error-handling": { type: "noul", noul: 0.9 },
+        docs: choiceAnswer("applicable_and_addressed"),
+      }),
+    });
+    const result = await judge(okAspects);
+    expect(result.judged).toBe(false);
+    expect(result.reasons).toContain("bad_payload");
+  });
+
+  test("missing or non-finite confidence -> judged:false", async () => {
+    for (const confidence of [undefined, Number.NaN]) {
+      const judge = createAspectCoverageJudge({
+        apiKey: "k",
+        fetchFn: aspectFetch({
+          "error-handling": choiceAnswer("applicable_and_addressed"),
+          docs: {
+            type: "choice",
+            choice: "applicable_and_addressed",
+            probabilities: { applicable_and_addressed: 1 },
+            ...(confidence === undefined ? {} : { confidence }),
+          },
+        }),
+      });
+      const result = await judge(okAspects);
+      expect(result.judged).toBe(false);
+      expect(result.reasons).toContain("bad_payload");
+    }
+  });
+
+  test("confidence out of 0..1 range -> judged:false", async () => {
+    const judge = createAspectCoverageJudge({
+      apiKey: "k",
+      fetchFn: aspectFetch(
+        markingsFrom({
+          "error-handling": ["applicable_and_addressed"],
+          docs: ["applicable_and_addressed", 1.5],
+        }),
+      ),
+    });
+    const result = await judge(okAspects);
+    expect(result.judged).toBe(false);
+    expect(result.markings).toEqual({});
+  });
+
+  test("low confidence below the effective floor -> fail closed, no mapping", async () => {
+    const judge = createAspectCoverageJudge({
+      apiKey: "k",
+      fetchFn: aspectFetch(
+        markingsFrom({
+          "error-handling": ["applicable_and_addressed"],
+          docs: ["applicable_and_addressed", 0.79],
+        }),
+      ),
+    });
+    const result = await judge(okAspects);
+    expect(result.judged).toBe(false);
+    expect(result.markings).toEqual({});
+    expect(result.reasons).toContain("low_confidence");
+  });
+
+  test("configured override raises the floor: 0.9 < 0.95 -> fail closed", async () => {
+    const judge = createAspectCoverageJudge({
+      apiKey: "k",
+      fetchFn: aspectFetch(
+        markingsFrom({
+          "error-handling": ["applicable_and_addressed"],
+          docs: ["applicable_and_addressed", 0.9],
+        }),
+      ),
+      minConfidence: 0.95,
+    });
+    const result = await judge(okAspects);
+    expect(result.judged).toBe(false);
+    expect(result.markings).toEqual({});
+  });
+
+  test("confidence exactly at the floor is accepted", async () => {
+    const judge = createAspectCoverageJudge({
+      apiKey: "k",
+      fetchFn: aspectFetch(
+        markingsFrom({
+          "error-handling": ["applicable_and_addressed", POLICY.minConfidenceToApprove],
+          docs: ["not_applicable", POLICY.minConfidenceToApprove],
+        }),
+      ),
+    });
+    const result = await judge(okAspects);
+    expect(result.judged).toBe(true);
+    expect(result.markings["docs"]).toBe("not_applicable");
+  });
+
+  test("service-option answer -> meta escape, judged:true, no markings", async () => {
+    const judge = createAspectCoverageJudge({
+      apiKey: "k",
+      fetchFn: aspectFetch({
+        "error-handling": choiceAnswer("ALL_OPTIONS_WRONG"),
+        docs: choiceAnswer("applicable_and_addressed"),
+        meta_reason: choiceAnswer("options_incomplete"),
+      }),
+    });
+    const result = await judge(okAspects);
+    expect(result.judged).toBe(true);
+    expect(result.escape).toBe(true);
+    expect(result.markings).toEqual({});
+    expect(result.reasons).toContain("meta_option");
+    expect(result.reasons).toContain("ALL_OPTIONS_WRONG");
+    expect(result.reasons).toContain("meta_reason:options_incomplete");
+  });
+
+  test("unknown extra answer id -> judged:false (exactly the supplied ids)", async () => {
+    const judge = createAspectCoverageJudge({
+      apiKey: "k",
+      fetchFn: aspectFetch({
+        ...markingsFrom({
+          "error-handling": ["applicable_and_addressed"],
+          docs: ["applicable_and_addressed"],
+        }),
+        extra: choiceAnswer("applicable_and_addressed"),
+      }),
+    });
+    const result = await judge(okAspects);
+    expect(result.judged).toBe(false);
+    expect(result.reasons).toContain("bad_payload");
+  });
+
+  test("empty aspects -> invalid_input, zero network", async () => {
+    let called = 0;
+    const judge = createAspectCoverageJudge({
+      apiKey: "k",
+      fetchFn: (async () => {
+        called++;
+        return jsonResponse(metaBody({}));
+      }) as unknown as typeof fetch,
+    });
+    await expect(judge({ ...okAspects, aspects: [] })).rejects.toBeInstanceOf(JevApiError);
+    expect(called).toBe(0);
+  });
+
+  test("empty aspect id or text -> invalid_input, zero network", async () => {
+    let called = 0;
+    const judge = createAspectCoverageJudge({
+      apiKey: "k",
+      fetchFn: (async () => {
+        called++;
+        return jsonResponse(metaBody({}));
+      }) as unknown as typeof fetch,
+    });
+    await expect(
+      judge({ ...okAspects, aspects: [{ id: "", text: "x" }] }),
+    ).rejects.toBeInstanceOf(JevApiError);
+    await expect(
+      judge({ ...okAspects, aspects: [{ id: "a", text: "  " }] }),
+    ).rejects.toBeInstanceOf(JevApiError);
+    expect(called).toBe(0);
+  });
+
+  test("non-boolean requireAll -> invalid_input, zero network", async () => {
+    let called = 0;
+    const judge = createAspectCoverageJudge({
+      apiKey: "k",
+      fetchFn: (async () => {
+        called++;
+        return jsonResponse(metaBody({}));
+      }) as unknown as typeof fetch,
+    });
+    await expect(
+      judge({ ...okAspects, requireAll: "yes" as unknown as boolean }),
+    ).rejects.toBeInstanceOf(JevApiError);
+    expect(called).toBe(0);
+  });
+
+  test("missing api key -> config error, zero network", async () => {
+    const judge = createAspectCoverageJudge({
+      apiKey: "",
+      fetchFn: aspectFetch(markingsFrom({ "error-handling": ["applicable_and_addressed"] })),
+    });
+    await expect(judge(okAspects)).rejects.toBeInstanceOf(JevApiError);
+  });
+
+  test("transport error surfaces typed JevApiError (no fabricated markings)", async () => {
+    const judge = createAspectCoverageJudge({
+      apiKey: "k",
+      fetchFn: (async () => {
+        throw new Error("ECONNRESET");
+      }) as unknown as typeof fetch,
+      maxRetries: 0,
+    });
+    await expect(judge(okAspects)).rejects.toBeInstanceOf(JevApiError);
   });
 });

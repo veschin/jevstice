@@ -22,7 +22,14 @@ import {
 	validateDeclaredControlPoint,
 } from "./control-points.js";
 import { STAGES } from "./stages.js";
-import { POLICY, type CourseCheckJudge, type CourseCheckResult } from "./types.js";
+import {
+	POLICY,
+	COURSE_CHECK_NEXT_ACTIONS,
+	type AspectCoverageJudge,
+	type AspectCoverageResult,
+	type CourseCheckJudge,
+	type CourseCheckResult,
+} from "./types.js";
 import {
 	type DecisionResult,
 	type DecisionStage,
@@ -54,20 +61,18 @@ export interface JevState {
 	workRevision: number;
 	/** sha256 of the latest before_agent_start prompt. */
 	taskFingerprint: string | undefined;
-	/** True once any mutating tool call was allowed; read-only sessions stay ungated (AC4). */
-	mutationsSeen: boolean;
 	/** Explicit unresolved blockers, surfaced verbatim - never replaced by fake success. */
 	blockers: string[];
 	/** Applied model-routing selection (AC2): enforced at before_subagent_spawn. */
 	routedModel: string | undefined;
 	/** Applied skill-routing selection (AC2), recorded for dispatch visibility. */
 	routedSkill: string | undefined;
-	/** Latest course_check outcome — recorded, never grants an approval. */
-	lastCourseCheck: { selectedOption: string; at: number } | undefined;
+	/** Latest judged course_check continue/verify record; completion requires a fresh one (task+work bound). */
+	lastCourseCheck: { selectedOption: string; at: number; taskFingerprint: string | undefined; workRevision: number } | undefined;
 	/** Open aspect_coverage drift: missed aspect ids for the current task (completion teeth). */
 	openAspectGaps: { missed: string[]; taskFingerprint: string | undefined } | undefined;
-	/** Calibration-tolerant completion: consecutive mid-band approves (FR: calibration rule). */
-	consecutiveCompletionApproves: { count: number; confidences: number[]; taskFingerprint: string | undefined; workRevision: number } | undefined;
+	/** Calibration-tolerant completion: consecutive mid-band approves, bound to task+work+exact content digest. */
+	consecutiveCompletionApproves: { count: number; confidences: number[]; taskFingerprint: string | undefined; workRevision: number; revisionHash: string } | undefined;
 }
 
 function freshState(): JevState {
@@ -76,7 +81,6 @@ function freshState(): JevState {
 		iterations: {},
 		workRevision: 0,
 		taskFingerprint: undefined,
-		mutationsSeen: false,
 		blockers: [],
 		routedModel: undefined,
 		routedSkill: undefined,
@@ -303,47 +307,6 @@ export function normalizeJudgeResult(raw: unknown, options: DecisionOption[], mi
 	};
 }
 
-/**
- * Requirement coverage: every capability id must appear in evidence text (AC6).
- * Matching ceiling: whole-word substring only — a capability whose verification is a
- * real command cannot be truly evidenced by prose; per-capability verify commands are
- * the proper fix and stay deferred with full AC6.
- */
-export function coverageGaps(capabilities: string[], evidence: Evidence[]): string[] {
-	const corpus = evidence.map(e => `${e.source} ${e.quote}`).join("\n").toLowerCase();
-	return capabilities.filter(c => {
-		const term = c.trim().toLowerCase();
-		if (term.length === 0) return false;
-		const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-		return !new RegExp(`(^|[^\\p{L}\\p{N}_])${escaped}([^\\p{L}\\p{N}_]|$)`, "u").test(corpus);
-	});
-}
-
-// ---------- aspect_coverage (forgotten-aspect detection, user order) ----------
-
-export type AspectMarking =
-	| "applicable_and_addressed"
-	| "applicable_not_addressed"
-	| "not_applicable";
-
-export interface AspectCoverageRequest {
-	aspects: Array<{ id: string; text: string }>;
-	currentAction: string;
-	evidence: Evidence[];
-}
-
-export interface AspectCoverageResult {
-	markings: Record<string, AspectMarking>;
-	reasons: string[];
-	confidence?: number;
-	/** False when the judge could not be consulted (fail-closed; never a mapping). */
-	judged: boolean;
-	/** Meta-option escape: judge cannot mark this batch -> insufficient_evidence. */
-	escape?: boolean;
-}
-
-export type AspectCoverageJudge = (request: AspectCoverageRequest) => Promise<AspectCoverageResult>;
-
 // ---------- controller ----------
 
 export interface ControllerDeps {
@@ -358,7 +321,7 @@ export interface ControllerDeps {
 	templateError?: string;
 	/** Per-requirement drift judge for the course_check preset (C1 wired path). */
 	courseCheckJudge?: CourseCheckJudge;
-	/** Three-way aspect marking judge for the aspect_coverage preset. */
+	/** Three-way aspect marking judge: the aspect_coverage preset AND judged completion capability coverage (requireAll). */
 	aspectCoverageJudge?: AspectCoverageJudge;
 	/** Valid catalog topic ids for the aspects[] pre-check (built in index from the catalog). */
 	catalogIds?: ReadonlySet<string>;
@@ -397,8 +360,8 @@ export class JevController {
 	/** R1: never below POLICY floor; a template override may only raise it. */
 	private minConfidence: number;
 	/** Calibration-tolerant completion: template/config may only RAISE these (Math.max clamp). */
-	private readonly completionConsecutiveApproves: number;
-	private readonly completionConfidenceFloor: number;
+	private completionConsecutiveApproves!: number;
+	private completionConfidenceFloor!: number;
 
 	constructor(deps: ControllerDeps) {
 		this.judge = deps.judge;
@@ -415,15 +378,18 @@ export class JevController {
 		this.template = deps.template ?? {};
 		this.templateError = deps.templateError;
 		this.extraPoints = extraPointsFromTemplate(this.template);
+		this.applyCompletionClamps();
+	}
+
+	/** Raise-only completion clamps from the active template (constructor + every reload). */
+	private applyCompletionClamps(): void {
 		this.completionConsecutiveApproves = Math.max(
 			POLICY.completionConsecutiveApproves,
-			(deps.template as { completion?: { consecutiveApproves?: number } } | undefined)?.completion
-				?.consecutiveApproves ?? 0,
+			this.template.completion?.consecutiveApproves ?? 0,
 		);
 		this.completionConfidenceFloor = Math.max(
 			POLICY.completionConfidenceFloor,
-			(deps.template as { completion?: { confidenceFloor?: number } } | undefined)?.completion
-				?.confidenceFloor ?? 0,
+			this.template.completion?.confidenceFloor ?? 0,
 		);
 	}
 
@@ -435,6 +401,8 @@ export class JevController {
 		if (templateError === undefined && template?.confidenceThreshold !== undefined) {
 			this.minConfidence = Math.max(POLICY.minConfidenceToApprove, template.confidenceThreshold);
 		}
+		// A raised completion config applies on reload, same raise-only clamp as construction.
+		this.applyCompletionClamps();
 	}
 
 	// ----- registration -----
@@ -449,10 +417,14 @@ export class JevController {
 				"with stage=understanding_review (plan stage) and verbatim quoted evidence — do not write files " +
 				"first, do not report the block to the user. " +
 				"Submit a structured important decision, review or completion claim to the Jev judge. " +
-				"Required before any file-mutating work and before finishing mutated work. Provide fixed options " +
+				"Required before any file-mutating work and before finishing work. Provide fixed options " +
 				"and evidence as {kind, source, quote} items (kind: user|spec|code|execution|log|documentation). " +
 				"Completion claims additionally need execution/code/log evidence; pass `capabilities` " +
-				"(original feature ids) for refactor completion coverage checks.",
+				"(original feature ids) for refactor completion coverage checks. " +
+				"Run stage=course_check at the task/plan boundary, after every work mutation and before claiming " +
+				"completion: the completion gate requires a fresh judged course_check with option continue " +
+				"(verify_before_proceeding never unlocks). Pass `aspects` (catalog topic ids) with " +
+				"stage=aspect_coverage to check for forgotten aspects.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -476,6 +448,11 @@ export class JevController {
 						},
 					},
 					capabilities: { type: "array", items: { type: "string" } },
+					aspects: {
+						type: "array",
+						items: { type: "string" },
+						description: "catalog topic ids to mark for the aspect_coverage stage",
+					},
 				},
 				required: ["stage", "task", "proposal", "options", "evidence"],
 			},
@@ -521,6 +498,17 @@ export class JevController {
 			return undefined;
 		}
 		if (typeof toolName === "string" && MUTATING_TOOLS.has(toolName)) {
+			// Fail-closed config (R5): restored approvals never unlock mutations while the
+			// template is invalid - the gates run on defaults that were never validated.
+			if (this.templateError !== undefined) {
+				return {
+					block: true,
+					reason:
+						`jev config invalid (fail-closed): ${this.templateError}. ` +
+						"Mutating work is blocked until the config file is fixed; " +
+						"read-only evidence gathering remains available.",
+				};
+			}
 			const plan = this.planApproval();
 			if (plan === undefined) {
 				return {
@@ -535,7 +523,6 @@ export class JevController {
 						"Your next tool call must be jev_decision (a normal registered tool call, exactly like read/write) — not a file write.",
 				};
 			}
-			this.state.mutationsSeen = true;
 			this.state.workRevision += 1;
 			this.persist();
 		}
@@ -644,13 +631,12 @@ export class JevController {
 				iterations: isRecord(data["iterations"]) ? (data["iterations"] as Record<string, number>) : {},
 				workRevision: typeof data["workRevision"] === "number" ? data["workRevision"] : 0,
 				taskFingerprint: typeof data["taskFingerprint"] === "string" ? data["taskFingerprint"] : undefined,
-				mutationsSeen: data["mutationsSeen"] === true,
 				blockers: Array.isArray(data["blockers"])
 					? data["blockers"].filter((b): b is string => typeof b === "string")
 					: [],
 				routedModel: typeof data["routedModel"] === "string" ? data["routedModel"] : undefined,
 				routedSkill: typeof data["routedSkill"] === "string" ? data["routedSkill"] : undefined,
-				lastCourseCheck: undefined,
+				lastCourseCheck: restoreCourseCheck(data["lastCourseCheck"]),
 				openAspectGaps: restoreAspectGaps(data["openAspectGaps"]),
 				consecutiveCompletionApproves: undefined,
 			};
@@ -706,7 +692,17 @@ export class JevController {
 	 * with different content supersedes and invalidates the earlier record.
 	 */
 	private async submitDecisionCore(raw: unknown): Promise<DecisionOutcome> {
+		// The completion streak is content-bound; every interruption (error, invalid or
+		// rejected submission, revise) breaks it. Helper covers the early failure returns.
+		const stopStageRaw = isRecord(raw) && raw["stage"] === "completion_review";
+		const interrupted = (): void => {
+			if (stopStageRaw && this.state.consecutiveCompletionApproves !== undefined) {
+				this.state.consecutiveCompletionApproves = undefined;
+				this.persist();
+			}
+		};
 		if (this.templateError !== undefined) {
+			interrupted();
 			return {
 				verdict: "insufficient_evidence",
 				reasons: [`jev config invalid (fail-closed, defaults NOT applied): ${this.templateError}`],
@@ -716,6 +712,7 @@ export class JevController {
 		}
 		const check = validateDecisionInput(raw, this.extraStageSet());
 		if (!check.ok || check.input === undefined) {
+			interrupted();
 			return { verdict: "insufficient_evidence", reasons: check.reasons, judged: false, summary: "" };
 		}
 		const input = check.input;
@@ -744,12 +741,14 @@ export class JevController {
 			problems.push("no_requirement_evidence");
 		}
 		if (problems.includes("no_requirement_evidence") || problems.length >= 2) {
+			interrupted();
 			return { verdict: "insufficient_evidence", reasons: problems, judged: false, summary: "" };
 		}
 
 		const point = lookupControlPoint(input.stage, this.extraPoints);
 		if (point?.requiresArtifactEvidence === true) {
 			if (!input.evidence.some(e => COMPLETION_EVIDENCE_KINDS.has(e.kind))) {
+				interrupted();
 				return {
 					verdict: "insufficient_evidence",
 					reasons: [
@@ -760,18 +759,16 @@ export class JevController {
 					summary: "",
 				};
 			}
-			const effectiveCaps = input.capabilities.length > 0 ? input.capabilities : (this.template.capabilities ?? []);
+			// Capability coverage is judged, never keyword-matched: requireAll three-way
+			// marking over the UNION of configured and submitted inventory (a caller cannot
+			// narrow the template by omitting capabilities). Denial happens before any
+			// consultation of the stage judge and consumes no rework.
+			const effectiveCaps = [...new Set([...(this.template.capabilities ?? []), ...input.capabilities])];
 			if (effectiveCaps.length > 0) {
-				const gaps = coverageGaps(effectiveCaps, input.evidence);
-				if (gaps.length > 0) {
-					return {
-						verdict: "revise",
-						reasons: [
-							`refactor requirement coverage incomplete: no evidence covers capability id(s) ${gaps.join(", ")}`,
-						],
-						judged: false,
-						summary: "",
-					};
+				const denial = await this.checkCapabilityCoverage(input, effectiveCaps);
+				if (denial !== undefined) {
+					interrupted();
+					return denial;
 				}
 			}
 		}
@@ -780,6 +777,7 @@ export class JevController {
 		const boundKey = `${taskFp}:${input.stage}`;
 		const used = this.state.iterations[boundKey] ?? 0;
 		if (used >= this.maxReworkIterations) {
+			interrupted();
 			const blocker =
 				`Jev rework bound exhausted for stage ${input.stage} (${used} judge consultations). ` +
 				"Escalated to the user; do not continue rework and do not claim completion.";
@@ -796,6 +794,7 @@ export class JevController {
 			const ids = new Set(judgeOptions.map(o => o.id));
 			const mismatch = [...point.fixedOptionIds].filter(id => !ids.has(id));
 			if (mismatch.length > 0 || ids.size !== judgeOptions.length) {
+				interrupted();
 				return {
 					verdict: "insufficient_evidence",
 					reasons: [
@@ -815,8 +814,6 @@ export class JevController {
 		if (templateStage?.instructions !== undefined) {
 			judgeProposal += `\n\n${templateStage.instructions.slice(0, 4000)}`;
 		}
-		// Config capabilities are DEFAULTS; caller-passed wins.
-		const capabilities = input.capabilities.length > 0 ? input.capabilities : (this.template.capabilities ?? []);
 
 		// C1 wired path: course_check preset consults the dedicated per-requirement judge.
 		if (input.stage === "course_check" && this.courseCheckJudge !== undefined) {
@@ -863,6 +860,14 @@ export class JevController {
 				evidence: input.evidence,
 			});
 		} catch (err) {
+			// A failed consultation is real rework for course_check: it consumes the
+			// bounded budget so a broken judge cannot loop forever. Other stages keep
+			// their existing no-burn failure semantics.
+			if (point?.verdictMapping === "course_check") {
+				this.state.iterations[boundKey] = used + 1;
+				this.persist();
+			}
+			interrupted();
 			return {
 				verdict: "insufficient_evidence",
 				reasons: [`judge unavailable: ${err instanceof Error ? err.message : String(err)}`],
@@ -881,14 +886,23 @@ export class JevController {
 			? Math.min(this.minConfidence, this.completionConfidenceFloor)
 			: this.minConfidence;
 		const normalized = normalizeJudgeResult(rawResult, judgeOptions, normalizeBar);
-		this.state.iterations[boundKey] = used + 1;
+		// Typed mid-band candidate (shared client contract): the client demoted a raw
+		// approve at completion_review into insufficient_evidence + completionCandidate.
+		// The controller counts it ONLY here (completion stage, default bar), validating
+		// the offered option, finite confidence at/above the effective floor - never from
+		// reason strings.
+		const candidate =
+			stopStage && streakEligible && normalized.verdict === "insufficient_evidence"
+				? this.typedCompletionCandidate(rawResult, judgeOptions)
+				: undefined;
 		// course_check advisory-to-binding mapping (record, never approve anything).
 		let result = normalized;
-		if (point?.verdictMapping === "course_check" && normalized.verdict === "ask_user") {
-			// Judge itself chose ask_user: escalate with a recorded blocker.
-			result = this.escalateCourseCheck(normalized);
-		}
-		if (point?.verdictMapping === "course_check" && normalized.verdict === "approve" && normalized.selectedOption !== undefined) {
+		let benignCourseCheck = false;
+		if (
+			point?.verdictMapping === "course_check" &&
+			normalized.verdict === "approve" &&
+			normalized.selectedOption !== undefined
+		) {
 			const picked = normalized.selectedOption;
 			if (COURSE_CHECK_REDIRECTING.has(picked)) {
 				result = {
@@ -900,10 +914,29 @@ export class JevController {
 				result = this.escalateCourseCheck(normalized);
 			} else {
 				// continue / verify_before_proceeding: record only, approves nothing.
-				this.state.lastCourseCheck = { selectedOption: picked, at: this.now() };
+				// The record binds to task+work revision so the completion boundary can
+				// demand a FRESH check (verify never unlocks; only continue does).
+				this.state.lastCourseCheck = {
+					selectedOption: picked,
+					at: this.now(),
+					taskFingerprint: this.state.taskFingerprint,
+					workRevision: this.state.workRevision,
+				};
+				benignCourseCheck = true;
 			}
+		} else if (point?.verdictMapping === "course_check" && normalized.verdict === "ask_user") {
+			// Judge itself chose ask_user: escalate with a recorded blocker.
+			result = this.escalateCourseCheck(normalized);
 		}
+		// Bounded rework counts real rework only: a benign continue/verify record is not
+		// a retry and consumes nothing; redirects, escalations and failures do.
+		if (!benignCourseCheck) this.state.iterations[boundKey] = used + 1;
 
+		// Lazy memo shared by the streak update and the approval record below: at most one
+		// content digest per submission.
+		let digestMemo: Promise<string> | undefined;
+		const contentDigest = (): Promise<string> =>
+			(digestMemo ??= revisionHash(input.stage, input.task, input.proposal, input.evidence));
 		// Advisory points (course_check benign pair, config-declared on_demand) never
 		// record gate approvals; their outcomes live in state records/feedback only.
 		// Calibration-tolerant completion rule: 0.6<=conf<minConfidence counts toward
@@ -925,28 +958,35 @@ export class JevController {
 				summary: "",
 			};
 		}
-		if (
+		// Completion streak: mid-band raw approves AND typed candidates count; the streak
+		// binds to the exact decision content digest as well as task+work revision, so any
+		// content change restarts it.
+		const midBandApprove =
 			stopStage &&
 			streakEligible &&
 			result.verdict === "approve" &&
 			result.confidence !== undefined &&
-			result.confidence < this.minConfidence
-		) {
-			const prev = this.state.consecutiveCompletionApproves;
-			const fresh =
-				prev === undefined ||
-				prev.taskFingerprint !== this.state.taskFingerprint ||
-				prev.workRevision !== this.state.workRevision;
-			const streak = fresh
-				? {
-						count: 0,
-						confidences: [] as number[],
-						taskFingerprint: this.state.taskFingerprint,
-						workRevision: this.state.workRevision,
-					}
-				: prev;
+			result.confidence < this.minConfidence;
+		if (stopStage && streakEligible && (midBandApprove || candidate !== undefined)) {
+			const digest = await contentDigest();
+			const confidence = midBandApprove ? result.confidence! : candidate!.confidence;
+			let streak = this.state.consecutiveCompletionApproves;
+			if (
+				streak === undefined ||
+				streak.taskFingerprint !== this.state.taskFingerprint ||
+				streak.workRevision !== this.state.workRevision ||
+				streak.revisionHash !== digest
+			) {
+				streak = {
+					count: 0,
+					confidences: [],
+					taskFingerprint: this.state.taskFingerprint,
+					workRevision: this.state.workRevision,
+					revisionHash: digest,
+				};
+			}
 			streak.count += 1;
-			streak.confidences.push(result.confidence);
+			streak.confidences.push(confidence);
 			this.state.consecutiveCompletionApproves = streak;
 			if (streak.count < this.completionConsecutiveApproves) {
 				this.persist();
@@ -955,22 +995,28 @@ export class JevController {
 					reasons: [
 						"completion_pending_consecutive_approves",
 						`n=${streak.count}/${this.completionConsecutiveApproves}`,
-						`conf=${result.confidence}`,
+						`conf=${confidence}`,
 					],
-					confidence: result.confidence,
+					confidence,
 					judged: true,
 					summary: "",
 				};
 			}
-			result = {
-				...result,
-				reasons: [
-					"consecutive_approves",
-					`n=${streak.count}`,
-					`conf=${streak.confidences.join(", ")}`,
-					...result.reasons,
-				],
-			};
+			const streakReasons = [
+				"consecutive_approves",
+				`n=${streak.count}`,
+				`conf=${streak.confidences.join(", ")}`,
+			];
+			result = midBandApprove
+				? { ...result, reasons: [...streakReasons, ...result.reasons] }
+				: {
+						// A completed candidate streak IS the calibration-tolerant approval: the
+						// typed candidate option becomes the recorded selectedOption.
+						verdict: "approve",
+						selectedOption: candidate!.selectedOption,
+						reasons: [...streakReasons, ...normalized.reasons],
+						confidence,
+					};
 		} else if (stopStage && result.verdict !== "approve") {
 			this.state.consecutiveCompletionApproves = undefined;
 		}
@@ -980,7 +1026,7 @@ export class JevController {
 			!(point.verdictMapping === "course_check" &&
 				(result.selectedOption === "ask_user" || COURSE_CHECK_REDIRECTING.has(result.selectedOption ?? "")));
 		if (result.verdict === "approve" && result.selectedOption !== undefined && !skipApproval) {
-			const digest = await revisionHash(input.stage, input.task, input.proposal, input.evidence);
+			const digest = await contentDigest();
 			// AC5 replay/supersede: an older approval of the same stage for this task with a
 			// different content digest is no longer authoritative.
 			this.state.approvals = this.state.approvals.filter(
@@ -1017,10 +1063,108 @@ export class JevController {
 	}
 
 	/**
+	 * requireAll capability coverage at the completion boundary, judged by the same
+	 * aspect coverage judge the aspect_coverage preset uses (no keyword matching).
+	 * Returns a denial outcome, or undefined when every declared capability is
+	 * applicable_and_addressed (the judge downgrades not_applicable under requireAll;
+	 * any other marking denies a declared capability).
+	 */
+	private async checkCapabilityCoverage(
+		input: ValidatedDecisionInput,
+		capabilities: string[],
+	): Promise<DecisionOutcome | undefined> {
+		if (this.aspectCoverageJudge === undefined) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [
+					"completion capability coverage requires a wired coverage judge; " +
+						"refusing to approve unverifiable capabilities (fail-closed)",
+				],
+				judged: false,
+				summary: "",
+			};
+		}
+		let raw: AspectCoverageResult;
+		try {
+			raw = await this.aspectCoverageJudge({
+				aspects: capabilities.map(id => ({ id, text: id })),
+				currentAction: input.proposal,
+				evidence: input.evidence,
+				requireAll: true,
+			});
+		} catch (err) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [`coverage judge unavailable: ${err instanceof Error ? err.message : String(err)}`],
+				judged: false,
+				summary: "",
+			};
+		}
+		if (!isRecord(raw) || raw["judged"] !== true || raw["escape"] === true || !isRecord(raw["markings"])) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: ["coverage judge returned an unjudged, escaped or malformed result; completion denied"],
+				judged: false,
+				summary: "",
+			};
+		}
+		const markings = raw["markings"] as Record<string, string>;
+		const unmarked = capabilities.filter(id => !(id in markings));
+		if (unmarked.length > 0) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [`coverage judge did not mark: ${unmarked.join(", ")}`],
+				judged: false,
+				summary: "",
+			};
+		}
+		const denied = capabilities.filter(id => markings[id] !== "applicable_and_addressed");
+		if (denied.length > 0) {
+			return {
+				verdict: "revise",
+				reasons: [
+					`refactor requirement coverage incomplete: capability id(s) not addressed per coverage judge ` +
+						`(requireAll): ${denied.join(", ")}`,
+				],
+				judged: true,
+				summary: "",
+			};
+		}
+		return undefined;
+	}
+
+	/**
+	 * Typed mid-band completion candidate from the shared client contract (strict
+	 * insufficient_evidence verdict + completionCandidate). Only the typed field counts;
+	 * invalid shapes -> undefined (never a mapping, never inferred from reasons).
+	 */
+	private typedCompletionCandidate(
+		rawResult: unknown,
+		options: DecisionOption[],
+	): { selectedOption: string; confidence: number } | undefined {
+		if (!isRecord(rawResult) || !isRecord(rawResult["completionCandidate"])) return undefined;
+		const selected = rawResult["completionCandidate"]["selectedOption"];
+		if (typeof selected !== "string" || !options.some(o => o.id === selected)) return undefined;
+		const confidence = rawResult["confidence"];
+		if (
+			typeof confidence !== "number" ||
+			!Number.isFinite(confidence) ||
+			confidence < 0 ||
+			confidence > 1 ||
+			confidence < this.completionConfidenceFloor
+		) {
+			return undefined;
+		}
+		return { selectedOption: selected, confidence };
+	}
+
+	/**
 	 * C1 wired course_check: per-requirement drift (Noul) + next-action Choice in ONE request.
-	 * Verdict mapping: continue/verify_before_proceeding -> recorded (no approval);
+	 * Verdict mapping: continue/verify_before_proceeding -> recorded (no approval, no rework);
 	 * return_to_requirement/replan -> revise + feedback; ask_user -> escalation.
-	 * Fail-closed identical: throw/unjudged/contract-violation -> insufficient_evidence, no record.
+	 * Rework bound consumes redirects, escalations and failures ONLY - a benign on-track
+	 * record is not a retry. Fail-closed: throw/unjudged/contract-violation/sub-floor
+	 * confidence/drift+continue -> insufficient_evidence, no unlock, rework consumed.
 	 */
 	private async submitCourseCheck(
 		input: ValidatedDecisionInput,
@@ -1043,6 +1187,7 @@ export class JevController {
 				requirements.push({ id, quote: e.quote });
 			});
 		if (requirements.length === 0) {
+			// Invalid submission, not judge rework: rejected before any consultation.
 			return {
 				verdict: "insufficient_evidence",
 				reasons: ["course_check requires at least one user or spec evidence item as the requirement under check"],
@@ -1050,6 +1195,15 @@ export class JevController {
 				summary: "",
 			};
 		}
+		// Every failure below is rework: it consumes the bounded budget (persist included).
+		const consume = (): void => {
+			this.state.iterations[boundKey] = used + 1;
+			this.persist();
+		};
+		const failClosed = (detail: string): DecisionOutcome => {
+			consume();
+			return { verdict: "insufficient_evidence", reasons: [detail], judged: false, summary: "" };
+		};
 		let raw: CourseCheckResult;
 		try {
 			raw = await this.courseCheckJudge!({
@@ -1058,46 +1212,78 @@ export class JevController {
 				evidence: input.evidence,
 			});
 		} catch (err) {
-			return {
-				verdict: "insufficient_evidence",
-				reasons: [`judge unavailable: ${err instanceof Error ? err.message : String(err)}`],
-				judged: false,
-				summary: "",
-			};
+			return failClosed(`judge unavailable: ${err instanceof Error ? err.message : String(err)}`);
 		}
 		if (!isRecord(raw) || raw["judged"] !== true || typeof raw["nextAction"] !== "string") {
 			// Contract violation / judge could not be consulted: never auto-continue.
-			return {
-				verdict: "insufficient_evidence",
-				reasons: ["course_check judge returned an unjudged or malformed result; no action taken"],
-				judged: false,
-				summary: "",
-			};
+			return failClosed("course_check judge returned an unjudged or malformed result; no action taken");
 		}
 		const nextAction = raw["nextAction"] as string;
-		const onTrack = isRecord(raw["onTrack"]) ? raw["onTrack"] : {};
+		if (!(COURSE_CHECK_NEXT_ACTIONS as readonly string[]).includes(nextAction)) {
+			return failClosed(`course_check judge returned an unknown next action: ${nextAction}`);
+		}
+		if (!isRecord(raw["onTrack"])) {
+			return failClosed("course_check judge result carries no onTrack record");
+		}
+		// Exact keys: the judge must answer every presented requirement and nothing else.
+		const onTrack = raw["onTrack"] as Record<string, unknown>;
+		const expectedKeys = requirements.map(r => r.id).sort();
+		const actualKeys = Object.keys(onTrack).sort();
+		if (expectedKeys.length !== actualKeys.length || expectedKeys.some((k, i) => k !== actualKeys[i])) {
+			return failClosed(
+				`course_check onTrack keys must be exactly the requirement ids (${expectedKeys.join(", ")}); ` +
+					`got ${actualKeys.join(", ")}`,
+			);
+		}
 		const drifted = Object.entries(onTrack)
 			.filter(([, ok]) => ok !== true)
 			.map(([id]) => id);
+		// False drift must not continue: a drifted requirement can never yield a plain
+		// continue record - the judge must redirect or escalate.
+		if (drifted.length > 0 && nextAction === "continue") {
+			return failClosed(
+				`course_check contract violation: drifted requirement(s) ${drifted.join(", ")} cannot yield continue`,
+			);
+		}
 		const reasons = [...(Array.isArray(raw["reasons"]) ? raw["reasons"].filter((r): r is string => typeof r === "string") : [])];
 		if (drifted.length > 0) reasons.push(`not on track: ${drifted.join(", ")}`);
-		this.state.iterations[boundKey] = used + 1;
 		if (nextAction === "continue" || nextAction === "verify_before_proceeding") {
-			this.state.lastCourseCheck = { selectedOption: nextAction, at: this.now() };
+			// A record that could unlock progress must carry finite confidence at/above the
+			// effective floor - an unquantified or sub-floor answer never records.
+			const confidence = raw["confidence"];
+			if (
+				typeof confidence !== "number" ||
+				!Number.isFinite(confidence) ||
+				confidence < 0 ||
+				confidence > 1 ||
+				confidence < this.completionConfidenceFloor
+			) {
+				return failClosed(
+					`course_check confidence must be a finite 0..1 number at/above the floor ${this.completionConfidenceFloor}`,
+				);
+			}
+			// Benign record: binds to task+work revision, consumes no rework. Only a judged
+			// continue satisfies the completion boundary (verify never unlocks).
+			this.state.lastCourseCheck = {
+				selectedOption: nextAction,
+				at: this.now(),
+				taskFingerprint: this.state.taskFingerprint,
+				workRevision: this.state.workRevision,
+			};
 			this.persist();
 			return {
 				verdict: "approve",
 				selectedOption: nextAction,
 				reasons,
-				confidence: typeof raw["confidence"] === "number" ? raw["confidence"] : undefined,
+				confidence,
 				judged: true,
 				summary: "",
 			};
 		}
 		const driftSuffix = drifted.length > 0 ? ` (drifted: ${drifted.join(", ")})` : "";
 		if (nextAction === "return_to_requirement" || nextAction === "replan") {
+			consume();
 			this.pushFeedback(`Jev course_check redirects: ${nextAction}${driftSuffix}`);
-			this.persist();
 			return {
 				verdict: "revise",
 				selectedOption: nextAction,
@@ -1107,9 +1293,9 @@ export class JevController {
 			};
 		}
 		// ask_user
+		consume();
 		const blocker = "course_check escalated to the user (ask_user chosen by the judge or rework bound).";
 		if (!this.state.blockers.includes(blocker)) this.state.blockers.push(blocker);
-		this.persist();
 		return {
 			verdict: "ask_user",
 			selectedOption: nextAction,
@@ -1229,8 +1415,30 @@ export class JevController {
 		);
 	}
 
+	/**
+	 * Fresh course_check for the completion boundary: a judged continue recorded for the
+	 * current task AND the current work revision. verify_before_proceeding never unlocks;
+	 * any mutation after the record makes it stale.
+	 */
+	private freshCourseCheck(): boolean {
+		const check = this.state.lastCourseCheck;
+		return (
+			check !== undefined &&
+			check.selectedOption === "continue" &&
+			check.taskFingerprint === this.state.taskFingerprint &&
+			check.workRevision === this.state.workRevision
+		);
+	}
+
 	private unmetStopGates(): string[] {
-		if (!this.state.mutationsSeen) return [];
+		// Fail-closed config (R5): corrupted template keeps every gate shut, regardless of
+		// restored approvals - they were granted under defaults that no longer validate.
+		if (this.templateError !== undefined) {
+			return [`jev config invalid (fail-closed): ${this.templateError}`];
+		}
+		// Once a task fingerprint exists the completion boundary applies to read-only work
+		// exactly like mutated work; a session with no established task stops free.
+		if (this.state.taskFingerprint === undefined) return [];
 		const missing: string[] = [];
 		if (this.planApproval() === undefined) {
 			missing.push("no plan-stage approval (understanding_review or direction_review) for the current task");
@@ -1253,6 +1461,13 @@ export class JevController {
 		} else if (completion.workRevision !== this.state.workRevision) {
 			missing.push(
 				`completion_review approval is stale: work revision ${this.state.workRevision} > approved ${completion.workRevision}`,
+			);
+		}
+		if (!this.freshCourseCheck()) {
+			missing.push(
+				"no fresh course_check pass: a judged course_check with option continue must be recorded " +
+					"for the current task and work revision (run it at the task/plan boundary, after every " +
+					"work mutation and before completion; verify_before_proceeding never unlocks)",
 			);
 		}
 		// aspect_coverage teeth: an open drift for the CURRENT task blocks completion until
@@ -1285,6 +1500,19 @@ function restoreAspectGaps(raw: unknown): { missed: string[]; taskFingerprint: s
 	return {
 		missed,
 		taskFingerprint: typeof raw["taskFingerprint"] === "string" ? raw["taskFingerprint"] : undefined,
+	};
+}
+
+/** Validate a persisted course-check record: malformed entries never unlock a boundary. */
+function restoreCourseCheck(raw: unknown): JevState["lastCourseCheck"] {
+	if (!isRecord(raw) || typeof raw["selectedOption"] !== "string") return undefined;
+	if (typeof raw["at"] !== "number" || !Number.isFinite(raw["at"])) return undefined;
+	if (typeof raw["workRevision"] !== "number" || !Number.isFinite(raw["workRevision"])) return undefined;
+	return {
+		selectedOption: raw["selectedOption"],
+		at: raw["at"],
+		taskFingerprint: typeof raw["taskFingerprint"] === "string" ? raw["taskFingerprint"] : undefined,
+		workRevision: raw["workRevision"],
 	};
 }
 

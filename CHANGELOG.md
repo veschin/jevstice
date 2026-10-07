@@ -20,3 +20,15 @@
 - Field trial: minecraft clone built autonomously via the addon (deepseek-flash); work execution-verified; completion gate fail-closed on 5 sub-floor approves -> honest escalation (calibration finding for GAP:3). Verdict: evidence/mc-session-verdict.md.
 - Meta-options: every judge Choice carries ALL_OPTIONS_WRONG/PARTIALLY_RIGHT_NONE_FULL/NO_FIT_OTHER_REASON + meta_reason; escape never approves (review CLEAR).
 - Release gate: aspect-drift teeth persist across restarts; completion streak only at policy-default threshold (raised thresholds = strict single bar); inert confidenceFloor rejected at load; README rewritten for public release; MIT license; renamed jevstice. 174/174 tests, tsc clean, guard clean; reviews CLEAR rounds 6-8.
+
+## 0.2.0 - 2026-10-07
+
+- Audit fixes (all reproduced before, regression-tested after):
+  - Invalid/unreadable config no longer unregisters the extension: gates stay registered and fail closed with the file+problem named (PRD 12.2/12.7; integration tests through the real entrypoint).
+  - Calibration-tolerant completion works in production: the SDK client reports a typed `completionCandidate` for mid-band approves (strict verdict stays `insufficient_evidence`); the controller counts 2 consecutive candidates bound to task+work+content digest (PRD 17.1). CLI output unchanged.
+  - Read-only tasks are gated: session_stop demands plan approval, a fresh judged course_check (continue) and completion evidence once a task fingerprint exists, mutated or not (PRD 12.2, FR-07).
+  - Benign course_check outcomes (continue/verify_before_proceeding) no longer consume the rework bound; only redirects, escalations and failed consultations do (PRD 14).
+  - Completion capability coverage is judge-assessed per aspect (fixed three-way Choice, untrusted-evidence policy, fail-closed on malformed/low-confidence/meta) instead of keyword matching; `requireAll` downgrades not_applicable for declared capabilities; `aspects` added to the tool schema (PRD 15/FR-13, AC12 reachable via the registered tool).
+  - Wired course_check validates the judge contract (fixed next-action set, exact onTrack keys, finite confidence at/above floor; drift never continues) and binds freshness to task+workRevision; raised completion config applies on mid-session reload.
+- Live-Jev review loop for this release: remediation plan direction_review + per-requirement course_check (both flagged the two weak areas before implementation); final release review through the addon CLI returned revise 0.33 -> verify_before_proceeding 0.60 (all six requirements on track) -> insufficient_evidence 0.38 - below the 0.6 floor, so release approval escalates to the user per POLICY (no faked success; same whole-project calibration ceiling as the field trial).
+- 217/217 tests, `tsc --noEmit` clean, LSP diagnostics clean; guard fast tier has no js/ts analyzer configured in this repo (deliberately no lint/format tooling).

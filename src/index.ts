@@ -13,7 +13,7 @@
 import { createJevController, type ControllerDeps, type JevController, type PiApi } from "./controller.js";
 import { JevConfigError, loadJevTemplateConfig, type JevTemplateConfig } from "./config.js";
 import { isRecord } from "./guards.js";
-import { createCourseCheckJudge, createJudge, createMultiLabelJudge } from "./client.js";
+import { createAspectCoverageJudge, createCourseCheckJudge, createJudge } from "./client.js";
 import { loadTopicCatalog } from "./catalog.js";
 import { POLICY, type Judge } from "./types.js";
 
@@ -69,8 +69,8 @@ function extractCustomEntries(sessionManager: unknown): Array<{ customType: stri
 
 export function createJevExtension(deps: Partial<ControllerDeps> = {}) {
 	return (pi: PiApi): void => {
-		// R5: load template config at extension load; an invalid file REFUSES registration
-		// (never silent defaults). Missing files are the normal defaults case.
+		// R5: invalid configuration keeps the controller registered with closed gates.
+		// Missing files are the normal defaults case.
 		let templateError: string | undefined;
 		let template: JevTemplateConfig | undefined;
 		try {
@@ -78,10 +78,10 @@ export function createJevExtension(deps: Partial<ControllerDeps> = {}) {
 		} catch (err) {
 			if (err instanceof JevConfigError) {
 				templateError = err.message;
-				process.stderr.write(`jev: refusing to register jev_decision — ${err.message}\n`);
-				return;
+				process.stderr.write(`jev: configuration invalid; gates remain closed — ${err.message}\n`);
+			} else {
+				throw err;
 			}
-			throw err;
 		}
 		// N1: the effective (R1-clamped) floor also raises the course-check demotion floor.
 		const effectiveMinConfidence = Math.max(
@@ -95,8 +95,7 @@ export function createJevExtension(deps: Partial<ControllerDeps> = {}) {
 			timeoutMs: intEnv("JEVI_TIMEOUT_MS"),
 			minConfidence: effectiveMinConfidence,
 		};
-		// aspect_coverage wiring: catalog ids pre-check + multi-label applicability judge;
-		// "addressed" derives from evidence text mentioning the aspect (label words).
+		// Catalog labels inform the judge; mentioning a label never proves preservation.
 		let catalogIds: ReadonlySet<string> = new Set();
 		let aspectTexts: ReadonlyMap<string, string> = new Map();
 		try {
@@ -106,53 +105,23 @@ export function createJevExtension(deps: Partial<ControllerDeps> = {}) {
 		} catch {
 			// Catalog unavailable: pre-check accepts nothing; wired judge stays undefined.
 		}
-		const multiLabelJudge = deps.judge === undefined ? createMultiLabelJudge(clientConfig) : undefined;
 		const aspectCoverageJudge =
 			deps.aspectCoverageJudge ??
-			(multiLabelJudge === undefined
-				? undefined
-				: async req => {
-						const result = await multiLabelJudge({
-							stage: "aspect_coverage",
-							task: req.currentAction,
-							evidence: req.evidence,
-							items: req.aspects.map(a => ({ id: a.id, text: aspectTexts.get(a.id) ?? a.text })),
-						});
-						if (result.verdict === "insufficient_evidence" || result.verdict === "ask_user") {
-							return { markings: {}, reasons: result.reasons, confidence: result.confidence, judged: false, escape: true };
-						}
-						const corpus = req.evidence.map(e => `${e.source} ${e.quote}`).join("\n").toLowerCase();
-						const markings: Record<string, "applicable_and_addressed" | "applicable_not_addressed" | "not_applicable"> = {};
-						for (const a of req.aspects) {
-							if (result.applicable[a.id] !== true) {
-								markings[a.id] = "not_applicable";
-							} else {
-								// F2: word-boundary match (same rule as coverageGaps), not substring.
-								const labelWords = (aspectTexts.get(a.id) ?? a.text)
-									.toLowerCase()
-									.split(/[^\p{L}\p{N}]+/u)
-									.filter(w => w.length > 3);
-								markings[a.id] =
-									labelWords.some(w =>
-										new RegExp(`(^|[^\\p{L}\\p{N}_])${w}([^\\p{L}\\p{N}_]|$)`, "u").test(corpus),
-									)
-										? "applicable_and_addressed"
-										: "applicable_not_addressed";
-							}
-						}
-						return {
-							markings,
-							reasons: result.reasons,
-							confidence: result.confidence,
-							judged: true,
-						};
-					});
+			(deps.judge === undefined
+				? async req => createAspectCoverageJudge(clientConfig)({
+						...req,
+						aspects: req.aspects.map(a => ({
+							...a,
+							text: req.requireAll ? a.text : (aspectTexts.get(a.id) ?? a.text),
+						})),
+					})
+				: undefined);
 		const controller: JevController = createJevController({
 			judge: deps.judge ?? buildProductionJudge(),
 			// C1 wired by default in production; tests inject their own.
 			courseCheckJudge:
 				deps.courseCheckJudge ??
-				(deps.judge === undefined ? createCourseCheckJudge(clientConfig) : undefined),
+				(deps.judge === undefined ? req => createCourseCheckJudge(clientConfig)(req) : undefined),
 			aspectCoverageJudge,
 			catalogIds,
 			template,
@@ -164,6 +133,7 @@ export function createJevExtension(deps: Partial<ControllerDeps> = {}) {
 		pi.on("session_start", (_event, ctx) => {
 			try {
 				template = deps.template ?? loadJevTemplateConfig(process.cwd(), process.env["HOME"] ?? "");
+				clientConfig.minConfidence = Math.max(POLICY.minConfidenceToApprove, template.confidenceThreshold ?? 0);
 				controller.setTemplateState(template, undefined);
 			} catch (err) {
 				if (err instanceof JevConfigError) {

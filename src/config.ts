@@ -5,8 +5,8 @@
  *   1. <cwd>/.omp/jev.config.json
  *   2. ~/.omp/agent/jev.config.json
  *
- * Invalid file (bad JSON, wrong types, confidenceThreshold outside 0..1, unknown stage key)
- * => JevConfigError naming file + problem. Callers MUST refuse to register the decision tool;
+ * Invalid or unreadable file => JevConfigError naming file + problem.
+ * Callers keep the controller registered with closed gates;
  * silent fallback to defaults is forbidden.
  */
 import * as fs from "node:fs";
@@ -225,7 +225,8 @@ function defaultReadFile(path: string): string | undefined {
 	// Synchronous, bounded read; missing file is the normal case.
 	try {
 		return fs.readFileSync(path, "utf8");
-	} catch {
-		return undefined;
+	} catch (err) {
+		if (isRecord(err) && err["code"] === "ENOENT") return undefined;
+		throw new JevConfigError(path, `cannot read file: ${err instanceof Error ? err.message : String(err)}`);
 	}
 }

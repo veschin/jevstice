@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const CLEAN_ENV: Record<string, string> = {};
 for (const [k, v] of Object.entries(process.env)) {
@@ -62,4 +65,55 @@ describe("cli contract (FR-09, FR-15; AC4c)", () => {
     expect(p.exitCode).toBe(4);
     expect(errObj(p).error).toBe("transport");
   }, 30000);
+});
+
+describe("extension configuration safety (FR-17)", () => {
+  test.each(["malformed", "unreadable"])("%s config preserves mutation and completion gates", (kind) => {
+    const dir = mkdtempSync(join(tmpdir(), "jev-config-"));
+    const configFile = join(dir, ".omp", "jev.config.json");
+    try {
+      mkdirSync(join(dir, ".omp"));
+      if (kind === "malformed") writeFileSync(configFile, "{not json");
+      else mkdirSync(configFile);
+      const entry = new URL("../src/index.ts", import.meta.url).pathname;
+      const script = `
+        import { createJevExtension } from ${JSON.stringify(entry)};
+        const hooks = new Map();
+        let decision;
+        createJevExtension({ judge: async () => { throw new Error("must not consult"); } })({
+          on: (name, handler) => hooks.set(name, handler),
+          registerTool: tool => { decision = tool; },
+          appendEntry() {},
+          sendMessage() {},
+        });
+        await hooks.get("before_agent_start")?.({prompt:"Inspect a project without changing its files"});
+        const mutation = await hooks.get("tool_call")?.({toolName:"write",input:{}});
+        const read = await hooks.get("tool_call")?.({toolName:"read",input:{}});
+        const stop = await hooks.get("session_stop")?.({stop_hook_active:false});
+        const outcome = await decision?.execute("invalid-config", {
+          stage:"direction_review", task:"Inspect the project",
+          proposal:"Inspect the project without changing any files",
+          options:[{id:"approve",label:"Approve",meaning:"proceed"},{id:"revise",label:"Revise",meaning:"rework"}],
+          evidence:[{kind:"user",source:"user",quote:"Inspect the project without changing its files"}],
+        });
+        console.log(JSON.stringify({mutation,read:read??null,stop,outcome:outcome?.details}));
+      `;
+      const result = spawnSync(process.execPath, ["-e", script], {
+        cwd: dir,
+        env: { ...CLEAN_ENV, HOME: dir },
+        encoding: "utf8",
+        timeout: 10000,
+      });
+      expect(result.status).toBe(0);
+      const actual = JSON.parse(result.stdout);
+      expect(actual.mutation?.block).toBe(true);
+      expect(actual.read).toBeNull();
+      expect(actual.stop?.decision).toBe("block");
+      expect(actual.outcome?.verdict).toBe("insufficient_evidence");
+      expect(actual.outcome?.judged).toBe(false);
+      expect(actual.outcome?.reasons.join(" ")).toContain(configFile);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

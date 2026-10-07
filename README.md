@@ -32,10 +32,17 @@ TYPESAFE_API_KEY="$(pass show token/jev)" bun ~/.omp/agent/extensions/jevstice/s
   judge approves a plan backed by verbatim quoted evidence. Reads stay free.
 - **completion** (`completion_review`): execution/code/log evidence required; a report alone
   never approves. Confidence in [0.6, 0.8) requires 2 consecutive approves; below 0.6 never counts.
+  Every task - read-only included - needs plan approval, a fresh course_check and completion
+  evidence before the session may stop.
 - **course_check**: per-requirement drift check plus a next action from a fixed set
   (`continue`, `return_to_requirement`, `replan`, `ask_user`, `verify_before_proceeding`).
-- **aspect_coverage**: claimed aspects three-way marked against a topic catalog;
-  missed aspects block completion until addressed.
+  Run it at the task/plan boundary, after each work mutation and before claiming completion;
+  only a judged `continue` satisfies the completion gate. Benign outcomes never consume the
+  rework bound; redirects and failed consultations do.
+- **aspect_coverage**: claimed aspects three-way marked by the judge against a topic catalog;
+  missed aspects block completion until addressed. Completion capability coverage uses the same
+  judge with `requireAll`, so a capability counts only when the judge marks it addressed from
+  artifact evidence - mentioning its name is not enough.
 
 Fail-closed: judge errors, malformed answers, meta-option escapes (`ALL_OPTIONS_WRONG`,
 `PARTIALLY_RIGHT_NONE_FULL`, `NO_FIT_OTHER_REASON`) and low confidence never approve.
@@ -60,8 +67,8 @@ fingerprint, content digest and work revision.
 }
 ```
 
-Thresholds and counts are raise-only. Meta options cannot be removed. Invalid config
-refuses to load, naming the file and the problem.
+Thresholds and counts are raise-only. Meta options cannot be removed. Invalid or unreadable
+config keeps the gates registered and closed, naming the file and the problem.
 
 ## Limits
 
