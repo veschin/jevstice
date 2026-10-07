@@ -13,7 +13,7 @@
 import { createJevController, type ControllerDeps, type JevController, type PiApi } from "./controller.js";
 import { JevConfigError, loadJevTemplateConfig, type JevTemplateConfig } from "./config.js";
 import { isRecord } from "./guards.js";
-import { createAspectCoverageJudge, createClaimCheckJudge, createCourseCheckJudge, createJudge, createMultiLabelJudge, createRequirementsFormalizationJudge, createReviewJudge } from "./client.js";
+import { createAspectCoverageJudge, createClaimCheckJudge, createCourseCheckJudge, createJudge, createMultiLabelJudge, createRefactorMarkingJudge, createRequirementsFormalizationJudge, createReviewJudge } from "./client.js";
 import { loadTopicCatalog, type CatalogTopic } from "./catalog.js";
 import { memoizedKeyResolver } from "./apikey.js";
 import { POLICY, type Judge } from "./types.js";
@@ -145,6 +145,11 @@ export function createJevExtension(deps: Partial<ControllerDeps> = {}) {
 				(deps.judge === undefined
 					? async req => createRequirementsFormalizationJudge(await withKey())(req)
 					: undefined),
+			// FR-13 refactor_marking: one preserved/lost marking per inventory item, judged from the
+			// material attached to that item in the same request.
+			refactorMarkingJudge:
+				deps.refactorMarkingJudge ??
+				(deps.judge === undefined ? async req => createRefactorMarkingJudge(await withKey())(req) : undefined),
 			// Review activities (business_review, architecture_review, security_review): the fixed
 			// question set of a review in ONE request.
 			reviewJudge:

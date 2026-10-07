@@ -398,6 +398,30 @@ export const ACTIVITY_REGISTRY: Readonly<Record<string, Activity>> = {
 					{ verdict: "ask_user", outcome: "ask_user" },
 				],
 			},
+			// FR-13 (refactoring): the inventory of the old functions is fixed before the first edit
+			// and every item is marked preserved-or-lost from its own artifact material afterwards.
+			// Both are development-time mechanisms; the completion boundary is what stays shut while
+			// an item carries no evidence-backed marking.
+			{
+				stage: "refactor_inventory",
+				wiring: ["stage"],
+				outcomeEdges: [
+					{ verdict: "approve", outcome: "continue" },
+					{ verdict: "revise", outcome: "return_to_requirement" },
+					{ verdict: "insufficient_evidence", outcome: "verify_before_proceeding" },
+					{ verdict: "ask_user", outcome: "ask_user" },
+				],
+			},
+			{
+				stage: "refactor_marking",
+				wiring: ["stage"],
+				outcomeEdges: [
+					{ verdict: "approve", outcome: "continue" },
+					{ verdict: "revise", outcome: "return_to_requirement" },
+					{ verdict: "insufficient_evidence", outcome: "verify_before_proceeding" },
+					{ verdict: "ask_user", outcome: "ask_user" },
+				],
+			},
 		],
 	},
 	review: {

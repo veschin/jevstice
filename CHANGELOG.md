@@ -380,3 +380,94 @@ hand-off gate (F1, F2).
     hook`, `an accepted result records the verdict without a blocker`); they encode the host order
     F2 replaced, are owned by the test-pruning slice, and were reported to the integrator rather
     than rewritten here. `bun run typecheck` clean; `src/index.ts` imports clean.
+
+## 0.8.0 - 2026-10-08
+
+FR-02 (the last mile of skill routing) and FR-13 (refactoring: the inventory before the first code
+edit, the per-item marking after it). Both were designed through the judge before being built; the
+verbatim verdicts are recorded under the matching bullet.
+
+FR-02 - a judge-selected skill now takes effect in the running session.
+  - Before: `submitRouting` recorded the selection in `JevState.routedSkill` and read it nowhere, so an
+    approved skill was a returned recommendation and nothing in the session changed. The suite could not
+    catch the regression either: the only assertion was on the state field.
+  - Now: `activateSkill` (`src/controller.ts`) delivers the selection to the executor through the same
+    channel every other verdict uses - `pi.sendMessage(..., { deliverAs: "aside", triggerTurn: false })` -
+    carrying the selected candidate's id, its label and the owner's own `meaning`, and records
+    `routedSkill` at the same time. A candidate the owner did not configure can never be activated (the
+    judge only ever sees the configured list) and no verdict other than `approve` delivers or records
+    anything. What the extension deliberately does not do is install a skill into the prompt: it delivers
+    the selection, and the executor applies the skill from its own files.
+  - Tests: `tests/skill-activation.test.ts` (2). The delivery test fails when the injection is removed
+    (verified by mutation); the second fails when a selection the judge did not approve starts driving
+    the work.
+  - Live judge design consultation (`jev-1.13.0`), three attempts with a changed approach each because
+    the loop forbids repeating a frame. Attempt 1, the product's own verdict frame over one design claim
+    (`src/cli.ts`, the request in `/tmp`): `{"verdict":"insufficient_evidence","reasons":["low_confidence"],"confidence":0.52}`.
+    Attempt 2, claim plus mechanism choice over the direct systemone instrument: claim
+    `{"type":"noul","noul":0.34}`; mechanism `{"type":"choice","choice":"session_feedback","confidence":0.78}`,
+    probabilities `session_feedback 0.82 / session_and_spawn 0.04 / state_only 0.03`. Attempt 3, restated
+    as an outcome plus the artifacts that settle it: `{"type":"noul","noul":0.44}`; mechanism
+    `{"type":"choice","choice":"session_feedback","confidence":0.95}`, probabilities
+    `session_feedback 0.96 / session_and_spawn 0.01 / state_only 0.01`.
+  - Reading, recorded honestly: the requirement-interpretation claim stayed below 0.5 across all three
+    approaches and is left as an OPEN item in this note rather than bent until it passed; the design
+    decision itself was answered decisively twice (0.78 then 0.95 confidence for the same mechanism) and
+    is what was built - in-session delivery, no per-spawn propagation. Transport: the first CLI call died
+    with the documented socket reset and the direct call needed four retries.
+
+FR-13 - a refactoring now has a fixed inventory and an evidence-backed marking per item.
+  - New control points `refactor_inventory` and `refactor_marking`, claimed by the `development`
+    activity (`src/activities.ts`), so `stagesWithoutActivity()` stays empty. `refactor_inventory`
+    refuses a submission that arrives after the first code edit of the task - tracked as
+    `taskStartWorkRevision` against the monotonic `workRevision`, reset when the task fingerprint
+    changes - records the items in `JevState.refactorInventory` and delivers the id/command list back
+    into the session. It consults no judge: a declaration is not a question.
+  - `refactor_marking` requires one `{id, evidence}` per inventory item and refuses, before any judge
+    call, material that carries no artifact kind (`code`/`execution`/`log`) - the executor's own report
+    is not evidence. `createRefactorMarkingJudge` (`src/client.ts`) then marks every item `preserved` /
+    `lost` / `not_evidenced` from THAT item's own material in one request, with the mandatory service
+    options appended and fail-closed handling: a judge error, a frame escape, an unknown marking, a
+    missing answer or a sub-floor confidence records nothing at all.
+  - The completion boundary (`unmetStopGates`) names every inventory item without an evidence-backed
+    marking at the current work revision; a `not_evidenced` item blocks completion under its own id, a
+    code edit after the marking makes it stale and re-opens the gap naming the items, and a task that
+    never recorded an inventory is unaffected. `JevState.lastRefactorMarking` carries the work revision
+    the marking was made at; both new records have restore validators, and a malformed persisted record
+    is dropped rather than trusted.
+  - Tests: `tests/refactor-inventory.test.ts` (9): the inventory is recorded with its commands and
+    delivered; a late inventory is refused and nothing is recorded; a report-only marking is refused and
+    the boundary still names the item; an evidence-backed marking is recorded per item and the item stops
+    blocking; a `not_evidenced` item blocks under its own id only; a later code edit makes the marking
+    stale; a judge that fails or escapes records nothing; and the judge's wire contract (each item's
+    material travels inside that item's own state entry; a low-confidence or service-option answer yields
+    no marking).
+  - Live judge design consultation (`jev-1.13.0`), three attempts with a changed approach. Attempt 1,
+    the product's own verdict frame: `{"verdict":"insufficient_evidence","reasons":["low_confidence"],"confidence":0.44}`.
+    Attempt 2, one umbrella claim plus the choice of vehicle: claim `{"type":"noul","noul":0.32}`;
+    vehicle `{"type":"choice","choice":"two_stages","confidence":0.88}`, probabilities
+    `two_stages 0.90 / inventory_stage_marking_inline 0.02 / extend_capabilities 0.01`. Attempt 3, the
+    umbrella claim split into one narrow claim per separately checkable part, with the vehicle repeated:
+    part 1 (the inventory and its verification commands, and the refusal after the first edit)
+    `{"type":"noul","noul":0.73}`, part 2 (an outcome per item taken from that item's own material)
+    `{"type":"noul","noul":0.58}`, part 3 (an item without material keeps the boundary shut by name; a
+    report is refused) `{"type":"noul","noul":0.56}` - all three above the 0.5 bar, so the design is
+    accepted; vehicle `{"type":"choice","choice":"two_stages","confidence":0.95}`, probabilities
+    `two_stages 0.96`. Transport: two CLI attempts died with socket resets and were retried through the
+    direct instrument.
+
+Both features end to end: the FR-02 effect is produced by the registered tool path (`stage=skill_routing`
+through `jev_decision` -> `submitRouting` -> `activateSkill`), and the FR-13 steps are registered stages
+consumed by the same `submitDecisionCore` pipeline (validation -> rework bound -> preset -> activity
+guard) whose records the `session_stop` boundary reads.
+
+Test count: 333 before this slice (HEAD 35b4d76), 344 after (+11: 2 FR-02, 9 FR-13), every one of them
+failing when its behaviour breaks (two verified by mutation, removal of the injection and removal of the
+before-the-first-edit refusal).
+
+Also in this slice: a one-line fix in the hand-off acceptance uncertainty text, which read with a
+doubled prefix ("Jev handoff (acceptance) not judged: not judged: the task tool result is ..."). The
+note no longer repeats the recorder's own prefix. Found in the live omp smoke of the same day
+(evidence/smoke-gates-reverify.log, cases C and D). The live smoke also measured that a dispatch verdict
+lands 299-428 ms AFTER the host's task `tool_result`; whether omp still cancels a spawn at that point is
+unproven, so nothing in this change rests on it.

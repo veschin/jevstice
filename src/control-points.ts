@@ -158,6 +158,26 @@ export const CONTROL_POINT_REGISTRY: Readonly<Record<string, ControlPoint>> = {
 		trigger: "on_demand",
 		verdictMapping: "standard",
 	},
+	// FR-13 part (1): the inventory of the old functions, each with its verification command,
+	// fixed BEFORE the first code edit of the task. The controller refuses a submission that
+	// arrives after the first edit (an inventory written afterwards cannot establish what
+	// existed before the refactoring), records the inventory in session state and delivers the
+	// item list back into the session. No judge consult: the declaration itself is not a
+	// question; the marking below is what is judged.
+	refactor_inventory: {
+		stage: "refactor_inventory",
+		trigger: "on_demand",
+		verdictMapping: "standard",
+	},
+	// FR-13 part (2): every inventory item marked preserved/lost AFTER the refactoring from the
+	// artifact material attached to that item (a code quote or a command output). Advisory like
+	// the other on_demand presets - it grants no gate approval; the completion boundary
+	// (session_stop) is what stays shut while an item carries no evidence-backed marking.
+	refactor_marking: {
+		stage: "refactor_marking",
+		trigger: "on_demand",
+		verdictMapping: "standard",
+	},
 };
 
 export { COURSE_CHECK_OPTION_IDS };

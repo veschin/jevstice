@@ -49,7 +49,7 @@ import {
 	lookupControlPoint,
 	validateDeclaredControlPoint,
 } from "./control-points.js";
-import { classifyTaskType, routeModel, routeSkills, selectTopics, type CatalogTopic } from "./catalog.js";
+import { classifyTaskType, routeModel, routeSkills, selectTopics, type CatalogTopic, type RoutingCandidate } from "./catalog.js";
 import { STAGES } from "./stages.js";
 import {
 	POLICY,
@@ -62,6 +62,10 @@ import {
 	type CourseCheckNextAction,
 	type CourseCheckResult,
 	type MultiLabelJudge,
+	type RefactorInventoryItem,
+	type RefactorMarkingJudge,
+	type RefactorMarkingOutcome,
+	type RefactorMarkingResult,
 	type RequirementsFormalizationJudge,
 	type RequirementsFormalizationResult,
 	type ReviewJudge,
@@ -145,6 +149,37 @@ export interface AutoCourseCheckRecord {
 }
 
 /**
+ * FR-13 part (1): the inventory of the old functions, each with its verification command,
+ * recorded BEFORE the first code edit of the task (a submission after the first edit is refused,
+ * so a record can never be reconstructed after the fact). Bound to the task it was declared for.
+ */
+export interface RefactorInventoryRecord {
+	items: RefactorInventoryItem[];
+	taskFingerprint: string | undefined;
+	at: number;
+}
+
+/** One inventory item as marked by the judge from the material attached to that item. */
+export interface RefactorMark {
+	id: string;
+	outcome: RefactorMarkingOutcome;
+	reasons: string[];
+}
+
+/**
+ * FR-13 part (2): the per-item marking made AFTER the refactoring from each item's own artifact
+ * material. Bound to the task AND to the work revision it was made at: a later code edit makes
+ * the marking stale, and the completion boundary then names every item again (a marking must
+ * describe the code that exists, not the code that existed when it was written).
+ */
+export interface RefactorMarkingRecord {
+	marks: RefactorMark[];
+	taskFingerprint: string | undefined;
+	workRevision: number;
+	at: number;
+}
+
+/**
  * One judged rework attempt (PRD 19, TASKS "Rules of the loop"): the approach the executor named
  * and the judge's own answer to it. Only a judged consultation is an attempt - a submission
  * refused before the judge call spends no approach and never enters the journal.
@@ -186,8 +221,17 @@ export interface JevState {
 	blockers: string[];
 	/** Applied model-routing selection (AC2): enforced at before_subagent_spawn. */
 	routedModel: string | undefined;
-	/** Applied skill-routing selection (AC2), recorded for dispatch visibility. */
+	/** Applied skill-routing selection (AC2), delivered into the session as an aside when made. */
 	routedSkill: string | undefined;
+	/**
+	 * Work revision the current task started at. FR-13 part (1): an inventory is only a
+	 * pre-refactoring inventory while no mutating call happened since the task began.
+	 */
+	taskStartWorkRevision: number;
+	/** FR-13 part (1): the old-function inventory of the current task, or undefined when none was declared. */
+	refactorInventory: RefactorInventoryRecord | undefined;
+	/** FR-13 part (2): the latest per-item marking of that inventory (task + work-revision bound). */
+	lastRefactorMarking: RefactorMarkingRecord | undefined;
 	/** Latest judged course_check continue/verify record; completion requires a fresh one (task+work bound). */
 	lastCourseCheck: { selectedOption: string; at: number; taskFingerprint: string | undefined; workRevision: number } | undefined;
 	/**
@@ -265,6 +309,9 @@ function freshState(): JevState {
 		blockers: [],
 		routedModel: undefined,
 		routedSkill: undefined,
+		taskStartWorkRevision: 0,
+		refactorInventory: undefined,
+		lastRefactorMarking: undefined,
 		lastCourseCheck: undefined,
 		lastClaimCheck: undefined,
 		lastFormalization: undefined,
@@ -339,6 +386,12 @@ const EVIDENCE_KINDS: ReadonlySet<string> = new Set([
 ]);
 /** Completion must rest on artifact evidence, not self-report (AC4b). */
 const COMPLETION_EVIDENCE_KINDS: ReadonlySet<string> = new Set(["execution", "code", "log"]);
+/** FR-13 part (2): the markings the judge may return per inventory item; anything else is a bad payload. */
+const REFACTOR_MARKING_OUTCOMES: Readonly<Record<string, true>> = {
+	preserved: true,
+	lost: true,
+	not_evidenced: true,
+};
 // Mutation-bearing builtins (omp 18.6.3 tools/builtin-names.ts + tool sources):
 // edit/write mutate files directly; ast_edit performs structural edits; bash executes
 // arbitrary shell (mutation-capable, conservatively gated); memory_edit and manage_skill
@@ -455,12 +508,37 @@ export interface ValidatedDecisionInput {
 	requirements: string[];
 	/** Per-requirement plan claims for the plan_mapping stage (planning activity). */
 	planClaims: Array<{ requirementId: string; claim: string }>;
+	/** FR-13 part (1): the old-function inventory submitted to the refactor_inventory stage. */
+	inventory: RefactorInventoryItem[];
+	/** FR-13 part (2): the artifact material attached to each inventory item for refactor_marking. */
+	inventoryMarks: Array<{ id: string; evidence: Evidence[] }>;
 }
 
 export interface ValidationResult {
 	ok: boolean;
 	reasons: string[];
 	input?: ValidatedDecisionInput;
+}
+
+/**
+ * Parse one {kind,source,quote} evidence item. Shared by the submission's own `evidence` array
+ * and by the per-item material a refactor marking attaches, so both boundaries reject the same
+ * malformed shapes with the same words. Undefined when malformed; the defect is pushed.
+ */
+function parseEvidenceItem(value: unknown, where: string, reasons: string[]): Evidence | undefined {
+	if (!isRecord(value) || typeof value["kind"] !== "string" || !EVIDENCE_KINDS.has(value["kind"])) {
+		reasons.push(`${where}.kind must be one of: ${[...EVIDENCE_KINDS].join(", ")}`);
+		return undefined;
+	}
+	if (!nonEmptyString(value["source"]) || !nonEmptyString(value["quote"])) {
+		reasons.push(`${where} must carry non-empty source and quote`);
+		return undefined;
+	}
+	return {
+		kind: value["kind"] as Evidence["kind"],
+		source: value["source"] as string,
+		quote: value["quote"] as string,
+	};
 }
 
 /** Validate the executor's structured decision submission. Never throws. */
@@ -508,19 +586,8 @@ export function validateDecisionInput(raw: unknown, extraStages: ReadonlySet<str
 	const evidence: Evidence[] = [];
 	if (Array.isArray(rawEvidence)) {
 		rawEvidence.forEach((e, i) => {
-			if (!isRecord(e) || typeof e["kind"] !== "string" || !EVIDENCE_KINDS.has(e["kind"])) {
-				reasons.push(`evidence[${i}].kind must be one of: ${[...EVIDENCE_KINDS].join(", ")}`);
-				return;
-			}
-			if (!nonEmptyString(e["source"]) || !nonEmptyString(e["quote"])) {
-				reasons.push(`evidence[${i}] must carry non-empty source and quote`);
-				return;
-			}
-			evidence.push({
-				kind: e["kind"] as Evidence["kind"],
-				source: e["source"] as string,
-				quote: e["quote"] as string,
-			});
+			const parsed = parseEvidenceItem(e, `evidence[${i}]`, reasons);
+			if (parsed !== undefined) evidence.push(parsed);
 		});
 	}
 	const aspects = Array.isArray(raw["aspects"])
@@ -548,6 +615,73 @@ export function validateDecisionInput(raw: unknown, extraStages: ReadonlySet<str
 			planClaims.push({ requirementId: c["requirementId"] as string, claim: c["claim"] as string });
 		});
 	}
+	// FR-13 part (1): the inventory of the old functions. Every item names the function and the
+	// command that verifies it; ids are unique so the marking below can only match one item.
+	const inventory: RefactorInventoryItem[] = [];
+	const rawInventory = raw["inventory"];
+	if (rawInventory !== undefined && !Array.isArray(rawInventory)) {
+		reasons.push("inventory must be an array of {id, name, verification}");
+	} else if (Array.isArray(rawInventory)) {
+		const seenInventoryIds = new Set<string>();
+		rawInventory.forEach((item, i) => {
+			if (
+				!isRecord(item) ||
+				!nonEmptyString(item["id"]) ||
+				!nonEmptyString(item["name"]) ||
+				!nonEmptyString(item["verification"])
+			) {
+				reasons.push(
+					`inventory[${i}] must have non-empty id, name and verification ` +
+						"(verification = the command that checks this function)",
+				);
+				return;
+			}
+			const id = item["id"] as string;
+			if (seenInventoryIds.has(id)) {
+				reasons.push(`inventory[${i}].id duplicated: ${id}`);
+				return;
+			}
+			seenInventoryIds.add(id);
+			inventory.push({
+				id,
+				name: item["name"] as string,
+				verification: item["verification"] as string,
+			});
+		});
+	}
+	// FR-13 part (2): the material attached to each inventory item. The shape is validated here;
+	// whether the material is an artifact (code/execution/log) rather than a claim is the
+	// stage's pre-check, because that is the requirement's own line, not a schema rule.
+	const inventoryMarks: Array<{ id: string; evidence: Evidence[] }> = [];
+	const rawMarks = raw["inventoryMarks"];
+	if (rawMarks !== undefined && !Array.isArray(rawMarks)) {
+		reasons.push("inventoryMarks must be an array of {id, evidence}");
+	} else if (Array.isArray(rawMarks)) {
+		const seenMarkIds = new Set<string>();
+		rawMarks.forEach((mark, i) => {
+			if (!isRecord(mark) || !nonEmptyString(mark["id"])) {
+				reasons.push(`inventoryMarks[${i}] must have a non-empty id`);
+				return;
+			}
+			const id = mark["id"] as string;
+			if (seenMarkIds.has(id)) {
+				reasons.push(`inventoryMarks[${i}].id duplicated: ${id}`);
+				return;
+			}
+			seenMarkIds.add(id);
+			const rawItemEvidence = mark["evidence"];
+			if (!Array.isArray(rawItemEvidence) || rawItemEvidence.length === 0) {
+				reasons.push(`inventoryMarks[${i}].evidence must be a non-empty array of {kind,source,quote}`);
+				return;
+			}
+			const itemEvidence: Evidence[] = [];
+			rawItemEvidence.forEach((e, j) => {
+				const parsed = parseEvidenceItem(e, `inventoryMarks[${i}].evidence[${j}]`, reasons);
+				if (parsed !== undefined) itemEvidence.push(parsed);
+			});
+			inventoryMarks.push({ id, evidence: itemEvidence });
+		});
+	}
 	if (reasons.length > 0) return { ok: false, reasons };
 	return {
 		ok: true,
@@ -564,6 +698,8 @@ export function validateDecisionInput(raw: unknown, extraStages: ReadonlySet<str
 			claims,
 			requirements,
 			planClaims,
+			inventory,
+			inventoryMarks,
 		},
 	};
 }
@@ -635,6 +771,11 @@ export interface ControllerDeps {
 	/** Per-item traceability judge: the requirements_formalization stage (one request, per-item marks). */
 	requirementsFormalizationJudge?: RequirementsFormalizationJudge;
 	/**
+	 * FR-13 per-item marking judge: the refactor_marking stage (one request, one preserved/lost
+	 * marking per inventory item, judged from the material attached to that item).
+	 */
+	refactorMarkingJudge?: RefactorMarkingJudge;
+	/**
 	 * Activity registry (src/activities.ts): the frame the controller enforces outcome sets
 	 * against. Tests inject a doctored registry to prove an undeclared outcome fails closed.
 	 */
@@ -687,6 +828,7 @@ export class JevController {
 	private readonly aspectCoverageJudge: AspectCoverageJudge | undefined;
 	private readonly claimCheckJudge: ClaimCheckJudge | undefined;
 	private readonly requirementsFormalizationJudge: RequirementsFormalizationJudge | undefined;
+	private readonly refactorMarkingJudge: RefactorMarkingJudge | undefined;
 	/** Activity registry the outcome-set guard resolves against (default: the product registry). */
 	private readonly activities: ActivityRegistry;
 	/** In-flight automatic (periodic) course-check chain; never awaited by the tool path. */
@@ -722,6 +864,7 @@ export class JevController {
 		this.aspectCoverageJudge = deps.aspectCoverageJudge;
 		this.claimCheckJudge = deps.claimCheckJudge;
 		this.requirementsFormalizationJudge = deps.requirementsFormalizationJudge;
+		this.refactorMarkingJudge = deps.refactorMarkingJudge;
 		this.activities = deps.activities ?? ACTIVITY_REGISTRY;
 		this.catalogIds = deps.catalogIds ?? new Set();
 		this.catalog = deps.catalog;
@@ -833,7 +976,16 @@ export class JevController {
 				"The review asks its fixed question set in ONE request and records the per-item results " +
 				"(scores with confidences, the chosen candidate, every statement verdict) in the session; it is " +
 				"advisory - it refuses nothing, and only a confident negative statement comes back as a finding to " +
-				"answer.",
+				"answer. " +
+				"Refactoring has two steps (FR-13). Before the first code edit of the task, submit " +
+				"stage=refactor_inventory with `inventory`: one {id, name, verification} per old function, where " +
+				"`verification` is the command that checks it. A submission after the first edit is refused " +
+				"(an inventory written afterwards cannot establish what existed before), and the recorded " +
+				"inventory is what the completion boundary compares against. After the refactoring, submit " +
+				"stage=refactor_marking with `inventoryMarks`: one {id, evidence} per inventory item, the evidence " +
+				"being that item's own artifact material (a code quote or a command output - kind code, execution " +
+				"or log; a claim is not evidence). The judge marks every item preserved or lost from its own " +
+				"material; an item it can only mark not_evidenced blocks completion, which names that item.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -894,6 +1046,50 @@ export class JevController {
 						description:
 							"stage=plan_mapping: one {requirementId, claim} per formalized requirement id, the claim " +
 							"being that the plan serves it; a requirement left out leaves planning incomplete",
+					},
+					inventory: {
+						type: "array",
+						items: {
+							type: "object",
+							properties: {
+								id: { type: "string" },
+								name: { type: "string" },
+								verification: { type: "string" },
+							},
+							required: ["id", "name", "verification"],
+						},
+						description:
+							"stage=refactor_inventory: the old functions the refactoring touches, one " +
+							"{id, name, verification} per function BEFORE the first code edit; `verification` is the " +
+							"command that checks that function, and a submission after the first edit is refused",
+					},
+					inventoryMarks: {
+						type: "array",
+						items: {
+							type: "object",
+							properties: {
+								id: { type: "string" },
+								evidence: {
+									type: "array",
+									items: {
+										type: "object",
+										properties: {
+											kind: { type: "string" },
+											source: { type: "string" },
+											quote: { type: "string" },
+										},
+										required: ["kind", "source", "quote"],
+									},
+								},
+							},
+							required: ["id", "evidence"],
+						},
+						description:
+							"stage=refactor_marking: one {id, evidence} per inventory item AFTER the refactoring; the " +
+							"evidence must be the artifact material for THAT item (kind code/execution/log - the code " +
+							"quote or the command output). The judge marks each item preserved or lost from its own " +
+							"material; an item whose material is a claim is marked not_evidenced and keeps completion " +
+							"blocked by name",
 					},
 				},
 				required: ["stage", "task", "proposal", "options", "evidence"],
@@ -1017,6 +1213,11 @@ export class JevController {
 		const fp = await fingerprint(event["prompt"]);
 		if (fp !== this.state.taskFingerprint) {
 			this.state.taskFingerprint = fp;
+			// FR-13: the first code edit of THIS task is what an inventory must precede, and a
+			// previous task's inventory/marking never gates a new one.
+			this.state.taskStartWorkRevision = this.state.workRevision;
+			this.state.refactorInventory = undefined;
+			this.state.lastRefactorMarking = undefined;
 			// FR-11: the requirement the handoff judge quotes for this task (same source as the
 			// fingerprint, so the two can never describe different prompts).
 			this.state.taskPrompt = event["prompt"];
@@ -1127,10 +1328,25 @@ export class JevController {
 		this.persist();
 	}
 
-	/** Record an applied skill-routing selection (AC2 dispatch visibility). */
-	rememberSkillRouting(skill: string): void {
-		this.state.routedSkill = skill;
+	/**
+	 * FR-02: make the judge's skill selection take effect in the running session. The selected
+	 * candidate is delivered to the executor as an aside through the same channel every other
+	 * verdict uses, carrying its id, its label and the owner's own statement of what choosing it
+	 * commits to; the selection is recorded in session state at the same time. A candidate the
+	 * owner did not offer can never be activated (the judge only ever sees the configured list),
+	 * and nothing is delivered and nothing is recorded on any verdict other than approve.
+	 * Returns false when the selection names no configured candidate.
+	 */
+	activateSkill(skill: string, candidates: readonly RoutingCandidate[]): boolean {
+		const candidate = candidates.find(c => c.id === skill);
+		if (candidate === undefined) return false;
+		this.state.routedSkill = candidate.id;
 		this.persist();
+		this.pushFeedback(
+			`Jev skill_routing activated skill \`${candidate.id}\` (${candidate.label}): ${candidate.meaning} ` +
+				"Apply this skill to the current task; session state records it as routedSkill.",
+		);
+		return true;
 	}
 
 	// ----- FR-11 handoff (dispatch + acceptance) -----
@@ -1293,7 +1509,7 @@ export class JevController {
 		if (!this.acceptanceWired() || !isRecord(event) || event["toolName"] !== "task") return undefined;
 		this.recordHandoffUncertainty(
 			"acceptance",
-			"not judged: the task tool result is the spawn acknowledgement, not the delegated result; the " +
+			"the task tool result is the spawn acknowledgement, not the delegated result; the " +
 				"delegated result is judged when the host delivers it",
 		);
 		return undefined;
@@ -1541,16 +1757,25 @@ export class JevController {
 						];
 					})
 				: [];
+			// FR-13: a session persisted before this field existed carries no task-start revision;
+			// assume the current task starts now rather than making the inventory undeclarable.
+			const restoredWorkRevision = typeof data["workRevision"] === "number" ? data["workRevision"] : 0;
 			this.state = {
 				approvals: restoredApprovals,
 				iterations: isRecord(data["iterations"]) ? (data["iterations"] as Record<string, number>) : {},
-				workRevision: typeof data["workRevision"] === "number" ? data["workRevision"] : 0,
+				workRevision: restoredWorkRevision,
 				taskFingerprint: typeof data["taskFingerprint"] === "string" ? data["taskFingerprint"] : undefined,
 				blockers: Array.isArray(data["blockers"])
 					? data["blockers"].filter((b): b is string => typeof b === "string")
 					: [],
 				routedModel: typeof data["routedModel"] === "string" ? data["routedModel"] : undefined,
 				routedSkill: typeof data["routedSkill"] === "string" ? data["routedSkill"] : undefined,
+				taskStartWorkRevision:
+					typeof data["taskStartWorkRevision"] === "number" && Number.isFinite(data["taskStartWorkRevision"])
+						? data["taskStartWorkRevision"]
+						: restoredWorkRevision,
+				refactorInventory: restoreRefactorInventory(data["refactorInventory"]),
+				lastRefactorMarking: restoreRefactorMarking(data["lastRefactorMarking"]),
 				lastCourseCheck: restoreCourseCheck(data["lastCourseCheck"]),
 				lastClaimCheck: restoreClaimCheck(data["lastClaimCheck"]),
 				lastFormalization: restoreFormalization(data["lastFormalization"]),
@@ -1866,6 +2091,17 @@ export class JevController {
 		if (input.stage === "skill_routing" || input.stage === "model_routing") {
 			const routed = await this.submitRouting(input);
 			if (routed !== undefined) return this.guardActivityOutcome(input.stage, routed) ?? routed;
+		}
+		// FR-13 part (1): the old-function inventory, declared before the first code edit. No judge
+		// consult: the declaration itself is not a question - what is judged is the marking below.
+		if (input.stage === "refactor_inventory") {
+			return this.submitRefactorInventory(input);
+		}
+		// FR-13 parts (2)+(3): every inventory item marked preserved or lost from its own artifact
+		// material; an item without such material keeps the completion boundary shut by name.
+		if (input.stage === "refactor_marking") {
+			const preset = await this.submitRefactorMarking(input, boundKey, used);
+			return this.guardActivityOutcome(input.stage, preset) ?? preset;
 		}
 		// aspect_coverage preset: catalog pre-check + dedicated three-way judge.
 		if (input.stage === "aspect_coverage") {
@@ -3184,7 +3420,7 @@ export class JevController {
 				const candidates = routing!.skills!;
 				const result = await routeSkills({ task: input.task, evidence: input.evidence, candidates, judge: this.judge });
 				if (result.verdict === "approve" && result.selectedOption !== undefined) {
-					this.rememberSkillRouting(result.selectedOption);
+					this.activateSkill(result.selectedOption, candidates);
 				}
 				return {
 					verdict: result.verdict,
@@ -3225,6 +3461,256 @@ export class JevController {
 				summary: "",
 			};
 		}
+	}
+
+	/**
+	 * FR-13 part (1): record the inventory of the old functions - one item per function, each
+	 * carrying the command that verifies it - BEFORE the first code edit of the task. A submission
+	 * after the first edit is refused: an inventory written afterwards cannot establish what
+	 * existed before the refactoring, so it can never be what the marking is made against. The
+	 * recorded inventory is bound to the task and is what the completion boundary compares
+	 * against. No judge is consulted - a declaration is not a question; the marking is judged.
+	 */
+	private submitRefactorInventory(input: ValidatedDecisionInput): DecisionOutcome {
+		const items = input.inventory;
+		if (items.length === 0) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [
+					"refactor_inventory needs `inventory`: one {id, name, verification} per old function, " +
+						"each verification being the command that checks that function",
+				],
+				judged: false,
+				summary: "",
+			};
+		}
+		const edits = this.state.workRevision - this.state.taskStartWorkRevision;
+		if (edits > 0) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [
+					`refactor_inventory refused: this task already has ${edits} code edit(s), so an inventory ` +
+						"submitted now cannot fix what existed before the refactoring (FR-13 part 1: the inventory " +
+						"exists before the first code edit). Record the inventory before the first edit.",
+				],
+				judged: false,
+				summary: "",
+			};
+		}
+		this.state.refactorInventory = { items, taskFingerprint: this.state.taskFingerprint, at: this.now() };
+		// A re-declared inventory supersedes a marking made against the previous one.
+		this.state.lastRefactorMarking = undefined;
+		this.persist();
+		const listed = items.map(i => `${i.id} (${i.verification})`).join("; ");
+		this.pushFeedback(
+			`Jev refactor_inventory fixed before the first code edit: ${items.length} item(s) — ${listed}. ` +
+				"After the refactoring, submit stage=refactor_marking with each item's own artifact material; " +
+				"an item without it keeps completion blocked under its id.",
+		);
+		return {
+			verdict: "approve",
+			reasons: [`inventory recorded before the first code edit: ${items.length} item(s)`],
+			judged: false,
+			summary:
+				`refactor_inventory: ${items.length} item(s) recorded before the first code edit — ` +
+				items.map(i => i.id).join(", "),
+		};
+	}
+
+	/**
+	 * FR-13 parts (2)+(3): mark every inventory item preserved or lost from the artifact material
+	 * attached to that item. A submission whose material is a claim is refused before any judge
+	 * call (a textual report is not evidence), an item the judge can only mark not_evidenced is
+	 * recorded as such and keeps the completion boundary shut under that item's id, and a judge
+	 * that fails, escapes the frame or answers below the floor records nothing (fail-closed).
+	 */
+	private async submitRefactorMarking(
+		input: ValidatedDecisionInput,
+		boundKey: string,
+		used: number,
+	): Promise<DecisionOutcome> {
+		const inventory = this.currentRefactorInventory();
+		if (inventory === undefined) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [
+					"refactor_marking needs an inventory recorded for the current task first: submit " +
+						"stage=refactor_inventory (before the first code edit) with one {id, name, verification} " +
+						"per old function",
+				],
+				judged: false,
+				summary: "",
+			};
+		}
+		const known = new Map(inventory.items.map(i => [i.id, i]));
+		const outside = input.inventoryMarks.filter(m => !known.has(m.id)).map(m => m.id);
+		if (outside.length > 0) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [`refactor_marking marks item id(s) that are not in the recorded inventory: ${outside.join(", ")}`],
+				judged: false,
+				summary: "",
+			};
+		}
+		const missing = inventory.items.filter(i => !input.inventoryMarks.some(m => m.id === i.id)).map(i => i.id);
+		if (missing.length > 0) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [`refactor_marking needs one marking per inventory item; no material submitted for: ${missing.join(", ")}`],
+				judged: false,
+				summary: "",
+			};
+		}
+		// FR-13 part (3): the executor's own report is not evidence. The material attached to an
+		// item must be an artifact - a code quote, a command output or a log excerpt.
+		const claimed = input.inventoryMarks
+			.filter(m => !m.evidence.some(e => COMPLETION_EVIDENCE_KINDS.has(e.kind)))
+			.map(m => m.id);
+		if (claimed.length > 0) {
+			const reason =
+				`refactor_marking: item(s) ${claimed.join(", ")} carry no artifact material ` +
+				"(a code quote, a command output or a log); a textual report is not evidence (FR-13 part 3)";
+			this.pushFeedback(`Jev refactor_marking refused: ${reason}`);
+			return { verdict: "insufficient_evidence", reasons: [reason], judged: false, summary: "" };
+		}
+		if (this.refactorMarkingJudge === undefined) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: ["refactor_marking judge not configured in this session"],
+				judged: false,
+				summary: "",
+			};
+		}
+		const items = input.inventoryMarks.map(m => ({ ...known.get(m.id)!, evidence: m.evidence }));
+		let raw: RefactorMarkingResult;
+		try {
+			raw = await this.refactorMarkingJudge({ items, currentAction: input.proposal });
+		} catch (err) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [`refactor marking judge unavailable: ${err instanceof Error ? err.message : String(err)}`],
+				judged: false,
+				summary: "",
+			};
+		}
+		if (!isRecord(raw) || raw["judged"] !== true || raw["escape"] === true || !isRecord(raw["markings"])) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: ["refactor marking judge returned an unjudged, escaped or malformed result; nothing is recorded"],
+				judged: false,
+				summary: "",
+			};
+		}
+		const markings = raw["markings"] as Record<string, string>;
+		const unmarked = inventory.items.filter(i => !(i.id in markings)).map(i => i.id);
+		if (unmarked.length > 0) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [`refactor marking judge did not mark: ${unmarked.join(", ")}`],
+				judged: false,
+				summary: "",
+			};
+		}
+		const unknownMarking = inventory.items
+			.filter(i => !(markings[i.id]! in REFACTOR_MARKING_OUTCOMES))
+			.map(i => i.id);
+		if (unknownMarking.length > 0) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [`refactor marking judge returned an unknown marking for: ${unknownMarking.join(", ")}`],
+				judged: false,
+				summary: "",
+			};
+		}
+		// A judged marking is real rework when it comes back incomplete: the budget is spent, so a
+		// broken marking loop cannot run forever (same rule as the aspect_coverage preset).
+		this.state.iterations[boundKey] = used + 1;
+		const marks: RefactorMark[] = inventory.items.map(i => ({
+			id: i.id,
+			outcome: markings[i.id] as RefactorMarkingOutcome,
+			reasons: [`${i.name}: ${markings[i.id]}`],
+		}));
+		this.state.lastRefactorMarking = {
+			marks,
+			taskFingerprint: this.state.taskFingerprint,
+			workRevision: this.state.workRevision,
+			at: this.now(),
+		};
+		this.persist();
+		const confidence = typeof raw["confidence"] === "number" ? raw["confidence"] : undefined;
+		const notEvidenced = marks.filter(m => m.outcome === "not_evidenced").map(m => m.id);
+		if (notEvidenced.length > 0) {
+			const named = notEvidenced.join(", ");
+			this.pushFeedback(
+				`Jev refactor_marking: item(s) ${named} have no evidence-backed marking — attach the code quote or ` +
+					"the command output for each one; completion stays blocked on those items by name.",
+			);
+			return {
+				verdict: "revise",
+				reasons: [
+					`refactor marking incomplete: item(s) without evidence: ${named} ` +
+						"(a claim is not evidence; attach a code quote or a command output)",
+				],
+				confidence,
+				judged: true,
+				summary: `refactor_marking: revise — not evidenced: ${named}`,
+			};
+		}
+		const lost = marks.filter(m => m.outcome === "lost").map(m => m.id);
+		this.pushFeedback(
+			`Jev refactor_marking: ${marks.length} item(s) marked from their own material` +
+				(lost.length > 0 ? ` — lost: ${lost.join(", ")}` : "") +
+				". The marking does not block completion.",
+		);
+		return {
+			verdict: "approve",
+			reasons: ["judged"],
+			confidence,
+			judged: true,
+			summary:
+				`refactor_marking: approve — ${marks.length} item(s) marked from evidence` +
+				(lost.length > 0 ? `, lost: ${lost.join(", ")}` : ""),
+		};
+	}
+
+	/** The refactor inventory recorded for the CURRENT task, or undefined when none was declared. */
+	private currentRefactorInventory(): RefactorInventoryRecord | undefined {
+		const record = this.state.refactorInventory;
+		if (record === undefined || record.taskFingerprint !== this.state.taskFingerprint) return undefined;
+		return record;
+	}
+
+	/**
+	 * FR-13 parts (2)+(3): an inventory recorded for the current task keeps the completion
+	 * boundary shut until EVERY item carries a marking made from its own material at the current
+	 * work revision. Returns the gap naming the items, or undefined when nothing is outstanding -
+	 * including when no inventory was declared, so a task that is not a refactoring is unaffected.
+	 */
+	private refactorMarkingGap(): string | undefined {
+		const inventory = this.currentRefactorInventory();
+		if (inventory === undefined) return undefined;
+		const ids = inventory.items.map(i => i.id);
+		const record = this.state.lastRefactorMarking;
+		if (record === undefined || record.taskFingerprint !== this.state.taskFingerprint) {
+			return (
+				`refactor inventory item(s) without a marking: ${ids.join(", ")} ` +
+				"(run stage=refactor_marking with each item's own artifact material)"
+			);
+		}
+		if (record.workRevision !== this.state.workRevision) {
+			return (
+				`refactor inventory item(s) marked before the latest code edit: ${ids.join(", ")} ` +
+				"(that marking describes the code that existed then; run stage=refactor_marking again)"
+			);
+		}
+		const unmarked = inventory.items
+			.filter(i => {
+				const mark = record.marks.find(m => m.id === i.id);
+				return mark === undefined || mark.outcome === "not_evidenced";
+			})
+			.map(i => i.id);
+		if (unmarked.length === 0) return undefined;
+		return `refactor inventory item(s) without evidence: ${unmarked.join(", ")}`;
 	}
 
 	/**
@@ -3430,6 +3916,11 @@ export class JevController {
 		if (gaps !== undefined && gaps.taskFingerprint === this.state.taskFingerprint && gaps.missed.length > 0) {
 			missing.push(`aspects not addressed: ${gaps.missed.join(", ")}`);
 		}
+		// FR-13 teeth: an inventory recorded for the current task keeps the boundary shut until
+		// every item carries a marking made from its own material at the current work revision,
+		// and the message names the item ids.
+		const refactorGap = this.refactorMarkingGap();
+		if (refactorGap !== undefined) missing.push(refactorGap);
 		return missing;
 	}
 
@@ -3506,6 +3997,61 @@ function restoreAspectGaps(raw: unknown): { missed: string[]; taskFingerprint: s
 	return {
 		missed,
 		taskFingerprint: typeof raw["taskFingerprint"] === "string" ? raw["taskFingerprint"] : undefined,
+	};
+}
+
+/**
+ * Validate a persisted refactor inventory: every item must carry a non-empty id, name and
+ * verification command and ids must be unique; a malformed record is dropped whole (it would
+ * otherwise name items the marking could never match, or gate completion on garbage).
+ */
+function restoreRefactorInventory(raw: unknown): RefactorInventoryRecord | undefined {
+	if (!isRecord(raw) || !Array.isArray(raw["items"])) return undefined;
+	const items: RefactorInventoryItem[] = [];
+	const seen = new Set<string>();
+	for (const item of raw["items"]) {
+		if (!isRecord(item)) return undefined;
+		const { id, name, verification } = item;
+		if (typeof id !== "string" || id.trim().length === 0) return undefined;
+		if (typeof name !== "string" || name.trim().length === 0) return undefined;
+		if (typeof verification !== "string" || verification.trim().length === 0) return undefined;
+		if (seen.has(id)) return undefined;
+		seen.add(id);
+		items.push({ id, name, verification });
+	}
+	if (items.length === 0) return undefined;
+	return {
+		items,
+		taskFingerprint: typeof raw["taskFingerprint"] === "string" ? raw["taskFingerprint"] : undefined,
+		at: typeof raw["at"] === "number" && Number.isFinite(raw["at"]) ? raw["at"] : 0,
+	};
+}
+
+/** Validate a persisted refactor marking: a malformed mark is dropped, never trusted as evidence. */
+function restoreRefactorMarking(raw: unknown): RefactorMarkingRecord | undefined {
+	if (!isRecord(raw) || !Array.isArray(raw["marks"])) return undefined;
+	if (typeof raw["workRevision"] !== "number" || !Number.isFinite(raw["workRevision"])) return undefined;
+	const marks: RefactorMark[] = [];
+	for (const mark of raw["marks"]) {
+		if (!isRecord(mark)) continue;
+		const id = mark["id"];
+		const outcome = mark["outcome"];
+		if (typeof id !== "string" || id.length === 0) continue;
+		if (outcome !== "preserved" && outcome !== "lost" && outcome !== "not_evidenced") continue;
+		marks.push({
+			id,
+			outcome,
+			reasons: Array.isArray(mark["reasons"])
+				? mark["reasons"].filter((r): r is string => typeof r === "string")
+				: [],
+		});
+	}
+	if (marks.length === 0) return undefined;
+	return {
+		marks,
+		taskFingerprint: typeof raw["taskFingerprint"] === "string" ? raw["taskFingerprint"] : undefined,
+		workRevision: raw["workRevision"],
+		at: typeof raw["at"] === "number" && Number.isFinite(raw["at"]) ? raw["at"] : 0,
 	};
 }
 

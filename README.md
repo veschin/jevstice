@@ -149,10 +149,55 @@ Skill and model routing read the candidate lists the owner holds:
 ```
 
 The judge chooses only from those candidates, so it can never invent a skill or a model. Submit the
-`skill_routing` or `model_routing` stage to get a choice; an approved skill is recorded, and an
-approved model is enforced at the next subagent spawn. `allowlist` defaults to the model candidate
+`skill_routing` or `model_routing` stage to get a choice. An approved model is enforced at the next
+subagent spawn. An approved skill takes effect in the running session: the controller delivers it to
+the executor as an aside through the same channel every other verdict uses - the skill's id, its
+label and the owner's own statement of what choosing it commits to - and records it in session state
+as `routedSkill`. Nothing is delivered and nothing is recorded on a verdict other than `approve`; the
+configured candidate list stays the only source a skill can come from. What the extension cannot do
+is install a skill into the prompt: it delivers the selection, and the executor applies it from the
+skill's own files. `allowlist` defaults to the model candidate
 list; a model outside it is excluded before the judge sees it. Without candidates the stage refuses
 explicitly - no candidates, no routing.
+
+## Refactoring: the inventory and the marking (FR-13)
+
+A refactoring is checked in two steps, and the first one has a deadline of its own.
+
+1. BEFORE the first code edit of the task, submit `stage=refactor_inventory` with `inventory`: one
+   `{id, name, verification}` per old function, where `verification` is the command that checks that
+   function. The inventory is recorded in session state and delivered back into the session. A
+   submission that arrives after the first edit is refused: an inventory written afterwards cannot
+   establish what existed before the refactoring.
+2. AFTER the refactoring, submit `stage=refactor_marking` with `inventoryMarks`: one
+   `{id, evidence}` per inventory item, the evidence being that item's own artifact material - a code
+   quote, a command output or a log excerpt. The judge marks every item `preserved` or `lost` from
+   its own material. An item it can only mark `not_evidenced` (the material is a claim, or belongs to
+   another item) keeps completion blocked under that item's id: the stop boundary names it and the
+   work is not finished. The executor's own report is not evidence - material that is not an artifact
+   is refused before the judge is asked.
+
+The marking is bound to the work revision it was made at: any code edit after it makes the marking
+stale and the boundary names every item again. A task that never recorded an inventory is unaffected.
+The separate `capabilities` list still drives the completion coverage check (every declared
+capability must be marked `applicable_and_addressed` from artifact evidence); the inventory is the
+FR-13 path, where each item carries its verification command and its own preserved/lost marking.
+
+```json
+{
+  "stage": "refactor_inventory",
+  "task": "Refactor the export pipeline",
+  "proposal": "Record the old functions this refactoring touches before the first edit.",
+  "options": [{ "id": "recorded", "label": "Recorded", "meaning": "the inventory is recorded" }],
+  "evidence": [{ "kind": "user", "source": "task prompt", "quote": "refactor the export pipeline" }],
+  "inventory": [
+    { "id": "export-json", "name": "exportJson()", "verification": "bun test tests/export.test.ts -t json" }
+  ]
+}
+```
+
+The inventory step consults no judge - a declaration is not a question; the marking is what is judged.
+`proposal` and `options` stay required by the tool schema on both stages.
 
 ## Catalog checks
 
@@ -202,7 +247,9 @@ How each activity is armed:
   advisory (it never blocks, never spends the rework budget and never satisfies the completion
   boundary) and checks against the formalized list when one exists, else the task prompt. The
   destructive-action gate and the hand-off gate are armed by `gates.destructive.patterns` and
-  `stages.subagent_handoff` respectively.
+  `stages.subagent_handoff` respectively. The FR-13 refactoring steps live here too: submit
+  `refactor_inventory` before the first code edit of the task, `refactor_marking` after the work, and
+  the stop boundary names every inventory item left without an evidence-backed marking.
 - `review` - always submittable, never gate-granting.
 - `completion` - armed by `gates.completion` (default on).
 
@@ -417,8 +464,10 @@ submittable `stage` and is shaped by the config key shown:
 | `claim_check` | `on_demand` | per-claim support marking against the quoted evidence (one request) | `stages.claim_check` |
 | `requirements_formalization` | `on_demand` | numbered requirement list: per-item traceability + coverage verdict (activities framework) | `stages.requirements_formalization` |
 | `plan_mapping` | `on_demand` | per-requirement plan claims, marked by the claim-check path (planning activity) | `stages.plan_mapping` |
-| `skill_routing` | `on_demand` | skill choice from `routing.skills` | `stages.skill_routing` |
+| `skill_routing` | `on_demand` | skill choice from `routing.skills`; an approved skill is delivered into the session and recorded | `stages.skill_routing` |
 | `model_routing` | `on_demand` | model choice from `routing.models` | `stages.model_routing` |
+| `refactor_inventory` | `on_demand` | FR-13: the old functions of a refactoring, each with its verification command, fixed before the first code edit; a later submission is refused | `stages.refactor_inventory` |
+| `refactor_marking` | `on_demand` | FR-13: per-item preserved/lost marking after the refactoring, judged from each item's own artifact material; an item without material keeps completion blocked by name | `stages.refactor_marking` |
 | `subagent_handoff` | `on_demand` | FR-11 hand-off check: dispatch before the spawn, acceptance on the delivered result (opt-in) | `stages.subagent_handoff` |
 | `destructive_action` | `on_demand` | execution-time judge of a destructive `bash` command (opt-in) | `stages.destructive_action` |
 | `business_review` | `on_demand` | business review: two 0..9 scores, declared-risk choice, value statement, one statement per declared decision (advisory) | `stages.business_review` |

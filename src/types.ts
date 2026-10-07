@@ -43,7 +43,9 @@ export type DecisionStage =
   | "plan_mapping" // activities framework (planning): per-requirement claim that the plan serves it, marked by the claim_check path
   | "business_review" // review activity (advisory): the product as it stands against the customer's promised outcome
   | "architecture_review" // review activity (advisory): how well the implementation absorbs the next change
-  | "security_review"; // review activity (advisory, opt-in): per-surface attack/disclosure paths
+  | "security_review" // review activity (advisory, opt-in): per-surface attack/disclosure paths
+  | "refactor_inventory" // FR-13 part (1): the old-function inventory, fixed BEFORE the first code edit of the task
+  | "refactor_marking"; // FR-13 part (2): per-item preserved/lost marking after the refactoring, from attached evidence
 
 /** Fixed option set presented to the judge (FR-08). */
 export interface DecisionOption {
@@ -177,6 +179,48 @@ export interface AspectCoverageResult {
 }
 
 export type AspectCoverageJudge = (request: AspectCoverageRequest) => Promise<AspectCoverageResult>;
+
+// ---------- Refactor inventory (FR-13: inventory before the first edit, per-item marking after it) ----------
+
+/** One item of the refactor inventory: an old function and the command that verifies it. */
+export interface RefactorInventoryItem {
+  id: string;
+  /** The old function/feature this item stands for. */
+  name: string;
+  /** The command that verifies this function (FR-13 part 1: every item carries one). */
+  verification: string;
+}
+
+/**
+ * What the judge can say about one inventory item after the refactoring (FR-13 part 2):
+ * preserved or lost FROM the artifact material attached to that item - or not_evidenced when
+ * the attached material does not establish either (a claim is not evidence).
+ */
+export type RefactorMarkingOutcome = "preserved" | "lost" | "not_evidenced";
+
+/** One inventory item with the artifact material attached to it (a code quote or a command output). */
+export interface RefactorMarkingSubject extends RefactorInventoryItem {
+  evidence: Evidence[];
+}
+
+export interface RefactorMarkingRequest {
+  items: RefactorMarkingSubject[];
+  /** What the executor says it did; context only, never evidence by itself. */
+  currentAction?: string;
+}
+
+export interface RefactorMarkingResult {
+  /** One marking per requested item id; empty when judged is false or the judge escaped the frame. */
+  markings: Record<string, RefactorMarkingOutcome>;
+  reasons: string[];
+  confidence?: number;
+  /** False when the judge could not be consulted (fail-closed; never a partial marking). */
+  judged: boolean;
+  /** Meta-option escape: the judge rejects the frame -> no marking is ever recorded. */
+  escape?: boolean;
+}
+
+export type RefactorMarkingJudge = (request: RefactorMarkingRequest) => Promise<RefactorMarkingResult>;
 
 // ---------- Claim check (per-claim support marking; claim_check preset) ----------
 
