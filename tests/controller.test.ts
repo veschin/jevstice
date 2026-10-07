@@ -1503,3 +1503,54 @@ describe("jev controller", () => {
 		expect(String(tool?.description)).toContain("course_check");
 	});
 });
+
+describe("jev controller: gates.mutation switch", () => {
+	test("gates.mutation=false lifts the plan gate for every mutating tool", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({ judge: gateJudge(), template: { gates: { mutation: false } } });
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "build it", systemPrompt: [] });
+		for (const mutating of ["edit", "write", "ast_edit", "bash", "memory_edit", "manage_skill"]) {
+			const res = blockResult(
+				await harness.emit("tool_call", { type: "tool_call", toolCallId: `m-${mutating}`, toolName: mutating, input: {} }),
+			);
+			expect(res.block).toBeUndefined();
+		}
+	});
+
+	test("gates.mutation=false: the stop gate drops the plan-approval requirement, keeps completion", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({ judge: gateJudge(), template: { gates: { mutation: false } } });
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "build it", systemPrompt: [] });
+		const res = await runStop(harness);
+		expect(res.decision).toBe("block");
+		expect(String(res.reason)).not.toContain("plan-stage approval");
+		expect(String(res.reason)).toContain("completion_review");
+	});
+
+	test("without the switch the plan gate still blocks", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({ judge: gateJudge() });
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "build it", systemPrompt: [] });
+		const res = blockResult(
+			await harness.emit("tool_call", { type: "tool_call", toolCallId: "m", toolName: "edit", input: {} }),
+		);
+		expect(res.block).toBe(true);
+	});
+});
+
+describe("jev controller: eval coverage", () => {
+	test("eval is blocked by the plan gate like the other mutation-capable builtins", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({ judge: gateJudge() });
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "build it", systemPrompt: [] });
+		const res = blockResult(
+			await harness.emit("tool_call", { type: "tool_call", toolCallId: "e", toolName: "eval", input: {} }),
+		);
+		expect(res.block).toBe(true);
+		expect(String(res.reason)).toContain("plan gate");
+	});
+});

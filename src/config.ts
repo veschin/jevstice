@@ -35,6 +35,12 @@ export interface JevTemplateConfig {
 	 */
 	/** Calibration-tolerant completion: may only RAISE POLICY defaults (controller clamps). */
 	completion?: { consecutiveApproves?: number; confidenceFloor?: number };
+	/**
+	 * Gate switches (user-owned). `mutation: false` lifts the plan gate: mutating tools are
+	 * no longer blocked while no plan-stage approval exists. Fail-closed judging, digests,
+	 * bounded rework and completion binding are unchanged.
+	 */
+	gates?: { mutation?: boolean };
 	controlPoints?: Record<
 		string,
 		{ trigger: "on_demand"; instructions?: string; options?: Array<{ id: string; label: string; meaning: string }> }
@@ -154,6 +160,16 @@ export function validateTemplateConfig(file: string, raw: unknown): JevTemplateC
 		}
 		out.capabilities = caps as string[];
 	}
+	if (raw["gates"] !== undefined) {
+		if (!isRecord(raw["gates"])) throw new JevConfigError(file, "gates must be an object");
+		const gates: { mutation?: boolean } = {};
+		const mutation = raw["gates"]["mutation"];
+		if (mutation !== undefined) {
+			if (typeof mutation !== "boolean") throw new JevConfigError(file, "gates.mutation must be a boolean");
+			gates.mutation = mutation;
+		}
+		out.gates = gates;
+	}
 	return out;
 }
 
@@ -168,6 +184,8 @@ export function mergeTemplateConfigs(user: JevTemplateConfig, project: JevTempla
 		// (R1 additionally clamps the effective value to max(POLICY.minConfidenceToApprove, x).)
 		confidenceThreshold: user.confidenceThreshold ?? project.confidenceThreshold,
 		capabilities: project.capabilities ?? user.capabilities,
+		// Trust split like the approval floor: the plan-gate switch is USER-owned.
+		gates: user.gates ?? project.gates,
 		completion:
 			user.completion === undefined && project.completion === undefined
 				? undefined

@@ -172,3 +172,20 @@ describe("jev template config", () => {
 		expect(merged.capabilities).toEqual(["x"]);
 	});
 });
+
+describe("jev template config: gates switch", () => {
+	test("gates.mutation=false is parsed", () => {
+		const parsed = validateTemplateConfig(USER_FILE, { gates: { mutation: false } });
+		expect(parsed.gates?.mutation).toBe(false);
+	});
+
+	test("trust split: the switch is user-owned, a project file cannot turn it back on", () => {
+		const merged = mergeTemplateConfigs({ gates: { mutation: false } }, { gates: { mutation: true } });
+		expect(merged.gates?.mutation).toBe(false);
+	});
+
+	test("fail-closed: gates.mutation must be a boolean and gates an object", () => {
+		expect(() => validateTemplateConfig(PROJECT_FILE, { gates: { mutation: "no" } })).toThrow(/gates\.mutation/);
+		expect(() => validateTemplateConfig(PROJECT_FILE, { gates: [] })).toThrow(/gates must be an object/);
+	});
+});

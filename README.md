@@ -55,6 +55,7 @@ fingerprint, content digest and work revision.
 
 ```json
 {
+  "gates": { "mutation": false },
   "confidenceThreshold": 0.9,
   "completion": { "consecutiveApproves": 3, "confidenceFloor": 0.7 },
   "stages": {
@@ -70,9 +71,13 @@ fingerprint, content digest and work revision.
 Thresholds and counts are raise-only. Meta options cannot be removed. Invalid or unreadable
 config keeps the gates registered and closed, naming the file and the problem.
 
+`gates.mutation: false` is user-owned and lifts the plan gate: mutating tools are no longer
+blocked while no plan-stage approval exists. Judging, content digests, bounded rework and the
+completion binding are unchanged.
+
 ## Limits
 
-- Mutation gate covers builtin tools only; custom/MCP tools are outside it.
+- Mutation gate covers builtin tools only, including `eval`; custom/MCP/xdev tools are outside it.
 - Subagent gates are per-session; the parent does not see subagent tool calls.
 - Provider prompt-cache hits are not measured.
 - Completion judging does not guarantee correctness.

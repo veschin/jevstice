@@ -1291,3 +1291,26 @@ describe("aspect coverage judge", () => {
     await expect(judge(okAspects)).rejects.toBeInstanceOf(JevApiError);
   });
 });
+
+describe("client: transport retry", () => {
+	test("a socket reset is retried and the answer is then returned", async () => {
+		let calls = 0;
+		const fetchFn = (async () => {
+			calls++;
+			if (calls <= 2) throw new Error("The socket connection was closed unexpectedly");
+			return okResponse();
+		}) as unknown as typeof fetch;
+		const judge = createJudge({ apiKey: "k", fetchFn, retryDelayMs: 0, maxRetries: 3 });
+		const result = await judge(okReq);
+		expect(result.verdict).toBe("approve");
+		expect(calls).toBe(3);
+	});
+
+	test("exhausted transport retries surface a transport JevApiError", async () => {
+		const fetchFn = (async () => {
+			throw new Error("The socket connection was closed unexpectedly");
+		}) as unknown as typeof fetch;
+		const judge = createJudge({ apiKey: "k", fetchFn, retryDelayMs: 0, maxRetries: 1 });
+		await expect(judge(okReq)).rejects.toThrow(JevApiError);
+	});
+});

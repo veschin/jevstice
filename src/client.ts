@@ -92,7 +92,7 @@ export interface JevClientConfig {
   apiUrl?: string;
   model?: string;
   timeoutMs?: number;
-  /** Extra attempts after the first; delegated to the SDK retry policy. */
+  /** Extra attempts after the first, applied by this module's transport retry. */
   maxRetries?: number;
   /** Below this the verdict demotes to insufficient_evidence. Default POLICY. */
   minConfidence?: number;
@@ -161,10 +161,9 @@ export function createSDKClient(config: JevClientConfig): TypeSafeClient {
     baseURL: sdkBaseURL(config.apiUrl ?? POLICY.defaultApiUrl),
     defaultModel: config.model ?? POLICY.defaultModel,
     timeout: config.timeoutMs ?? 30000,
-    retry: {
-      maxRetries: config.maxRetries ?? 4,
-      backoffInitialMs: config.retryDelayMs ?? 500,
-    },
+    // SDK retry off: this module owns the one retry policy (stacking SDK retries on top
+    // multiplied the budget and turned an unreachable endpoint into a 30s+ hang).
+    retry: { maxRetries: 0 },
     logLevel: "off",
     ...(config.fetchFn ? { fetch: config.fetchFn } : {}),
   });
@@ -248,6 +247,36 @@ async function systemOne(
   }
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Transport-level retry: the SDK retry policy does not cover socket resets reliably
+ * (live: 2 of 3 extension calls died with APIConnectionError after maxRetries=4 while
+ * plain fetch to the same endpoint succeeded). Retries only transport-class failures;
+ * validation and auth errors are returned immediately.
+ */
+async function systemOneWithTransportRetry(
+  client: TypeSafeClient,
+  body: JevApiRequest,
+  config: JevClientConfig,
+): Promise<JevApiResponse> {
+  const attempts = Math.max(1, (config.maxRetries ?? 4) + 1);
+  const baseDelay = config.retryDelayMs ?? 500;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await systemOne(client, body);
+    } catch (err) {
+      const retryable =
+        err instanceof JevApiError &&
+        (err.code === "transport" || err.code === "timeout" || err.code === "rate_limited");
+      if (!retryable || attempt >= attempts - 1) throw err;
+      await delay(baseDelay * 2 ** attempt);
+    }
+  }
+}
+
 /**
  * Production judge. Same code path as the CLI. Throws JevApiError on any
  * transport/validation problem; a returned result always reflects an explicit
@@ -291,7 +320,9 @@ export function createJudge(config: JevClientConfig): Judge {
     }
 
     const client = createSDKClient(config);
-    const parsed = validateAnswers(await systemOne(client, buildRequestBody(effectiveRequest, config)));
+    const parsed = validateAnswers(
+      await systemOneWithTransportRetry(client, buildRequestBody(effectiveRequest, config), config),
+    );
     const verdictAnswer = parsed.answers["verdict"]!;
     const optionAnswer = parsed.answers["option"]!;
 

@@ -110,7 +110,7 @@ describe("cli: runCli", () => {
       called++;
       return new Response("{}", { status: 200 });
     }) as unknown as typeof fetch;
-    const out = await runCli(["--", JSON.stringify(okReq)], { fetchFn });
+    const out = await runCli(["--", JSON.stringify(okReq)], { env: {}, fetchFn });
     expect(out.exitCode).toBe(4);
     expect(called).toBe(0);
     expect(out.stderr).toContain("config");
@@ -133,7 +133,7 @@ describe("cli: runCli", () => {
   });
 
   test("probe subcommand without key emits clean error JSON and nonzero exit", async () => {
-    const out = await runCli(["probe"], { fetchFn: okFetch() });
+    const out = await runCli(["probe"], { env: {}, fetchFn: okFetch() });
     expect(out.exitCode).toBe(4);
     const parsed = JSON.parse(out.stderr);
     expect(parsed.error).toBe("config");

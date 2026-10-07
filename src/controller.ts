@@ -140,6 +140,9 @@ const MUTATING_TOOLS: ReadonlySet<string> = new Set([
 	"bash",
 	"memory_edit",
 	"manage_skill",
+	// eval spawns processes and writes files from inside the kernel without a tool_call
+	// of its own: gated for the same reason as bash (conservative, mutation-capable).
+	"eval",
 ]);
 /** course_check redirecting options: approve+these map to revise (registry holds the full set). */
 const COURSE_CHECK_REDIRECTING: ReadonlySet<string> = new Set(["return_to_requirement", "replan"]);
@@ -510,7 +513,9 @@ export class JevController {
 				};
 			}
 			const plan = this.planApproval();
-			if (plan === undefined) {
+			// User-owned switch: `gates.mutation === false` lifts the block. Judging,
+			// digests and the work-revision bump on the next lines are unchanged.
+			if (plan === undefined && this.template.gates?.mutation !== false) {
 				return {
 					block: true,
 					reason:
@@ -1440,7 +1445,7 @@ export class JevController {
 		// exactly like mutated work; a session with no established task stops free.
 		if (this.state.taskFingerprint === undefined) return [];
 		const missing: string[] = [];
-		if (this.planApproval() === undefined) {
+		if (this.template.gates?.mutation !== false && this.planApproval() === undefined) {
 			missing.push("no plan-stage approval (understanding_review or direction_review) for the current task");
 		}
 		// Latest approval wins: supersede keeps same-digest records, so the freshest

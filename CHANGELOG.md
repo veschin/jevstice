@@ -32,3 +32,23 @@
   - Wired course_check validates the judge contract (fixed next-action set, exact onTrack keys, finite confidence at/above floor; drift never continues) and binds freshness to task+workRevision; raised completion config applies on mid-session reload.
 - Live-Jev review loop for this release: remediation plan direction_review + per-requirement course_check (both flagged the two weak areas before implementation); final release review through the addon CLI returned revise 0.33 -> verify_before_proceeding 0.60 (all six requirements on track) -> insufficient_evidence 0.38 - below the 0.6 floor, so release approval escalates to the user per POLICY (no faked success; same whole-project calibration ceiling as the field trial).
 - 217/217 tests, `tsc --noEmit` clean, LSP diagnostics clean; guard fast tier has no js/ts analyzer configured in this repo (deliberately no lint/format tooling).
+
+## 0.3.0 - 2026-10-07
+
+- `gates.mutation` switch (user-owned, default on): `false` lifts the plan gate so mutating tools
+  are no longer blocked while no plan-stage approval exists. Judging, digests, bounded rework and
+  the completion binding are unchanged; the stop gate drops the plan requirement under the same
+  switch. Written because the gate had no way back once plan-stage approvals stopped arriving.
+- One transport retry policy: the SDK retry is switched off and this module owns transport-class
+  retries (socket resets, timeouts, rate limits) with exponential backoff. Live: 2 of 3 extension
+  calls died with APIConnectionError after maxRetries=4 while plain fetch to the same endpoint
+  succeeded; stacking SDK retries on top of ours turned an unreachable endpoint into a 30s+ hang.
+- `eval` added to the mutation gate: it spawns processes and writes files from inside the kernel
+  without a tool_call of its own, so it was a straight bypass of the gate.
+- CLI tests made hermetic (two cases relied on an empty ambient environment).
+- Threshold diagnosis (live, 15 judged calls): approval confidence is not option-count-limited -
+  a decisive evidence set yields approve 0.94-0.96 on both 2-way and 7-way questions. It collapses
+  to 0.14-0.26 when the question asks for an open judgement (approve my plan) and reaches 0.79 when
+  the same plan is phrased as a claim checked against quoted sources. The 0.8 floor is calibrated
+  for verification, not for plan approval; the plan stage therefore fails closed permanently.
+  225/225 tests, tsc clean.
