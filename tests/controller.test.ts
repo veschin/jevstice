@@ -89,7 +89,11 @@ function judgeResult(partial: Partial<DecisionResult>): DecisionResult {
 /** Grant the plan gate so mutating tool calls are allowed (AC4a). */
 async function approvePlan(controller: { submitDecision(input: unknown): Promise<unknown> }): Promise<unknown> {
 	return controller.submitDecision(
-		validDecisionInput({ stage: "understanding_review", proposal: "Plan: implement feature X in module M." }),
+		validDecisionInput({
+			stage: "understanding_review",
+			proposal: "Plan: implement feature X in module M.",
+			evidence: [evidence("user", "Implement feature X for the dashboard"), evidence("execution", "dry-run plan output ok")],
+		}),
 	);
 }
 
@@ -596,10 +600,10 @@ describe("jev controller", () => {
 		const outcome = await controller.submitDecision(
 			courseInput({
 				evidence: [
-					evidence("user", "REQ user quote: login must persist"),
-					evidence("user", "REQ user quote: login must persist"), // exact duplicate -> merged
-					evidence("spec", "REQ spec quote: session expiry differs"), // same id, different quote -> REQ#2
-					evidence("execution", "tests pass"),
+					evidence("user", "REQ user quote: login sessions must persist across restarts"),
+					evidence("user", "REQ user quote: login sessions must persist across restarts"), // exact duplicate -> merged
+					evidence("spec", "REQ spec quote: session expiry policy differs by tier"), // same id, different quote -> #2
+					evidence("execution", "dry-run output: all checks green"),
 				],
 			}),
 		);

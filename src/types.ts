@@ -72,6 +72,8 @@ export interface DecisionResult {
   reasons: string[];
   /** Judge confidence 0..1 when the API returns one. */
   confidence?: number;
+  /** Pre-judge evidence-quality notices (duplicate/short quotes); advisory only. */
+  warnings?: string[];
 }
 
 // ---------- Judge dependency ----------

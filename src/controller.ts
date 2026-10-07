@@ -89,6 +89,8 @@ export interface DecisionOutcome {
 	confidence?: number;
 	/** Judge was actually consulted for this outcome. */
 	judged: boolean;
+	/** Non-fatal evidence-quality codes surfaced alongside a judged verdict. */
+	warnings?: string[];
 }
 
 export interface StopGateResult {
@@ -603,6 +605,33 @@ export class JevController {
 		}
 		const input = check.input;
 
+		// P3 evidence pre-check: catch would-be-wasted consultations before burning the
+		// rework counter. >=2 problems (or missing requirement evidence on plan stages)
+		// reject immediately; a single quality problem judges with a warnings annotation.
+		const planStage = lookupControlPoint(input.stage, this.extraPoints)?.trigger === "mutation_gate";
+		const problems: string[] = [];
+		const warnings: string[] = [];
+		const seenQuotes = new Map<string, number>();
+		input.evidence.forEach((e, i) => {
+			const first = seenQuotes.get(e.quote);
+			if (first !== undefined) {
+				problems.push(`duplicate_evidence_quote#${i}`);
+				warnings.push(`duplicate_evidence_quote#${i}`);
+				return;
+			}
+			seenQuotes.set(e.quote, i);
+			if (e.quote.length < 20) {
+				problems.push(`quote_too_short:${e.source}#${i}`);
+				warnings.push(`quote_too_short:${e.source}#${i}`);
+			}
+		});
+		if (planStage && !input.evidence.some(e => e.kind === "user" || e.kind === "spec")) {
+			problems.push("no_requirement_evidence");
+		}
+		if (problems.includes("no_requirement_evidence") || problems.length >= 2) {
+			return { verdict: "insufficient_evidence", reasons: problems, judged: false };
+		}
+
 		const point = lookupControlPoint(input.stage, this.extraPoints);
 		if (point?.requiresArtifactEvidence === true) {
 			if (!input.evidence.some(e => COMPLETION_EVIDENCE_KINDS.has(e.kind))) {
@@ -754,6 +783,9 @@ export class JevController {
 			this.pushFeedback(`Jev judge asked for revision: ${result.reasons.join(" ")}`);
 		}
 		this.persist();
+		if (warnings.length > 0) {
+			return { ...result, judged: true, warnings };
+		}
 		return { ...result, judged: true };
 	}
 
