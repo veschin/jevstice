@@ -102,6 +102,78 @@ takes:
 - Submissions that name no `approach` are untouched by this dimension and keep the older digest
   budget: an identical resubmission consumes it, a changed submission starts a fresh one.
 
+## The answer obliges: the standing problems of a refusal (PRD 1.1 / FR-10)
+
+The owner's rule is one sentence: *"если ты спросил судью и он сказал переделать значит выясняй что не
+так и переделывай"*. A refusal is therefore not only a verdict in the transcript - it is a list of
+problems the work has to answer.
+
+- **What obliges.** A judged refusal (`revise`) that names at least one reason and carries a real
+  confidence at or above the floor a blocking gate uses (`POLICY.minConfidenceToApprove`, 0.8,
+  raise-only). A review is the one exception, by its own contract: a *finding* is how a review states
+  a confident negative (declared statement polarity above the fixed threshold, `src/reviews.ts`), so
+  it obliges without a choice-confidence. An abstention, a below-floor or unquantified refusal, a
+  judge error and a frame escape create NO obligation: the fail-closed rule decides, and uncertainty
+  is turned into neither an obligation nor an approval.
+- **What is recorded.** The judge's own reasons, verbatim, de-duplicated and in the order it named
+  them, as the standing problems of that task+stage (`outstandingRework` in the session state,
+  restored on a restart). A later refusal of the same stage ADDS what it names; a problem already
+  standing is never renumbered or dropped.
+- **What reaches the session.** The refusal delivers the numbered list into the SAME session,
+  together with what the next submission must do: change the WORK and answer every problem by
+  position. The rework journal keeps its own rule beside it - the attempt must name a different
+  approach.
+- **What the judge sees.** The next consultation of that stage carries the standing problems and the
+  declared answers verbatim inside the claim, with the question it is asked: does the quoted evidence
+  show every named problem resolved? An approve is then an answer about the problem, not a fresh
+  reading of the work.
+- **What is not recorded.** While any standing problem is unanswered: no approval of that stage, no
+  pass record a boundary consumes (the course-check `continue`, the aspect-coverage gap clearance,
+  the refactor marking), no completion-streak credit. The outcome is `insufficient_evidence` naming
+  `outstanding_rework_unanswered` and every problem.
+- **What stays shut.** On a plan-granting stage (`understanding_review`, `direction_review`) an older
+  approval no longer covers a later refusal: the mutation gate stays shut and names the problems, so
+  no mutating work continues as if the judge had answered approve.
+- **What clears it.** The judge's own approval of a submission that answered every problem, or an
+  escalation THE JUDGE answered (`ask_user`; the blocker then carries the problems). Nothing else - an
+  abstention, a judge error and a sub-floor answer leave it standing, and so does exhausting the
+  attempt bound: that escalation was answered by no judge, it names the approaches spent, and
+  spending attempts settles no problem.
+
+```json
+{
+  "stage": "understanding_review",
+  "task": "Plan the dashboard slice",
+  "proposal": "...",
+  "approach": "split the export item into narrower checkable items",
+  "answers": ["the export module and its own test are now in the plan and named in the proposal"],
+  "options": [ { "id": "approve", "label": "...", "meaning": "..." } ],
+  "evidence": [ { "kind": "user", "source": "task prompt", "quote": "..." } ]
+}
+```
+
+`answers` is positional: entry *i* answers problem *i* of the numbered list the refusal delivered. A
+blank entry is a submission defect (refused before the judge call), and `answers` never resets the
+rework budget - a submission that only re-words its answers is still the same submission.
+
+Where the obligation cannot be enforced, and why:
+
+- **Reviews stay advisory.** A finding obliges that review stage (the next review of it is not
+  recorded as a pass until it answers), but a review holds no boundary, so nothing is blocked by it.
+- **Stages whose refusal carries no confidence** (`claim_check`, `requirements_formalization`,
+  `plan_mapping`, `acceptance_criteria`, `requirement_priorities`, `refactor_marking`) return derived
+  marks rather than a judged refusal with a confidence, so no obligation is recorded for them: their
+  refusals are surfaced exactly as before.
+- **The acceptance side of the hand-off gate** runs on `message_end`, where the host cannot refuse a
+  result: the verdict is recorded and fed back, never enforced.
+- **The automatic periodic course check** is background and advisory by construction: it blocks
+  nothing and spends no rework, so it creates no obligation.
+- **Across stages** the obligation is per task+stage: a standing problem on one stage does not stop a
+  submission on another, and only that stage's own boundary (the plan gate, the completion gate, the
+  course-check pass) reflects it.
+- `refactor_inventory` consults no judge at all (a declaration is not a question), so it can never
+  carry an obligation.
+
 ## Claim check
 
 `stage=claim_check` puts several claims in one request and returns one verdict per claim, judged
@@ -645,6 +717,12 @@ Meta options cannot be removed: they are appended to every judge choice regardle
 - The judge abstains on questions that rest on the owner's preference rather than on evidence in the
   request - "should this be built" asked of it returned `insufficient_evidence` (0.35-0.64) three
   times, and the product's fail-closed rule then leaves the decision unmade rather than guessing it.
+  The obligation mechanism in "The answer obliges" was put to the judge the same way, in three
+  approaches (a design choice, the three readings of the owner's sentence, and a contradiction claim
+  against the quotes): all three came back `insufficient_evidence` (0.73 with `low_confidence`, 0.40,
+  0.23), so the DESIGN is recorded OPEN - the behaviour is derived from the requirement, not from a
+  judge approval, and it is the fail-closed rule that keeps a sub-floor or abstaining answer from
+  obliging anything.
 - The product's value is not demonstrated in its own favour. Three blind with-or-without runs - a
   small-task set, a drift-prone set, and a horizon set on a frozen revision with the weakest cheap
   model the owner's configuration runs - found no outcome difference: across 136 requirement

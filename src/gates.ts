@@ -460,6 +460,71 @@ export function confidentNegative(
 	);
 }
 
+/**
+ * The named problems a judge's refusal leaves standing (PRD section 1.1 and FR-10, the owner's own
+ * words: "если ты спросил судью и он сказал переделать значит выясняй что не так и переделывай" -
+ * the answer obliges). The problems are the judge's OWN reasons, kept verbatim and in the order it
+ * named them: they are what the next submission on the stage must answer by name, and what the
+ * next consult shows the judge verbatim. A frame escape is not a statement about the work and an
+ * empty reason names nothing, so neither becomes a problem; a repeat of an already-standing problem
+ * is not a second problem.
+ */
+export function namedRefusalProblems(reasons: readonly string[]): string[] {
+	const problems: string[] = [];
+	for (const reason of reasons) {
+		const problem = reason.trim();
+		if (problem.length === 0 || problem === FRAME_ESCAPE_REASON) continue;
+		if (problems.includes(problem)) continue;
+		problems.push(problem);
+	}
+	return problems;
+}
+
+/**
+ * Which named problems a submission did not answer. Answers are POSITIONAL: one entry per standing
+ * problem, in the order the refusal named them (the same order the feedback numbers them and the
+ * numbered list repeats), so a missing or blank entry leaves that problem standing. This is a
+ * precondition only - the executor's own words are never evidence (FR-16); the judge's answer is
+ * what decides whether a problem is resolved.
+ */
+export function unansweredProblems(problems: readonly string[], answers: readonly string[] | undefined): string[] {
+	return problems.filter((_, i) => {
+		const answer = answers?.[i];
+		return answer === undefined || answer.trim().length === 0;
+	});
+}
+
+/** `1. <problem>` lines: the numbered, verbatim list of standing problems the executor reads. */
+export function numberedProblems(problems: readonly string[]): string {
+	return problems.map((problem, i) => `${i + 1}. ${problem}`).join("\n");
+}
+
+/**
+ * The consult block that makes the standing problems part of the judgement: the named problems
+ * verbatim, the declared answers verbatim, and the question asked about them. Empty while no
+ * problem stands, so a first submission's frame is untouched - and a submission that answered
+ * nothing reaches the judge with that visible, never as a silently fresh question.
+ */
+export function outstandingProblemsBlock(problems: readonly string[], answers: readonly string[] | undefined): string {
+	if (problems.length === 0) return "";
+	const declared = problems
+		.map((_, i) => {
+			const answer = answers?.[i];
+			return answer === undefined || answer.trim().length === 0
+				? `${i + 1}. <not answered>`
+				: `${i + 1}. ${answer.trim()}`;
+		})
+		.join("\n");
+	return (
+		"THIS STAGE IS UNDER AN OUTSTANDING REFUSAL: a previous submission on it was refused and the judge " +
+		"named the problems below.\n\n" +
+		`Named problems (verbatim, from the judge):\n${numberedProblems(problems)}\n\n` +
+		`What this submission declares changed for each problem (verbatim, from the executor):\n${declared}\n\n` +
+		"Question on THIS submission: does the quoted evidence show every named problem resolved? Approve only " +
+		"if it does; if any named problem still stands, refuse again and name that problem."
+	);
+}
+
 export interface GateConsultContext {
 	/** Which frame of the descriptor frames this consultation. */
 	frame: string;

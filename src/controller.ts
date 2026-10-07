@@ -304,6 +304,26 @@ export interface ReworkJournal {
 	at: number;
 }
 
+/**
+ * The named problems a confident refusal left standing for one task+stage (PRD section 1.1 and
+ * FR-10: "если ты спросил судью и он сказал переделать значит выясняй что не так и переделывай" -
+ * the answer obliges). `problems` are the judge's own reasons, verbatim and in the order it named
+ * them: the numbered list the refusal delivers into the session, the list the next submission must
+ * answer by position, and the list the next consult shows the judge verbatim. The record is cleared
+ * only by the judge's own approval of a submission that answered every problem, or by an escalation
+ * the judge answered (`ask_user`); an abstention, a judge error, a sub-floor answer and an
+ * escalation from the attempt bound neither create nor clear it.
+ */
+export interface OutstandingRework {
+	stage: string;
+	taskFingerprint: string | undefined;
+	/** The standing problems, verbatim, in the order the refusals named them (never re-ordered). */
+	problems: string[];
+	/** How many confident refusals have contributed problems to this obligation. */
+	refusals: number;
+	at: number;
+}
+
 export interface JevState {
 	approvals: ApprovalRecord[];
 	/** Judge consultations per `${taskFingerprint}:${stage}` - bounded rework (FR-12). */
@@ -370,6 +390,13 @@ export interface JevState {
 	 * touched by this dimension and keep the digest budget above unchanged.
 	 */
 	reworkJournal: Record<string, ReworkJournal>;
+	/**
+	 * The standing named problems of a confident refusal per `taskFingerprint:stage` (PRD 1.1 /
+	 * FR-10: the answer obliges). While a record stands, the stage's next submission must answer
+	 * every problem by position, the consult shows the judge the problems and the declared answers
+	 * verbatim, and no approval of that stage is recorded from a submission that answers none.
+	 */
+	outstandingRework: Record<string, OutstandingRework>;
 	/** FR-01 record: task type the judge assigned at task start (undefined = not established). */
 	taskType: string | undefined;
 	/** FR-04 record: catalog topic ids the judge marked applicable at task start. */
@@ -422,6 +449,7 @@ function freshState(): JevState {
 		consecutiveCompletionApproves: undefined,
 		submissionDigests: {},
 		reworkJournal: {},
+		outstandingRework: {},
 		taskType: undefined,
 		selectedTopics: undefined,
 		taskPrompt: undefined,
@@ -606,6 +634,12 @@ export interface ValidatedDecisionInput {
 	 * judge call, a new name is a new attempt.
 	 */
 	approach?: string;
+	/**
+	 * The declared answers to the standing named problems of this stage (PRD 1.1/FR-10: the answer
+	 * obliges). Positional: entry i answers problem i of the numbered list the refusal delivered,
+	 * each stating what changed in the work. Empty when no problem stands.
+	 */
+	answers: string[];
 	options: DecisionOption[];
 	evidence: Evidence[];
 	capabilities: string[];
@@ -672,6 +706,21 @@ export function validateDecisionInput(raw: unknown, extraStages: ReadonlySet<str
 			reasons.push("approach must be a non-empty string naming the approach when provided");
 		} else {
 			approach = rawApproach.trim();
+		}
+	}
+	// The declared answers to a standing refusal (PRD 1.1/FR-10): positional, one per named
+	// problem. A blank entry is a submission defect like every other malformed field - the
+	// problem it claims to answer would not be answered by it either way.
+	const rawAnswers = raw["answers"];
+	const answers: string[] = [];
+	if (rawAnswers !== undefined) {
+		if (!Array.isArray(rawAnswers) || rawAnswers.some(a => typeof a !== "string" || a.trim().length === 0)) {
+			reasons.push(
+				"answers must be an array of non-empty strings: one entry per standing problem, in the order " +
+					"the refusal named them, each stating what changed in the work",
+			);
+		} else {
+			for (const answer of rawAnswers) answers.push((answer as string).trim());
 		}
 	}
 	const rawOptions = raw["options"];
@@ -834,6 +883,7 @@ export function validateDecisionInput(raw: unknown, extraStages: ReadonlySet<str
 			task: raw["task"] as string,
 			proposal: raw["proposal"] as string,
 			approach,
+			answers,
 			options,
 			evidence,
 			capabilities,
@@ -1092,6 +1142,14 @@ export class JevController {
 				`never a new attempt. When the ${this.maxReworkIterations} attempts are exhausted the stage escalates ` +
 				"as an OPEN item with the journal of approaches and the judge's answer to each; the wording is " +
 				"never bent to fit an answer. " +
+				"THE ANSWER OBLIGES: when the judge refuses a submission on a stage and names its reasons, those " +
+				"reasons are recorded as the standing problems of that stage and delivered into this session as a " +
+				"numbered list. The next submission on that stage must state, positionally in `answers`, what changed " +
+				"in the WORK for each problem (one entry per problem, in the numbered order), and no approval or pass " +
+				"of that stage is recorded while any problem is unanswered - for a plan-granting stage the mutation " +
+				"gate stays shut even when an older approval exists. The judge reads the standing problems and your " +
+				"answers verbatim inside the next consultation, so it decides whether each problem is resolved; an " +
+				"abstention, a sub-floor answer or a judge error neither creates nor clears the obligation. " +
 				"An abstention is not a verdict: insufficient_evidence means better " +
 				"evidence is needed, not the same request again, and a judge-chosen service option means the " +
 				"offered set was wrong, not that the work failed. " +
@@ -1158,6 +1216,15 @@ export class JevController {
 							"short name of the approach this attempt takes, e.g. \"tighten the trigger\"; it must " +
 							"differ from every approach already spent on this stage - a repeated approach is " +
 							"refused before any judge call",
+					},
+					answers: {
+						type: "array",
+						items: { type: "string" },
+						description:
+							"the declared answers to the standing named problems of this stage, POSITIONAL: entry i " +
+							"answers problem i of the numbered list the refusal delivered into the session, each " +
+							"stating what changed in the WORK for that problem. Required (complete) when the stage is " +
+							"under a refusal: with any problem unanswered no approval or pass of this stage is recorded",
 					},
 					options: {
 						type: "array",
@@ -1365,6 +1432,19 @@ export class JevController {
 			// rank the accepted batch (FR-21). Only a task with an accepted
 			// requirements_formalization is affected - without one the gate behaves as before.
 			if (this.template.gates?.mutation !== false) {
+				// PRD 1.1/FR-10: a refusal on a plan-granting stage names problems that oblige, and
+				// an older approval of that stage does not lift them - the boundary keeps the judge's
+				// own answer standing instead of the plan approval it replaced.
+				const standing = this.outstandingGrantingProblem();
+				if (standing !== undefined) {
+					return {
+						block: true,
+						reason:
+							`plan gate: ${standing}. Answer them in the same \`answers\` field of the next ` +
+							`submission on that stage and let the judge decide. Read-only evidence gathering ` +
+							"remains available.",
+					};
+				}
 				const mappingGap = this.planMappingGap();
 				const orderGap = this.prioritiesGap();
 				if (mappingGap !== undefined || orderGap !== undefined) {
@@ -1979,6 +2059,7 @@ export class JevController {
 				openAspectGaps: restoreAspectGaps(data["openAspectGaps"]),
 				submissionDigests: restoreDigests(data["submissionDigests"]),
 				reworkJournal: restoreReworkJournal(data["reworkJournal"]),
+				outstandingRework: restoreOutstandingRework(data["outstandingRework"]),
 				taskType: typeof data["taskType"] === "string" ? data["taskType"] : undefined,
 				selectedTopics: Array.isArray(data["selectedTopics"])
 					? (data["selectedTopics"] as unknown[]).filter((t): t is string => typeof t === "string")
@@ -2010,6 +2091,10 @@ export class JevController {
 		// approach and the judge's own verdict, and a rejection feeds back what the next attempt must
 		// change. Pre-judge refusals (`judged:false`) never spend an approach, so they are never recorded.
 		await this.recordReworkAttempt(raw, outcome);
+		// The answer obliges (PRD 1.1/FR-10): a confident refusal's named problems are recorded,
+		// delivered into this session and shown to the next judgement; an answered approval clears
+		// them and nothing else does.
+		this.applyOutstandingRework(raw, outcome);
 		if (outcome.summary !== "") return outcome;
 		const stage = isRecord(raw) && typeof raw["stage"] === "string" ? raw["stage"] : "unknown";
 		const options =
@@ -2280,6 +2365,12 @@ export class JevController {
 		if (templateStage?.instructions !== undefined) {
 			judgeProposal += `\n\n${templateStage.instructions.slice(0, 4000)}`;
 		}
+		// PRD 1.1/FR-10: while this stage carries standing named problems, the judgement is about
+		// them - the judge reads the problems and the declared answers verbatim inside the claim, so
+		// its approve decides the standing problem and nothing else can clear it. The block is
+		// derived from the standing record, never from the submission, so it cannot be omitted by
+		// answering nothing (that variant reaches the judge with `<not answered>` visible).
+		judgeProposal = this.withOutstandingProblems(boundKey, input, judgeProposal);
 
 		// C1 wired path: course_check preset consults the dedicated per-requirement judge.
 		if (input.stage === "course_check" && this.courseCheckJudge !== undefined) {
@@ -2465,6 +2556,19 @@ export class JevController {
 				// continue / verify_before_proceeding: record only, approves nothing.
 				// The record binds to task+work revision so the completion boundary can
 				// demand a FRESH check (verify never unlocks; only continue does).
+				// `continue` is the pass the completion boundary consumes, so the standing
+				// problems decide before it is written: with any of them unanswered there is
+				// no pass at all (the refusal below names them and spends the budget).
+				if (picked === "continue") {
+					const withheld = this.withheldByOutstanding(boundKey, input);
+					if (withheld !== undefined) {
+						// The consultation was spent on a submission that did not answer the standing
+						// problems: real rework, so it spends the bounded budget like a redirect.
+						this.state.iterations[boundKey] = used + 1;
+						this.persist();
+						return withheld;
+					}
+				}
 				this.state.lastCourseCheck = {
 					selectedOption: picked,
 					at: this.now(),
@@ -2480,6 +2584,20 @@ export class JevController {
 		// Bounded rework counts real rework only: a benign continue/verify record is not
 		// a retry and consumes nothing; redirects, escalations and failures do.
 		if (!benignCourseCheck) this.state.iterations[boundKey] = used + 1;
+
+		// The answer obliges (PRD 1.1/FR-10): while this stage carries standing named problems,
+		// an approve whose submission answered none of them is NOT recorded - no gate approval, no
+		// pass record, no completion-streak credit; the outcome is the refusal naming every problem.
+		// A benign course_check record is the exception the boundary itself handles: `continue` was
+		// already withheld above (it is what unlocks completion), while `verify_before_proceeding`
+		// unlocks nothing and is recorded as before with the problems left standing.
+		if (result.verdict === "approve" && !benignCourseCheck) {
+			const withheld = this.withheldByOutstanding(boundKey, input);
+			if (withheld !== undefined) {
+				interrupted();
+				return withheld;
+			}
+		}
 
 		// Lazy memo shared by the streak update and the approval record below: at most one
 		// content digest per submission.
@@ -2756,7 +2874,9 @@ export class JevController {
 		try {
 			raw = await this.courseCheckJudge!({
 				requirements,
-				currentAction: input.proposal,
+				// PRD 1.1/FR-10: while the stage carries standing named problems, the judge reads
+				// them and the declared answers verbatim beside the action being checked.
+				currentAction: this.withOutstandingProblems(boundKey, input, input.proposal),
 				evidence: input.evidence,
 			});
 		} catch (err) {
@@ -2812,6 +2932,16 @@ export class JevController {
 			}
 			// Benign record: binds to task+work revision, consumes no rework. Only a judged
 			// continue satisfies the completion boundary (verify never unlocks).
+			// The answer obliges (PRD 1.1/FR-10): `continue` is the pass that boundary consumes,
+			// so it is not written while a standing named problem of this stage is unanswered -
+			// the refusal names the problems and spends the budget like a redirect.
+			if (nextAction === "continue") {
+				const withheld = this.withheldByOutstanding(boundKey, input);
+				if (withheld !== undefined) {
+					consume();
+					return withheld;
+				}
+			}
 			this.state.lastCourseCheck = {
 				selectedOption: nextAction,
 				at: this.now(),
@@ -2832,10 +2962,20 @@ export class JevController {
 		if (nextAction === "return_to_requirement" || nextAction === "replan") {
 			consume();
 			this.pushFeedback(`Jev course_check redirects: ${nextAction}${driftSuffix}`);
+			// The judge's own confidence travels with the redirect: the standing-problem rule
+			// (PRD 1.1/FR-10) reads it exactly as it reads the choice verdicts, so a sub-floor or
+			// unquantified redirect stays uncertainty and obliges nothing.
+			const redirectConfidence = raw["confidence"];
 			return {
 				verdict: "revise",
 				selectedOption: nextAction,
 				reasons,
+				...(typeof redirectConfidence === "number" &&
+				Number.isFinite(redirectConfidence) &&
+				redirectConfidence >= 0 &&
+				redirectConfidence <= 1
+					? { confidence: redirectConfidence }
+					: {}),
 				judged: true,
 				summary: `course_check: revise — ${nextAction}: back to requirement${driftSuffix}`,
 			};
@@ -3684,7 +3824,14 @@ export class JevController {
 		}
 		const outcome = await consultReview({
 			stage: gate.stage,
-			task: `${gate.consult.task}\n\nSubject under review: ${input.task}`,
+			// PRD 1.1/FR-10: the findings of the previous review of this stage and the declared
+			// answers travel with the subject, verbatim, so an approve is the judge's own answer
+			// about the standing problem rather than a fresh reading of the same material.
+			task: this.withOutstandingProblems(
+				boundKey,
+				input,
+				`${gate.consult.task}\n\nSubject under review: ${input.task}`,
+			),
 			questions,
 			items,
 			// The template may replace the review's declared candidate set exactly as it may replace
@@ -3699,10 +3846,10 @@ export class JevController {
 			taskFingerprint: this.state.taskFingerprint,
 			workRevision: this.state.workRevision,
 		});
-		this.state.reviews[gate.id] = record;
 		if (!outcome.ok) {
 			// A review that could not be judged is real rework: it consumes the bound so a broken
 			// consult cannot loop forever, and it records the uncertainty without blocking anything.
+			this.state.reviews[gate.id] = record;
 			this.state.iterations[boundKey] = used + 1;
 			this.persist();
 			this.pushFeedback(`Jev ${gate.stage} not judged: ${outcome.detail}. Nothing is blocked.`);
@@ -3713,6 +3860,20 @@ export class JevController {
 				summary: `${gate.stage}: insufficient_evidence — ${outcome.detail} (recorded; nothing is blocked)`,
 			};
 		}
+		if (record.findings.length === 0) {
+			// The answer obliges (PRD 1.1/FR-10): a review with no findings is the pass of this
+			// stage, so while a standing named problem of it is unanswered the pass is not recorded
+			// at all - the refusal names the problems (the stage stays advisory: no blocker, no
+			// boundary moves, the finding list is simply not cleared by answering nothing). The
+			// consultation was spent on a submission that answered nothing, so it is real rework.
+			const withheld = this.withheldByOutstanding(boundKey, input);
+			if (withheld !== undefined) {
+				this.state.iterations[boundKey] = used + 1;
+				this.persist();
+				return withheld;
+			}
+		}
+		this.state.reviews[gate.id] = record;
 		if (record.findings.length > 0) {
 			this.state.iterations[boundKey] = used + 1;
 			this.persist();
@@ -3738,7 +3899,9 @@ export class JevController {
 		try {
 			raw = await this.aspectCoverageJudge!({
 				aspects: input.aspects.map(id => ({ id, text: id })),
-				currentAction: input.proposal,
+				// PRD 1.1/FR-10: standing named problems and the declared answers travel with the
+				// action under check, verbatim.
+				currentAction: this.withOutstandingProblems(boundKey, input, input.proposal),
 				evidence: input.evidence,
 			});
 		} catch (err) {
@@ -3791,6 +3954,11 @@ export class JevController {
 				summary: `aspect_coverage: revise — applicable_not_addressed: ${missed.join(", ")}`,
 			};
 		}
+		// The answer obliges (PRD 1.1/FR-10): an approve whose submission answered none of the
+		// standing named problems is not recorded - the drift teeth are not lifted and no pass of
+		// this stage is written while the judge's own problem stands.
+		const withheldAspect = this.withheldByOutstanding(boundKey, input);
+		if (withheldAspect !== undefined) return withheldAspect;
 		this.state.openAspectGaps = undefined;
 		this.persist();
 		return {
@@ -3919,6 +4087,192 @@ export class JevController {
 						"narrower separately checkable items; restate it as an outcome plus the evidence that " +
 						"settles it) - the same approach in different words is not a new attempt."),
 		);
+	}
+
+	// ----- the standing named problems of a confident refusal (PRD 1.1 / FR-10) -----
+
+	/**
+	 * The standing problems for a `taskFingerprint:stage` key, when any stand. A record without a
+	 * problem (or without a current task) is no obligation at all.
+	 */
+	private outstandingReworkFor(key: string): OutstandingRework | undefined {
+		const record = this.state.outstandingRework[key];
+		return record === undefined || record.problems.length === 0 ? undefined : record;
+	}
+
+	/** Parse the answers of a raw submission the way validateDecisionInput does (blank entries dropped). */
+	private static submissionAnswers(raw: unknown): string[] {
+		if (!isRecord(raw) || !Array.isArray(raw["answers"])) return [];
+		return raw["answers"]
+			.filter((a): a is string => typeof a === "string" && a.trim().length > 0)
+			.map(a => a.trim());
+	}
+
+	/**
+	 * The named problems a judged outcome leaves standing (`[]` = the outcome obliges nothing).
+	 * The problems are the judge's own reasons (src/gates.ts keeps them verbatim and de-duplicated).
+	 *
+	 * Who may oblige: only a refusal the product reads as confident. For every stage but a review
+	 * that means the judge's own confidence, present and at or above the minimum that gate refusals
+	 * use - a sub-floor or unquantified refusal is uncertainty, and uncertainty is never turned into
+	 * an obligation (while an approval still requires the floor and the fail-closed normalizer). A
+	 * review is the exception by its own contract: `src/reviews.ts` builds a finding out of the
+	 * declared statement polarity above a fixed threshold and calls it a confident negative, so a
+	 * finding IS how a review states a refusal - it carries no choice-confidence to compare.
+	 */
+	private namedRefusalProblems(stage: string, outcome: DecisionOutcome): string[] {
+		if (outcome.judged !== true || outcome.verdict !== "revise") return [];
+		// A frame escape is the judge rejecting the OFFERED OPTION SET, not the work: it records
+		// and never refuses, so it obliges nothing either (src/gates.ts, FRAME_ESCAPE_REASON).
+		if (outcome.reasons.includes(mechanism.FRAME_ESCAPE_REASON)) return [];
+		const problems = mechanism.namedRefusalProblems(outcome.reasons);
+		if (problems.length === 0) return [];
+		if (mechanism.reviewGateForStage(stage) !== undefined) return problems;
+		const confidence = outcome.confidence;
+		if (
+			confidence === undefined ||
+			!Number.isFinite(confidence) ||
+			confidence < this.minConfidence ||
+			confidence > 1
+		) {
+			return [];
+		}
+		return problems;
+	}
+
+	/**
+	 * Record (or extend) the standing problems of a task+stage and deliver the numbered list into the
+	 * SAME session as the thing to fix: what the judge named, that every problem must be answered by
+	 * position in `answers` on the next submission of this stage, and that the judge sees the problems
+	 * and the answers verbatim. Problems already standing are never renumbered or dropped - a refusal
+	 * adds what it named.
+	 */
+	private recordOutstandingRework(key: string, stage: string, problems: readonly string[], confidence: number | undefined): void {
+		const record = this.state.outstandingRework[key] ?? {
+			stage,
+			taskFingerprint: this.state.taskFingerprint,
+			problems: [],
+			refusals: 0,
+			at: this.now(),
+		};
+		for (const problem of problems) {
+			if (!record.problems.includes(problem)) record.problems.push(problem);
+		}
+		record.refusals += 1;
+		record.at = this.now();
+		this.state.outstandingRework[key] = record;
+		this.persist();
+		this.pushFeedback(
+			`Jev ${stage}: the judge refused and named ${problems.length} problem(s) - this answer obliges ` +
+				"(PRD 1.1: выясняй что не так и переделывай). The next submission on this stage must change the " +
+				`WORK and answer every problem below by position in \`answers\` (one entry per problem, in this ` +
+				`order), and no approval of this stage is recorded while any of them stands unanswered:\n` +
+				mechanism.numberedProblems(record.problems) +
+				(record.problems.length > problems.length
+					? `\n(${record.problems.length - problems.length} problem(s) named by an earlier refusal of ` +
+						"this stage still stand too.)"
+					: "") +
+				(confidence !== undefined ? `\n(that refusal carried confidence ${confidence})` : ""),
+		);
+	}
+
+	/** Drop a standing obligation: its stage is no longer under a refusal (approved or escalated). */
+	private clearOutstandingRework(key: string, stage: string, why: string): void {
+		if (this.state.outstandingRework[key] === undefined) return;
+		delete this.state.outstandingRework[key];
+		this.persist();
+		this.pushFeedback(`Jev ${stage}: the standing problems are settled - ${why}.`);
+	}
+
+	/**
+	 * The refusal that withholds an approval: while a stage carries standing named problems, a
+	 * submission that answers none of them is NOT recorded as an approval - the outcome is
+	 * insufficient_evidence naming every problem and the fix, so the boundary that consumes an
+	 * approval (the plan gate, the stop gate, the course-check pass) stays shut and the next step is
+	 * the rework the judge asked for. `undefined` when no problem stands or every problem is answered
+	 * (then the judge's own answer decides).
+	 */
+	private withheldByOutstanding(key: string, input: ValidatedDecisionInput): DecisionOutcome | undefined {
+		const record = this.outstandingReworkFor(key);
+		if (record === undefined) return undefined;
+		const unanswered = mechanism.unansweredProblems(record.problems, input.answers);
+		if (unanswered.length === 0) return undefined;
+		const problem =
+			`outstanding_rework_unanswered: ${input.stage} is under a refusal that named ` +
+			`${record.problems.length} problem(s); ${unanswered.length} of them are not answered by this ` +
+			"submission, so it is not recorded as an approval and no pass of this stage is written. Answer every " +
+			"problem by position in `answers` (one entry per problem, in the order below, each stating what changed " +
+			"in the work - changing the wording is not a rework). Named problems:\n" +
+			mechanism.numberedProblems(record.problems);
+		this.pushFeedback(`Jev ${input.stage}: approval withheld - ${problem}`);
+		return {
+			verdict: "insufficient_evidence",
+			reasons: [problem],
+			judged: true,
+			summary: `${input.stage}: insufficient_evidence — approval withheld: ${unanswered.length} named problem(s) unanswered`,
+		};
+	}
+
+	/**
+	 * The standing named problems of a plan-granting stage, as one line naming the stage and quoting
+	 * the problems verbatim - or undefined when none stands. The mutation boundary reads it beside
+	 * the approval record: a refusal on a granting stage keeps the boundary shut even when an older
+	 * approval of that stage is still in state, so no mutating work continues as if the judge had
+	 * answered approve (PRD 1.1/FR-10, and section 12.11 keeps the boundary check alongside the
+	 * obligation to rework).
+	 */
+	private outstandingGrantingProblem(): string | undefined {
+		const taskFingerprint = this.state.taskFingerprint;
+		if (taskFingerprint === undefined) return undefined;
+		for (const stage of this.approvalBoundary().grantingStages) {
+			const record = this.outstandingReworkFor(`${taskFingerprint}:${stage}`);
+			if (record !== undefined) {
+				return (
+					`${stage} carries ${record.problems.length} named problem(s) from a refusal of the judge: ` +
+					`${record.problems.join(" | ")}. Mutating work is blocked until a submission on that stage ` +
+					"answers every one of them and the judge approves it"
+				);
+			}
+		}
+		return undefined;
+	}
+
+	/** The judge-facing text with the standing problems and the declared answers attached, verbatim. */
+	private withOutstandingProblems(key: string, input: ValidatedDecisionInput, text: string): string {
+		const record = this.outstandingReworkFor(key);
+		if (record === undefined) return text;
+		return `${text}\n\n${mechanism.outstandingProblemsBlock(record.problems, input.answers)}`;
+	}
+
+	/**
+	 * The obligation in one place, after every path has produced its outcome: a confident refusal
+	 * records the problems it named, an APPROVED submission that answered every problem clears them,
+	 * an escalation to the user hands the loop over (the blocker names the problems), and an
+	 * abstention, a judge error or a sub-floor refusal leaves the record exactly as it was.
+	 */
+	private applyOutstandingRework(raw: unknown, outcome: DecisionOutcome): void {
+		if (!isRecord(raw) || outcome.judged !== true) return;
+		const stage = typeof raw["stage"] === "string" ? raw["stage"] : undefined;
+		const fingerprintNow = this.state.taskFingerprint;
+		if (stage === undefined || fingerprintNow === undefined) return;
+		const key = `${fingerprintNow}:${stage}`;
+		const standing = this.outstandingReworkFor(key);
+		if (standing !== undefined) {
+			if (outcome.verdict === "approve") {
+				const unanswered = mechanism.unansweredProblems(standing.problems, JevController.submissionAnswers(raw));
+				if (unanswered.length === 0) {
+					this.clearOutstandingRework(key, stage, "the judge approved a submission that answered every problem");
+				}
+				return;
+			}
+			if (outcome.verdict === "ask_user") {
+				this.clearOutstandingRework(key, stage, "the loop was escalated to the user, who owns the decision now");
+				return;
+			}
+		}
+		const problems = this.namedRefusalProblems(stage, outcome);
+		if (problems.length === 0) return;
+		this.recordOutstandingRework(key, stage, problems, outcome.confidence);
 	}
 
 	/**
@@ -4253,7 +4607,12 @@ export class JevController {
 		const items = input.inventoryMarks.map(m => ({ ...known.get(m.id)!, evidence: m.evidence }));
 		let raw: RefactorMarkingResult;
 		try {
-			raw = await this.refactorMarkingJudge({ items, currentAction: input.proposal });
+			raw = await this.refactorMarkingJudge({
+				items,
+				// PRD 1.1/FR-10: standing named problems and the declared answers travel with the
+				// action under check, verbatim.
+				currentAction: this.withOutstandingProblems(boundKey, input, input.proposal),
+			});
 		} catch (err) {
 			return {
 				verdict: "insufficient_evidence",
@@ -4291,14 +4650,24 @@ export class JevController {
 				summary: "",
 			};
 		}
-		// A judged marking is real rework when it comes back incomplete: the budget is spent, so a
-		// broken marking loop cannot run forever (same rule as the aspect_coverage preset).
-		this.state.iterations[boundKey] = used + 1;
+		const confidence = typeof raw["confidence"] === "number" ? raw["confidence"] : undefined;
 		const marks: RefactorMark[] = inventory.items.map(i => ({
 			id: i.id,
 			outcome: markings[i.id] as RefactorMarkingOutcome,
 			reasons: [`${i.name}: ${markings[i.id]}`],
 		}));
+		const notEvidenced = marks.filter(m => m.outcome === "not_evidenced").map(m => m.id);
+		// The answer obliges (PRD 1.1/FR-10): a complete marking is the pass this stage records for
+		// the completion boundary, so it is not written while a standing named problem of this stage
+		// is unanswered - the refusal names the problems instead. An incomplete marking is refused by
+		// name below as before (it blocks completion through the items, not through a pass).
+		if (notEvidenced.length === 0) {
+			const withheld = this.withheldByOutstanding(boundKey, input);
+			if (withheld !== undefined) return withheld;
+		}
+		// A judged marking is real rework when it comes back incomplete: the budget is spent, so a
+		// broken marking loop cannot run forever (same rule as the aspect_coverage preset).
+		this.state.iterations[boundKey] = used + 1;
 		this.state.lastRefactorMarking = {
 			marks,
 			taskFingerprint: this.state.taskFingerprint,
@@ -4306,8 +4675,6 @@ export class JevController {
 			at: this.now(),
 		};
 		this.persist();
-		const confidence = typeof raw["confidence"] === "number" ? raw["confidence"] : undefined;
-		const notEvidenced = marks.filter(m => m.outcome === "not_evidenced").map(m => m.id);
 		if (notEvidenced.length > 0) {
 			const named = notEvidenced.join(", ");
 			this.pushFeedback(
@@ -4611,6 +4978,15 @@ export class JevController {
 					"work mutation and before completion; verify_before_proceeding never unlocks)",
 			);
 		}
+		// PRD 1.1/FR-10: a later refusal of the stop stage is not covered by an older completion
+		// approval - the boundary names the problems the judge asked to answer instead of closing.
+		const standingAtStop = this.outstandingReworkFor(`${this.state.taskFingerprint}:${stopStage}`);
+		if (standingAtStop !== undefined) {
+			missing.push(
+				`${stopStage} carries ${standingAtStop.problems.length} named problem(s) from a refusal of the ` +
+					`judge: ${standingAtStop.problems.join(" | ")} - completion is not claimed while they stand`,
+			);
+		}
 		// aspect_coverage teeth: an open drift for the CURRENT task blocks completion until
 		// a fresh aspect_coverage submission clears it (advisory preset, no own stop gate).
 		const gaps = this.state.openAspectGaps;
@@ -4684,6 +5060,31 @@ function restoreReworkJournal(raw: unknown): Record<string, ReworkJournal> {
 			stage: value["stage"],
 			attempts: attempts.map((a, i) => ({ ...a, attempt: i + 1 })),
 			open: value["open"] === true,
+			at: typeof value["at"] === "number" ? value["at"] : 0,
+		};
+	}
+	return out;
+}
+
+/**
+ * Validate persisted standing problems: a malformed record is dropped whole (it would otherwise
+ * withhold honest work or assert a refusal that was never judged), and a record without a problem
+ * is dropped too - there is nothing to answer in it.
+ */
+function restoreOutstandingRework(raw: unknown): Record<string, OutstandingRework> {
+	if (!isRecord(raw)) return {};
+	const out: Record<string, OutstandingRework> = {};
+	for (const [key, value] of Object.entries(raw)) {
+		if (!isRecord(value) || typeof value["stage"] !== "string") continue;
+		const problems = Array.isArray(value["problems"])
+			? value["problems"].filter((p): p is string => typeof p === "string" && p.trim().length > 0)
+			: [];
+		if (problems.length === 0) continue;
+		out[key] = {
+			stage: value["stage"],
+			taskFingerprint: typeof value["taskFingerprint"] === "string" ? value["taskFingerprint"] : undefined,
+			problems,
+			refusals: typeof value["refusals"] === "number" && Number.isFinite(value["refusals"]) ? value["refusals"] : 1,
 			at: typeof value["at"] === "number" ? value["at"] : 0,
 		};
 	}

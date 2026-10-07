@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+- **The answer obliges: the standing problems of a refusal (PRD 1.1 / FR-10).** The owner's sentence
+  - "если ты спросил судью и он сказал переделать значит выясняй что не так и переделывай" - is now
+  the product's behaviour, not only advice. A judged refusal that names reasons at or above the
+  confidence floor records those reasons verbatim as the standing problems of that task+stage
+  (`outstandingRework`), delivers them into the same session as a numbered list, and shows them to the
+  next consultation of that stage together with the executor's declared `answers`. While any problem
+  is unanswered, no approval and no pass record of that stage is written - not the plan or completion
+  approval, not the course-check `continue`, not the aspect-coverage or refactor-marking pass - and on
+  a plan-granting stage the mutation gate stays shut even when an older approval exists. The
+  obligation clears only on the judge's own approval of a submission that answered every problem, or
+  on an escalation the judge answered (`ask_user`); exhausting the attempt bound clears nothing, and
+  an abstention, a sub-floor or unquantified refusal, a judge error and a frame escape create no
+  obligation and clear none: the fail-closed rule decides. A review finding is the one refusal that
+  obliges without a choice-confidence, by the review's own contract.
+  Documented in README "The answer obliges", with the places it cannot be enforced named there. The
+  design was put to the judge in three approaches (a design choice, three readings of the owner's
+  sentence, a contradiction claim against the quotes): all three abstained (0.73 low_confidence, 0.40,
+  0.23), so the design is recorded OPEN and the behaviour derives from the requirement.
+- `answers` is a new positional field of `jev_decision` (one entry per standing problem, in the order
+  the refusal named them); a blank entry is refused before any judge call, and the field never resets
+  the rework budget.
+- Verification: `bun run typecheck` clean; `bun test` 376 pass / 0 fail / 1773 expect() calls / 16
+  files (363 before; 13 added for this behaviour, each proven to fail when its rule is removed by a
+  mutation check against the green baseline - the withhold guards, the recording and delivery, the
+  judge-facing block, the clearing rule, the confidence floor and frame-escape filter, the restore
+  validator, the `answers` validation and both boundary checks).
+
 ## 1.0.0 - 2026-10-08
 
 First complete release. The product does one thing: the executor puts its business and architecture
