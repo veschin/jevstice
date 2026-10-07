@@ -167,20 +167,26 @@ export const HANDOFF_OPTIONS: readonly DecisionOption[] = [
 	},
 ];
 
-/** Destructive-action option set: the refusal is an explicit `revise`, never the absence of one. */
+/**
+ * Destructive-action option set: the refusal is an explicit `revise`, never the absence of one.
+ * The wording covers both triggers of the descriptor (a shell command and an out-of-root write), so
+ * the same option set stays truthful whichever boundary produced the consult.
+ */
 export const DESTRUCTIVE_OPTIONS: readonly DecisionOption[] = [
 	{
 		id: "approve",
 		label: "Safe to execute",
 		meaning:
-			"the command is not destructive or irreversible, or it is scoped so that running it is clearly intended",
+			"the command is not destructive or irreversible, or the write goes to a path the quoted task " +
+			"clearly intends, and the action is scoped so that running it is clearly intended",
 	},
 	{
 		id: "revise",
 		label: "Destructive or irreversible",
 		meaning:
-			"the command deletes or overwrites data, rewrites history, drops schema or is otherwise hard to " +
-			"reverse; do not run it without a fresh explicit decision - name the hazard",
+			"the command or the write deletes or overwrites data, rewrites history, drops schema, or lands " +
+			"outside the project the task works in, and is otherwise hard to reverse; do not run it without a " +
+			"fresh explicit decision - name the hazard",
 	},
 ];
 
@@ -195,7 +201,9 @@ export const DESTRUCTIVE_OPTIONS: readonly DecisionOption[] = [
  *  - `subagent_handoff`: the FR-11 gate. The controller consults it at the task-tool boundary
  *    (dispatch, before the spawn) and at the delivery of the delegated result (acceptance).
  *  - `destructive_action`: POLICY-DRAFT I. The controller consults it at the tool_call boundary
- *    for a bash command matching `gates.destructive.patterns`.
+ *    twice: for a bash command matching `gates.destructive.patterns`, and (when
+ *    `gates.destructive.outsideProjectWrites` arms it) for a write/edit/ast_edit call whose target
+ *    lies outside the project root - the same descriptor, one option set, one refusal rule.
  *  - the three reviews: advisory stages with fixed question sets; they record per-item results
  *    and surface them, and refuse nothing.
  */
@@ -254,10 +262,16 @@ export const GATE_REGISTRY: Readonly<Record<GateId, GateDescriptor>> = {
 		stage: "destructive_action",
 		mode: "blocking",
 		trigger: "on_demand",
-		boundary: "onDestructiveCall (tool_call, before a matching bash command runs)",
-		armedBy: "gates.destructive.patterns (owner config; absent or empty = the gate does not exist)",
-		evidenceRequired: "the bash command about to run, verbatim, plus the session task prompt when captured",
-		evidenceKinds: ["spec", "user"],
+		boundary:
+			"onDestructiveCall (tool_call, before a matching bash command runs, and before a write/edit/ast_edit " +
+			"whose resolved target lies outside the project root)",
+		armedBy:
+			"gates.destructive.patterns arms the command trigger (absent or empty = it does not exist); " +
+			"gates.destructive.outsideProjectWrites (owner config, off by default) arms the outside-root write trigger",
+		evidenceRequired:
+			"the bash command about to run, or the outside-root write's tool name, target path(s) and content " +
+			"prefix, verbatim, plus the session task prompt when captured",
+		evidenceKinds: ["spec", "user", "code", "log"],
 		consult: {
 			kind: "decision",
 			options: DESTRUCTIVE_OPTIONS,
@@ -272,7 +286,20 @@ export const GATE_REGISTRY: Readonly<Record<GateId, GateDescriptor>> = {
 						"now is not safe without a fresh explicit decision - it deletes or overwrites data, rewrites " +
 						"history, drops schema, or is otherwise hard to reverse.\n\n" +
 						subject,
-					deadlineMs: 25_000,
+					deadlineMs: DESTRUCTIVE_DEADLINE_MS,
+				},
+				outside_root_write: {
+					task:
+						"Judge this file write or edit at execution time, before it runs: its target lies outside the " +
+						"project root the task works in (POLICY-DRAFT destructive-action gate; the plan never covers " +
+						"a target outside its own boundary).",
+					claim: subject =>
+						"Claim under judgment: this write or edit modifies a path outside the project root the task " +
+						"works in, which is outside the boundary the plan covers - creating, overwriting or deleting " +
+						"a file there is not safe without a fresh explicit decision unless the quoted task clearly " +
+						"intends it.\n\n" +
+						subject,
+					deadlineMs: DESTRUCTIVE_DEADLINE_MS,
 				},
 			},
 		},

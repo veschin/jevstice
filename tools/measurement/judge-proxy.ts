@@ -12,6 +12,8 @@
  * `bun run tools/measurement/proxy-check.ts`.
  */
 import { isRecord } from "../../src/guards";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 const REAL_JUDGE_ORIGIN = "https://api.typesafe.ai";
 
@@ -20,12 +22,20 @@ export interface JudgeCall {
 	path: string;
 	model: string;
 	questionIds: string[];
+	/** Top-level keys of the request's `state`: what the consultation was about, without dumping it. */
+	stateKeys: string[];
 	stateBytes: number;
 	status: number;
 	latencyMs: number;
 	inputTokens: number;
 	outputTokens: number;
 	responseSummary: string;
+	/** Set only when JEV_PROXY_DUMP_DIR is configured: the verbatim request/response bodies. */
+	requestPath?: string;
+	responsePath?: string;
+	dumpError?: string;
+	/** Set when the relay itself failed (the endpoint resets sockets intermittently): status 502. */
+	relayError?: string;
 }
 
 export interface TrafficRecord {
@@ -48,12 +58,36 @@ export function systemOneFromApiUrl(apiUrl: string): string {
 
 /** One line per call, safe to print and to persist: no headers, no API key. */
 export function summariseCall(call: JudgeCall): string {
-	return `${call.at} ${call.status} ${call.latencyMs}ms questions=[${call.questionIds.join(",")}] state=${call.stateBytes}B tokens=${call.inputTokens}/${call.outputTokens} answers="${call.responseSummary}"`;
+	const state = call.stateKeys.length > 0 ? `state=[${call.stateKeys.join(",")}]` : "state=[]";
+	return `${call.at} ${call.status} ${call.latencyMs}ms questions=[${call.questionIds.join(",")}] ${state} ${call.stateBytes}B tokens=${call.inputTokens}/${call.outputTokens} answers="${call.responseSummary}"${call.requestPath === undefined ? "" : ` payload=${call.requestPath}`}`;
+}
+
+/**
+ * The full request/response bodies are written only when JEV_PROXY_DUMP_DIR names a directory: a
+ * measurement that wants to show what a consultation was about, and not only that one happened, sets
+ * that variable and gets one JSON pair per call. Headers are never written, so the API key stays out
+ * of the dump; the bodies hold extension-composed states (task text, plans, candidate answers).
+ */
+export function payloadDumpDir(): string | undefined {
+	const dir = process.env["JEV_PROXY_DUMP_DIR"];
+	return dir === undefined || dir.length === 0 ? undefined : dir;
+}
+
+function writeIfConfigured(path: string | undefined, text: string): string | undefined {
+	if (path === undefined) return undefined;
+	try {
+		writeFileSync(path, text, "utf8");
+		return undefined;
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
+	}
 }
 
 export async function startJudgeProxy(label: string): Promise<JudgeProxy> {
 	const calls: JudgeCall[] = [];
 	const record: TrafficRecord = { label, calls };
+	const dumpDir = payloadDumpDir();
+	if (dumpDir !== undefined) mkdirSync(dumpDir, { recursive: true });
 	const server = Bun.serve({
 		port: 0,
 		hostname: "127.0.0.1",
@@ -64,32 +98,58 @@ export async function startJudgeProxy(label: string): Promise<JudgeProxy> {
 			const headers = new Headers(request.headers);
 			headers.delete("host");
 			headers.delete("content-length");
-			const upstream = await fetch(`${REAL_JUDGE_ORIGIN}${url.pathname}${url.search}`, {
-				method: request.method,
-				headers,
-				...(bodyText.length > 0 ? { body: bodyText } : {}),
-			});
-			// The decoded body is relayed as text, so the encoding/length headers of the upstream
-			// response must go: forwarding `content-encoding: gzip` with a decoded body makes the
-			// SDK fail with a ZlibError.
-			const responseText = await upstream.text();
-			const relayHeaders = new Headers(upstream.headers);
-			relayHeaders.delete("content-encoding");
-			relayHeaders.delete("content-length");
-			relayHeaders.delete("transfer-encoding");
+
 			let model = "";
 			let questionIds: string[] = [];
+			let stateKeys: string[] = [];
 			if (bodyText.length > 0) {
 				try {
 					const parsed: unknown = JSON.parse(bodyText);
 					if (isRecord(parsed)) {
 						if (typeof parsed["model"] === "string") model = parsed["model"];
 						if (isRecord(parsed["questions"])) questionIds = Object.keys(parsed["questions"]);
+						if (isRecord(parsed["state"])) stateKeys = Object.keys(parsed["state"]);
 					}
 				} catch {
 					// not JSON: recorded with an empty summary below
 				}
 			}
+
+			// Numbered by arrival: the index is the call's position in this run's traffic record.
+			const index = calls.length + 1;
+			const requestPath = dumpDir === undefined ? undefined : join(dumpDir, `${label}-${index}.request.json`);
+			const responsePath = dumpDir === undefined ? undefined : join(dumpDir, `${label}-${index}.response.json`);
+			// The request is dumped before it is relayed, so a relay that fails still shows what the
+			// extension asked, and a consultation that never produced a judgement is still counted.
+			let dumpError = writeIfConfigured(requestPath, bodyText);
+
+			let status = 0;
+			let responseText = "";
+			let relayHeaders = new Headers();
+			let relayError: string | undefined;
+			try {
+				const upstream = await fetch(`${REAL_JUDGE_ORIGIN}${url.pathname}${url.search}`, {
+					method: request.method,
+					headers,
+					...(bodyText.length > 0 ? { body: bodyText } : {}),
+				});
+				status = upstream.status;
+				// The decoded body is relayed as text, so the encoding/length headers of the upstream
+				// response must go: forwarding `content-encoding: gzip` with a decoded body makes the
+				// SDK fail with a ZlibError.
+				responseText = await upstream.text();
+				relayHeaders = new Headers(upstream.headers);
+				relayHeaders.delete("content-encoding");
+				relayHeaders.delete("content-length");
+				relayHeaders.delete("transfer-encoding");
+			} catch (error) {
+				relayError = error instanceof Error ? error.message : String(error);
+				status = 502;
+				responseText = JSON.stringify({ error: "proxy relay failed: " + relayError });
+				relayHeaders = new Headers({ "content-type": "application/json" });
+			}
+			dumpError = dumpError ?? writeIfConfigured(responsePath, responseText);
+
 			let inputTokens = 0;
 			let outputTokens = 0;
 			let responseSummary = "";
@@ -124,14 +184,19 @@ export async function startJudgeProxy(label: string): Promise<JudgeProxy> {
 				path: url.pathname,
 				model,
 				questionIds,
+				stateKeys,
 				stateBytes: bodyText.length,
-				status: upstream.status,
+				status,
 				latencyMs: Date.now() - started,
 				inputTokens,
 				outputTokens,
-				responseSummary,
+				responseSummary: relayError === undefined ? responseSummary : `relay failed: ${relayError}`,
+				...(requestPath === undefined ? {} : { requestPath }),
+				...(responsePath === undefined ? {} : { responsePath }),
+				...(dumpError === undefined ? {} : { dumpError }),
+				...(relayError === undefined ? {} : { relayError }),
 			});
-			return new Response(responseText, { status: upstream.status, headers: relayHeaders });
+			return new Response(responseText, { status, headers: relayHeaders });
 		},
 	});
 	return {

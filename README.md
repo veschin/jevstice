@@ -531,15 +531,28 @@ anything malformed.
   cannot refuse a delivery, so a confident negative is recorded as an unresolved blocker and fed
   back into the session. Undeclared, the stage is still submittable through the tool but no hand-off
   check runs - the PRD marks this policy unconfirmed (GAP:3).
-- **destructive_action** (POLICY-DRAFT I, `on_demand`, opt-in): when the config sets a non-empty
-  `gates.destructive.patterns` list, a `bash` command matching any pattern is judged before it runs,
-  with the command and the session task as evidence - a fresh execution-time decision the plan never
-  covers (POLICY-DRAFT class I, `always_judge` 0.88). Only a judged `revise` at or above the
-  confidence floor refuses the call; an abstention, a judge error, a low confidence, a frame escape
-  or a verdict past the 25s internal deadline records the uncertainty and lets the command run.
-  Patterns are case-insensitive literal substrings (whitespace collapsed), so pattern text is data and
-  never a regular expression. An absent or empty list means the gate does not exist (default off); a
-  `stages.destructive_action` template may still replace its option set.
+- **destructive_action** (POLICY-DRAFT I, `on_demand`, opt-in): one descriptor, one option set, one
+  refusal rule, two triggers.
+  - The **command** trigger: when the config sets a non-empty `gates.destructive.patterns` list, a
+    `bash` command matching any pattern is judged before it runs, with the command and the session
+    task as evidence - a fresh execution-time decision the plan never covers (POLICY-DRAFT class I,
+    `always_judge` 0.88). Patterns are case-insensitive literal substrings (whitespace collapsed), so
+    pattern text is data and never a regular expression. An absent or empty list means this trigger
+    does not exist (default off).
+  - The **outside-root write** trigger: when the config sets `gates.destructive.outsideProjectWrites:
+    true` (off by default, independent of the pattern list), a `write`, `edit` or `ast_edit` call
+    whose target is a plain filesystem path outside the project root is judged before it runs, with
+    the tool name, the target path(s) and a verbatim prefix of the content it would write as
+    evidence. The project root is the working directory the config loader reads
+    `<cwd>/.omp/jev.config.json` from; a relative target resolves against it and an absolute one is
+    used as it stands. This is the path that was invisible before: the live session that wrote
+    `/tmp/jev-smoke.ts` from a project elsewhere did so under a tool name no pattern list can reach
+    (`evidence/measurement-2026-10-08-horizon/raw/horizon-api-control-r1.stdout.jsonl:3036`).
+  Both triggers: only a judged `revise` at or above the confidence floor refuses the call; an
+  abstention, a judge error, a low confidence, a frame escape or a verdict past the 25s internal
+  deadline records the uncertainty and lets it run, and neither trigger ever approves anything
+  (nothing is unlocked by not refusing). A `stages.destructive_action` template may replace the
+  option set of both.
 - **reviews** (`business_review`, `architecture_review`, `security_review`; `on_demand`,
   advisory): the review activities above. They record per-item results and surface them; they never
   refuse an action and never record an approval.
@@ -588,7 +601,7 @@ submittable `stage` and is shaped by the config key shown:
 | `refactor_inventory` | `on_demand` | FR-13: the old functions of a refactoring, each with its verification command, fixed before the first code edit; a later submission is refused | `stages.refactor_inventory` |
 | `refactor_marking` | `on_demand` | FR-13: per-item preserved/lost marking after the refactoring, judged from each item's own artifact material; an item without material keeps completion blocked by name | `stages.refactor_marking` |
 | `subagent_handoff` | `on_demand` | FR-11 hand-off check: dispatch before the spawn, acceptance on the delivered result (opt-in) | `stages.subagent_handoff` |
-| `destructive_action` | `on_demand` | execution-time judge of a destructive `bash` command (opt-in) | `stages.destructive_action` |
+| `destructive_action` | `on_demand` | execution-time judge of a destructive `bash` command, and of a `write`/`edit`/`ast_edit` targeting a path outside the project root (both opt-in) | `stages.destructive_action` |
 | `business_review` | `on_demand` | business review: two 0..9 scores, declared-risk choice, value statement, one statement per declared decision (advisory) | `stages.business_review` |
 | `architecture_review` | `on_demand` | architecture review: 0..9 quality score, one statement per declared defect, declared-change choice (advisory) | `stages.architecture_review` |
 | `security_review` | `on_demand` | security review: one statement per declared surface, worst-surface choice (advisory, opt-in) | `stages.security_review` |
@@ -627,7 +640,7 @@ the file and the problem.
 {
   "gates": {
     "mutation": false,
-    "destructive": { "patterns": ["rm -rf", "git push --force", "drop table"] },
+    "destructive": { "patterns": ["rm -rf", "git push --force", "drop table"], "outsideProjectWrites": true },
     "handoffAcceptance": true
   },
   "courseCheck": { "everyMutations": 5 },
@@ -670,12 +683,19 @@ Per key, with its trust rule:
   deliberately). The automatic consult never blocks, never spends the rework budget and never
   satisfies the completion boundary. A malformed block fails closed naming the file and the key.
 - `gates` - `mutation` and `completion` booleans (both default true) plus the `destructive` block.
-  User-owned: when the user file declares `gates`, the project block is ignored. `gates.mutation:
+  Merged per key, never whole-block: a user file that declares only some switches does not drop the
+  project's others, and `destructive.patterns` is a union a project may add to but never remove (a
+  live defect on 2026-10-08: the gate could not be armed from a project file). `gates.mutation:
   false` lifts the plan gate (mutating tools are no longer blocked while no plan-stage approval
   exists) and `gates.completion: false` lifts the stop gate; both switch block decisions only:
-  judging, content digests and bounded rework are unchanged. `gates.destructive.patterns` (an array
-  of non-empty strings) arms the execution-time destructive-action gate; an absent or empty list
-  means the gate does not exist. The FR-11 hand-off gate is not a `gates` switch: it runs only when
+  judging, content digests and bounded rework are unchanged. `gates.destructive` takes two keys,
+  merged per key: `patterns` (an array of non-empty strings, required) arms the execution-time
+  destructive gate's command trigger - an absent or empty list means that trigger does not exist;
+  `outsideProjectWrites` (a boolean, optional, off by default and validated as a boolean) arms its
+  second trigger, the judgement of a `write`/`edit`/`ast_edit` whose target is a path outside the
+  project root. The two triggers are independent in both directions: an empty pattern list does not
+  disarm the write trigger, and arming the write trigger does not judge any command. The FR-11
+  hand-off gate is not a `gates` switch: it runs only when
   the config declares `stages.subagent_handoff` (see the preset above). Its acceptance side - the
   check of the delegated result the host delivers - is a separate opt-in boolean,
   `gates.handoffAcceptance` (default false), because it depends on the host's background-result
@@ -686,10 +706,36 @@ Meta options cannot be removed: they are appended to every judge choice regardle
 ## Limits
 
 - The mutation gate covers the builtin tools `edit`, `write`, `ast_edit`, `bash`, `memory_edit`,
-  `manage_skill` and `eval`; custom/MCP/xdev tools are outside it.
-- The destructive-action gate covers `bash` only, reading the command from the tool call's `command`
-  field, and matches the owner's patterns as case-insensitive literal substrings - a pattern is data,
-  never a regular expression, so an owner typo cannot silently change what matches.
+  `manage_skill`, `learn`, `retain` and `eval`; custom/MCP/xdev tools are outside it. `learn` and
+  `retain` were added because they write the same user-level state `memory_edit` and `manage_skill`
+  do (a lesson into long-term memory, and - with `learn` - a managed skill): the live session that
+  made two `learn` calls wrote long-term memory and created a managed skill while the gate had
+  nothing to bite. The remaining memory/context builtins (`checkpoint`, `rewind`, `context_notes`,
+  `new_context`, `recall`, `reflect`) are NOT in the set, so they are not mutation-gated; the fix
+  also has no effect where `gates.mutation` is off, which is how the same session was configured.
+- The destructive-action gate has two triggers and two documented reach limits.
+  - The **command** trigger covers `bash` only, reading the command from the tool call's `command`
+    field, and matches the owner's patterns as case-insensitive literal substrings - a pattern is
+    data, never a regular expression, so an owner typo cannot silently change what matches. It does
+    not read a `bash` command's own file targets: a shell redirect or `sd`-style rewrite outside the
+    project root is covered only if its text matches a pattern.
+  - The **outside-root write** trigger covers the plain filesystem targets of `write`, `edit` and
+    `ast_edit` calls: the `path`/`file_path` argument, the `paths` array, and - for `edit` - the
+    targets named inside its own payload (the hashline `[PATH#TAG]` section headers and the
+    apply-patch `*** Add File:` / `*** Update File:` / `*** Delete File:` / `*** Move to:`
+    directives). The `MV` destination of a hashline move is NOT read. A target carrying a `://`
+    scheme is never read as a filesystem path, so a `write` to an internal URL or a mounted tool
+    device (`xd://<device>`, `local://`, `agent://`, `proc://`) reaches no judgement here, and neither
+    does an archive or SQLite selector target. It cannot see the write tool's own `chmod +x` on a
+    shebang file: that happens inside the tool call, after the boundary the handler runs at, so the
+    permission change is inferable from the written call but never judged on its own. Reads are never
+    affected: only a mutating call's target is read, and the plan gate's existing rules for mutations
+    inside the project are unchanged.
+  Both triggers are opt-in (`gates.destructive.patterns` for the first,
+  `gates.destructive.outsideProjectWrites` for the second) and the second costs one judge
+  consultation per out-of-root write, on a frame whose live record is abstention-prone (the
+  command trigger's two live runs answered 0.38 and 0.4). A call the plan gate already refused is
+  not judged: the plan gate's handler runs first and a block short-circuits the event.
 - Gates are per session: each subagent session gets its own controller (own gates, approvals and
   state), and the parent's controller does not see the subagent's tool calls - the one cross-session
   hook is `before_subagent_spawn`, where the routed model is enforced. `session_stop` never fires for
@@ -723,16 +769,47 @@ Meta options cannot be removed: they are appended to every judge choice regardle
   0.23), so the DESIGN is recorded OPEN - the behaviour is derived from the requirement, not from a
   judge approval, and it is the fail-closed rule that keeps a sub-floor or abstaining answer from
   obliging anything.
-- The product's value is not demonstrated in its own favour. Three blind with-or-without runs - a
-  small-task set, a drift-prone set, and a horizon set on a frozen revision with the weakest cheap
-  model the owner's configuration runs - found no outcome difference: across 136 requirement
-  observations both arms kept everything, and the judge called every comparison a tie (in the
-  decisive run, a tie probability of 0.79 and 0.76). The cost is measured: the addon pays judge
-  consultations the control never pays, and in the decisive run about twice the wall time and half
-  again the coding tokens. The weak model also never called the decision tool on its own - every
-  consultation came from the extension's automatic paths. The benefit is untested rather than
-  disproved: no task set has yet made the control arm drop a requirement.
-  `tools/measurement/` reproduces this and its self-test validates the checks first.
+  The widened destructive-action boundary (the second trigger and frame, and the coverage of `learn`
+  and `retain`) was put to the judge the same way, in three approaches (a design frame over quoted
+  code and a session record; a narrow structural fact about the mechanism; the outcome stated with
+  the artifacts that settle it): `approve` 0.28 (raw 0.38), `insufficient_evidence` 0.32, `approve`
+  0.57 (raw 0.63) - all below the 0.8 floor, so the DESIGN is recorded OPEN. What the option
+  questions say is unambiguous and is what the build follows: "a second trigger and frame in the
+  existing descriptor" at 0.64 and then 0.84 probability against "a new blocking stage" at 0.25 and
+  0.05 and "leave it bash-only" at 0.01 and 0.07; the second attempt's own narrow claim ("the
+  judgement machinery is trigger-agnostic") was answered `not_established` at 0.87, which is why the
+  descriptor's declared boundary, arming and evidence kinds were rewritten rather than left
+  describing the old reach. No live run has yet produced a judgement from the write trigger; the
+  frame's evidence kinds had to grow from `["spec","user"]` to include `code` and `log` for the
+  quoted content, and the switch is off until an owner arms it.
+- The product's value is not demonstrated in its own favour, and the fourth measurement is the
+  decisive one. Three blind with-or-without runs first - a small-task set, a drift-prone set, and a
+  horizon set on a frozen revision with the weakest cheap model the owner's configuration runs -
+  found no outcome difference: across 136 requirement observations both arms kept everything, and the
+  judge called every comparison a tie (in the decisive run of those three, a tie probability of 0.79
+  and 0.76). A fourth run then went after the one task shape on which the cheap model genuinely
+  fails: a refactor that must carry an edge-heavy behaviour surface through a rewrite, where the
+  run's own signature declares an option field optional and its code rejects the absence. Paired
+  runs, five per arm, one source revision proved single-revision (digest identical before and after,
+  no `src/` file's mtime inside the run window), everything else held equal:
+
+  | Arm | Requirements kept | The one failing requirement dropped | Mean wall time | Mean coding tokens | Judge consultations |
+  | --- | --- | --- | --- | --- | --- |
+  | plain omp | 43/45 | 2 of 5 runs | 52.2 s | 189,149 | 0 |
+  | with this extension | 42/45 | 3 of 5 runs | 113.3 s | 692,262 | 21 |
+
+  So: the extension did not rescue the failure, the 2-of-5 versus 3-of-5 difference is noise at this
+  sample size, and what it cost is roughly double the wall time and over three times the coding
+  tokens, plus judge traffic the control never pays. Across four measurements and 181 requirement
+  observations, no run has this extension's arm doing better than the plain one. The one informative
+  detail: in three of the five addon runs the extension made no requirement-level judgement at all
+  (classification and topic selection only) and that requirement was dropped; in the single run where
+  the requirement-level pipeline did run, the judge examined the section holding that rule, marked it
+  satisfied at 0.90-0.91, and the requirement was kept - consistent with the consultation mattering,
+  but one observation, and confounded by that session also being the longest and most thorough in the
+  run. The weak model never called the decision tool on its own in any arm: every consultation came
+  from the extension's automatic paths. `tools/measurement/` reproduces this and its self-test
+  validates the checks first.
 - Completion judging does not guarantee correctness.
 
 ## License

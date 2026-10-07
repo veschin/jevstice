@@ -25,11 +25,11 @@
  * The API key is read from TYPESAFE_API_KEY (or JEVI_API_KEY); it is never printed, logged or
  * persisted anywhere.
  *
- * usage: bun run tools/measurement/run.ts [--out evidence/measurement-<date>.log] [--seed N]
+ * usage: bun run tools/measurement/run.ts [--out evidence/measurement-<date>.log] [--raw <dir>] [--seed N]
  *          [--only slug,median] [--repeats N] [--timeout 420] [--probe/--no-probe] [--dry-run]
  */
 import { createHash } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import {
 	APIConnectionError,
@@ -39,8 +39,8 @@ import {
 	TypeSafeClient,
 } from "@typesafe-ai/sdk";
 import { isRecord } from "../../src/guards";
-import { startJudgeProxy, type JudgeCall } from "./judge-proxy";
-import { ITEMS_SRC, ITEMS_TEST_SRC, MEDIAN_TEST_SRC, TASK_SETS, type TaskDef } from "./tasks";
+import { startJudgeProxy, summariseCall, type JudgeCall } from "./judge-proxy";
+import { DURATION_REPORT_SRC, ITEMS_SRC, ITEMS_TEST_SRC, MEDIAN_TEST_SRC, MONEY_SRC, TASK_SETS, type TaskDef } from "./tasks";
 
 const REPO_ROOT = resolve(import.meta.dir, "../..");
 const EXTENSION_ENTRY = join(REPO_ROOT, "src/index.ts");
@@ -73,7 +73,16 @@ const allTasks = TASK_SETS[setName];
 if (allTasks === undefined) throw new Error(`--set must be one of ${Object.keys(TASK_SETS).join(", ")} (got "${setName}")`);
 const outFile =
 	flagValue("--out") || join(REPO_ROOT, "evidence", `measurement-${today}${setName === "core" ? "" : `-${setName}`}.log`);
-const rawDir = join(REPO_ROOT, "evidence", `measurement-${today}${setName === "core" ? "" : `-${setName}`}`, "raw");
+const rawFlag = flagValue("--raw");
+/**
+ * Raw artifacts default to a directory derived from the date and the set. `--raw` overrides it, which
+ * is what a second run of the same set needs: without it the second run would overwrite the first
+ * run's event streams while its log still points at them.
+ */
+const rawDir =
+	rawFlag !== undefined && rawFlag.length > 0
+		? resolve(REPO_ROOT, rawFlag)
+		: join(REPO_ROOT, "evidence", `measurement-${today}${setName === "core" ? "" : `-${setName}`}`, "raw");
 const seed = Number.parseInt(flagValue("--seed") ?? `${date.getTime()}`, 10);
 const repeats = Math.max(1, Number.parseInt(flagValue("--repeats") ?? "1", 10));
 const sessionTimeoutSec = Number.parseInt(flagValue("--timeout") ?? "420", 10);
@@ -809,6 +818,7 @@ function renderRun(task: TaskDef, run: RunCapture): string {
 	lines.push(
 		`- judge traffic observed by the local forwarding proxy: ${run.judgeTraffic.calls} call(s), ${run.judgeTraffic.inputTokens} input + ${run.judgeTraffic.outputTokens} output tokens (${run.judgeTraffic.rawPath})`,
 	);
+	for (const call of run.judgeTraffic.detail) lines.push(`  - consultation: ${summariseCall(call)}`);
 	if (run.nonJsonLines > 0) lines.push(`- non-JSON stdout lines (host noise, not counted as events): ${run.nonJsonLines}`);
 	if (run.error !== undefined) lines.push(`- harness error: ${run.error}`);
 	lines.push("");
@@ -1412,6 +1422,461 @@ const HORIZON_SYNC_COMMENT_ONLY = `${HORIZON_SYNC_RIGHT}
 // --group-by=level and the watch mode are deferred by the spec and are NOT implemented here.
 `;
 
+// --- hard-set (ledger) reference solution and deliberately wrong variants (validation only) ------
+
+const LEDGER_RIGHT = `import { parseAmount } from "./src/money";
+
+const args = process.argv.slice(2);
+if (args.includes("--help")) {
+	console.error("usage: bun allocate.ts [--file=<path>] [--by=sku|cost]");
+	process.exit(0);
+}
+const fileArg = args.find(arg => arg.startsWith("--file="));
+const cartPath = fileArg === undefined ? "data/cart.json" : fileArg.slice("--file=".length);
+const byArg = args.find(arg => arg.startsWith("--by="));
+const by = byArg === undefined ? "sku" : byArg.slice("--by=".length);
+
+interface CartLine { sku: string; qty: number; unitPrice: string }
+const cart = JSON.parse(await Bun.file(cartPath).text()) as { discountCents: number; lines: CartLine[] };
+const discount = cart.discountCents;
+
+const rows = cart.lines.map((line, index) => ({
+	sku: line.sku,
+	index,
+	subtotal: line.qty * parseAmount(line.unitPrice),
+	allocated: 0,
+	fraction: 0,
+}));
+const total = rows.reduce((sum, row) => sum + row.subtotal, 0);
+if (discount > total) {
+	console.error("discount exceeds total");
+	process.exit(3);
+}
+for (const row of rows) {
+	const numerator = row.subtotal * discount;
+	row.allocated = total === 0 ? 0 : Math.floor(numerator / total);
+	row.fraction = total === 0 ? 0 : numerator % total;
+}
+let leftover = discount - rows.reduce((sum, row) => sum + row.allocated, 0);
+const byFraction = [...rows].sort((a, b) => b.fraction - a.fraction || a.index - b.index);
+for (let step = 0; leftover > 0 && step < byFraction.length * 4; step++) {
+	const row = byFraction[step % byFraction.length]!;
+	if (row.allocated < row.subtotal) {
+		row.allocated += 1;
+		leftover -= 1;
+	}
+}
+const bySku = (a: { sku: string }, b: { sku: string }): number => (a.sku < b.sku ? -1 : a.sku > b.sku ? 1 : 0);
+const ordered = [...rows].sort((a, b) => (by === "cost" ? b.allocated - a.allocated || bySku(a, b) : bySku(a, b)));
+await Bun.write(
+	"allocation.json",
+	JSON.stringify({
+		total,
+		discount,
+		lines: ordered.map(row => ({ sku: row.sku, subtotal: row.subtotal, allocated: row.allocated })),
+	}) + "\\n",
+);
+console.log("allocated " + discount + " of " + total + " cents across " + rows.length + " lines");
+`;
+
+/** Drops R3: hands the leftover cents to the largest subtotals instead of the largest fractions. */
+const LEDGER_LEFTOVER_BY_SUBTOTAL = LEDGER_RIGHT.replace(
+	"const byFraction = [...rows].sort((a, b) => b.fraction - a.fraction || a.index - b.index);",
+	"const byFraction = [...rows].sort((a, b) => b.subtotal - a.subtotal || a.index - b.index);",
+);
+
+/** Drops R5: always writes sku order and ignores --by=cost. */
+const LEDGER_NO_BY_COST = LEDGER_RIGHT.replace(
+	'const by = byArg === undefined ? "sku" : byArg.slice("--by=".length);',
+	'const by = "sku";',
+);
+
+/** Drops R9: no guard for a discount larger than the total. */
+const LEDGER_NO_OVERSIZE_GUARD = LEDGER_RIGHT.replace(
+	`if (discount > total) {
+	console.error("discount exceeds total");
+	process.exit(3);
+}
+`,
+	"",
+);
+
+/** Over-delivers R12: implements the deferred --csv report. */
+const LEDGER_WITH_CSV = LEDGER_RIGHT.replace(
+	'await Bun.write(\n\t"allocation.json",',
+	'if (args.includes("--csv")) await Bun.write("allocation.csv", "sku,allocated\\n");\nawait Bun.write(\n\t"allocation.json",',
+);
+
+/** A comment naming the deferred flag is documentation, not over-delivery: must PASS R12. */
+const LEDGER_COMMENT_ONLY = `${LEDGER_RIGHT}
+// --csv is deliberately deferred by the spec and is NOT implemented here.
+`;
+
+/** Breaks R10: "improves" the frozen money module by adding an export. */
+const LEDGER_MONEY_EXTENDED = `${MONEY_SRC}
+/** A helper the task did not ask for: adding it changes the module's exported contract. */
+export function roundCents(cents: number): number {
+	return Math.round(cents);
+}
+`;
+
+// --- search attempt 2 (tickets): reference solution and deliberately wrong variants (validation only) ---
+
+const TICKETS_RIGHT_STORE = `/** In-memory issue store: every issue has an id, a title, a status and a priority. */
+
+export interface Issue {
+	id: string;
+	title: string;
+	status: "open" | "closed";
+	priority: "low" | "normal" | "high";
+}
+
+export interface Store {
+	issues: Issue[];
+	nextId: number;
+}
+
+const PRIORITIES = ["low", "normal", "high"] as const;
+const PREFIX = { low: "TASK-", normal: "BUG-", high: "EPIC-" } as const;
+
+function parsePriority(value: string): Issue["priority"] {
+	if (!(PRIORITIES as readonly string[]).includes(value)) throw new Error("invalid priority: " + value);
+	return value as Issue["priority"];
+}
+
+export function newStore(): Store {
+	return { issues: [], nextId: 1 };
+}
+
+export function openIssue(store: Store, title: string, priority = "normal"): Issue {
+	const parsed = parsePriority(priority);
+	const issue: Issue = { id: PREFIX[parsed] + store.nextId, title, status: "open", priority: parsed };
+	store.nextId += 1;
+	store.issues.push(issue);
+	return issue;
+}
+
+export function closeIssue(store: Store, id: string): Issue {
+	const issue = store.issues.find(candidate => candidate.id === id);
+	if (issue === undefined) throw new Error("unknown issue: " + id);
+	issue.status = "closed";
+	return issue;
+}
+`;
+
+const TICKETS_RIGHT_FORMAT = `import type { Issue } from "./store";
+
+/** Titles longer than this are truncated in a row. */
+export const TITLE_LIMIT = 24;
+
+/** Renders one issue as \`#<id> [<status>] <title>\`, optionally showing the priority. */
+export function formatRow(issue: Issue, options?: { showPriority?: boolean }): string {
+	const title = issue.title.length > TITLE_LIMIT ? issue.title.slice(0, TITLE_LIMIT) + "..." : issue.title;
+	const priority = options?.showPriority === true ? "(" + issue.priority + ") " : "";
+	return "#" + issue.id + " [" + issue.status + "] " + priority + title;
+}
+`;
+
+const TICKETS_RIGHT_CLI = `import { formatRow } from "./format";
+import { closeIssue, openIssue, type Issue, type Store } from "./store";
+
+export interface CliResult {
+	lines: string[];
+	errors: string[];
+	code: number;
+}
+
+const USAGE = "usage: issues [list [--all] [--priority=<low|normal|high>] [--sort=priority] [--summary] [--json] | open <title> [--priority=<low|normal|high>] | close <id> | --help]";
+const PRIORITY_ORDER = { high: 0, normal: 1, low: 2 } as const;
+
+function parsePriority(value: string): Issue["priority"] {
+	if (value !== "low" && value !== "normal" && value !== "high") throw new Error("invalid priority: " + value);
+	return value;
+}
+
+/** Runs one command against the store and returns its output; nothing here touches the filesystem. */
+export function runCli(store: Store, args: string[]): CliResult {
+	if (args.length === 0 || args.includes("--help")) return { lines: [USAGE], errors: [], code: 0 };
+	const [command, ...rest] = args;
+	if (command === "list") {
+		const priorityArg = rest.find(arg => arg.startsWith("--priority="));
+		const sortArg = rest.find(arg => arg.startsWith("--sort="));
+		let priority: Issue["priority"] | undefined;
+		try {
+			if (priorityArg !== undefined) priority = parsePriority(priorityArg.slice("--priority=".length));
+			if (sortArg !== undefined && sortArg !== "--sort=priority") throw new Error("invalid sort: " + sortArg.slice("--sort=".length));
+		} catch (error) {
+			return { lines: [], errors: [error instanceof Error ? error.message : String(error)], code: 2 };
+		}
+		const all = rest.includes("--all");
+		const showPriority = priority !== undefined || sortArg === "--sort=priority";
+		const pool = priority === undefined ? store.issues : store.issues.filter(issue => issue.priority === priority);
+		const listed = all ? [...pool] : pool.filter(issue => issue.status === "open");
+		const ordered = sortArg === "--sort=priority" ? [...listed].sort((a, b) => PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority]) : listed;
+		const lines = rest.includes("--json")
+			? [JSON.stringify(ordered.map(issue => ({ id: issue.id, title: issue.title, status: issue.status, priority: issue.priority })))]
+			: ordered.map(issue => formatRow(issue, { showPriority }));
+		if (rest.includes("--summary")) {
+			const openCount = pool.filter(issue => issue.status === "open").length;
+			lines.push(openCount + " open, " + (pool.length - openCount) + " closed");
+		}
+		return { lines, errors: [], code: 0 };
+	}
+	if (command === "open") {
+		const priorityArg = rest.find(arg => arg.startsWith("--priority="));
+		let priority: Issue["priority"] = "normal";
+		try {
+			if (priorityArg !== undefined) priority = parsePriority(priorityArg.slice("--priority=".length));
+		} catch (error) {
+			return { lines: [], errors: [error instanceof Error ? error.message : String(error)], code: 2 };
+		}
+		const title = rest.filter(arg => !arg.startsWith("--priority=")).join(" ").trim();
+		if (title.length === 0) return { lines: [], errors: [USAGE], code: 2 };
+		return { lines: ["opened " + openIssue(store, title, priority).id], errors: [], code: 0 };
+	}
+	if (command === "close") {
+		const id = rest[0] ?? "";
+		const found = store.issues.find(issue => issue.id === id);
+		if (found !== undefined && found.status === "closed") return { lines: [], errors: ["already closed: " + id], code: 3 };
+		try {
+			closeIssue(store, id);
+			return { lines: ["closed " + id], errors: [], code: 0 };
+		} catch (error) {
+			return { lines: [], errors: [error instanceof Error ? error.message : String(error)], code: 2 };
+		}
+	}
+	return { lines: [], errors: [USAGE], code: 2 };
+}
+`;
+
+const TICKETS_RIGHT_FILES: Record<string, string> = {
+	"src/store.ts": TICKETS_RIGHT_STORE,
+	"src/format.ts": TICKETS_RIGHT_FORMAT,
+	"src/cli.ts": TICKETS_RIGHT_CLI,
+};
+
+/** Drops R2: the prefix never follows the priority. */
+const TICKETS_NO_PREFIX = {
+	...TICKETS_RIGHT_FILES,
+	"src/store.ts": TICKETS_RIGHT_STORE.replace(
+		'const PREFIX = { low: "TASK-", normal: "BUG-", high: "EPIC-" } as const;',
+		'const PREFIX = { low: "BUG-", normal: "BUG-", high: "BUG-" } as const;',
+	),
+};
+
+/** Drops R6 (and R8's filtered case with it): the --priority flag of `list` is ignored. */
+const TICKETS_NO_LIST_FILTER = {
+	...TICKETS_RIGHT_FILES,
+	"src/cli.ts": TICKETS_RIGHT_CLI.replace(
+		'\t\tconst priorityArg = rest.find(arg => arg.startsWith("--priority="));\n\t\tconst sortArg',
+		"\t\tconst priorityArg = undefined;\n\t\tconst sortArg",
+	),
+};
+
+/** Drops R7: --sort is accepted but ignored, and no other value is rejected. */
+const TICKETS_NO_SORT = {
+	...TICKETS_RIGHT_FILES,
+	"src/cli.ts": TICKETS_RIGHT_CLI.replace(
+		'\t\t\tif (sortArg !== undefined && sortArg !== "--sort=priority") throw new Error("invalid sort: " + sortArg.slice("--sort=".length));\n',
+		"",
+	).replace("\t\tconst ordered = sortArg === \"--sort=priority\" ? [...listed].sort((a, b) => PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority]) : listed;", "\t\tconst ordered = listed;"),
+};
+
+/** Drops R8: --summary prints nothing. */
+const TICKETS_NO_SUMMARY = {
+	...TICKETS_RIGHT_FILES,
+	"src/cli.ts": TICKETS_RIGHT_CLI.replace('if (rest.includes("--summary")) {', "if (false) {"),
+};
+
+/** Drops R10: a second close silently succeeds. */
+const TICKETS_NO_SECOND_CLOSE = {
+	...TICKETS_RIGHT_FILES,
+	"src/cli.ts": TICKETS_RIGHT_CLI.replace(
+		'\t\tif (found !== undefined && found.status === "closed") return { lines: [], errors: ["already closed: " + id], code: 3 };\n',
+		"",
+	),
+};
+
+/** Breaks R13: adds a test file the ticket forbids. */
+const TICKETS_EXTRA_TEST = {
+	...TICKETS_RIGHT_FILES,
+	"test/priority.test.ts": `import { expect, test } from "bun:test";
+
+test("the new priority flags exist", () => {
+	expect(true).toBe(true);
+});
+`,
+};
+
+/** Over-delivers R12: accepts and reads the deferred --assign flag. */
+const TICKETS_WITH_ASSIGN = {
+	...TICKETS_RIGHT_FILES,
+	"src/cli.ts": TICKETS_RIGHT_CLI.replace(
+		'\t\tconst priorityArg = rest.find(arg => arg.startsWith("--priority="));\n\t\tconst sortArg',
+		'\t\tconst assignArg = rest.find(arg => arg.startsWith("--assign="));\n\t\tconst priorityArg = assignArg === undefined || assignArg.length > 0 ? rest.find(arg => arg.startsWith("--priority=")) : undefined;\n\t\tconst sortArg',
+	),
+};
+
+/** A comment naming the deferred flag is documentation, not over-delivery: must PASS R12. */
+const TICKETS_COMMENT_ONLY = {
+	...TICKETS_RIGHT_FILES,
+	"src/cli.ts": `${TICKETS_RIGHT_CLI}\n// --assign=<name> is deliberately deferred to a later revision and is NOT implemented here.\n`,
+};
+
+/** Breaks R14: the store exports a new name. */
+const TICKETS_GROWN_API = {
+	...TICKETS_RIGHT_FILES,
+	"src/store.ts": TICKETS_RIGHT_STORE.replace(
+		'const PRIORITIES = ["low", "normal", "high"] as const;',
+		'export const PRIORITIES = ["low", "normal", "high"] as const;',
+	),
+};
+
+// --- search attempt 3 (duration/refactor): reference solution and deliberately wrong variants -----
+
+const DURATION_RIGHT_DURATION = `/** Compact duration parsing and formatting. */
+
+const UNIT_MS = { w: 604800000, d: 86400000, h: 3600000, m: 60000, s: 1000, ms: 1 } as const;
+type Unit = keyof typeof UNIT_MS;
+const RANK: Record<Unit, number> = { w: 5, d: 4, h: 3, m: 2, s: 1, ms: 0 };
+const ORDER = ["w", "d", "h", "m", "s", "ms"] as const;
+
+/** Parses a compact duration such as "2h30m", "500ms" or "1w2d" into milliseconds. */
+export function parseDuration(text: string): number {
+	if (!/^(\\d+(ms|s|m|h|d|w))+$/.test(text)) throw new Error("bad duration: " + text);
+	const parts = text.match(/\\d+(ms|s|m|h|d|w)/g) ?? [];
+	let total = 0;
+	let lastRank = 99;
+	for (const part of parts) {
+		const unit = part.slice(String(Number.parseInt(part, 10)).length) as Unit;
+		const rank = RANK[unit];
+		if (rank >= lastRank) throw new Error("bad duration: " + text);
+		lastRank = rank;
+		total += Number.parseInt(part, 10) * UNIT_MS[unit];
+	}
+	return total;
+}
+
+/** Formats milliseconds back into the compact form; with \`maxUnits\` only the largest non-zero terms are kept. */
+export function formatDuration(ms: number, options?: { maxUnits?: number }): string {
+	if (!Number.isInteger(ms) || ms < 0) throw new Error("bad milliseconds: " + ms);
+	const maxUnits = options?.maxUnits;
+	if (maxUnits !== undefined && (!Number.isInteger(maxUnits) || maxUnits < 1)) throw new Error("bad maxUnits: " + maxUnits);
+	if (ms === 0) return "0s";
+	let rest = ms;
+	const parts: string[] = [];
+	for (const unit of ORDER) {
+		const value = Math.floor(rest / UNIT_MS[unit]);
+		if (value > 0 && (maxUnits === undefined || parts.length < maxUnits)) parts.push(value + unit);
+		rest -= value * UNIT_MS[unit];
+	}
+	return parts.join("");
+}
+`;
+
+const DURATION_RIGHT_WINDOW = `import { parseDuration } from "./duration";
+
+/** True when \`ts\` lies in the window that starts at \`start\` and lasts \`length\` milliseconds. */
+export function covers(start: number, length: number, ts: number): boolean {
+	return ts >= start && ts < start + length;
+}
+
+const DATE = /^\\d{4}-\\d{2}-\\d{2}$/;
+const INSTANT = /^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$/;
+
+function parseInstant(value: string): number {
+	if (DATE.test(value)) return Date.parse(value + "T00:00:00Z");
+	if (INSTANT.test(value)) {
+		const ms = Date.parse(value);
+		if (Number.isFinite(ms)) return ms;
+	}
+	throw new Error("bad timestamp: " + value);
+}
+
+/** True when the timestamp \`ts\` lies in the window that starts at \`start\` and lasts \`length\`. */
+export function coversWindow(start: string, length: string, ts: string): boolean {
+	return covers(parseInstant(start), parseDuration(length), parseInstant(ts));
+}
+`;
+
+const DURATION_RIGHT_REPORT = `import { formatDuration, parseDuration } from "./duration";
+import { covers } from "./window";
+
+/** One line for a check result: the normalised duration and whether the instant is inside the window. */
+export function describeCheck(start: number, length: string, ts: number): string {
+	const ms = parseDuration(length);
+	return formatDuration(ms) + " " + (covers(start, ms, ts) ? "inside" : "outside");
+}
+`;
+
+const DURATION_RIGHT_FILES: Record<string, string> = {
+	"src/duration.ts": DURATION_RIGHT_DURATION,
+	"src/window.ts": DURATION_RIGHT_WINDOW,
+	"src/report.ts": DURATION_RIGHT_REPORT,
+};
+
+/** Breaks R2 and R9: leaves a re-export shim behind and never cuts the caller over. */
+const DURATION_WITH_SHIM = {
+	...DURATION_RIGHT_FILES,
+	"src/window.ts": `export { formatDuration, parseDuration } from "./duration";
+
+${DURATION_RIGHT_WINDOW}`,
+	"src/report.ts": DURATION_REPORT_SRC,
+};
+
+/** Drops R4: the maxUnits argument is accepted and ignored. */
+const DURATION_NO_MAX_UNITS = {
+	...DURATION_RIGHT_FILES,
+	"src/duration.ts": DURATION_RIGHT_DURATION.replace(
+		"\tconst maxUnits = options?.maxUnits;\n\tif (maxUnits !== undefined && (!Number.isInteger(maxUnits) || maxUnits < 1)) throw new Error(\"bad maxUnits: \" + maxUnits);\n",
+		"\tconst maxUnits = undefined;\n\tvoid options;\n",
+	),
+};
+
+/** Drops R3: the ordered-unit rule is lost (ascending units are accepted). */
+const DURATION_ASCENDING_UNITS = {
+	...DURATION_RIGHT_FILES,
+	"src/duration.ts": DURATION_RIGHT_DURATION.replace("if (rank >= lastRank) throw", "if (rank > lastRank) throw"),
+};
+
+/** Drops R5: the window of coversWindow becomes end-inclusive. */
+const DURATION_END_INCLUSIVE = {
+	...DURATION_RIGHT_FILES,
+	"src/window.ts": DURATION_RIGHT_WINDOW.replace(
+		"\treturn covers(parseInstant(start), parseDuration(length), parseInstant(ts));",
+		"\tconst from = parseInstant(start);\n\tconst to = from + parseDuration(length);\n\tconst at = parseInstant(ts);\n\treturn at >= from && at <= to;",
+	),
+};
+
+/** Over-delivers R7 and drops R6: accepts offsets and implements a timezone parameter. */
+const DURATION_WITH_ZONES = {
+	...DURATION_RIGHT_FILES,
+	"src/window.ts": DURATION_RIGHT_WINDOW.replace(
+		"const INSTANT = /^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$/;",
+		"const INSTANT = /^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(Z|[+-]\\d{2}:\\d{2})$/;",
+	).replace(
+		"export function coversWindow(start: string, length: string, ts: string): boolean {",
+		'export function coversWindow(start: string, length: string, ts: string, zone?: string): boolean {\n\tif (zone !== undefined) Intl.DateTimeFormat("en-US", { timeZone: zone }).format(0);',
+	),
+};
+
+/** Breaks R8: adds a test file the ticket forbids. */
+const DURATION_EXTRA_TEST = {
+	...DURATION_RIGHT_FILES,
+	"test/duration.test.ts": `import { expect, test } from "bun:test";
+
+test("the window entry point exists", () => {
+	expect(true).toBe(true);
+});
+`,
+};
+
+/** A comment naming the deferred flag is documentation, not over-delivery: must PASS R7. */
+const DURATION_TZ_COMMENT = {
+	...DURATION_RIGHT_FILES,
+	"src/window.ts": `${DURATION_RIGHT_WINDOW}\n// --tz=<zone> and offset timestamps are deferred by the ticket and are NOT implemented here.\n`,
+};
+
 const VALIDATION_VARIANTS: CheckVariant[] = [
 	{ taskId: "slug", name: "unsolved (no module, no test)", files: {}, expect: "any-fail" },
 	{ taskId: "slug", name: "wrong solution (no trim)", files: { "src/slug.ts": SLUG_WRONG, "src/slug.test.ts": SLUG_TEST }, expect: "any-fail" },
@@ -1591,6 +2056,208 @@ const VALIDATION_VARIANTS: CheckVariant[] = [
 		files: { "sync.ts": HORIZON_SYNC_RIGHT },
 		expect: "all-pass",
 		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass" },
+	},
+	// --- hard set (ledger): unsolved, one requirement dropped, the distractor over-delivered, a
+	// comment-only mention, the frozen module "improved", correct ---
+	{
+		taskId: "ledger",
+		name: "unsolved (setup only)",
+		files: {},
+		expect: "any-fail",
+		expectRequirements: { R1: "fail", R2: "fail", R3: "fail", R4: "fail", R5: "fail", R6: "fail", R7: "fail", R8: "fail", R9: "fail", R10: "pass", R11: "pass", R12: "fail" },
+	},
+	{
+		taskId: "ledger",
+		name: "drops R3 (leftover cents go to the largest subtotals)",
+		files: { "allocate.ts": LEDGER_LEFTOVER_BY_SUBTOTAL },
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "fail", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass", R9: "pass", R10: "pass", R11: "pass", R12: "pass" },
+	},
+	{
+		taskId: "ledger",
+		name: "drops R5 (ignores --by=cost)",
+		files: { "allocate.ts": LEDGER_NO_BY_COST },
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "fail", R6: "pass", R7: "pass", R8: "pass", R9: "pass", R10: "pass", R11: "pass", R12: "pass" },
+	},
+	{
+		taskId: "ledger",
+		name: "drops R9 (no discount-exceeds-total guard)",
+		files: { "allocate.ts": LEDGER_NO_OVERSIZE_GUARD },
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass", R9: "fail", R10: "pass", R11: "pass", R12: "pass" },
+	},
+	{
+		taskId: "ledger",
+		name: "over-delivers R12 (implements the deferred --csv)",
+		files: { "allocate.ts": LEDGER_WITH_CSV },
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass", R9: "pass", R10: "pass", R11: "fail", R12: "fail" },
+	},
+	{
+		taskId: "ledger",
+		name: "mentions --csv in a comment only (must not count)",
+		files: { "allocate.ts": LEDGER_COMMENT_ONLY },
+		expect: "all-pass",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass", R9: "pass", R10: "pass", R11: "pass", R12: "pass" },
+	},
+	{
+		taskId: "ledger",
+		name: "breaks R10 (adds an export to the frozen money module)",
+		files: { "allocate.ts": LEDGER_RIGHT, "src/money.ts": LEDGER_MONEY_EXTENDED },
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass", R9: "pass", R10: "fail", R11: "pass", R12: "pass" },
+	},
+	{
+		taskId: "ledger",
+		name: "correct solution",
+		files: { "allocate.ts": LEDGER_RIGHT },
+		expect: "all-pass",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass", R9: "pass", R10: "pass", R11: "pass", R12: "pass" },
+	},
+	// --- search attempt 2 (tickets): unsolved, one requirement dropped at a time, the distractor
+	// over-delivered, a comment-only mention, a broken constraint, correct ---
+	{
+		taskId: "tickets",
+		name: "unsolved (setup only)",
+		files: {},
+		expect: "any-fail",
+		expectRequirements: { R1: "fail", R2: "fail", R3: "pass", R4: "fail", R5: "fail", R6: "fail", R7: "fail", R8: "fail", R9: "fail", R10: "fail", R11: "fail", R12: "pass", R13: "pass", R14: "pass" },
+	},
+	{
+		taskId: "tickets",
+		name: "drops R2 (the id prefix never follows the priority)",
+		files: TICKETS_NO_PREFIX,
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "fail", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass", R9: "pass", R10: "pass", R11: "pass", R12: "pass", R13: "pass", R14: "pass" },
+	},
+	{
+		taskId: "tickets",
+		name: "drops R6 (ignores the list --priority filter; R8's filtered case goes with it)",
+		files: TICKETS_NO_LIST_FILTER,
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "fail", R7: "pass", R8: "fail", R9: "pass", R10: "pass", R11: "pass", R12: "pass", R13: "pass", R14: "pass" },
+	},
+	{
+		taskId: "tickets",
+		name: "drops R7 (accepts --sort but ignores it, and rejects no value)",
+		files: TICKETS_NO_SORT,
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "fail", R8: "pass", R9: "pass", R10: "pass", R11: "pass", R12: "pass", R13: "pass", R14: "pass" },
+	},
+	{
+		taskId: "tickets",
+		name: "drops R8 (no --summary line)",
+		files: TICKETS_NO_SUMMARY,
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "fail", R9: "pass", R10: "pass", R11: "pass", R12: "pass", R13: "pass", R14: "pass" },
+	},
+	{
+		taskId: "tickets",
+		name: "drops R10 (a second close silently succeeds)",
+		files: TICKETS_NO_SECOND_CLOSE,
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass", R9: "pass", R10: "fail", R11: "pass", R12: "pass", R13: "pass", R14: "pass" },
+	},
+	{
+		taskId: "tickets",
+		name: "breaks R13 (adds a test file the ticket forbids)",
+		files: TICKETS_EXTRA_TEST,
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass", R9: "pass", R10: "pass", R11: "pass", R12: "pass", R13: "fail", R14: "pass" },
+	},
+	{
+		taskId: "tickets",
+		name: "over-delivers R12 (accepts the deferred --assign)",
+		files: TICKETS_WITH_ASSIGN,
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass", R9: "pass", R10: "pass", R11: "pass", R12: "fail", R13: "pass", R14: "pass" },
+	},
+	{
+		taskId: "tickets",
+		name: "mentions --assign in a comment only (must not count)",
+		files: TICKETS_COMMENT_ONLY,
+		expect: "all-pass",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass", R9: "pass", R10: "pass", R11: "pass", R12: "pass", R13: "pass", R14: "pass" },
+	},
+	{
+		taskId: "tickets",
+		name: "breaks R14 (grows the store's exported API)",
+		files: TICKETS_GROWN_API,
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass", R9: "pass", R10: "pass", R11: "pass", R12: "pass", R13: "pass", R14: "fail" },
+	},
+	{
+		taskId: "tickets",
+		name: "correct solution",
+		files: TICKETS_RIGHT_FILES,
+		expect: "all-pass",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass", R9: "pass", R10: "pass", R11: "pass", R12: "pass", R13: "pass", R14: "pass" },
+	},
+	// --- search attempt 3 (duration/refactor): unsolved, one requirement dropped at a time, the
+	// distractor over-delivered, a comment-only mention, a broken constraint, correct ---
+	{
+		taskId: "duration",
+		name: "unsolved (setup only)",
+		files: {},
+		expect: "any-fail",
+		expectRequirements: { R1: "fail", R2: "fail", R3: "fail", R4: "fail", R5: "fail", R6: "fail", R7: "pass", R8: "pass", R9: "fail" },
+	},
+	{
+		taskId: "duration",
+		name: "breaks R2/R9 (re-export shim left in window.ts, caller not cut over)",
+		files: DURATION_WITH_SHIM,
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "fail", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass", R9: "fail" },
+	},
+	{
+		taskId: "duration",
+		name: "drops R4 (accepts maxUnits and ignores it)",
+		files: DURATION_NO_MAX_UNITS,
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "fail", R5: "pass", R6: "pass", R7: "pass", R8: "pass", R9: "pass" },
+	},
+	{
+		taskId: "duration",
+		name: "drops R3 (loses the ordered-unit rule while rewriting)",
+		files: DURATION_ASCENDING_UNITS,
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "fail", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass", R9: "pass" },
+	},
+	{
+		taskId: "duration",
+		name: "drops R5 (coversWindow becomes end-inclusive)",
+		files: DURATION_END_INCLUSIVE,
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "fail", R6: "pass", R7: "pass", R8: "pass", R9: "pass" },
+	},
+	{
+		taskId: "duration",
+		name: "over-delivers R7 and drops R6 (accepts offsets, adds a timezone parameter)",
+		files: DURATION_WITH_ZONES,
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "fail", R7: "fail", R8: "pass", R9: "pass" },
+	},
+	{
+		taskId: "duration",
+		name: "breaks R8 (adds a test file the ticket forbids)",
+		files: DURATION_EXTRA_TEST,
+		expect: "any-fail",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "fail", R9: "pass" },
+	},
+	{
+		taskId: "duration",
+		name: "mentions --tz in a comment only (must not count)",
+		files: DURATION_TZ_COMMENT,
+		expect: "all-pass",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass", R9: "pass" },
+	},
+	{
+		taskId: "duration",
+		name: "correct solution",
+		files: DURATION_RIGHT_FILES,
+		expect: "all-pass",
+		expectRequirements: { R1: "pass", R2: "pass", R3: "pass", R4: "pass", R5: "pass", R6: "pass", R7: "pass", R8: "pass", R9: "pass" },
 	},
 ];
 
@@ -1781,11 +2448,22 @@ try {
 	out.push(`Judge: TypeSafe systemone \`${JUDGE_MODEL}\`, one request per task with 3 questions (one choice "which of A/B better satisfies the task", one noul per result "does this result satisfy the task as quoted", threshold ${NOUL_SUPPORTED_THRESHOLD}). The A/B labels are randomised per task from seed ${seed}; the judge never sees the command lines, arm names, timings or token usage. Judge key: present in the environment, never printed, never written to this log.`);
 	out.push("");
 	out.push(`**Measured revision of the extension**: \`src/\` content digest \`${revision.digest}\` over ${revision.files} files (sha256 of the sorted \`path:sha256\` manifest), git HEAD \`${gitHead}\`. The digest is taken at the start of the run: if \`src/\` changes afterwards the run is no longer reproducible, so re-check the digest before comparing two runs.`);
+	const revisionAfter = extensionRevision();
+	const srcWrittenDuringRun = listFiles(join(REPO_ROOT, "src")).filter(rel => {
+		try {
+			return statSync(join(REPO_ROOT, "src", rel)).mtimeMs >= startedAt.getTime();
+		} catch {
+			// A file that vanished mid-run counts as a write: the run crossed a revision change.
+			return true;
+		}
+	});
+	out.push("");
+	out.push(`**Revision check after the run**: digest \`${revisionAfter.digest}\` over ${revisionAfter.files} files — unchanged during the run: **${revisionAfter.digest === revision.digest && revisionAfter.files === revision.files ? "yes" : "NO — THE RUN CROSSED A REVISION CHANGE"}**; \`src/\` files whose mtime falls inside the run window: ${srcWrittenDuringRun.length === 0 ? "none, so every session in this run read the same revision" : `**${srcWrittenDuringRun.join(", ")} — THIS RUN IS NOT SINGLE-REVISION**`}. The addon arm loads \`-e src/index.ts\` when a session starts, so a write that lands after a session started may or may not be visible to it; treat any file listed here as a reason to discard the run.`);
 	out.push("");
 	out.push("## Reproduce");
 	out.push("");
 	out.push("```");
-	out.push(`$ bun run tools/measurement/run.ts --set ${setName} --out ${outFile.startsWith(REPO_ROOT) ? relative(REPO_ROOT, outFile) : outFile} --seed ${seed}${repeats > 1 ? ` --repeats ${repeats}` : ""}${only.length > 0 ? ` --only ${only.join(",")}` : ""}`);
+	out.push(`$ bun run tools/measurement/run.ts --set ${setName} --out ${outFile.startsWith(REPO_ROOT) ? relative(REPO_ROOT, outFile) : outFile} --seed ${seed}${repeats > 1 ? ` --repeats ${repeats}` : ""}${only.length > 0 ? ` --only ${only.join(",")}` : ""}${rawFlag !== undefined && rawFlag.length > 0 ? ` --raw ${relative(REPO_ROOT, rawDir)}` : ""}`);
 	out.push("```");
 	out.push("");
 	out.push("The task checks can be validated on their own, with no omp session and no judge:");
@@ -1911,6 +2589,9 @@ try {
 		}
 	}
 	const killed = results.flatMap(r => [r.runs.control, r.runs.addon]).filter(c => c.timedOut);
+	if (revisionAfter.digest !== revision.digest || srcWrittenDuringRun.length > 0) {
+		out.push(`- **Revision**: this run is NOT single-revision - \`src/\` changed or was written inside the run window (${srcWrittenDuringRun.join(", ") || "the digest changed"}). The addon arm may have loaded two different revisions, so discard this run rather than comparing it.`);
+	}
 	out.push(`- Agent sessions killed at the harness time limit: ${killed.length === 0 ? "none" : killed.map(k => `${k.taskId}/${k.arm}`).join(", ")}.`);
 	const nonZero = results.flatMap(r => [r.runs.control, r.runs.addon]).filter(c => c.exitCode !== 0);
 	out.push(`- Agent sessions with a non-zero exit code: ${nonZero.length === 0 ? "none" : nonZero.map(k => `${k.taskId}/${k.arm}=${k.exitCode}`).join(", ")}.`);

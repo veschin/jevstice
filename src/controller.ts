@@ -21,6 +21,7 @@
  * - Same-agent feedback: `pi.sendMessage(payload, {deliverAs, triggerTurn})` injects into the
  *   SAME session - no respawn, no new session.
  */
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { isRecord, nonEmptyString } from "./guards.js";
 import type { JevTemplateConfig } from "./config.js";
 import * as mechanism from "./gates.js";
@@ -495,12 +496,39 @@ export interface HandoffRecord extends mechanism.GateRecordFields {
 	phase: "dispatch" | "acceptance";
 }
 
-/** POLICY-DRAFT I record of one execution-time destructive-action consultation. */
+/**
+ * POLICY-DRAFT I record of one execution-time destructive-action consultation. Both triggers share
+ * one record shape: the shared gate fields, the trigger and what it quoted.
+ */
+export type DestructiveTrigger = "command" | "outsideProjectWrite";
+
 export interface DestructiveRecord extends mechanism.GateRecordFields {
-	/** The owner pattern that matched, verbatim from the config. */
+	/**
+	 * Which trigger judged: a bash command matching an owner pattern, or a write/edit/ast_edit call
+	 * whose target lies outside the project root. Absent on records persisted before the second
+	 * trigger existed, and read back as the command trigger.
+	 */
+	trigger?: DestructiveTrigger;
+	/**
+	 * What triggered the judgement, verbatim from its source: the owner pattern that matched
+	 * (trigger `command`), or the outside-root target path(s) (trigger `outsideProjectWrite`).
+	 */
 	pattern: string;
-	/** The bash command that was judged (verbatim prefix, capped for readability). */
+	/**
+	 * The text that was judged (verbatim prefix): the bash command, or the content the call would write
+	 * (`outsideProjectWrite`, or the target path list when the call carries no content).
+	 */
 	command: string;
+}
+
+/** What the outside-root write trigger read from the tool call, for the consult and the record. */
+interface OutsideRootWriteFacts {
+	toolName: string;
+	targets: readonly string[];
+	/** The project root the targets were measured against, quoted verbatim in the judge's subject. */
+	root: string;
+	/** The content the call would write, or undefined when the call carries none. */
+	content: string | undefined;
 }
 
 // ---------- tool input validation ----------
@@ -524,7 +552,9 @@ const REFACTOR_MARKING_OUTCOMES: Readonly<Record<string, true>> = {
 // Mutation-bearing builtins (omp 18.6.3 tools/builtin-names.ts + tool sources):
 // edit/write mutate files directly; ast_edit performs structural edits; bash executes
 // arbitrary shell (mutation-capable, conservatively gated); memory_edit and manage_skill
-// write user-level state. Non-builtin custom tools are out of this gate's reach (documented).
+// write user-level state, and learn/retain write the same state (a lesson into long-term
+// memory, and - with `learn` - a managed skill) under names the set did not carry.
+// Non-builtin custom tools are out of this gate's reach (documented).
 const MUTATING_TOOLS: ReadonlySet<string> = new Set([
 	"edit",
 	"write",
@@ -532,6 +562,8 @@ const MUTATING_TOOLS: ReadonlySet<string> = new Set([
 	"bash",
 	"memory_edit",
 	"manage_skill",
+	"learn",
+	"retain",
 	// eval spawns processes and writes files from inside the kernel without a tool_call
 	// of its own: gated for the same reason as bash (conservative, mutation-capable).
 	"eval",
@@ -993,6 +1025,12 @@ export interface ControllerDeps {
 	 * timeout, whose on-timeout policy is fail-closed (DESTRUCTIVE_DEADLINE_MS). Tests only.
 	 */
 	destructiveDeadlineMs?: number;
+	/**
+	 * Project root the outside-root write trigger measures a target against - the same directory the
+	 * config loader reads `<cwd>/.omp/jev.config.json` from. Absent = `process.cwd()` read at each
+	 * judgement, which is what the extension's own config loading resolves (tests pin it).
+	 */
+	projectRoot?: string;
 	/** Review judge: the fixed question set of a review stage in one request (src/client.ts). */
 	reviewJudge?: ReviewJudge;
 	/** Review consult deadline; must stay under the host's handler timeout (REVIEW_DEADLINE_MS). Tests only. */
@@ -1053,6 +1091,8 @@ export class JevController {
 	private readonly handoffDispatchDeadlineMs: number;
 	/** Destructive-action consult deadline (under the host's fail-closed 30s tool_call timeout). */
 	private readonly destructiveDeadlineMs: number;
+	/** Project root for the outside-root write trigger; undefined = `process.cwd()` at each judgement. */
+	private readonly projectRoot: string | undefined;
 	/** Review judge: the fixed question set of a review stage in one request. */
 	private readonly reviewJudge: ReviewJudge | undefined;
 	/** Review consult deadline (under the host's handler timeout). */
@@ -1074,6 +1114,7 @@ export class JevController {
 		this.maxReworkIterations = deps.maxReworkIterations ?? POLICY.maxReworkIterations;
 		this.handoffDispatchDeadlineMs = deps.handoffDispatchDeadlineMs ?? mechanism.HANDOFF_DISPATCH_DEADLINE_MS;
 		this.destructiveDeadlineMs = deps.destructiveDeadlineMs ?? mechanism.DESTRUCTIVE_DEADLINE_MS;
+		this.projectRoot = deps.projectRoot;
 		this.reviewJudge = deps.reviewJudge;
 		this.reviewDeadlineMs = deps.reviewDeadlineMs ?? REVIEW_DEADLINE_MS;
 		// R1: a confidenceThreshold override may only RAISE the bar above POLICY.
@@ -1905,36 +1946,100 @@ export class JevController {
 	// ----- POLICY-DRAFT I: destructive-action gate -----
 
 	/**
-	 * Destructive-action gate (POLICY-DRAFT class I, always_judge 0.88). A bash command matching an
-	 * owner pattern is judged before it runs, with the command and the session task as evidence. The
-	 * call is refused ONLY on a judged explicit negative at or above the confidence floor - the same
+	 * Destructive-action gate (POLICY-DRAFT class I, always_judge 0.88). One descriptor, one option
+	 * set, one refusal rule, two triggers:
+	 *  - a bash command matching an owner pattern (`gates.destructive.patterns`);
+	 *  - a `write`/`edit`/`ast_edit` call whose target is a plain path outside the project root
+	 *    (`gates.destructive.outsideProjectWrites`, off by default) - the class the live session
+	 *    performed under a tool name no pattern list can reach.
+	 * Either call is judged before it runs, with the call's own text and the session task as evidence.
+	 * The call is refused ONLY on a judged explicit negative at or above the confidence floor - the same
 	 * condition as the FR-11 handoff gate - so an abstention, a judge error, a low confidence, a frame
-	 * escape, a deadline loss or an unwired pattern list lets the command run and records the
-	 * uncertainty (the owner measured that blocking on an abstention becomes a permanent block).
+	 * escape, a deadline loss or a disarmed trigger lets it run and records the uncertainty (the owner
+	 * measured that blocking on an abstention becomes a permanent block).
 	 */
 	async onDestructiveCall(event: unknown, _ctx?: unknown): Promise<{ block?: boolean; reason?: string } | undefined> {
-		if (!isRecord(event) || event["toolName"] !== "bash") return undefined;
+		if (!isRecord(event)) return undefined;
 		// An invalid config is already blocked fail-closed by the mutation gate; never judge on it.
 		if (this.templateError !== undefined) return undefined;
-		// Absent or empty list means the gate does not exist (default off).
-		const patterns = this.template.gates?.destructive?.patterns ?? [];
-		if (patterns.length === 0) return undefined;
+		const toolName = event["toolName"];
+		if (typeof toolName !== "string") return undefined;
+		const destructive = this.template.gates?.destructive;
 		const input = event["input"];
-		const command = isRecord(input) && nonEmptyString(input["command"]) ? input["command"] : undefined;
-		if (command === undefined) return undefined;
-		const matched = destructivePatternMatch(command, patterns);
-		if (matched === undefined) return undefined;
+		if (toolName === "bash") {
+			// Absent or empty list means the command trigger does not exist (default off).
+			const patterns = destructive?.patterns ?? [];
+			if (patterns.length === 0) return undefined;
+			const command = isRecord(input) && nonEmptyString(input["command"]) ? input["command"] : undefined;
+			if (command === undefined) return undefined;
+			const matched = destructivePatternMatch(command, patterns);
+			if (matched === undefined) return undefined;
+			return this.consultDestructive("command", matched, command);
+		}
+		// The second trigger: a file write or edit that lands outside the project the task works in.
+		// Disarmed by default, and independent of the pattern list (`outsideProjectWrites`).
+		if (destructive?.outsideProjectWrites !== true) return undefined;
+		if (OUTSIDE_ROOT_WRITE_TOOLS[toolName] !== true) return undefined;
+		const root = this.projectRoot ?? process.cwd();
+		const targets = outsideRootWriteTargets(toolName, input, root);
+		if (targets.length === 0) return undefined;
+		const content = writePayloadText(input);
+		return this.consultDestructive(
+			"outsideProjectWrite",
+			targets.join(", "),
+			content ?? targets.join("\n"),
+			{ toolName, targets, root, content },
+		);
+	}
+
+	/**
+	 * One destructive-action consult for either trigger: the frame, the evidence, the deadline race,
+	 * then the one refusal rule. The subject names the concrete fact - the command, or the tool and
+	 * the outside-root target(s) - so the judge quotes what it judged.
+	 */
+	private async consultDestructive(
+		trigger: DestructiveTrigger,
+		subjectText: string,
+		judgedText: string,
+		write?: OutsideRootWriteFacts,
+	): Promise<{ block?: boolean; reason?: string } | undefined> {
 		const gate = mechanism.decisionGate("destructive_action");
-		const evidence: Evidence[] = [
-			mechanism.gateEvidence("spec", "bash tool call command (about to run)", command),
-		];
+		const evidence: Evidence[] = [];
+		let subject: string;
+		if (write === undefined) {
+			evidence.push(mechanism.gateEvidence("spec", "bash tool call command (about to run)", judgedText));
+			subject = mechanism.gateSubject("Command about to run (verbatim)", judgedText);
+		} else {
+			// The concrete fact, quotable: which tool, which path(s), outside which root.
+			subject = mechanism.gateSubject(
+				`Outside-root write about to run (tool: ${write.toolName})`,
+				`Tool call: ${write.toolName}\nTarget path(s), outside the project root ${write.root}:\n` +
+					write.targets.join("\n"),
+			);
+			evidence.push(
+				mechanism.gateEvidence(
+					"code",
+					`${write.toolName} tool call target path(s), outside the project root ${write.root}`,
+					write.targets.join("\n"),
+				),
+			);
+			if (write.content !== undefined) {
+				evidence.push(
+					mechanism.gateEvidence(
+						"code",
+						`${write.toolName} tool call content (about to be written)`,
+						write.content,
+					),
+				);
+			}
+		}
 		const task = this.state.taskPrompt;
 		if (task !== undefined) evidence.push(mechanism.gateEvidence("user", "session task prompt", task));
 		// A late answer must never block: the host's own tool_call timeout is fail-closed, so the
 		// frame's deadline must fire first and take the fail-open path.
 		const consult = await mechanism.consultGate(gate, {
-			frame: "execution",
-			subject: mechanism.gateSubject("Command about to run (verbatim)", command),
+			frame: trigger === "command" ? "execution" : "outside_root_write",
+			subject,
 			evidence,
 			options: this.template.stages?.[gate.stage]?.options,
 			judge: this.judge,
@@ -1943,15 +2048,17 @@ export class JevController {
 		});
 		if (consult.deadlineLost) {
 			this.recordDestructiveUncertainty(
-				matched,
-				command,
+				trigger,
+				subjectText,
+				judgedText,
 				`the judge did not answer before the destructive-gate deadline (${this.destructiveDeadlineMs}ms)`,
 			);
 			return undefined;
 		}
 		const record: DestructiveRecord = {
-			pattern: matched,
-			command: mechanism.cappedQuote(command).quote,
+			trigger,
+			pattern: subjectText,
+			command: mechanism.cappedQuote(judgedText).quote,
 			judged: consult.judged,
 			verdict: consult.verdict,
 			confidence: consult.confidence,
@@ -1961,33 +2068,46 @@ export class JevController {
 		};
 		if (consult.negative) {
 			const reason =
-				`Jev destructive-action gate refused this command before execution: ${record.reasons.join(" ")} ` +
-				`(judge revise at confidence ${record.confidence}, matched pattern "${record.pattern}"). ` +
-				"Confirm the destructive action with the user or replace it with a reversible step, then run it again.";
+				write === undefined
+					? `Jev destructive-action gate refused this command before execution: ${record.reasons.join(" ")} ` +
+						`(judge revise at confidence ${record.confidence}, matched pattern "${subjectText}"). ` +
+						"Confirm the destructive action with the user or replace it with a reversible step, then run it again."
+					: `Jev destructive-action gate refused this write before execution: ${record.reasons.join(" ")} ` +
+						`(judge revise at confidence ${record.confidence}, tool ${write.toolName} targeting a path ` +
+						`outside the project root: ${subjectText}). Confirm the out-of-root write with the user, move it ` +
+						"inside the project, or replace it with a reversible step, then run it again.";
 			this.blockDestructive(record, reason);
 			return { block: true, reason };
 		}
 		this.state.lastDestructive = record;
 		this.pushFeedback(
-			`Jev destructive-action gate (${mechanism.gateLine(`command matched "${record.pattern}"`, record)}). ` +
-				"The command proceeds.",
+			`Jev destructive-action gate (${mechanism.gateLine(
+				trigger === "command" ? `command matched "${subjectText}"` : `write outside the project root: ${subjectText}`,
+				record,
+			)}). ${trigger === "command" ? "The command" : "The write"} proceeds.`,
 		);
 		this.persist();
 		return undefined;
 	}
 
 	/** Unjudged destructive outcome: recorded in state and surfaced, never a block (owner constraint). */
-	private recordDestructiveUncertainty(pattern: string, command: string, note: string): void {
+	private recordDestructiveUncertainty(
+		trigger: DestructiveTrigger,
+		subject: string,
+		judgedText: string,
+		note: string,
+	): void {
 		this.state.lastDestructive = {
-			pattern,
-			command: mechanism.cappedQuote(command).quote,
+			trigger,
+			pattern: subject,
+			command: mechanism.cappedQuote(judgedText).quote,
 			judged: false,
 			reasons: [note],
 			blocked: false,
 			at: this.now(),
 		};
 		this.persist();
-		this.pushFeedback(`Jev destructive-action gate not judged: ${note}. The command proceeds.`);
+		this.pushFeedback(`Jev destructive-action gate not judged: ${note}. The work proceeds.`);
 	}
 
 	/** Confident negative: recorded as an explicit unresolved blocker (same shape as the gate blockers). */
@@ -5401,12 +5521,19 @@ function restoreHandoffRecord(raw: unknown): HandoffRecord | undefined {
 	return { phase: raw["phase"], ...base };
 }
 
-/** Validate a persisted destructive-action record: shared fields + the matched pattern and command. */
+/** Validate a persisted destructive-action record: shared fields + the trigger, the subject and the text. */
 function restoreDestructiveRecord(raw: unknown): DestructiveRecord | undefined {
 	const base = mechanism.restoreGateRecordFields(raw);
 	if (base === undefined || !isRecord(raw)) return undefined;
 	if (!nonEmptyString(raw["pattern"]) || typeof raw["command"] !== "string") return undefined;
-	return { pattern: raw["pattern"], command: raw["command"], ...base };
+	const trigger = raw["trigger"];
+	if (trigger !== undefined && trigger !== "command" && trigger !== "outsideProjectWrite") return undefined;
+	return {
+		trigger: trigger as DestructiveTrigger | undefined,
+		pattern: raw["pattern"],
+		command: raw["command"],
+		...base,
+	};
 }
 
 /**
@@ -5671,6 +5798,89 @@ function destructivePatternMatch(command: string, patterns: readonly string[]): 
 		if (needle.length > 0 && haystack.includes(needle)) return pattern;
 	}
 	return undefined;
+}
+
+/** The tool calls whose target the outside-root write trigger reads (the builtin plain-file writers). */
+const OUTSIDE_ROOT_WRITE_TOOLS: Readonly<Record<string, true>> = {
+	write: true,
+	edit: true,
+	ast_edit: true,
+};
+
+/**
+ * Targets an `edit` payload names inside its own text, read only from the documented headers: the
+ * hashline `[PATH#TAG]` section headers and the apply-patch `*** Add/Update/Delete File:` and
+ * `*** Move to:` directives. Content that merely looks like a header inside a body row is not a
+ * target; the hashline `MV` destination is none of these and is not read (documented limit).
+ */
+function editPayloadTargets(payload: string): string[] {
+	const out: string[] = [];
+	for (const line of payload.split(/\r?\n/)) {
+		const trimmed = line.trim();
+		const hashline = /^\[([^[\]#]+)#[0-9A-Fa-f]{4}\]$/.exec(trimmed);
+		if (hashline !== null) {
+			out.push(hashline[1]!.trim());
+			continue;
+		}
+		const directive = /^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$/.exec(trimmed);
+		if (directive !== null) out.push(directive[1]!.trim());
+	}
+	return out;
+}
+
+/**
+ * The plain filesystem targets a write/edit/ast_edit call names, as the model wrote them. A target
+ * carrying a `://` scheme addresses an internal resource or a mounted tool device whose own handler
+ * owns the write semantics, so it is not read here (documented limit). Deduplicated, order kept.
+ */
+function writeTargetPaths(toolName: string, input: unknown): string[] {
+	if (!isRecord(input)) return [];
+	const out: string[] = [];
+	const add = (value: unknown): void => {
+		if (!nonEmptyString(value)) return;
+		const target = value.trim();
+		if (target.length === 0 || target.includes("://") || out.includes(target)) return;
+		out.push(target);
+	};
+	if (toolName === "ast_edit") {
+		const paths = input["paths"];
+		if (Array.isArray(paths)) for (const path of paths) add(path);
+	}
+	add(input["path"]);
+	add(input["file_path"]);
+	if (toolName === "edit") {
+		const payload = input["input"];
+		if (typeof payload === "string") for (const target of editPayloadTargets(payload)) add(target);
+	}
+	return out;
+}
+
+/**
+ * Which of the named targets land outside the project root, in the order given. A relative target
+ * resolves against the root - the way the write/edit tools resolve it against the session cwd - and
+ * an absolute one is used as it stands.
+ */
+function outsideRootWriteTargets(toolName: string, input: unknown, projectRoot: string): string[] {
+	return writeTargetPaths(toolName, input).filter(target => {
+		const rel = relative(projectRoot, resolve(projectRoot, target));
+		return rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
+	});
+}
+
+/**
+ * The text a write/edit/ast_edit call would apply, for the consult's content evidence: the write
+ * payload, the edit patch or replaced text, or the ast_edit rewrite ops. `gateEvidence` caps it.
+ */
+function writePayloadText(input: unknown): string | undefined {
+	if (!isRecord(input)) return undefined;
+	const parts: string[] = [];
+	for (const key of ["input", "content", "new_string", "old_string"]) {
+		const value = input[key];
+		if (typeof value === "string" && value.trim().length > 0) parts.push(value);
+	}
+	const ops = input["ops"];
+	if (Array.isArray(ops) && ops.length > 0) parts.push(JSON.stringify(ops));
+	return parts.length > 0 ? parts.join("\n") : undefined;
 }
 
 function hostModelIds(ctxOrList: unknown): string[] {

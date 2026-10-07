@@ -45,14 +45,17 @@ export interface JevTemplateConfig {
 	/**
 	 * Gate switches (user-owned). `mutation: false` lifts the plan gate: mutating tools are
 	 * no longer blocked while no plan-stage approval exists. `destructive.patterns` arms the
-	 * execution-time destructive-action gate: a bash command matching any pattern is judged
-	 * before it runs; an absent or empty list means the gate does not exist. Fail-closed
-	 * judging, digests, bounded rework and completion binding are unchanged.
+	 * command trigger of the execution-time destructive-action gate: a bash command matching any
+	 * pattern is judged before it runs; an absent or empty list means that trigger does not exist.
+	 * `destructive.outsideProjectWrites` arms the gate's second trigger: a `write`/`edit`/`ast_edit`
+	 * call whose target is a plain path outside the project root is judged before it runs. It is off
+	 * by default and independent of the pattern list. Fail-closed judging, digests, bounded rework and
+	 * completion binding are unchanged.
 	 */
 	gates?: {
 		mutation?: boolean;
 		completion?: boolean;
-		destructive?: { patterns: string[] };
+		destructive?: { patterns: string[]; outsideProjectWrites?: boolean; };
 		/**
 		 * F2: arms the ACCEPTANCE side of the FR-11 hand-off gate. Opt-in and off by default: it
 		 * judges the delegated result the host delivers (the `async-result` background delivery),
@@ -276,8 +279,15 @@ export function validateTemplateConfig(file: string, raw: unknown): JevTemplateC
 					throw new JevConfigError(file, `gates.destructive.patterns[${i}] must be a non-empty string`);
 				}
 			});
-			// An empty list is a legal no-op: the gate does not exist (default off).
-			gates.destructive = { patterns: patterns as string[] };
+			const outside = destructive["outsideProjectWrites"];
+			if (outside !== undefined && typeof outside !== "boolean") {
+				throw new JevConfigError(file, "gates.destructive.outsideProjectWrites must be a boolean");
+			}
+			// An empty list is a legal no-op: the command trigger does not exist (default off).
+			gates.destructive = {
+				patterns: patterns as string[],
+				...(typeof outside === "boolean" ? { outsideProjectWrites: outside } : {}),
+			};
 		}
 		out.gates = gates;
 	}
@@ -318,6 +328,11 @@ export function mergeTemplateConfigs(user: JevTemplateConfig, project: JevTempla
 												...(project.gates?.destructive?.patterns ?? []),
 											]),
 										],
+										// Per-key like every other gate switch: the boundary trigger is off unless a
+										// config file arms it, and the patterns union never carries the switch.
+										outsideProjectWrites:
+											user.gates?.destructive?.outsideProjectWrites ??
+											project.gates?.destructive?.outsideProjectWrites,
 									},
 					},
 		// Trust split like the plan-gate switch: the automatic course-check period is USER-owned.

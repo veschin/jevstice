@@ -2,6 +2,66 @@
 
 ## Unreleased
 
+- **The invisible write paths are visible to the gate.** Two paths that ran unjudged now reach a
+  judgement, both opt-in and both off by default:
+  - The destructive-action gate (`destructive_action`) gained a **second trigger and frame**: a
+    `write`, `edit` or `ast_edit` call whose target is a plain filesystem path outside the project
+    root is judged before it runs, with the tool name, the target path(s) and a verbatim prefix of
+    the content it would write as evidence. It is armed by the new owner switch
+    `gates.destructive.outsideProjectWrites` (validated as a boolean, merged per key, off by
+    default). The command trigger and its `patterns` list are unchanged, and the two triggers are
+    independent: an empty pattern list does not disarm the write trigger, and arming the write
+    trigger judges no command. The descriptor's declared boundary, arming rule, required evidence and
+    evidence kinds were rewritten to describe both triggers (`evidenceKinds` grew from
+    `["spec","user"]` to `["spec","user","code","log"]`), and the judgement record carries which
+    trigger produced it. Why this and not a longer pattern list: the observed out-of-root write
+    happened under the `write` tool, which the handler never saw at all (its first line rejected
+    every non-`bash` call), so no pattern could ever have matched it - a live session wrote
+    `/tmp/jev-smoke.ts` from a project elsewhere
+    (`evidence/measurement-2026-10-08-horizon/raw/horizon-api-control-r1.stdout.jsonl:3036`).
+  - The plan gate's mutating-tool set gained `learn` and `retain`, so they are covered exactly the
+    way `memory_edit` and `manage_skill` already were - they write the same user-level state (a
+    lesson into long-term memory, and, with `learn`, a managed skill). The live session that made two
+    `learn` calls ran with the gate armed for `edit`/`write` and had nothing covering the calls that
+    wrote memory and created a skill.
+  Failure behaviour, unchanged and stated for both new paths: an abstention, a judge error, a
+  sub-floor confidence, a frame escape and a missed deadline let the action run and record the
+  uncertainty - none of them refuses and none of them approves; only an explicit `revise` at or above
+  the confidence floor refuses, and a recorded approve unlocks nothing.
+  The design was put to the judge before it was built, in three approaches and with a changed
+  approach each time (a design frame over quoted code and a session record; a narrow structural
+  claim about the mechanism; the outcome plus the artifacts that settle it): `approve` 0.28 (raw
+  0.38), `insufficient_evidence` 0.32, `approve` 0.57 (raw 0.63) - all below the 0.8 floor, so the
+  disposition is recorded OPEN, with the option question naming this design at 0.64 then 0.84 against
+  0.25/0.05 for a new blocking stage and 0.01/0.07 for leaving it bash-only. The second attempt's
+  narrow claim ("the judgement machinery is trigger-agnostic") was rejected at `not_established`
+  0.87, which is what forced the descriptor's own declared boundary to be rewritten instead of
+  re-used. Documented in README "Gates", "Stages", "Config" and "Limits", including what remains
+  invisible: the write tool's own `chmod +x` (it happens after the boundary), internal-URL and
+  mounted-device targets, archive/SQLite selectors, the hashline `MV` destination, `bash` file
+  redirects outside the root, and the memory/context builtins (`checkpoint`, `rewind`,
+  `context_notes`, `new_context`) that are not in the mutating set.
+- Verification: `bun run typecheck` clean; `bun test` 392 pass / 0 fail / 1901 expect() calls / 17
+  files (376 before; 16 added for this behaviour, each proven to fail when its rule is removed by a
+  mutation check against the green baseline - eight mutations run: the two new tool names, the
+  arming guard, the outside-root filter, the refusal rule, the deadline branch, the scheme rule, the
+  config validation and the config merge).
+- **The fourth measurement: the extension did not rescue the failure.** On the one task shape where
+  the cheap model genuinely fails - a refactor that must carry an edge-heavy behaviour surface
+  through a rewrite, the run's own signature declaring an option field optional while its code
+  rejects the absence - five paired runs per arm on one revision kept 43/45 requirements for plain
+  omp and 42/45 with this extension; the same requirement was dropped in 2 of 5 control runs and 3
+  of 5 addon runs, at 52.2 s / 189,149 coding tokens against 113.3 s / 692,262 plus 21 judge
+  consultations. At this sample size 2-of-5 versus 3-of-5 is noise, so the honest reading is that the
+  product's premise - a cheap model's drift is caught by putting a judge in its path - is not
+  demonstrated, and that a positive result would require the requirement-level judgement to actually
+  run (in three of the five addon runs it did not: classification and topic selection only) plus a
+  third arm with the judge disabled to separate the pipeline's effect from extra effort. Across four
+  measurements and 181 requirement observations, no run has this extension's arm doing better than
+  the plain one.
+
+## 1.0.0 - 2026-10-08
+
 - **The answer obliges: the standing problems of a refusal (PRD 1.1 / FR-10).** The owner's sentence
   - "если ты спросил судью и он сказал переделать значит выясняй что не так и переделывай" - is now
   the product's behaviour, not only advice. A judged refusal that names reasons at or above the
@@ -70,6 +130,19 @@ Stated plainly, because a release should not hide it:
   consultations the control arm never pays, and in the decisive run roughly twice the wall time. The
   weak model never called the decision tool on its own; every consultation came from the extension's
   automatic paths. `tools/measurement/` reproduces this, and its self-test validates the checks first.
+  A fourth measurement then ran the one task shape on which the cheap model genuinely fails - a
+  refactor that must carry an edge-heavy behaviour surface through a rewrite, where the run's own
+  signature declares an option field optional while its code rejects the absence - as five paired
+  runs per arm on a single revision: plain omp kept 43/45 requirements and this extension 42/45, the
+  same requirement dropped in 2 of 5 control runs and 3 of 5 addon runs, at 52.2 s / 189,149 coding
+  tokens against 113.3 s / 692,262 plus 21 judge consultations. The extension did not rescue the
+  failure and the 2-of-5 versus 3-of-5 difference is noise at this sample size, so the premise that a
+  cheap model's drift is caught by putting a judge in its path is not demonstrated; a positive result
+  would need the requirement-level judgement to actually run (in three of the five addon runs the
+  extension never reached the requirement level, classifying the task and picking topics only) and a
+  third arm with the judge disabled to separate the pipeline's effect from extra effort. Across four
+  measurements and 181 requirement observations, no run has this extension's arm doing better than
+  the plain one.
 - Two decisions the owner delegated to the judge returned abstentions (which below-floor measures to
   build; whether the plan and completion checks should stop work), so neither was built or tightened.
 - Several requirement formulations remain OPEN after three approaches each, recorded with their

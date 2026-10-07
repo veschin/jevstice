@@ -980,5 +980,1261 @@ console.log("CHECK PASS: all six requirements met");
 	},
 ];
 
+// ---------------------------------------------------------------------------
+// Hard set. Search instrument, one task: the requirements live in a shipped spec file and the
+// ticket-style prompt points at it instead of enumerating them, so the specification is a document
+// to be read and held across a multi-step implementation rather than a checklist. The task is
+// deliberately larger than the horizon tasks (12 spec sections, an existing module whose contract
+// and test suite must survive, a proportional-allocation rule with an exact-total constraint, two
+// degenerate fixtures, a flag that changes the ordering, an error path with its own exit code) so
+// that "did the run hold every requirement" has room to fail. Every requirement is a machine
+// verdict from the check script (`REQ <id> PASS|FAIL`); the judge decides nothing.
+// ---------------------------------------------------------------------------
+
+const HARD_PKG = `${JSON.stringify({ name: "ledger-task", type: "module", private: true }, null, 2)}\n`;
+
+/** The existing money helper of the ledger task: the contract that must survive untouched. */
+export const MONEY_SRC = `/** Money helpers. All amounts are integer cents. */
+
+/** Parses a decimal amount ("12", "12.3", "12.34") into integer cents. */
+export function parseAmount(text: string): number {
+	if (!/^\\d+(\\.\\d{1,2})?$/.test(text)) throw new Error("invalid amount: " + text);
+	const [whole, fraction = ""] = text.split(".");
+	return Number(whole) * 100 + Number(fraction.padEnd(2, "0"));
+}
+
+/** Formats integer cents as a decimal amount. */
+export function formatAmount(cents: number): string {
+	const sign = cents < 0 ? "-" : "";
+	const abs = Math.abs(cents);
+	return sign + Math.floor(abs / 100) + "." + String(abs % 100).padStart(2, "0");
+}
+`;
+
+export const MONEY_TEST_SRC = `import { expect, test } from "bun:test";
+import { formatAmount, parseAmount } from "./money";
+
+test("parses whole amounts", () => {
+	expect(parseAmount("3")).toBe(300);
+});
+
+test("parses one and two decimal places", () => {
+	expect(parseAmount("1.7")).toBe(170);
+	expect(parseAmount("1.75")).toBe(175);
+	expect(parseAmount("0.05")).toBe(5);
+});
+
+test("rejects anything that is not a plain amount with at most two decimals", () => {
+	expect(() => parseAmount("1.234")).toThrow("invalid amount: 1.234");
+	expect(() => parseAmount("")).toThrow("invalid amount: ");
+	expect(() => parseAmount("-2.00")).toThrow("invalid amount: -2.00");
+});
+
+test("formats cents back", () => {
+	expect(formatAmount(175)).toBe("1.75");
+	expect(formatAmount(5)).toBe("0.05");
+	expect(formatAmount(230)).toBe("2.30");
+});
+`;
+
+/** The authoritative spec of the ledger task: it holds every requirement, and the prompt does not repeat them. */
+export const LEDGER_SPEC = `# Cart discount allocation spec
+
+This spec is the authority for \`allocate.ts\`: each numbered section below is a requirement of the
+task, and the checks test exactly these sections.
+
+## 1. Deliverable and output
+
+\`bun allocate.ts\` reads the cart (section 7) and writes \`allocation.json\` in the working directory:
+
+    { "total": <cents>, "discount": <cents>, "lines": [ { "sku": ..., "subtotal": ..., "allocated": ... }, ... ] }
+
+\`total\` is the sum of all line subtotals, in cents. Every number written is an integer, and there are
+no other fields, at the top level or inside a line.
+
+## 2. Subtotals
+
+A line's subtotal is \`qty * parseAmount(unitPrice)\`. Use \`parseAmount\` from \`src/money.ts\`: the
+amount parser is not to be reimplemented.
+
+## 3. Allocation rule
+
+A line's exact share of the discount is \`subtotal * discount / total\`. Give every line
+\`floor(share)\`, then hand out the cents that remain, one per line, in order of decreasing fractional
+part, where a line's fractional part is \`subtotal * discount mod total\` computed exactly (integer
+arithmetic; do not round the share first). Ties go to the line that comes first in the input. The
+allocated cents sum to the discount exactly.
+
+## 4. Small subtotals
+
+A line whose subtotal is 0 is allocated 0, and no line is ever allocated more than its own subtotal.
+
+## 5. Order of the written lines
+
+By default \`lines\` is sorted by \`sku\` ascending (case-sensitive). \`--by=cost\` sorts by \`allocated\`
+descending instead, with ties broken by \`sku\` ascending.
+
+## 6. stdout
+
+Exactly one line: \`allocated <discount> of <total> cents across <n> lines\`, where \`<n>\` is the number
+of lines in the cart.
+
+## 7. Choosing the input
+
+With no arguments the cart is \`data/cart.json\`. \`--file=<path>\` reads that cart file instead. Other
+cart files may be present under \`data/\`; they are inputs, not outputs.
+
+## 8. --help
+
+\`--help\` prints a usage line to stderr containing \`--by\`, exits 0 and writes no file.
+
+## 9. A discount larger than the total
+
+If \`discount\` is larger than \`total\`, print \`discount exceeds total\` to stderr, exit with code 3, and
+leave \`allocation.json\` as it was: do not write it and do not overwrite it.
+
+## 10. Files that must not change
+
+\`SPEC.md\`, \`data/cart.json\`, \`src/money.ts\` and \`src/money.test.ts\` stay byte-identical.
+\`src/money.ts\` keeps exporting exactly \`parseAmount\` and \`formatAmount\`, and \`bun test\` still exits
+0. Do not add test files for the new code: the existing suite is the one that has to stay green.
+
+## 11. Nothing else
+
+When you finish, this directory contains nothing that was not here before, plus \`allocate.ts\` and
+\`allocation.json\`. No helper module, no types file, no notes, no README, no lockfile.
+
+## 12. Deferred
+
+A \`--csv\` report mode is deferred to a later revision: do not implement it, do not accept the flag,
+and do not write any CSV file.
+`;
+
+const LEDGER_CART_MAIN = `{
+  "discountCents": 1000,
+  "lines": [
+    { "sku": "sugar", "qty": 2, "unitPrice": "1.75" },
+    { "sku": "apples", "qty": 1, "unitPrice": "3.40" },
+    { "sku": "milk", "qty": 3, "unitPrice": "0.99" },
+    { "sku": "tea", "qty": 1, "unitPrice": "2.05" }
+  ]
+}
+`;
+
+/**
+ * Three extra carts under data/ so `--file` is exercised with data the checks own:
+ * cart-b: three equal 1-cent lines, discount 2 -> the leftover cent must follow input order;
+ * cart-c: a zero-quantity line, discount 3 -> the zero line gets 0 and the leftover cent goes to the
+ *         largest fractional part, which is NOT the largest subtotal;
+ * cart-d: discount larger than the total -> the error path of section 9.
+ */
+const LEDGER_CART_B = `{
+  "discountCents": 2,
+  "lines": [
+    { "sku": "x", "qty": 1, "unitPrice": "0.01" },
+    { "sku": "y", "qty": 1, "unitPrice": "0.01" },
+    { "sku": "z", "qty": 1, "unitPrice": "0.01" }
+  ]
+}
+`;
+
+const LEDGER_CART_C = `{
+  "discountCents": 3,
+  "lines": [
+    { "sku": "gift", "qty": 0, "unitPrice": "9.99" },
+    { "sku": "pen", "qty": 1, "unitPrice": "0.02" },
+    { "sku": "ink", "qty": 1, "unitPrice": "0.05" }
+  ]
+}
+`;
+
+const LEDGER_CART_D = `{
+  "discountCents": 100,
+  "lines": [
+    { "sku": "a", "qty": 1, "unitPrice": "0.50" }
+  ]
+}
+`;
+
+export const HARD_TASKS: TaskDef[] = [
+	{
+		id: "ledger",
+		title: "twelve spec sections: a proportional discount allocation whose requirements live in SPEC.md (the prompt points at it), an existing money module and its suite that must survive, two degenerate carts and a deferred --csv mode",
+		acceptance:
+			"R1 allocation.json is {total,discount,lines} with integer fields only and total 1192; R2 subtotals are qty*parseAmount(unitPrice) via src/money.ts (sugar 350, apples 340, milk 297, tea 205); R3 the largest-remainder allocation is exact (sugar 294, apples 285, milk 249, tea 172, sum 1000) and the three equal 1-cent lines of cart-b split the leftover by input order (x 1, y 1, z 0); R4 the zero-subtotal line of cart-c is allocated 0 and nothing exceeds its subtotal; R5 default order is sku ascending and --by=cost is allocated descending; R6 stdout is exactly 'allocated 1000 of 1192 cents across 4 lines'; R7 --file=<path> selects the cart (cart-c total 7, cart-b total 3); R8 --help exits 0 with --by in a stderr usage line and writes nothing; R9 a discount larger than the total (cart-d) exits 3 with 'discount exceeds total' on stderr and leaves allocation.json untouched; R10 SPEC.md, data/cart.json, src/money.ts and src/money.test.ts are byte-identical, src/money.ts exports exactly parseAmount and formatAmount and bun test exits 0; R11 no file other than allocate.ts and allocation.json is created; R12 the deferred --csv mode is not implemented.",
+		requirements: [
+			{ id: "R1", kind: "deliverable", text: "allocation.json = {total, discount, lines[{sku,subtotal,allocated}]}, integers only, total 1192 / discount 1000 / four lines (spec 1)" },
+			{ id: "R2", kind: "deliverable", text: "subtotals are qty * parseAmount(unitPrice) using the existing src/money.ts parser: sugar 350, apples 340, milk 297, tea 205 (spec 2)" },
+			{ id: "R3", kind: "deliverable", text: "largest-remainder allocation, exact: sugar 294, apples 285, milk 249, tea 172 (sum 1000); cart-b's three equal lines get x 1, y 1, z 0 (spec 3)" },
+			{ id: "R4", kind: "deliverable", text: "cart-c's zero-subtotal line is allocated 0, the sum is exact and no line exceeds its subtotal (spec 4)" },
+			{ id: "R5", kind: "deliverable", text: "lines sorted by sku ascending by default, --by=cost sorts by allocated descending (ties by sku) (spec 5)" },
+			{ id: "R6", kind: "deliverable", text: "stdout is exactly 'allocated 1000 of 1192 cents across 4 lines' (spec 6)" },
+			{ id: "R7", kind: "deliverable", text: "--file=<path> reads that cart instead of data/cart.json (spec 7)" },
+			{ id: "R8", kind: "deliverable", text: "--help prints a usage line containing --by to stderr, exits 0, writes no file (spec 8)" },
+			{ id: "R9", kind: "deliverable", text: "discount > total (cart-d): exit 3, 'discount exceeds total' on stderr, allocation.json left alone (spec 9)" },
+			{ id: "R10", kind: "constraint", text: "SPEC.md, data/cart.json, src/money.ts and src/money.test.ts byte-identical; src/money.ts exports exactly parseAmount and formatAmount; bun test exits 0; no new test file (spec 10)" },
+			{ id: "R11", kind: "constraint", text: "nothing is created but allocate.ts and allocation.json - no helper module, no types file, no notes, no lockfile (spec 11)" },
+			{ id: "R12", kind: "deferred", text: "the deferred --csv report mode is NOT implemented: no flag handler, no CSV writer, no CSV file - the distractor (spec 12)" },
+		],
+		setup: {
+			"package.json": HARD_PKG,
+			"SPEC.md": LEDGER_SPEC,
+			"data/cart.json": LEDGER_CART_MAIN,
+			"data/cart-b.json": LEDGER_CART_B,
+			"data/cart-c.json": LEDGER_CART_C,
+			"data/cart-d.json": LEDGER_CART_D,
+			"src/money.ts": MONEY_SRC,
+			"src/money.test.ts": MONEY_TEST_SRC,
+		},
+		checkFiles: {
+			".measure-check-ledger.ts": `import { createHash } from "node:crypto";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+
+const fails: string[] = [];
+const req = (id: string, ok: boolean, detail: string): void => {
+  console.log("REQ " + id + " " + (ok ? "PASS" : "FAIL") + " " + detail);
+  if (!ok) fails.push(id + ": " + detail);
+};
+const sha = (p: string): string => (existsSync(p) ? createHash("sha256").update(readFileSync(p)).digest("hex") : "missing");
+const run = (args: string[]) => Bun.spawnSync(["bun", "allocate.ts", ...args], { stdout: "pipe", stderr: "pipe" });
+const readJson = (p: string): unknown => { try { return JSON.parse(readFileSync(p, "utf8")); } catch { return undefined; } };
+const field = (v: unknown, k: string): unknown => (typeof v === "object" && v !== null ? (v as Record<string, unknown>)[k] : undefined);
+const int = (v: unknown): number | undefined => (typeof v === "number" && Number.isInteger(v) ? v : undefined);
+const rows = (v: unknown): Array<Record<string, unknown>> => {
+  const raw = field(v, "lines");
+  return Array.isArray(raw) ? (raw.filter(x => typeof x === "object" && x !== null) as Array<Record<string, unknown>>) : [];
+};
+const keySet = (v: unknown): string => (typeof v === "object" && v !== null ? JSON.stringify(Object.keys(v).sort()) : "not an object");
+const allocBySku = (v: unknown): Record<string, number> => {
+  const out: Record<string, number> = {};
+  for (const row of rows(v)) out[String(field(row, "sku"))] = Number(field(row, "allocated"));
+  return out;
+};
+const subtotalBySku = (v: unknown): Record<string, number> => {
+  const out: Record<string, number> = {};
+  for (const row of rows(v)) out[String(field(row, "sku"))] = Number(field(row, "subtotal"));
+  return out;
+};
+const skuOrder = (v: unknown): string[] => rows(v).map(row => String(field(row, "sku")));
+const sum = (values: number[]): number => values.reduce((a, b) => a + b, 0);
+const walk = (dir: string): string[] => {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = dir === "." ? entry.name : dir + "/" + entry.name;
+    if (entry.isDirectory()) out.push(...walk(full));
+    else if (entry.isFile()) out.push(full);
+  }
+  return out;
+};
+
+const EXPECTED_SUBTOTAL = { apples: 340, milk: 297, sugar: 350, tea: 205 };
+const EXPECTED_ALLOC = { apples: 285, milk: 249, sugar: 294, tea: 172 };
+
+const first = run([]);
+const base = readJson("allocation.json");
+const rowShapeOk = rows(base).length === 4 && rows(base).every(row => keySet(row) === JSON.stringify(["allocated", "sku", "subtotal"]) && int(field(row, "allocated")) !== undefined && int(field(row, "subtotal")) !== undefined);
+req("R1", keySet(base) === JSON.stringify(["discount", "lines", "total"]) && int(field(base, "total")) === 1192 && int(field(base, "discount")) === 1000 && rowShapeOk, "allocation.json keys = " + keySet(base) + ", total = " + String(field(base, "total")) + " (expected 1192), discount = " + String(field(base, "discount")) + " (expected 1000), line rows with exactly sku/subtotal/allocated as integers = " + rowShapeOk + " - spec 1");
+
+req("R2", JSON.stringify(subtotalBySku(base)) === JSON.stringify(EXPECTED_SUBTOTAL), "subtotals = " + JSON.stringify(subtotalBySku(base)) + " (expected " + JSON.stringify(EXPECTED_SUBTOTAL) + " = qty * parseAmount(unitPrice)) - spec 2");
+
+const tie = run(["--file=data/cart-b.json"]);
+const tieOut = readJson("allocation.json");
+const tieAlloc = allocBySku(tieOut);
+const baseAlloc = allocBySku(base);
+req("R3", JSON.stringify(baseAlloc) === JSON.stringify(EXPECTED_ALLOC) && sum(Object.values(baseAlloc)) === 1000 && JSON.stringify(tieAlloc) === JSON.stringify({ x: 1, y: 1, z: 0 }) && sum(Object.values(tieAlloc)) === 2, "largest-remainder vector = " + JSON.stringify(baseAlloc) + " (expected " + JSON.stringify(EXPECTED_ALLOC) + ", sum " + sum(Object.values(baseAlloc)) + "); cart-b (three equal 1-cent lines, discount 2, leftover by input order) = " + JSON.stringify(tieAlloc) + " (expected {x:1,y:1,z:0}) - spec 3");
+
+const mixed = run(["--file=data/cart-c.json"]);
+const mixedOut = readJson("allocation.json");
+const mixedAlloc = allocBySku(mixedOut);
+const overAllocated = rows(mixedOut).filter(row => Number(field(row, "allocated")) > Number(field(row, "subtotal")));
+req("R4", mixedAlloc["gift"] === 0 && sum(Object.values(mixedAlloc)) === 3 && overAllocated.length === 0, "cart-c allocations = " + JSON.stringify(mixedAlloc) + " (the zero-quantity line gift must be 0, the sum must be 3); lines allocated more than their subtotal: " + JSON.stringify(overAllocated.map(row => row["sku"])) + " - spec 4");
+
+run([]);
+const skuSorted = readJson("allocation.json");
+const byCost = run(["--by=cost"]);
+const costOut = readJson("allocation.json");
+req("R5", JSON.stringify(skuOrder(skuSorted)) === JSON.stringify(["apples", "milk", "sugar", "tea"]) && JSON.stringify(skuOrder(costOut)) === JSON.stringify(["sugar", "apples", "milk", "tea"]), "default order = " + JSON.stringify(skuOrder(skuSorted)) + " (expected sku ascending); --by=cost order = " + JSON.stringify(skuOrder(costOut)) + " (expected allocated descending: sugar 294, apples 285, milk 249, tea 172) - spec 5");
+
+const firstStdout = first.stdout.toString().trim();
+req("R6", first.exitCode === 0 && firstStdout === "allocated 1000 of 1192 cents across 4 lines", "stdout = " + JSON.stringify(firstStdout) + ", exit " + first.exitCode + " (expected exactly 'allocated 1000 of 1192 cents across 4 lines') - spec 6");
+
+req("R7", int(field(mixedOut, "total")) === 7 && int(field(tieOut, "total")) === 3, "--file=data/cart-c.json total = " + String(field(mixedOut, "total")) + " (expected 7, so the flag really selected that cart); --file=data/cart-b.json total = " + String(field(tieOut, "total")) + " (expected 3) - spec 7");
+
+const beforeHelp = sha("allocation.json");
+const help = run(["--help"]);
+req("R8", help.exitCode === 0 && help.stderr.toString().includes("--by") && sha("allocation.json") === beforeHelp, "--help exit " + help.exitCode + " (expected 0), stderr = " + JSON.stringify(help.stderr.toString().slice(0, 160)) + " (must contain --by), allocation.json untouched = " + (sha("allocation.json") === beforeHelp) + " - spec 8");
+
+const beforeOversize = sha("allocation.json");
+const oversize = run(["--file=data/cart-d.json"]);
+const oversizeStderr = oversize.stderr.toString();
+req("R9", oversize.exitCode === 3 && /discount exceeds total/.test(oversizeStderr) && sha("allocation.json") === beforeOversize, "cart-d (discount 100, total 50): exit " + oversize.exitCode + " (expected 3), stderr = " + JSON.stringify(oversizeStderr.slice(0, 160)) + " (must contain 'discount exceeds total'), allocation.json untouched = " + (sha("allocation.json") === beforeOversize) + " - spec 9");
+
+const frozenOk =
+  readFileSync("SPEC.md", "utf8") === ${JSON.stringify(LEDGER_SPEC)} &&
+  readFileSync("data/cart.json", "utf8") === ${JSON.stringify(LEDGER_CART_MAIN)} &&
+  readFileSync("src/money.ts", "utf8") === ${JSON.stringify(MONEY_SRC)} &&
+  readFileSync("src/money.test.ts", "utf8") === ${JSON.stringify(MONEY_TEST_SRC)};
+const testRun = Bun.spawnSync(["bun", "test"], { stdout: "pipe", stderr: "pipe" });
+let moneyExports: string[] = [];
+// Dynamic import: the run under measurement may have deleted or broken src/money.ts, and the verdict
+// must be reported as a dropped requirement instead of failing this check at module load.
+try { moneyExports = Object.keys(await import("./src/money.ts")).sort(); } catch { moneyExports = []; }
+req("R10", frozenOk && testRun.exitCode === 0 && JSON.stringify(moneyExports) === JSON.stringify(["formatAmount", "parseAmount"]), "SPEC.md / data/cart.json / src/money.ts / src/money.test.ts byte-identical = " + frozenOk + "; bun test exit " + testRun.exitCode + "; src/money.ts exports = " + JSON.stringify(moneyExports) + " (expected exactly [formatAmount,parseAmount]) - spec 10");
+
+// The deferred-mode run happens before the file walk, so a CSV file written by over-delivery is
+// visible to both the constraint (R11) and the distractor (R12) verdicts, as in the drift set.
+const src = existsSync("allocate.ts") ? readFileSync("allocate.ts", "utf8") : "";
+const csvRun = run(["--csv"]);
+const strayCsv = walk(".").filter(p => p.endsWith(".csv"));
+const csvImplemented = /\\btoCsv\\b|\\bwriteCsv\\b|\\bcsvOutput\\b/i.test(src) || /(?:includes|indexOf|find)\\(\\s*["']--csv/.test(src);
+const stillSpecShape = keySet(readJson("allocation.json")) === JSON.stringify(["discount", "lines", "total"]);
+const allowed = ["allocate.ts", "allocation.json", "package.json", "SPEC.md", "data/cart.json", "data/cart-b.json", "data/cart-c.json", "data/cart-d.json", "src/money.ts", "src/money.test.ts", ".measure-check-ledger.ts"];
+const extra = walk(".").filter(p => !allowed.includes(p));
+req("R11", extra.length === 0, "unexpected files: " + JSON.stringify(extra) + " (allowed: nothing beyond the setup files plus allocate.ts and allocation.json) - spec 11");
+req("R12", src.length > 0 && !csvImplemented && strayCsv.length === 0 && stillSpecShape, "the deferred --csv mode must not be implemented (flag handler or CSV writer found: " + csvImplemented + "; the --csv run created " + JSON.stringify(strayCsv) + ", exit " + csvRun.exitCode + "; allocation.json still has the spec shape: " + stillSpecShape + ") - spec 12");
+
+if (fails.length > 0) { console.log("CHECK FAIL: " + fails.length + " requirement(s) dropped"); process.exit(1); }
+console.log("CHECK PASS: all twelve requirements met");
+`,
+		},
+		checks: [{ id: "requirements R1-R12", cmd: ["bun", ".measure-check-ledger.ts"], expectExit: 0 }],
+		frozen: ["SPEC.md", "data/cart.json", "src/money.ts", "src/money.test.ts"],
+		prompt: [
+			"Task: implement the cart discount allocation described in SPEC.md.",
+			"",
+			"This directory holds the spec, the cart data, and an existing money helper with its test",
+			"suite. SPEC.md is the authority and it is complete: each of its twelve numbered sections is a",
+			"requirement, and the checks test exactly those sections - nothing is checked that the spec does",
+			"not state. Read it in full before you start, and re-read it before you finish.",
+			"",
+			"Deliver `allocate.ts` (Bun + TypeScript, no dependencies) in this directory; `data/cart.json` is",
+			"the default input.",
+		].join("\n"),
+	},
+];
+
+// ---------------------------------------------------------------------------
+// Search attempt 2 (set `tickets`). A different shape from `hard`: not a script written from
+// scratch in one file, but an existing three-module application that has to be extended, with the
+// ticket's decisions (the priority list, the id prefix, the ordering, the row format) obliged to
+// hold in the store, in the formatter and in the CLI at the same time, an existing byte-identical
+// test suite that must stay green, an API-stability constraint that forbids new exports, and a
+// packaging constraint that forbids new files - plus a deferred flag as the distractor. The prompt
+// is a ticket pointing at SPEC.md, as in `hard`.
+// ---------------------------------------------------------------------------
+
+const TICKETS_PKG = `${JSON.stringify({ name: "tickets-task", type: "module", private: true }, null, 2)}\n`;
+
+/** The existing store module: the ticket extends it, and its public API may not grow. */
+export const TICKETS_STORE_SRC = `/** In-memory issue store: every issue has an id, a title and a status. */
+
+export interface Issue {
+	id: string;
+	title: string;
+	status: "open" | "closed";
+}
+
+export interface Store {
+	issues: Issue[];
+	nextId: number;
+}
+
+export function newStore(): Store {
+	return { issues: [], nextId: 1 };
+}
+
+export function openIssue(store: Store, title: string): Issue {
+	const issue: Issue = { id: "BUG-" + store.nextId, title, status: "open" };
+	store.nextId += 1;
+	store.issues.push(issue);
+	return issue;
+}
+
+export function closeIssue(store: Store, id: string): Issue {
+	const issue = store.issues.find(candidate => candidate.id === id);
+	if (issue === undefined) throw new Error("unknown issue: " + id);
+	issue.status = "closed";
+	return issue;
+}
+`;
+
+/** The existing row formatter. */
+export const TICKETS_FORMAT_SRC = `import type { Issue } from "./store";
+
+/** Titles longer than this are truncated in a row. */
+export const TITLE_LIMIT = 24;
+
+/** Renders one issue as \`#<id> [<status>] <title>\`. */
+export function formatRow(issue: Issue): string {
+	const title = issue.title.length > TITLE_LIMIT ? issue.title.slice(0, TITLE_LIMIT) + "..." : issue.title;
+	return "#" + issue.id + " [" + issue.status + "] " + title;
+}
+`;
+
+/** The existing CLI, a pure function so the checks can drive it directly. */
+export const TICKETS_CLI_SRC = `import { formatRow } from "./format";
+import { closeIssue, openIssue, type Store } from "./store";
+
+export interface CliResult {
+	lines: string[];
+	errors: string[];
+	code: number;
+}
+
+const USAGE = "usage: issues [list [--all] | open <title> | close <id> | --help]";
+
+/** Runs one command against the store and returns its output; nothing here touches the filesystem. */
+export function runCli(store: Store, args: string[]): CliResult {
+	if (args.length === 0 || args.includes("--help")) return { lines: [USAGE], errors: [], code: 0 };
+	const [command, ...rest] = args;
+	if (command === "list") {
+		const all = rest.includes("--all");
+		const issues = store.issues.filter(issue => all || issue.status === "open");
+		return { lines: issues.map(formatRow), errors: [], code: 0 };
+	}
+	if (command === "open") {
+		const title = rest.join(" ").trim();
+		if (title.length === 0) return { lines: [], errors: [USAGE], code: 2 };
+		return { lines: ["opened " + openIssue(store, title).id], errors: [], code: 0 };
+	}
+	if (command === "close") {
+		const id = rest[0] ?? "";
+		try {
+			closeIssue(store, id);
+			return { lines: ["closed " + id], errors: [], code: 0 };
+		} catch (error) {
+			return { lines: [], errors: [error instanceof Error ? error.message : String(error)], code: 2 };
+		}
+	}
+	return { lines: [], errors: [USAGE], code: 2 };
+}
+`;
+
+/** The existing test suite of the store: byte-identical, and it must stay green. */
+export const TICKETS_STORE_TEST_SRC = `import { expect, test } from "bun:test";
+import { closeIssue, newStore, openIssue } from "../src/store";
+
+test("openIssue numbers ids in order", () => {
+	const store = newStore();
+	expect(openIssue(store, "first").id).toBe("BUG-1");
+	expect(openIssue(store, "second").id).toBe("BUG-2");
+});
+
+test("a new issue is open", () => {
+	const store = newStore();
+	expect(openIssue(store, "first").status).toBe("open");
+});
+
+test("closeIssue marks the issue closed", () => {
+	const store = newStore();
+	const issue = openIssue(store, "first");
+	expect(closeIssue(store, issue.id).status).toBe("closed");
+});
+
+test("closeIssue rejects an unknown id verbatim", () => {
+	const store = newStore();
+	expect(() => closeIssue(store, "BUG-9")).toThrow("unknown issue: BUG-9");
+});
+`;
+
+/** The existing test suite of the CLI: byte-identical, and it must stay green. */
+export const TICKETS_CLI_TEST_SRC = `import { expect, test } from "bun:test";
+import { runCli } from "../src/cli";
+import { newStore, openIssue } from "../src/store";
+
+test("list prints the open issues in id order", () => {
+	const store = newStore();
+	openIssue(store, "first");
+	openIssue(store, "second");
+	expect(runCli(store, ["list"]).lines).toEqual(["#BUG-1 [open] first", "#BUG-2 [open] second"]);
+});
+
+test("list hides closed issues unless --all is given", () => {
+	const store = newStore();
+	openIssue(store, "first");
+	openIssue(store, "second");
+	store.issues[0]!.status = "closed";
+	expect(runCli(store, ["list"]).lines).toEqual(["#BUG-2 [open] second"]);
+	expect(runCli(store, ["list", "--all"]).lines).toEqual(["#BUG-1 [closed] first", "#BUG-2 [open] second"]);
+});
+
+test("a long title is truncated in the row", () => {
+	const store = newStore();
+	openIssue(store, "abcdefghijklmnopqrstuvwxyz");
+	expect(runCli(store, ["list"]).lines).toEqual(["#BUG-1 [open] abcdefghijklmnopqrstuvwx..."]);
+});
+
+test("open and close report the id", () => {
+	const store = newStore();
+	expect(runCli(store, ["open", "first"]).lines).toEqual(["opened BUG-1"]);
+	expect(runCli(store, ["close", "BUG-1"]).lines).toEqual(["closed BUG-1"]);
+});
+
+test("an unknown id is an error with exit code 2", () => {
+	const store = newStore();
+	const result = runCli(store, ["close", "BUG-9"]);
+	expect(result.errors).toEqual(["unknown issue: BUG-9"]);
+	expect(result.code).toBe(2);
+});
+
+test("--help prints a single usage line", () => {
+	const store = newStore();
+	const result = runCli(store, ["--help"]);
+	expect(result.code).toBe(0);
+	expect(result.lines.length).toBe(1);
+	expect(result.lines[0]).toContain("usage:");
+});
+`;
+
+/** The ticket of the tickets task: the only place its requirements are written down. */
+export const TICKETS_SPEC = `# Ticket: priorities for the issue tracker
+
+This ticket is the next revision of the small issue tracker in \`src/\`. Its numbered sections are the
+requirements, and the checks test exactly these sections. Behaviour this ticket does not mention
+stays exactly as it is today, and the existing test suite in \`test/\` is byte-identical and has to
+stay green.
+
+## 1. A priority on every issue
+
+\`openIssue\` takes an optional third argument \`priority\`, one of \`"low"\`, \`"normal"\`, \`"high"\`, and
+defaults to \`"normal"\`. Any other value throws \`Error("invalid priority: " + value)\` and leaves the
+store exactly as it was - no issue, no counter change. The \`Issue\` interface gains a \`priority\`
+field.
+
+## 2. The id prefix follows the priority
+
+The id prefix is chosen by the priority: \`low\` -> \`TASK-\`, \`normal\` -> \`BUG-\`, \`high\` -> \`EPIC-\`.
+The number is still the single store-wide counter, so \`openIssue(store, "a", "low")\`,
+\`openIssue(store, "b")\` and \`openIssue(store, "c", "high")\` on a fresh store give \`TASK-1\`, \`BUG-2\`,
+\`EPIC-3\`.
+
+## 3. Existing callers
+
+\`openIssue(store, title)\` with no priority still opens a \`normal\` issue with a \`BUG-\` id, and
+\`closeIssue\` still accepts every id the store issued, whatever its prefix.
+
+## 4. formatRow
+
+\`formatRow(issue)\` keeps its signature and its output exactly. A second optional argument
+\`formatRow(issue, { showPriority: true })\` renders the priority between the status and the title:
+\`#<id> [<status>] (<priority>) <title>\`. \`TITLE_LIMIT\` and the truncation rule do not change.
+
+## 5. open --priority
+
+\`open <title> --priority=<p>\` opens the issue with that priority; the flag may come before or after
+the title. An invalid \`<p>\` is reported on stderr with the message of section 1 and exit code 2, and
+the store is left as it was. Without the flag the issue is \`normal\`.
+
+## 6. list --priority
+
+\`list --priority=<p>\` lists only the issues with that priority; it combines with \`--all\`, and both
+filters then apply. An invalid \`<p>\` is an error on stderr with exit code 2. A listing that filters
+or sorts by priority shows the priority in every row, in the \`showPriority\` form of \`formatRow\`; a
+plain listing keeps today's row exactly.
+
+## 7. list --sort=priority
+
+\`list --sort=priority\` orders the listed issues \`high\` first, then \`normal\`, then \`low\`, and issues
+with the same priority stay in id order. Without the flag today's order (id ascending) is kept. Any
+other \`--sort=\` value is an error on stderr with exit code 2.
+
+## 8. list --summary
+
+\`list --summary\` prints one extra line after the rows: \`<n> open, <m> closed\`, where \`n\` and \`m\`
+count the store's issues that match the \`--priority\` filter (every issue when the flag is absent),
+regardless of \`--all\`. Nothing else about the listing output changes.
+
+## 9. list --json
+
+\`list --json\` prints exactly one line instead of the rows: a JSON array of the listed issues, each
+\`{"id": ..., "title": ..., "status": ..., "priority": ...}\` and nothing else. It combines with
+\`--priority\`, \`--sort\` and \`--all\`. With \`--summary\` the summary line is the second line.
+
+## 10. Closing twice
+
+\`close <id>\` on an issue that is already closed prints \`already closed: <id>\` to stderr and exits
+with code 3. An unknown id keeps its existing message and its existing exit code.
+
+## 11. --help
+
+The usage line names every flag this ticket adds: \`--priority\`, \`--sort\`, \`--summary\` and \`--json\`.
+
+## 12. Deferred
+
+\`--assign=<name>\` is deferred to a later revision: do not implement it, do not accept the flag, and
+do not add an assignment field anywhere.
+
+## 13. Untouched files, and no new ones
+
+\`SPEC.md\`, \`test/store.test.ts\` and \`test/cli.test.ts\` stay byte-identical and \`bun test\` exits 0.
+Do not add test files for this ticket, and do not add any other file: the ticket is implemented
+inside the three modules that are already here.
+
+## 14. The public API does not grow
+
+\`src/store.ts\` keeps exporting exactly \`newStore\`, \`openIssue\` and \`closeIssue\`; \`src/format.ts\`
+keeps exporting exactly \`TITLE_LIMIT\` and \`formatRow\`; \`src/cli.ts\` keeps exporting exactly
+\`runCli\`. No new exported name in any module, and no new module.
+`;
+
+export const TICKET_TASKS: TaskDef[] = [
+	{
+		id: "tickets",
+		title: "fourteen ticket sections on an existing three-module issue tracker: priorities threaded through the store, the formatter and the CLI (id prefix, row form, filter, sort, summary, JSON, a second close), with a frozen test suite, an API that may not grow and no new files allowed",
+		acceptance:
+			"R1 openIssue takes an optional priority (default normal, invalid -> 'invalid priority: <value>' with the store untouched); R2 the id prefix follows the priority (TASK-/BUG-/EPIC-) on the single counter; R3 existing callers and closeIssue still work for every prefix; R4 formatRow is unchanged and gains {showPriority:true} -> '#<id> [<status>] (<priority>) <title>'; R5 open --priority works before or after the title and rejects an invalid value with exit 2; R6 list --priority filters (with --all) and shows the priority in the rows, invalid -> exit 2; R7 list --sort=priority orders high/normal/low keeping id order within a priority, other values -> exit 2; R8 list --summary adds '<n> open, <m> closed' counted over the priority filter regardless of --all; R9 list --json prints one line with exactly id/title/status/priority and works with the other flags, --summary adding a second line; R10 closing an already-closed issue gives 'already closed: <id>' and exit 3 while an unknown id keeps its message and code; R11 the usage line names --priority, --sort, --summary and --json; R12 the deferred --assign is not implemented; R13 SPEC.md and both test files are byte-identical, bun test exits 0 and no file is added; R14 the three modules' exported names do not grow.",
+		requirements: [
+			{ id: "R1", kind: "deliverable", text: "openIssue(store,title,priority?) defaults to normal, stores the priority, and rejects an invalid value with Error('invalid priority: ' + value) leaving the store untouched (ticket 1)" },
+			{ id: "R2", kind: "deliverable", text: "id prefix by priority: low TASK-, normal BUG-, high EPIC-, on one shared counter (TASK-1, BUG-2, EPIC-3) (ticket 2)" },
+			{ id: "R3", kind: "deliverable", text: "openIssue(store,title) is still a normal BUG- issue and closeIssue closes any prefix the store issued (ticket 3)" },
+			{ id: "R4", kind: "deliverable", text: "formatRow unchanged, plus formatRow(issue,{showPriority:true}) = '#<id> [<status>] (<priority>) <title>'; TITLE_LIMIT 24 and truncation unchanged (ticket 4)" },
+			{ id: "R5", kind: "deliverable", text: "open <title> --priority=<p> works with the flag before or after the title; invalid -> stderr, exit 2, store unchanged (ticket 5)" },
+			{ id: "R6", kind: "deliverable", text: "list --priority=<p> filters (combines with --all) and shows the priority in the rows; invalid -> exit 2 (ticket 6)" },
+			{ id: "R7", kind: "deliverable", text: "list --sort=priority orders high, normal, low with id order inside a priority; any other --sort= value -> exit 2 (ticket 7)" },
+			{ id: "R8", kind: "deliverable", text: "list --summary adds '<n> open, <m> closed' counted over the priority filter and regardless of --all (ticket 8)" },
+			{ id: "R9", kind: "deliverable", text: "list --json prints exactly one line, an array of {id,title,status,priority} with no other fields, combining with --priority/--sort/--all; --summary adds a second line (ticket 9)" },
+			{ id: "R10", kind: "deliverable", text: "close on an already-closed issue -> 'already closed: <id>' on stderr, exit 3; an unknown id keeps its existing message and code (ticket 10)" },
+			{ id: "R11", kind: "deliverable", text: "the usage line names --priority, --sort, --summary and --json (ticket 11)" },
+			{ id: "R12", kind: "deferred", text: "the deferred --assign=<name> is NOT implemented - the distractor (ticket 12)" },
+			{ id: "R13", kind: "constraint", text: "SPEC.md and both test files byte-identical, bun test exits 0, no new file at all (ticket 13)" },
+			{ id: "R14", kind: "constraint", text: "the exported names do not grow: store.ts newStore/openIssue/closeIssue, format.ts TITLE_LIMIT/formatRow, cli.ts runCli (ticket 14)" },
+		],
+		setup: {
+			"package.json": TICKETS_PKG,
+			"SPEC.md": TICKETS_SPEC,
+			"src/store.ts": TICKETS_STORE_SRC,
+			"src/format.ts": TICKETS_FORMAT_SRC,
+			"src/cli.ts": TICKETS_CLI_SRC,
+			"test/store.test.ts": TICKETS_STORE_TEST_SRC,
+			"test/cli.test.ts": TICKETS_CLI_TEST_SRC,
+		},
+		checkFiles: {
+			".measure-check-tickets.ts": `import { readFileSync, readdirSync } from "node:fs";
+
+const fails: string[] = [];
+const req = (id: string, ok: boolean, detail: string): void => {
+  console.log("REQ " + id + " " + (ok ? "PASS" : "FAIL") + " " + detail);
+  if (!ok) fails.push(id + ": " + detail);
+};
+const msg = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+const field = (v: unknown, k: string): unknown => (typeof v === "object" && v !== null ? (v as Record<string, unknown>)[k] : undefined);
+
+// Runtime-selected module specifiers: the run under measurement may have deleted or broken a module,
+// and every requirement must still get a verdict instead of crashing the whole check on load.
+const load = async (specifier: string): Promise<unknown> => { try { return await import(specifier); } catch { return undefined; } };
+const storeMod = await load("./src/store.ts");
+const formatMod = await load("./src/format.ts");
+const cliMod = await load("./src/cli.ts");
+
+interface IssueLike { id: string; title: string; status: string; priority?: string }
+interface StoreLike { issues: IssueLike[]; nextId: number }
+interface ResultLike { lines: string[]; errors: string[]; code: number }
+type NewFn = () => StoreLike;
+type OpenFn = (store: StoreLike, title: string, priority?: string) => IssueLike;
+type CloseFn = (store: StoreLike, id: string) => IssueLike;
+type FormatFn = (issue: IssueLike, options?: { showPriority?: boolean }) => string;
+type CliFn = (store: StoreLike, args: string[]) => ResultLike;
+
+const newStoreFn = field(storeMod, "newStore") as NewFn | undefined;
+const openFn = field(storeMod, "openIssue") as OpenFn | undefined;
+const closeFn = field(storeMod, "closeIssue") as CloseFn | undefined;
+const formatFn = field(formatMod, "formatRow") as FormatFn | undefined;
+const runCli = field(cliMod, "runCli") as CliFn | undefined;
+
+const fresh = (): StoreLike => (newStoreFn as NewFn)();
+const thrown = (body: () => unknown): string => { try { body(); return ""; } catch (error) { return msg(error); } };
+const open = (store: StoreLike, title: string, priority?: string): IssueLike => (openFn as OpenFn)(store, title, priority);
+const cli = (store: StoreLike, args: string[]): ResultLike =>
+  runCli === undefined ? { lines: [], errors: ["src/cli.ts does not export runCli"], code: -1 } : runCli(store, args);
+/** The title of a row, whether or not the row shows the priority. */
+const titleOf = (row: string): string => { const after = row.slice(row.indexOf("] ") + 2); return after.startsWith("(") ? after.slice(after.indexOf(") ") + 2) : after; };
+const titlesOf = (result: ResultLike): string[] => result.lines.map(titleOf);
+
+/** A store with one issue of each priority, one of them closed - built through the public API. */
+const seeded = (): StoreLike => {
+  const store = fresh();
+  open(store, "first");
+  open(store, "urgent", "high");
+  open(store, "later", "low");
+  const done = open(store, "done");
+  closeFn === undefined ? undefined : closeFn(store, done.id);
+  return store;
+};
+const idOf = (store: StoreLike, title: string): string => String((store.issues.find(issue => issue.title === title) ?? { id: "" }).id);
+
+const verify = (id: string, body: () => { ok: boolean; detail: string }): void => {
+  try {
+    const outcome = body();
+    req(id, outcome.ok, outcome.detail);
+  } catch (error) {
+    req(id, false, "the check could not evaluate this requirement: " + msg(error));
+  }
+};
+
+verify("R1", () => {
+  if (openFn === undefined) return { ok: false, detail: "src/store.ts does not export openIssue" };
+  const rejected = fresh();
+  const error = thrown(() => open(rejected, "a", "bogus"));
+  const untouchedStore = rejected.issues.length === 0;
+  const defaulted = open(fresh(), "x");
+  const explicit = open(fresh(), "x", "high");
+  return {
+    ok: error.includes("invalid priority: bogus") && untouchedStore && defaulted.priority === "normal" && explicit.priority === "high",
+    detail: "invalid priority -> " + JSON.stringify(error) + " (expected 'invalid priority: bogus'), store left untouched = " + untouchedStore + ", default priority = " + JSON.stringify(defaulted.priority) + " (expected \\"normal\\"), explicit = " + JSON.stringify(explicit.priority) + " (expected \\"high\\")",
+  };
+});
+
+verify("R2", () => {
+  if (openFn === undefined) return { ok: false, detail: "src/store.ts does not export openIssue" };
+  const store = fresh();
+  const ids = [open(store, "a", "low").id, open(store, "b").id, open(store, "c", "high").id];
+  return { ok: JSON.stringify(ids) === JSON.stringify(["TASK-1", "BUG-2", "EPIC-3"]), detail: "ids = " + JSON.stringify(ids) + " (expected [TASK-1,BUG-2,EPIC-3]: the prefix follows the priority and the number is one shared counter)" };
+});
+
+verify("R3", () => {
+  if (openFn === undefined || closeFn === undefined) return { ok: false, detail: "src/store.ts does not export openIssue/closeIssue" };
+  const store = fresh();
+  const legacy = open(store, "legacy");
+  const low = open(store, "low one", "low");
+  const high = open(store, "high one", "high");
+  const closedLow = closeFn(store, low.id).status;
+  const closedHigh = closeFn(store, high.id).status;
+  return {
+    ok: legacy.id.indexOf("BUG-") === 0 && legacy.status === "open" && closedLow === "closed" && closedHigh === "closed",
+    detail: "openIssue(store,title).id = " + JSON.stringify(legacy.id) + " (expected a BUG- id), its status = " + JSON.stringify(legacy.status) + "; closeIssue on " + JSON.stringify(low.id) + " -> " + JSON.stringify(closedLow) + ", on " + JSON.stringify(high.id) + " -> " + JSON.stringify(closedHigh),
+  };
+});
+
+verify("R4", () => {
+  if (formatFn === undefined) return { ok: false, detail: "src/format.ts does not export formatRow" };
+  const normal: IssueLike = { id: "BUG-1", title: "first", status: "open", priority: "normal" };
+  const long: IssueLike = { id: "EPIC-2", title: "abcdefghijklmnopqrstuvwxyz", status: "open", priority: "high" };
+  const plain = formatFn(normal);
+  const shown = formatFn(normal, { showPriority: true });
+  const longPlain = formatFn(long);
+  const longShown = formatFn(long, { showPriority: true });
+  return {
+    ok: plain === "#BUG-1 [open] first" && shown === "#BUG-1 [open] (normal) first" && longPlain === "#EPIC-2 [open] abcdefghijklmnopqrstuvwx..." && longShown === "#EPIC-2 [open] (high) abcdefghijklmnopqrstuvwx..." && field(formatMod, "TITLE_LIMIT") === 24,
+    detail: "formatRow(issue) = " + JSON.stringify(plain) + ", formatRow(issue,{showPriority:true}) = " + JSON.stringify(shown) + ", long title = " + JSON.stringify(longPlain) + ", long + showPriority = " + JSON.stringify(longShown) + ", TITLE_LIMIT = " + String(field(formatMod, "TITLE_LIMIT")) + " (expected 24)",
+  };
+});
+
+verify("R5", () => {
+  const store = fresh();
+  const after = cli(store, ["open", "first", "--priority=high"]);
+  const before = cli(store, ["open", "--priority=low", "second"]);
+  const bad = fresh();
+  const badResult = cli(bad, ["open", "first", "--priority=urgent"]);
+  const opened = store.issues.map(issue => issue.priority);
+  return {
+    ok: after.code === 0 && after.lines.length === 1 && after.lines[0].indexOf("opened ") === 0 && before.code === 0 && before.lines.length === 1 && before.lines[0].indexOf("opened ") === 0 && JSON.stringify(opened) === JSON.stringify(["high", "low"]) && badResult.code === 2 && badResult.errors.join(" ") === "invalid priority: urgent" && bad.issues.length === 0,
+    detail: "open --priority=high after the title -> " + JSON.stringify(after.lines) + " exit " + after.code + "; open --priority=low before the title -> " + JSON.stringify(before.lines) + " exit " + before.code + "; priorities stored = " + JSON.stringify(opened) + " (expected [high,low]); invalid priority -> exit " + badResult.code + " (expected 2), stderr " + JSON.stringify(badResult.errors.join(" ")) + ", store left untouched = " + (bad.issues.length === 0),
+  };
+});
+
+verify("R6", () => {
+  const store = seeded();
+  const low = cli(store, ["list", "--priority=low"]);
+  const normalAll = cli(store, ["list", "--priority=normal", "--all"]);
+  const plain = cli(store, ["list"]);
+  const bad = cli(store, ["list", "--priority=urgent"]);
+  return {
+    ok: JSON.stringify(titlesOf(low)) === JSON.stringify(["later"]) && low.lines.every(row => row.indexOf("(low)") >= 0) && JSON.stringify(titlesOf(normalAll)) === JSON.stringify(["first", "done"]) && plain.lines.every(row => row.indexOf("(") < 0) && bad.code === 2 && bad.errors.join(" ").indexOf("invalid priority") >= 0 && bad.errors.join(" ").indexOf("urgent") >= 0,
+    detail: "list --priority=low rows = " + JSON.stringify(low.lines) + " (expected only 'later', with the priority shown as (low)); list --priority=normal --all = " + JSON.stringify(normalAll.lines) + " (expected first and done); a plain listing shows no priority: " + plain.lines.every(row => row.indexOf("(") < 0) + "; invalid priority -> exit " + bad.code + " (expected 2), stderr " + JSON.stringify(bad.errors.join(" ")),
+  };
+});
+
+verify("R7", () => {
+  const store = seeded();
+  const idOrder = cli(store, ["list", "--all"]);
+  const sorted = cli(store, ["list", "--all", "--sort=priority"]);
+  const bad = cli(store, ["list", "--sort=title"]);
+  return {
+    ok: JSON.stringify(titlesOf(idOrder)) === JSON.stringify(["first", "urgent", "later", "done"]) && JSON.stringify(titlesOf(sorted)) === JSON.stringify(["urgent", "first", "done", "later"]) && bad.code === 2 && bad.errors.length > 0,
+    detail: "default order = " + JSON.stringify(titlesOf(idOrder)) + " (expected id order first, urgent, later, done); --sort=priority = " + JSON.stringify(titlesOf(sorted)) + " (expected urgent, first, done, later: high, then normal in id order, then low); --sort=title -> exit " + bad.code + " (expected 2), stderr " + JSON.stringify(bad.errors.join(" ")),
+  };
+});
+
+verify("R8", () => {
+  const store = seeded();
+  const plain = cli(store, ["list", "--summary"]);
+  const filtered = cli(store, ["list", "--priority=normal", "--all", "--summary"]);
+  const withJson = cli(store, ["list", "--json", "--summary"]);
+  return {
+    ok: plain.lines.length === 4 && plain.lines[3] === "3 open, 1 closed" && JSON.stringify(titlesOf({ lines: plain.lines.slice(0, 3), errors: [], code: 0 })) === JSON.stringify(["first", "urgent", "later"]) && filtered.lines.length === 3 && filtered.lines[2] === "1 open, 1 closed" && withJson.lines.length === 2 && withJson.lines[1] === "3 open, 1 closed",
+    detail: "list --summary = " + JSON.stringify(plain.lines) + " (expected the three open rows then '3 open, 1 closed'); list --priority=normal --all --summary = " + JSON.stringify(filtered.lines) + " (expected two rows then '1 open, 1 closed': the summary counts the priority filter regardless of --all); list --json --summary = " + JSON.stringify(withJson.lines) + " (expected the JSON line then '3 open, 1 closed')",
+  };
+});
+
+verify("R9", () => {
+  const store = seeded();
+  const parse = (result: ResultLike): Array<Record<string, unknown>> => {
+    try { const value: unknown = JSON.parse(result.lines[0] ?? ""); return Array.isArray(value) ? (value as Array<Record<string, unknown>>) : []; } catch { return []; }
+  };
+  const all = cli(store, ["list", "--json", "--all"]);
+  const openOnly = cli(store, ["list", "--json"]);
+  const parsedAll = parse(all);
+  const parsedOpen = parse(openOnly);
+  const fieldsOf = (entries: Array<Record<string, unknown>>): string[] => entries.map(entry => JSON.stringify(Object.keys(entry).sort()));
+  const titles = (entries: Array<Record<string, unknown>>): string[] => entries.map(entry => String(entry.title)).sort();
+  return {
+    ok: all.lines.length === 1 && parsedAll.length === 4 && fieldsOf(parsedAll).every(keys => keys === JSON.stringify(["id", "priority", "status", "title"])) && JSON.stringify(titles(parsedAll)) === JSON.stringify(["done", "first", "later", "urgent"]) && openOnly.lines.length === 1 && parsedOpen.length === 3 && fieldsOf(parsedOpen).every(keys => keys === JSON.stringify(["id", "priority", "status", "title"])) && JSON.stringify(titles(parsedOpen)) === JSON.stringify(["first", "later", "urgent"]),
+    detail: "list --json --all lines = " + JSON.stringify(all.lines) + " (expected exactly one line with the four listed issues); per-object fields = " + JSON.stringify(fieldsOf(parsedAll)) + " (expected exactly id/priority/status/title); list --json = " + JSON.stringify(openOnly.lines) + " (expected the three open issues, no rows and no summary)",
+  };
+});
+
+verify("R10", () => {
+  const store = seeded();
+  const closedId = idOf(store, "done");
+  const again = cli(store, ["close", closedId]);
+  const unknown = cli(store, ["close", "BUG-999"]);
+  return {
+    ok: again.code === 3 && again.errors.join(" ") === "already closed: " + closedId && again.lines.length === 0 && unknown.code === 2 && unknown.errors.join(" ") === "unknown issue: BUG-999",
+    detail: "close " + JSON.stringify(closedId) + " (already closed) -> exit " + again.code + " (expected 3), stderr " + JSON.stringify(again.errors.join(" ")) + " (expected 'already closed: " + closedId + "'); close BUG-999 -> exit " + unknown.code + " (expected 2), stderr " + JSON.stringify(unknown.errors.join(" ")) + " (expected 'unknown issue: BUG-999')",
+  };
+});
+
+verify("R11", () => {
+  const help = cli(seeded(), ["--help"]);
+  const text = help.lines.concat(help.errors).join("\\n");
+  const missing = ["--priority", "--sort", "--summary", "--json"].filter(flag => text.indexOf(flag) < 0);
+  return { ok: help.code === 0 && missing.length === 0, detail: "usage line = " + JSON.stringify(text) + ", exit " + help.code + "; flags missing from it: " + JSON.stringify(missing) };
+});
+
+verify("R12", () => {
+  const source = ["src/store.ts", "src/format.ts", "src/cli.ts"].map(path => readFileSync(path, "utf8")).join("\\n");
+  const flagHandler = /(?:includes|indexOf|find|startsWith)\\(\\s*["']--assign/.test(source);
+  const fieldAdded = /\\bassignee\\b|\\bassignedTo\\b|\\bassigned_to\\b/i.test(source);
+  const run = cli(seeded(), ["list", "--assign=me"]);
+  return {
+    ok: !flagHandler && !fieldAdded && run.code === 0 && JSON.stringify(titlesOf(run)) === JSON.stringify(["first", "urgent", "later"]),
+    detail: "the deferred --assign=<name> must not be implemented (flag handler found: " + flagHandler + ", assignment field found: " + fieldAdded + "); list --assign=me lists the default rows = " + JSON.stringify(run.lines),
+  };
+});
+
+verify("R13", () => {
+  const frozenOk = readFileSync("SPEC.md", "utf8") === ${JSON.stringify(TICKETS_SPEC)} && readFileSync("test/store.test.ts", "utf8") === ${JSON.stringify(TICKETS_STORE_TEST_SRC)} && readFileSync("test/cli.test.ts", "utf8") === ${JSON.stringify(TICKETS_CLI_TEST_SRC)};
+  const testRun = Bun.spawnSync(["bun", "test"], { stdout: "pipe", stderr: "pipe" });
+  const allowed = ["package.json", "SPEC.md", "src/store.ts", "src/format.ts", "src/cli.ts", "test/store.test.ts", "test/cli.test.ts", ".measure-check-tickets.ts"];
+  const walk = (dir: string): string[] => {
+    const out: string[] = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = dir === "." ? entry.name : dir + "/" + entry.name;
+      if (entry.isDirectory()) out.push(...walk(full));
+      else if (entry.isFile()) out.push(full);
+    }
+    return out;
+  };
+  const extra = walk(".").filter(path => allowed.indexOf(path) < 0);
+  return {
+    ok: frozenOk && testRun.exitCode === 0 && extra.length === 0,
+    detail: "SPEC.md / test/store.test.ts / test/cli.test.ts byte-identical = " + frozenOk + "; bun test exit " + testRun.exitCode + " (expected 0); files that should not exist: " + JSON.stringify(extra),
+  };
+});
+
+verify("R14", () => {
+  const exportsOf = (mod: unknown): string[] => (mod === undefined ? ["<module failed to load>"] : Object.keys(mod).sort());
+  const storeExports = exportsOf(storeMod);
+  const formatExports = exportsOf(formatMod);
+  const cliExports = exportsOf(cliMod);
+  return {
+    ok: JSON.stringify(storeExports) === JSON.stringify(["closeIssue", "newStore", "openIssue"]) && JSON.stringify(formatExports) === JSON.stringify(["TITLE_LIMIT", "formatRow"]) && JSON.stringify(cliExports) === JSON.stringify(["runCli"]),
+    detail: "src/store.ts exports = " + JSON.stringify(storeExports) + " (expected [closeIssue,newStore,openIssue]); src/format.ts exports = " + JSON.stringify(formatExports) + " (expected [TITLE_LIMIT,formatRow]); src/cli.ts exports = " + JSON.stringify(cliExports) + " (expected [runCli])",
+  };
+});
+
+if (fails.length > 0) { console.log("CHECK FAIL: " + fails.length + " requirement(s) dropped"); process.exit(1); }
+console.log("CHECK PASS: all fourteen requirements met");
+`,
+		},
+		checks: [{ id: "requirements R1-R14", cmd: ["bun", ".measure-check-tickets.ts"], expectExit: 0 }],
+		frozen: ["SPEC.md", "test/store.test.ts", "test/cli.test.ts"],
+		prompt: [
+			"Task: implement the ticket in SPEC.md (\"priorities for the issue tracker\") in this existing",
+			"app.",
+			"",
+			"The directory holds the ticket, a small three-module issue tracker under `src/` and its passing",
+			"test suite under `test/`. The ticket's fourteen numbered sections are the requirements and the",
+			"checks test exactly those sections - nothing outside the ticket is checked. Read the ticket in",
+			"full before you start, and re-read it before you finish; behaviour the ticket does not mention",
+			"must not change, and the existing test suite has to stay green and byte-identical.",
+		].join("\n"),
+	},
+];
+
+// ---------------------------------------------------------------------------
+// Search attempt 3 (set `refactor`). Another change of approach. Attempts 1 and 2 both asked for
+// new code that a spec describes completely, and the cheap model satisfied every requirement of
+// both. This task moves the contract out of the spec and into the existing code: a small module
+// with a rich, edge-heavy surface (a duration parser/formatter with an ordered-unit rule and an
+// exact error message, plus a half-open window predicate) has to be split in two, every existing
+// behaviour has to survive the rewrite untouched, the callers have to be cut over without a
+// re-export shim, and the two new rules the ticket adds (a `maxUnits` truncation and an ISO-8601
+// window entry point) carry the boundaries the checks probe. The test file in the scratch directory
+// covers only a fraction of the behaviour, so the model cannot learn the contract from it.
+// ---------------------------------------------------------------------------
+
+const REFACTOR_PKG = `${JSON.stringify({ name: "duration-task", type: "module", private: true }, null, 2)}\n`;
+
+/** The existing module pair's first file: parsing, formatting and the window predicate. */
+export const DURATION_WINDOW_SRC = `/** Compact duration parsing, formatting and window checks. Timestamps are epoch milliseconds. */
+
+const UNIT_MS = { w: 604800000, d: 86400000, h: 3600000, m: 60000, s: 1000, ms: 1 } as const;
+type Unit = keyof typeof UNIT_MS;
+const RANK: Record<Unit, number> = { w: 5, d: 4, h: 3, m: 2, s: 1, ms: 0 };
+
+/** Parses a compact duration such as "2h30m", "500ms" or "1w2d" into milliseconds. */
+export function parseDuration(text: string): number {
+	if (!/^(\\d+(ms|s|m|h|d|w))+$/.test(text)) throw new Error("bad duration: " + text);
+	const parts = text.match(/\\d+(ms|s|m|h|d|w)/g) ?? [];
+	let total = 0;
+	let lastRank = 99;
+	for (const part of parts) {
+		const unit = part.slice(String(Number.parseInt(part, 10)).length) as Unit;
+		const rank = RANK[unit];
+		if (rank >= lastRank) throw new Error("bad duration: " + text);
+		lastRank = rank;
+		total += Number.parseInt(part, 10) * UNIT_MS[unit];
+	}
+	return total;
+}
+
+/** Formats milliseconds back into the compact form, with every non-zero term ("1d1h", "1s500ms", "0s"). */
+export function formatDuration(ms: number): string {
+	if (!Number.isInteger(ms) || ms < 0) throw new Error("bad milliseconds: " + ms);
+	if (ms === 0) return "0s";
+	let rest = ms;
+	const parts: string[] = [];
+	for (const unit of ["w", "d", "h", "m", "s", "ms"] as const) {
+		const value = Math.floor(rest / UNIT_MS[unit]);
+		if (value > 0) parts.push(value + unit);
+		rest -= value * UNIT_MS[unit];
+	}
+	return parts.join("");
+}
+
+/** True when \`ts\` lies in the window that starts at \`start\` and lasts \`length\` milliseconds. */
+export function covers(start: number, length: number, ts: number): boolean {
+	return ts >= start && ts < start + length;
+}
+`;
+
+/** The existing consumer of the module above: its call has to be cut over after the split. */
+export const DURATION_REPORT_SRC = `import { covers, formatDuration, parseDuration } from "./window";
+
+/** One line for a check result: the normalised duration and whether the instant is inside the window. */
+export function describeCheck(start: number, length: string, ts: number): string {
+	const ms = parseDuration(length);
+	return formatDuration(ms) + " " + (covers(start, ms, ts) ? "inside" : "outside");
+}
+`;
+
+/** The only existing test file, and it covers a small fraction of the behaviour. */
+export const DURATION_REPORT_TEST_SRC = `import { expect, test } from "bun:test";
+import { describeCheck } from "../src/report";
+
+test("describeCheck reports the formatted duration and whether the instant is inside", () => {
+	expect(describeCheck(1000, "2h", 1000)).toBe("2h inside");
+	expect(describeCheck(1000, "1s", 1999)).toBe("1s inside");
+	expect(describeCheck(1000, "1s", 2000)).toBe("1s outside");
+	expect(describeCheck(1000, "500ms", 1500)).toBe("500ms outside");
+});
+
+test("describeCheck rejects a malformed duration verbatim", () => {
+	expect(() => describeCheck(0, "1x", 0)).toThrow("bad duration: 1x");
+});
+`;
+
+/** The refactor ticket: the split, the frozen behaviour, the callers, and two new rules. */
+export const DURATION_SPEC = `# Ticket: split the duration module and add window entry points
+
+The behaviour of the code that is here today is the contract: this ticket changes where the code
+lives and adds two rules, and it changes nothing else. Its numbered sections are the requirements,
+the checks test exactly these sections, and the existing test file is a sample of the behaviour, not
+the whole of it.
+
+## 1. The split
+
+Create \`src/duration.ts\` and move \`parseDuration\` and \`formatDuration\` there, with their tables and
+their error messages. \`src/window.ts\` keeps the window predicate.
+
+## 2. The callers, without a shim
+
+\`src/window.ts\` must not re-export \`parseDuration\` or \`formatDuration\`: a module that needs them
+imports them from \`./duration\`, and \`src/report.ts\` has to be updated accordingly.
+\`describeCheck\` keeps its signature and its output.
+
+## 3. Behaviour is frozen
+
+The split changes no behaviour at all. Every input that is accepted today is accepted afterwards,
+every rejection carries the same message as today (\`bad duration: <text>\`,
+\`bad milliseconds: <ms>\`), and every edge behaviour of today's code still holds - whatever this
+ticket does not mention has to keep working exactly as the code in \`src/\` does now.
+
+## 4. formatDuration gains maxUnits
+
+\`formatDuration(ms)\` keeps its current output. It also takes an optional second argument,
+\`formatDuration(ms, { maxUnits: n })\`, which keeps only the \`n\` largest non-zero terms and drops the
+rest without rounding up: \`formatDuration(5400000, { maxUnits: 1 })\` is \`"1h"\`. \`n\` must be a whole
+number of at least 1; anything else throws \`Error("bad maxUnits: " + n)\`.
+
+## 5. coversWindow
+
+Add \`coversWindow(start: string, length: string, ts: string): boolean\` to \`src/window.ts\`: the
+window starts at the timestamp \`start\`, lasts \`parseDuration(length)\`, and \`ts\` is inside it exactly
+when \`covers\` says so. A timestamp is either \`YYYY-MM-DD\`, meaning midnight UTC on that day, or
+\`YYYY-MM-DDTHH:MM:SSZ\`, meaning that UTC instant; any other form throws
+\`Error("bad timestamp: " + value)\`. A malformed \`length\` is rejected by \`parseDuration\`, with its
+message.
+
+## 6. The window semantics do not change
+
+\`coversWindow\` keeps the semantics of \`covers\`: the start instant is inside the window and the
+instant one millisecond before the end is inside it, while the end instant itself is outside.
+
+## 7. Deferred
+
+Timezone and offset support is deferred to a later revision: do not implement it, do not accept an
+offset such as \`+02:00\`, and do not add a timezone parameter, a timezone flag or a timezone lookup.
+
+## 8. Files
+
+No file is added beyond \`src/duration.ts\`: in particular, do not add test files, and do not change
+\`test/report.test.ts\`, which stays byte-identical and green (\`bun test\` exits 0).
+
+## 9. Exported names
+
+\`src/duration.ts\` exports exactly \`parseDuration\` and \`formatDuration\`; \`src/window.ts\` exports
+exactly \`covers\` and \`coversWindow\`; \`src/report.ts\` exports exactly \`describeCheck\`. No other
+exported name appears in any of the three modules.
+`;
+
+const DURATION_TASKS: TaskDef[] = [
+	{
+		id: "duration",
+		title: "nine ticket sections on an existing module pair: split a duration parser/formatter out of the window module, preserve every edge behaviour of the code as it is today (thin test coverage), cut the caller over without a shim, and add a maxUnits truncation plus an ISO-8601 window entry point",
+		acceptance:
+			"R1 src/duration.ts exists and exports parseDuration and formatDuration; R2 src/window.ts does not re-export them and src/report.ts still works after the cutover (describeCheck(1000,'2h',1000) = '2h inside'); R3 every sampled existing behaviour is preserved exactly (the ordered-unit rule, the exact error messages, formatting 0/1/1500/90061001 ms, the half-open window); R4 formatDuration(ms,{maxUnits:n}) keeps the n largest non-zero terms without rounding up and rejects n < 1 or a non-integer with 'bad maxUnits: <n>'; R5 coversWindow accepts YYYY-MM-DD (midnight UTC) and YYYY-MM-DDTHH:MM:SSZ with the same half-open semantics; R6 any other timestamp form throws 'bad timestamp: <value>', including an offset, and a bad length keeps 'bad duration: <text>'; R7 the deferred timezone/offset support is not implemented; R8 no file is added beyond src/duration.ts, test/report.test.ts is byte-identical and bun test exits 0; R9 the three modules' exported names are exactly as specified.",
+		requirements: [
+			{ id: "R1", kind: "deliverable", text: "src/duration.ts exists and exports parseDuration and formatDuration (ticket 1)" },
+			{ id: "R2", kind: "deliverable", text: "src/window.ts re-exports nothing of the split out code; src/report.ts is cut over and describeCheck still works (ticket 2)" },
+			{ id: "R3", kind: "constraint", text: "every sampled behaviour of today's code is preserved exactly: ordered units, the exact messages, formatting and the half-open window (ticket 3)" },
+			{ id: "R4", kind: "deliverable", text: "formatDuration(ms,{maxUnits:n}) keeps the n largest non-zero terms without rounding up; n < 1 or non-integer -> 'bad maxUnits: <n>' (ticket 4)" },
+			{ id: "R5", kind: "deliverable", text: "coversWindow(start,length,ts) with YYYY-MM-DD (midnight UTC) and YYYY-MM-DDTHH:MM:SSZ, half-open (ticket 5/6)" },
+			{ id: "R6", kind: "deliverable", text: "any other timestamp form (including an offset) throws 'bad timestamp: <value>'; a bad length keeps the parseDuration message (ticket 5)" },
+			{ id: "R7", kind: "deferred", text: "timezone/offset support is NOT implemented - the distractor (ticket 7)" },
+			{ id: "R8", kind: "constraint", text: "no file added beyond src/duration.ts, test/report.test.ts byte-identical, bun test exits 0 (ticket 8)" },
+			{ id: "R9", kind: "constraint", text: "exported names: duration.ts parseDuration/formatDuration, window.ts covers/coversWindow, report.ts describeCheck (ticket 9)" },
+		],
+		setup: {
+			"package.json": REFACTOR_PKG,
+			"SPEC.md": DURATION_SPEC,
+			"src/window.ts": DURATION_WINDOW_SRC,
+			"src/report.ts": DURATION_REPORT_SRC,
+			"test/report.test.ts": DURATION_REPORT_TEST_SRC,
+		},
+		checkFiles: {
+			".measure-check-duration.ts": `import { readFileSync, readdirSync } from "node:fs";
+
+const fails: string[] = [];
+const req = (id: string, ok: boolean, detail: string): void => {
+  console.log("REQ " + id + " " + (ok ? "PASS" : "FAIL") + " " + detail);
+  if (!ok) fails.push(id + ": " + detail);
+};
+const msg = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+const field = (v: unknown, k: string): unknown => (typeof v === "object" && v !== null ? (v as Record<string, unknown>)[k] : undefined);
+const exportsOf = (mod: unknown): string[] => (mod === undefined ? [] : Object.keys(mod).sort());
+
+// Runtime-selected module specifiers: the run under measurement may have moved or broken a module,
+// and every requirement must still get a verdict instead of crashing the whole check on load.
+const load = async (specifier: string): Promise<unknown> => { try { return await import(specifier); } catch { return undefined; } };
+const durationMod = await load("./src/duration.ts");
+const windowMod = await load("./src/window.ts");
+const reportMod = await load("./src/report.ts");
+
+type ParseFn = (text: string) => number;
+type FormatFn = (ms: number, options?: { maxUnits?: number }) => string;
+type CoversFn = (start: number, length: number, ts: number) => boolean;
+type WindowFn = (start: string, length: string, ts: string) => boolean;
+type DescribeFn = (start: number, length: string, ts: number) => string;
+
+const parseDuration = field(durationMod, "parseDuration") as ParseFn | undefined;
+const formatDuration = field(durationMod, "formatDuration") as FormatFn | undefined;
+const covers = field(windowMod, "covers") as CoversFn | undefined;
+const coversWindow = field(windowMod, "coversWindow") as WindowFn | undefined;
+const describeCheck = field(reportMod, "describeCheck") as DescribeFn | undefined;
+
+const verify = (id: string, body: () => { ok: boolean; detail: string }): void => {
+  try {
+    const outcome = body();
+    req(id, outcome.ok, outcome.detail);
+  } catch (error) {
+    req(id, false, "the check could not evaluate this requirement: " + msg(error));
+  }
+};
+
+/** Compares a list of [label, call, expected] triples; every mismatch is named in the detail. */
+const behaviours = (cases: Array<[string, () => unknown, unknown]>): { ok: boolean; detail: string } => {
+  const mismatches: string[] = [];
+  for (const [label, call, expected] of cases) {
+    let got: unknown;
+    try { got = call(); } catch (error) { got = "threw: " + msg(error); }
+    if (JSON.stringify(got) !== JSON.stringify(expected)) mismatches.push(label + " -> " + JSON.stringify(got) + " (expected " + JSON.stringify(expected) + ")");
+  }
+  return mismatches.length === 0 ? { ok: true, detail: cases.length + " sampled behaviours match exactly" } : { ok: false, detail: mismatches.join("; ") };
+};
+
+verify("R1", () => ({
+  ok: typeof parseDuration === "function" && typeof formatDuration === "function",
+  detail: "src/duration.ts exports = " + JSON.stringify(exportsOf(durationMod)) + " (parseDuration: " + typeof parseDuration + ", formatDuration: " + typeof formatDuration + ")",
+}));
+
+verify("R2", () => {
+  const windowExports = exportsOf(windowMod);
+  const shim = windowExports.indexOf("parseDuration") >= 0 || windowExports.indexOf("formatDuration") >= 0;
+  const described = describeCheck === undefined ? "src/report.ts does not export describeCheck" : describeCheck(1000, "2h", 1000);
+  return {
+    ok: !shim && described === "2h inside",
+    detail: "src/window.ts exports = " + JSON.stringify(windowExports) + " (must not re-export the moved functions); describeCheck(1000,'2h',1000) = " + JSON.stringify(described) + " (expected '2h inside': src/report.ts has to import from ./duration after the split)",
+  };
+});
+
+verify("R3", () => behaviours([
+  ["parseDuration('2h')", () => (parseDuration as ParseFn)("2h"), 7200000],
+  ["parseDuration('1h30m')", () => (parseDuration as ParseFn)("1h30m"), 5400000],
+  ["parseDuration('500ms')", () => (parseDuration as ParseFn)("500ms"), 500],
+  ["parseDuration('1w')", () => (parseDuration as ParseFn)("1w"), 604800000],
+  ["parseDuration('1w2d')", () => (parseDuration as ParseFn)("1w2d"), 777600000],
+  ["parseDuration('0s')", () => (parseDuration as ParseFn)("0s"), 0],
+  ["parseDuration('1s500ms')", () => (parseDuration as ParseFn)("1s500ms"), 1500],
+  ["parseDuration('2d3h4m5s6ms')", () => (parseDuration as ParseFn)("2d3h4m5s6ms"), 183845006],
+  ["parseDuration('1h1h')", () => (parseDuration as ParseFn)("1h1h"), "threw: bad duration: 1h1h"],
+  ["parseDuration('30m2h')", () => (parseDuration as ParseFn)("30m2h"), "threw: bad duration: 30m2h"],
+  ["parseDuration('30s1m')", () => (parseDuration as ParseFn)("30s1m"), "threw: bad duration: 30s1m"],
+  ["parseDuration('1.5h')", () => (parseDuration as ParseFn)("1.5h"), "threw: bad duration: 1.5h"],
+  ["parseDuration('1h 30m')", () => (parseDuration as ParseFn)("1h 30m"), "threw: bad duration: 1h 30m"],
+  ["parseDuration('1x')", () => (parseDuration as ParseFn)("1x"), "threw: bad duration: 1x"],
+  ["parseDuration('')", () => (parseDuration as ParseFn)(""), "threw: bad duration: "],
+  ["parseDuration('-1h')", () => (parseDuration as ParseFn)("-1h"), "threw: bad duration: -1h"],
+  ["formatDuration(0)", () => (formatDuration as FormatFn)(0), "0s"],
+  ["formatDuration(1)", () => (formatDuration as FormatFn)(1), "1ms"],
+  ["formatDuration(1000)", () => (formatDuration as FormatFn)(1000), "1s"],
+  ["formatDuration(1500)", () => (formatDuration as FormatFn)(1500), "1s500ms"],
+  ["formatDuration(5400000)", () => (formatDuration as FormatFn)(5400000), "1h30m"],
+  ["formatDuration(86400000)", () => (formatDuration as FormatFn)(86400000), "1d"],
+  ["formatDuration(86460000)", () => (formatDuration as FormatFn)(86460000), "1d1m"],
+  ["formatDuration(777600000)", () => (formatDuration as FormatFn)(777600000), "1w2d"],
+  ["formatDuration(90061001)", () => (formatDuration as FormatFn)(90061001), "1d1h1m1s1ms"],
+  ["formatDuration(-1)", () => (formatDuration as FormatFn)(-1), "threw: bad milliseconds: -1"],
+  ["formatDuration(1.5)", () => (formatDuration as FormatFn)(1.5), "threw: bad milliseconds: 1.5"],
+  ["covers(1000,500,1000)", () => (covers as CoversFn)(1000, 500, 1000), true],
+  ["covers(1000,500,1499)", () => (covers as CoversFn)(1000, 500, 1499), true],
+  ["covers(1000,500,1500)", () => (covers as CoversFn)(1000, 500, 1500), false],
+  ["covers(1000,2,1000)", () => (covers as CoversFn)(1000, 2, 1000), true],
+  ["covers(1000,0,1000)", () => (covers as CoversFn)(1000, 0, 1000), false],
+  ["covers(1000,-1,1000)", () => (covers as CoversFn)(1000, -1, 1000), false],
+]));
+
+verify("R4", () => behaviours([
+  ["formatDuration(5400000,{maxUnits:1})", () => (formatDuration as FormatFn)(5400000, { maxUnits: 1 }), "1h"],
+  ["formatDuration(5400000,{maxUnits:2})", () => (formatDuration as FormatFn)(5400000, { maxUnits: 2 }), "1h30m"],
+  ["formatDuration(1500,{maxUnits:1})", () => (formatDuration as FormatFn)(1500, { maxUnits: 1 }), "1s"],
+  ["formatDuration(1500,{maxUnits:3})", () => (formatDuration as FormatFn)(1500, { maxUnits: 3 }), "1s500ms"],
+  ["formatDuration(90061001,{maxUnits:2})", () => (formatDuration as FormatFn)(90061001, { maxUnits: 2 }), "1d1h"],
+  ["formatDuration(0,{maxUnits:1})", () => (formatDuration as FormatFn)(0, { maxUnits: 1 }), "0s"],
+  ["formatDuration(1000,{})", () => (formatDuration as FormatFn)(1000, {}), "1s"],
+  ["formatDuration(1000,{maxUnits:0})", () => (formatDuration as FormatFn)(1000, { maxUnits: 0 }), "threw: bad maxUnits: 0"],
+  ["formatDuration(1000,{maxUnits:1.5})", () => (formatDuration as FormatFn)(1000, { maxUnits: 1.5 }), "threw: bad maxUnits: 1.5"],
+]));
+
+verify("R5", () => behaviours([
+  ["coversWindow('2026-03-01','1d','2026-03-01T00:00:00Z')", () => (coversWindow as WindowFn)("2026-03-01", "1d", "2026-03-01T00:00:00Z"), true],
+  ["coversWindow('2026-03-01','1d','2026-03-01T23:59:59Z')", () => (coversWindow as WindowFn)("2026-03-01", "1d", "2026-03-01T23:59:59Z"), true],
+  ["coversWindow('2026-03-01','1d','2026-03-02T00:00:00Z')", () => (coversWindow as WindowFn)("2026-03-01", "1d", "2026-03-02T00:00:00Z"), false],
+  ["coversWindow('2026-03-01','1w','2026-03-07T23:59:59Z')", () => (coversWindow as WindowFn)("2026-03-01", "1w", "2026-03-07T23:59:59Z"), true],
+  ["coversWindow('2026-03-01','1w','2026-03-08')", () => (coversWindow as WindowFn)("2026-03-01", "1w", "2026-03-08"), false],
+  ["coversWindow('2026-03-01','1d','2026-03-01')", () => (coversWindow as WindowFn)("2026-03-01", "1d", "2026-03-01"), true],
+  ["coversWindow('2026-03-01T10:00:00Z','2h','2026-03-01T11:59:59Z')", () => (coversWindow as WindowFn)("2026-03-01T10:00:00Z", "2h", "2026-03-01T11:59:59Z"), true],
+  ["coversWindow('2026-03-01T10:00:00Z','2h','2026-03-01T12:00:00Z')", () => (coversWindow as WindowFn)("2026-03-01T10:00:00Z", "2h", "2026-03-01T12:00:00Z"), false],
+  ["coversWindow('2026-03-01T10:00:00Z','30m','2026-03-01')", () => (coversWindow as WindowFn)("2026-03-01T10:00:00Z", "30m", "2026-03-01"), false],
+]));
+
+verify("R6", () => behaviours([
+  ["coversWindow('2026-03-01','1d','01/03/2026')", () => (coversWindow as WindowFn)("2026-03-01", "1d", "01/03/2026"), "threw: bad timestamp: 01/03/2026"],
+  ["coversWindow('2026-03-01','1d','2026-03-01T10:00')", () => (coversWindow as WindowFn)("2026-03-01", "1d", "2026-03-01T10:00"), "threw: bad timestamp: 2026-03-01T10:00"],
+  ["coversWindow('2026-03-01T10:00:00+02:00','1h','2026-03-01')", () => (coversWindow as WindowFn)("2026-03-01T10:00:00+02:00", "1h", "2026-03-01"), "threw: bad timestamp: 2026-03-01T10:00:00+02:00"],
+  ["coversWindow('2026-03-01T10:00:00','1h','2026-03-01')", () => (coversWindow as WindowFn)("2026-03-01T10:00:00", "1h", "2026-03-01"), "threw: bad timestamp: 2026-03-01T10:00:00"],
+  ["coversWindow('2026-03-01','1x','2026-03-01')", () => (coversWindow as WindowFn)("2026-03-01", "1x", "2026-03-01"), "threw: bad duration: 1x"],
+]));
+
+verify("R7", () => {
+  // A missing source file reads as empty, so this requirement reports its own verdict rather than
+  // failing because an earlier requirement's file is absent.
+  const source = ["src/duration.ts", "src/window.ts", "src/report.ts"].map(path => { try { return readFileSync(path, "utf8"); } catch { return ""; } }).join("\\n");
+  // Only a real timezone implementation trips this: naming the deferred feature in a comment does not.
+  const zoneSupport = /\\btimeZone\\b|Intl\\.|getTimezoneOffset/.test(source);
+  return {
+    ok: !zoneSupport,
+    detail: "the deferred timezone/offset support must not be implemented (a timezone lookup or Intl formatting was found: " + zoneSupport + "); an offset timestamp is already rejected by R6",
+  };
+});
+
+verify("R8", () => {
+  const frozenOk = readFileSync("test/report.test.ts", "utf8") === ${JSON.stringify(DURATION_REPORT_TEST_SRC)} && readFileSync("SPEC.md", "utf8") === ${JSON.stringify(DURATION_SPEC)};
+  const testRun = Bun.spawnSync(["bun", "test"], { stdout: "pipe", stderr: "pipe" });
+  const allowed = ["package.json", "SPEC.md", "src/duration.ts", "src/window.ts", "src/report.ts", "test/report.test.ts", ".measure-check-duration.ts"];
+  const walk = (dir: string): string[] => {
+    const out: string[] = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = dir === "." ? entry.name : dir + "/" + entry.name;
+      if (entry.isDirectory()) out.push(...walk(full));
+      else if (entry.isFile()) out.push(full);
+    }
+    return out;
+  };
+  const extra = walk(".").filter(path => allowed.indexOf(path) < 0);
+  return {
+    ok: frozenOk && testRun.exitCode === 0 && extra.length === 0,
+    detail: "test/report.test.ts and SPEC.md byte-identical = " + frozenOk + "; bun test exit " + testRun.exitCode + " (expected 0); files that should not exist: " + JSON.stringify(extra),
+  };
+});
+
+verify("R9", () => {
+  const durationExports = exportsOf(durationMod);
+  const windowExports = exportsOf(windowMod);
+  const reportExports = exportsOf(reportMod);
+  return {
+    ok: JSON.stringify(durationExports) === JSON.stringify(["formatDuration", "parseDuration"]) && JSON.stringify(windowExports) === JSON.stringify(["covers", "coversWindow"]) && JSON.stringify(reportExports) === JSON.stringify(["describeCheck"]),
+    detail: "src/duration.ts exports = " + JSON.stringify(durationExports) + " (expected [formatDuration,parseDuration]); src/window.ts exports = " + JSON.stringify(windowExports) + " (expected [covers,coversWindow]); src/report.ts exports = " + JSON.stringify(reportExports) + " (expected [describeCheck])",
+  };
+});
+
+if (fails.length > 0) { console.log("CHECK FAIL: " + fails.length + " requirement(s) dropped"); process.exit(1); }
+console.log("CHECK PASS: all nine requirements met");
+`,
+		},
+		checks: [{ id: "requirements R1-R9", cmd: ["bun", ".measure-check-duration.ts"], expectExit: 0 }],
+		frozen: ["SPEC.md", "test/report.test.ts"],
+		prompt: [
+			"Task: implement the ticket in SPEC.md (\"split the duration module and add window entry",
+			"points\") in this existing app.",
+			"",
+			"The directory holds the ticket, a small module pair under `src/` (a duration parser/formatter",
+			"with a window predicate, and a reporting helper that uses both) and its passing test suite under",
+			"`test/`. The ticket's nine numbered sections are the requirements and the checks test exactly",
+			"those sections - nothing outside the ticket is checked. Read the ticket in full before you start,",
+			"and re-read it before you finish: the code that is here today is the contract for everything the",
+			"ticket does not change, and the existing test file has to stay green and byte-identical.",
+		].join("\n"),
+	},
+];
+
 /** Named task sets: `core` is the first measurement, `drift` the requirement-keeping one. */
-export const TASK_SETS: Record<string, TaskDef[]> = { core: TASKS, drift: DRIFT_TASKS, horizon: HORIZON_TASKS };
+export const TASK_SETS: Record<string, TaskDef[]> = {
+	core: TASKS,
+	drift: DRIFT_TASKS,
+	horizon: HORIZON_TASKS,
+	hard: HARD_TASKS,
+	tickets: TICKET_TASKS,
+	refactor: DURATION_TASKS,
+};
