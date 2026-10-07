@@ -189,3 +189,10 @@ describe("jev template config: gates switch", () => {
 		expect(() => validateTemplateConfig(PROJECT_FILE, { gates: [] })).toThrow(/gates must be an object/);
 	});
 });
+
+describe("jev template config: completion switch", () => {
+	test("gates.completion=false is parsed and fails closed on a non-boolean", () => {
+		expect(validateTemplateConfig(USER_FILE, { gates: { completion: false } }).gates?.completion).toBe(false);
+		expect(() => validateTemplateConfig(PROJECT_FILE, { gates: { completion: 1 } })).toThrow(/gates\.completion/);
+	});
+});

@@ -1576,3 +1576,24 @@ describe("jev controller: submission language rule", () => {
 		expect(description).toContain("verbatim");
 	});
 });
+
+describe("jev controller: gates.completion switch", () => {
+	test("gates.completion=false lets the session stop with no approvals recorded", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({ judge: gateJudge(), template: { gates: { completion: false } } });
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "build it", systemPrompt: [] });
+		const res = await runStop(harness);
+		expect(res.decision).toBeUndefined();
+	});
+
+	test("without the switch the stop gate still demands completion evidence", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({ judge: gateJudge() });
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "build it", systemPrompt: [] });
+		const res = await runStop(harness);
+		expect(res.decision).toBe("block");
+		expect(String(res.reason)).toContain("course_check");
+	});
+});

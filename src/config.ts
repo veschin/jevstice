@@ -40,7 +40,7 @@ export interface JevTemplateConfig {
 	 * no longer blocked while no plan-stage approval exists. Fail-closed judging, digests,
 	 * bounded rework and completion binding are unchanged.
 	 */
-	gates?: { mutation?: boolean };
+	gates?: { mutation?: boolean; completion?: boolean };
 	controlPoints?: Record<
 		string,
 		{ trigger: "on_demand"; instructions?: string; options?: Array<{ id: string; label: string; meaning: string }> }
@@ -162,11 +162,12 @@ export function validateTemplateConfig(file: string, raw: unknown): JevTemplateC
 	}
 	if (raw["gates"] !== undefined) {
 		if (!isRecord(raw["gates"])) throw new JevConfigError(file, "gates must be an object");
-		const gates: { mutation?: boolean } = {};
-		const mutation = raw["gates"]["mutation"];
-		if (mutation !== undefined) {
-			if (typeof mutation !== "boolean") throw new JevConfigError(file, "gates.mutation must be a boolean");
-			gates.mutation = mutation;
+		const gates: { mutation?: boolean; completion?: boolean } = {};
+		for (const key of ["mutation", "completion"] as const) {
+			const value = raw["gates"][key];
+			if (value === undefined) continue;
+			if (typeof value !== "boolean") throw new JevConfigError(file, `gates.${key} must be a boolean`);
+			gates[key] = value;
 		}
 		out.gates = gates;
 	}

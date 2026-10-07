@@ -66,4 +66,10 @@
 - Submissions to the judge are English by rule: the executor's own text (task, proposal, option
   labels, meanings) is English; quoted evidence keeps its source wording verbatim. Stated in the
   tool description and in the README, asserted by a test.
-- 235/235 tests, `tsc --noEmit` clean.
+- Second permanent-block path found and switched: the stop gate requires a judged `course_check`
+  with a `continue` record at or above the 0.6 confidence floor, but the next-action question
+  offers eight options and the judge's confidence on it lands below the floor, so the completion
+  boundary could never be satisfied. `gates.completion` (user-owned, default on) lifts the stop
+  gate - completion approval, the fresh course_check and the aspect teeth - while judging, digests
+  and bounded rework stay unchanged.
+- 238/238 tests, `tsc --noEmit` clean.

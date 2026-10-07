@@ -78,8 +78,9 @@ Thresholds and counts are raise-only. Meta options cannot be removed. Invalid or
 config keeps the gates registered and closed, naming the file and the problem.
 
 `gates.mutation: false` is user-owned and lifts the plan gate: mutating tools are no longer
-blocked while no plan-stage approval exists. Judging, content digests, bounded rework and the
-completion binding are unchanged.
+blocked while no plan-stage approval exists. `gates.completion: false` lifts the stop gate
+(completion approval, the fresh course_check and the aspect teeth). Both default to on; judging,
+content digests and bounded rework are unchanged by either.
 
 ## Limits
 

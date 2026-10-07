@@ -1447,6 +1447,9 @@ export class JevController {
 		if (this.templateError !== undefined) {
 			return [`jev config invalid (fail-closed): ${this.templateError}`];
 		}
+		// User-owned switch: `gates.completion === false` lifts the stop gate entirely
+		// (completion approval, fresh course_check, aspect teeth). Judging is untouched.
+		if (this.template.gates?.completion === false) return [];
 		// Once a task fingerprint exists the completion boundary applies to read-only work
 		// exactly like mutated work; a session with no established task stops free.
 		if (this.state.taskFingerprint === undefined) return [];
