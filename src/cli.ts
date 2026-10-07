@@ -9,8 +9,7 @@
  * TYPESAFE_API_URL overrides the endpoint. The key never reaches stdout,
  * stderr, or the request body - only the Authorization header.
  */
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { resolveApiKey } from "./apikey";
 import type { DecisionRequest, DecisionStage } from "./types";
 import { createJudge, JevApiError, REASON_CODES } from "./client";
 import { validateDecisionRequest } from "./evidence";
@@ -26,29 +25,6 @@ export interface CliOutcome {
   exitCode: 0 | 2 | 4;
   stdout: string;
   stderr: string;
-}
-
-const execFileP = promisify(execFile);
-
-async function readKey(env: Record<string, string | undefined>): Promise<string | undefined> {
-  const direct = env["TYPESAFE_API_KEY"] ?? env["JEVI_API_KEY"];
-  if (direct) return direct;
-  const command = env["TYPESAFE_API_KEY_COMMAND"];
-  if (command) {
-    // single command string run through the shell; stdout trimmed is the key
-    let stdout: string;
-    try {
-      ({ stdout } = await execFileP("/bin/sh", ["-c", command], { timeout: 15000 }));
-    } catch (err) {
-      throw new JevApiError(
-        "config",
-        `TYPESAFE_API_KEY_COMMAND failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-    const key = stdout.trim();
-    return key.length > 0 ? key : undefined;
-  }
-  return undefined;
 }
 
 const USAGE =
@@ -90,7 +66,7 @@ export async function runCli(args: string[], deps: CliDeps = {}): Promise<CliOut
   const env = deps.env ?? (process.env as Record<string, string | undefined>);
   let apiKey: string | undefined;
   try {
-    apiKey = await readKey(env);
+    apiKey = await resolveApiKey(env);
   } catch (err) {
     return {
       exitCode: 4,

@@ -52,3 +52,15 @@
   the same plan is phrased as a claim checked against quoted sources. The 0.8 floor is calibrated
   for verification, not for plan approval; the plan stage therefore fails closed permanently.
   225/225 tests, tsc clean.
+
+## 0.3.1 - 2026-10-07
+
+- Key resolution unified (`src/apikey.ts`): one path for the CLI and the extension - environment
+  variable first, else the resolver command. The extension resolves the key lazily and memoized,
+  so a host that keeps the secret in `pass` needs no exported variable; a transient resolver
+  failure is retried instead of poisoning the session. The main judge and both sub-judges
+  (course check, aspect coverage) use the resolved key.
+- Plan-stage directive in the tool description: file a plan as a claim checked against the quoted
+  evidence (what it asserts, which quote supports it), with the measured numbers - an open plan
+  summary with no quotable anchor is answered insufficient_evidence.
+- 234/234 tests, `tsc --noEmit` clean.

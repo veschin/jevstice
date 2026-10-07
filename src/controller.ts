@@ -420,7 +420,11 @@ export class JevController {
 				"with stage=understanding_review (plan stage) and verbatim quoted evidence — do not write files " +
 				"first, do not report the block to the user. " +
 				"Submit a structured important decision, review or completion claim to the Jev judge. " +
-				"Required before any file-mutating work and before finishing work. Provide fixed options " +
+				"Required before any file-mutating work and before finishing work. " +
+				"Plan-stage proposals read as claims checked against the quoted evidence: state what the plan " +
+				"asserts and which quote supports it. An open plan summary with no quotable anchor is answered " +
+				"insufficient_evidence (live: 0.14-0.26 against 0.79 for the same plan phrased as a claim). " +
+				"Provide fixed options " +
 				"and evidence as {kind, source, quote} items (kind: user|spec|code|execution|log|documentation). " +
 				"Completion claims additionally need execution/code/log evidence; pass `capabilities` " +
 				"(original feature ids) for refactor completion coverage checks. " +

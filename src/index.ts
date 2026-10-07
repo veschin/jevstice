@@ -15,6 +15,7 @@ import { JevConfigError, loadJevTemplateConfig, type JevTemplateConfig } from ".
 import { isRecord } from "./guards.js";
 import { createAspectCoverageJudge, createCourseCheckJudge, createJudge } from "./client.js";
 import { loadTopicCatalog } from "./catalog.js";
+import { memoizedKeyResolver } from "./apikey.js";
 import { POLICY, type Judge } from "./types.js";
 
 function envValue(...names: string[]): string | undefined {
@@ -33,23 +34,29 @@ function intEnv(name: string): number | undefined {
 }
 
 /** Build the production judge dependencies; fail-closed when unconfigured. */
+/**
+ * Production judge. The key resolves lazily - environment variable first, else the
+ * resolver command - so a host that keeps the secret in `pass` needs no exported
+ * variable, and a transient resolver failure stays retryable.
+ */
 export function buildProductionJudge(env: NodeJS.ProcessEnv = process.env): Judge {
-	const apiKey = envValue("TYPESAFE_API_KEY", "JEVI_API_KEY");
-	if (apiKey === undefined || apiKey.length === 0) {
-		// Explicit fail-closed: unconfigured judge can never approve (POLICY.failureNeverApproves).
-		return async () => {
-			throw new Error(
-				`jev judge unconfigured: set ${POLICY.apiKeyEnv} (or JEVI_API_KEY); ` +
-					"a missing judge can never approve",
-			);
-		};
-	}
-	return createJudge({
-		apiKey,
+	const resolveKey = memoizedKeyResolver(env);
+	const base = {
 		apiUrl: envValue("TYPESAFE_API_URL", "JEVI_BASE_URL"),
 		model: envValue("JEVI_MODEL"),
 		timeoutMs: intEnv("JEVI_TIMEOUT_MS"),
-	});
+	};
+	return async request => {
+		const apiKey = await resolveKey();
+		if (apiKey === undefined) {
+			// Explicit fail-closed: unconfigured judge can never approve (POLICY.failureNeverApproves).
+			throw new Error(
+				`jev judge unconfigured: set ${POLICY.apiKeyEnv} or TYPESAFE_API_KEY_COMMAND ` +
+					"(e.g. 'pass show token/jev'); a missing judge can never approve",
+			);
+		}
+		return createJudge({ ...base, apiKey })(request);
+	};
 }
 
 function extractCustomEntries(sessionManager: unknown): Array<{ customType: string; data: unknown }> {
@@ -89,12 +96,15 @@ export function createJevExtension(deps: Partial<ControllerDeps> = {}) {
 			template?.confidenceThreshold ?? 0,
 		);
 		const clientConfig = {
-			apiKey: envValue("TYPESAFE_API_KEY", "JEVI_API_KEY") ?? "",
 			apiUrl: envValue("TYPESAFE_API_URL", "JEVI_BASE_URL"),
 			model: envValue("JEVI_MODEL"),
 			timeoutMs: intEnv("JEVI_TIMEOUT_MS"),
 			minConfidence: effectiveMinConfidence,
 		};
+		// Same lazy resolution as the main judge; the sub-judges are built per call, so
+		// they see the key the moment it resolves.
+		const resolveKey = memoizedKeyResolver(process.env);
+		const withKey = async () => ({ ...clientConfig, apiKey: (await resolveKey()) ?? "" });
 		// Catalog labels inform the judge; mentioning a label never proves preservation.
 		let catalogIds: ReadonlySet<string> = new Set();
 		let aspectTexts: ReadonlyMap<string, string> = new Map();
@@ -108,7 +118,7 @@ export function createJevExtension(deps: Partial<ControllerDeps> = {}) {
 		const aspectCoverageJudge =
 			deps.aspectCoverageJudge ??
 			(deps.judge === undefined
-				? async req => createAspectCoverageJudge(clientConfig)({
+				? async req => createAspectCoverageJudge(await withKey())({
 						...req,
 						aspects: req.aspects.map(a => ({
 							...a,
@@ -121,7 +131,7 @@ export function createJevExtension(deps: Partial<ControllerDeps> = {}) {
 			// C1 wired by default in production; tests inject their own.
 			courseCheckJudge:
 				deps.courseCheckJudge ??
-				(deps.judge === undefined ? req => createCourseCheckJudge(clientConfig)(req) : undefined),
+				(deps.judge === undefined ? async req => createCourseCheckJudge(await withKey())(req) : undefined),
 			aspectCoverageJudge,
 			catalogIds,
 			template,

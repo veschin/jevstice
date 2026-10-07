@@ -13,8 +13,8 @@ the executor validates every important step through fixed-option questions inste
 git clone https://github.com/veschin/jevstice ~/.omp/agent/extensions/jevstice
 ```
 
-Dependencies install automatically on first run (bun). Requires a Jev API key
-(`TYPESAFE_API_KEY` env or `pass show token/jev`).
+Dependencies install automatically on first run (bun). Requires a Jev API key: `TYPESAFE_API_KEY` env, or `TYPESAFE_API_KEY_COMMAND` with a
+resolver such as `pass show token/jev` (the extension and the CLI use the same resolution).
 
 ## Usage
 
@@ -29,7 +29,10 @@ TYPESAFE_API_KEY="$(pass show token/jev)" bun ~/.omp/agent/extensions/jevstice/s
 ## Gates
 
 - **plan** (`understanding_review` / `direction_review`): file mutations blocked until the
-  judge approves a plan backed by verbatim quoted evidence. Reads stay free.
+  judge approves a plan backed by verbatim quoted evidence. Reads stay free. Submit the plan as a
+  claim checked against the quotes (`state what it asserts, which quote supports it`): the judge
+  verifies claims against quoted sources and does not score an open plan summary. Set
+  `gates.mutation: false` to lift this gate entirely.
 - **completion** (`completion_review`): execution/code/log evidence required; a report alone
   never approves. Confidence in [0.6, 0.8) requires 2 consecutive approves; below 0.6 never counts.
   Every task - read-only included - needs plan approval, a fresh course_check and completion

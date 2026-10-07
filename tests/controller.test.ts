@@ -1554,3 +1554,14 @@ describe("jev controller: eval coverage", () => {
 		expect(String(res.reason)).toContain("plan gate");
 	});
 });
+
+describe("jev controller: plan-stage directive text", () => {
+	test("the tool description tells the executor to phrase plans as claims against quotes", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({ judge: async () => judgeResult({}) });
+		controller.register(harness.pi);
+		const description = String(harness.getTool()?.description);
+		expect(description).toContain("claims checked against the quoted evidence");
+		expect(description).toContain("insufficient_evidence");
+	});
+});
