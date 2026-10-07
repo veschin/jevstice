@@ -45,9 +45,9 @@ Bun/TypeScript package, delivered as an omp extension (`src/index.ts` entry per 
 
 ## Verification
 
-Bun tests (unit + boundary), `tsc --noEmit`, guard.py --deep, LSP diagnostics; smoke against actually installed omp extension loader; live API probe proves error path (network unreachable - documented blocker, no network changes).
+Bun tests (unit + boundary), `tsc --noEmit`, guard.py --deep, LSP diagnostics; smoke against actually installed omp extension loader via explicit extension-path argument (no global install); live API probe proves error path and success path (official key via pass, integrator-only paid calls). Full verifiable completion criteria: ACCEPTANCE.md AC1-AC9, including mandatory dogfooding (AC9: a genuine project correction routed through the addon itself; PASS required before claiming finished).
 
 ## Known blockers (not solved here)
 
-- Live Jev API unreachable from this network (PRD §7 [S:PROBE]); needs user-approved route change. Client + CLI probe exist; success path verified against mock fetch per docs wire format.
+- ~~Live Jev API unreachable~~ RESOLVED 2026-10-07: official key (`pass token/jev`) works against the direct TypeSafe endpoint. Live proof (HTTP 200, jev-1.13.0, ~0.5s, usage returned): noul arithmetic 0.98; classification/choice, review and completion questions answered per schema. Observed judge behavior on synthetic snippets (NOT a claimed accuracy measure): with task context stated in `state`, a correct sum implementation → approve 0.96 and `xs.length` → revise 1.0 (an earlier phrasing with task only in criteria produced a false revise); report-only completion → insufficient_evidence 0.94; intermittent connection resets (~50%) with retry succeeding → client retries must include transport resets, not only 429/529.
 - GAP:1 (success metrics), GAP:3 (mandatory checks/verdict policy) remain user decisions; defaults above.

@@ -78,6 +78,27 @@ export interface DecisionResult {
 /** Pure decision call. Tests inject this; production uses the real client. */
 export type Judge = (request: DecisionRequest) => Promise<DecisionResult>;
 
+/**
+ * Multi-label marking (FR-04 topic selection): one Noul question per item,
+ * sharded <=255 items per systemone request. approve = marking completed;
+ * ids outside the requested batch are a contract violation -> insufficient_evidence.
+ */
+export interface MultiLabelRequest {
+  stage: DecisionStage;
+  task: string;
+  evidence: Evidence[];
+  items: { id: string; text: string }[];
+}
+
+export interface MultiLabelResult {
+  verdict: DecisionVerdict;
+  applicable: Record<string, boolean>;
+  reasons: string[];
+  confidence?: number;
+}
+
+export type MultiLabelJudge = (request: MultiLabelRequest) => Promise<MultiLabelResult>;
+
 // ---------- TypeSafe systemone wire types (S:API, verified from docs.typesafe.ai/api) ----------
 
 export interface JevNoulCriteria {

@@ -9,6 +9,7 @@
     "cli": "bun run src/cli.ts"
   },
   "engines": { "bun": ">=1.1" },
+  "omp": { "extensions": ["src/index.ts"] },
   "devDependencies": {
     "@types/bun": "^1.1.0",
     "typescript": "^5.5.0"
