@@ -1,0 +1,16 @@
+{
+  "name": "jev",
+  "version": "0.1.0",
+  "description": "Jev decision judge for oh my pi: TypeSafe systemone client, catalog routing, omp extension controller",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "cli": "bun run src/cli.ts"
+  },
+  "engines": { "bun": ">=1.1" },
+  "devDependencies": {
+    "@types/bun": "^1.1.0",
+    "typescript": "^5.5.0"
+  }
+}
