@@ -32,3 +32,6 @@ See PLAN.md §"FR acceptance" (FR-01..FR-16). Gate policy: failure/low-confidenc
 - FR-17 interaction templates (default templates versioned/tested; project-level override file; invalid override = fail-closed error; template inventory in README).
 - POLICY-DRAFT.md post-approval items: high-risk bash pattern gate, spawn budget gate, destructive-action detector, memory/skill class policy, judge-every-edit vs plan+completion decision.
 | 10 | Universal engine + course_check preset (S:U10/S:U11) | Extension+Client workers, integrator docs | DONE — reviews CLEAR rounds 3-5 | registry, presets, config controlPoints, drift judge wired, live round-trip; AC11 PASS |
+| 11 | Field trial (minecraft via addon, S:U13) | JevIntegrator | DONE | /tmp/jev-mc built+verified; VERDICT.md; completion gate honestly unsatisfied (calibration finding for GAP:3) |
+| 12 | Meta-options feature (S:U9j: "обязательные пункты типа тут нет нужного варианта") | JevClientWorker | DONE — commit 322e5a0, review CLEAR | every Choice carries escape options; never approve |
+| 13 | aspect_coverage preset (forgotten-aspect detection) | JevExtensionWorker | APPROVED SPEC — implement on signal | three-way marking vs catalog, completion teeth via unmetStopGates |
