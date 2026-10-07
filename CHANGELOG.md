@@ -13,3 +13,6 @@
 - Live-Jev dev consultations: gating-policy draft (POLICY-DRAFT.md), PRD gap review, implementation satisfaction review (evidence/).
 - AC9 dogfood executed: whole-project final review through the addon in real omp; live verdict insufficient_evidence (0.41, judged=true) — fail-closed held; completion remains a user decision.
 - Final state: 128/128 tests, tsc clean, guard --deep clean, both reviews CLEAR, AC observed statuses recorded in ACCEPTANCE.md.
+- Universal decision-point engine: control-points registry (4 presets), stages derived from registry, config `controlPoints` (on_demand) with fail-closed validation; course_check preset (per-requirement drift Noul + fixed next-action Choice) with live round-trip proof.
+- Round-3 scope: 140/140 tests, tsc clean, guard clean; live-Jev idea reviews (evidence/jev-ideas-review.md) confirmed generalize direction (9/10) and implementation gap.
+- Round 4-5: per-requirement drift judge wired into production course_check (createCourseCheckJudge; requirements = verbatim user/spec quotes; continue/verify recorded only, redirects -> revise + same-session feedback, ask_user escalates); duplicate-requirement dedupe; config threshold threaded into course-check floor. 148/148 tests, tsc clean, guard clean; live drift round-trip (0.74 -> verify_before_proceeding). Reviews CLEAR rounds 3-5.

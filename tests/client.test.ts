@@ -525,3 +525,173 @@ describe("multi-label judge", () => {
     await expect(judge({ ...okMulti, evidence: [] })).rejects.toBeInstanceOf(JevApiError);
   });
 });
+
+// ---------- createCourseCheckJudge (universal decision-point: course_check preset) ----------
+
+import { createCourseCheckJudge } from "../src/client";
+import {
+  COURSE_CHECK_NEXT_ACTIONS,
+  type CourseCheckRequest,
+  type CourseCheckResult,
+} from "../src/types";
+
+const okCourse: CourseCheckRequest = {
+  requirements: [
+    { id: "req-1", quote: "POST /login returns a JWT." },
+    { id: "req-2", quote: "Failures return 401." },
+  ],
+  currentAction: "Implemented handler, adding tests",
+  evidence: [{ kind: "code", source: "src/login.ts:10", quote: "return sign(payload, secret);" }],
+};
+
+function courseBody(noul: Record<string, number>, action: string, confidence: number) {
+  return {
+    model: "jev-1.13.0",
+    answers: {
+      ...Object.fromEntries(
+        Object.entries(noul).map(([id, p]) => [id, { type: "noul", noul: p }]),
+      ),
+      next_action: {
+        type: "choice",
+        choice: action,
+        probabilities: Object.fromEntries(
+          COURSE_CHECK_NEXT_ACTIONS.map((a) => [a, a === action ? 0.9 : 0.01]),
+        ),
+        confidence,
+      },
+    },
+    usage: { input_tokens: 100, output_tokens: 10 },
+  };
+}
+
+function courseFetch(noul: Record<string, number>, action: string, confidence: number) {
+  return (async () =>
+    jsonResponse(courseBody(noul, action, confidence))) as unknown as typeof fetch;
+}
+
+describe("course check judge", () => {
+  test("one systemone request: noul per requirement + next_action choice", async () => {
+    const calls: { body?: unknown }[] = [];
+    const fetchFn = (async (_url: unknown, init?: RequestInit) => {
+      calls.push({ body: JSON.parse(init?.body as string) });
+      return jsonResponse(courseBody({ "req-1": 0.95, "req-2": 0.2 }, "continue", 0.9));
+    }) as unknown as typeof fetch;
+    const judge = createCourseCheckJudge({ apiKey: "k", fetchFn });
+    const result: CourseCheckResult = await judge(okCourse);
+    expect(calls).toHaveLength(1);
+    const questions = (calls[0]!.body as { questions: Record<string, unknown> }).questions;
+    expect(Object.keys(questions).sort()).toEqual(["next_action", "req-1", "req-2"]);
+    expect(result.judged).toBe(true);
+    expect(result.onTrack).toEqual({ "req-1": true, "req-2": false });
+    expect(result.nextAction).toBe("continue");
+  });
+
+  test("requirement quotes verbatim in state only", async () => {
+    const calls: { body?: unknown }[] = [];
+    const fetchFn = (async (_url: unknown, init?: RequestInit) => {
+      calls.push({ body: JSON.parse(init?.body as string) });
+      return jsonResponse(courseBody({ "req-1": 0.9 }, "continue", 0.9));
+    }) as unknown as typeof fetch;
+    const judge = createCourseCheckJudge({ apiKey: "k", fetchFn });
+    await judge({ ...okCourse, requirements: [{ id: "req-1", quote: "VERBATIM_QUOTE_MARKER" }] });
+    const body = calls[0]!.body as {
+      state: unknown;
+      questions: Record<string, { instructions: unknown }>;
+    };
+    expect(JSON.stringify(body.state)).toContain("VERBATIM_QUOTE_MARKER");
+    expect(JSON.stringify(body.questions["next_action"]!.instructions)).not.toContain(
+      "VERBATIM_QUOTE_MARKER",
+    );
+  });
+
+  test("contract violation (unknown id) -> judged:false, never auto-continue", async () => {
+    const fetchFn = (async () =>
+      jsonResponse({
+        model: "jev-1.13.0",
+        answers: {
+          "req-1": { type: "noul", noul: 0.9 },
+          extra: { type: "noul", noul: 0.1 },
+          next_action: {
+            type: "choice",
+            choice: "continue",
+            probabilities: { continue: 1 },
+            confidence: 0.9,
+          },
+        },
+        usage: {},
+      })) as unknown as typeof fetch;
+    const judge = createCourseCheckJudge({ apiKey: "k", fetchFn });
+    const result = await judge(okCourse);
+    expect(result.judged).toBe(false);
+    expect(result.reasons).toContain("bad_payload");
+    expect(result.nextAction).not.toBe("continue");
+  });
+
+  test("low-confidence next_action -> verify_before_proceeding, never continue", async () => {
+    const judge = createCourseCheckJudge({
+      apiKey: "k",
+      fetchFn: courseFetch({ "req-1": 0.9, "req-2": 0.9 }, "continue", 0.5),
+    });
+    const result = await judge(okCourse);
+    expect(result.judged).toBe(true);
+    expect(result.nextAction).toBe("verify_before_proceeding");
+    expect(result.reasons).toContain("low_confidence");
+  });
+
+  test("transport error surfaces typed error, no action fabricated", async () => {
+    const fetchFn = (async () => {
+      throw new Error("ECONNRESET");
+    }) as unknown as typeof fetch;
+    const judge = createCourseCheckJudge({ apiKey: "k", fetchFn, maxRetries: 0 });
+    await expect(judge(okCourse)).rejects.toBeInstanceOf(JevApiError);
+  });
+
+  test("empty requirements rejected, zero network", async () => {
+    let called = 0;
+    const fetchFn = (async () => {
+      called++;
+      return jsonResponse(courseBody({}, "continue", 0.9));
+    }) as unknown as typeof fetch;
+    const judge = createCourseCheckJudge({ apiKey: "k", fetchFn });
+    await expect(judge({ ...okCourse, requirements: [] })).rejects.toBeInstanceOf(JevApiError);
+    expect(called).toBe(0);
+  });
+
+  test("missing api key config error, zero network", async () => {
+    const judge = createCourseCheckJudge({ apiKey: "", fetchFn: courseFetch({}, "continue", 0.9) });
+    await expect(judge(okCourse)).rejects.toBeInstanceOf(JevApiError);
+  });
+
+  test("confidence override raises bar: 0.85 < threshold -> verify_before_proceeding", async () => {
+    const judge = createCourseCheckJudge({
+      apiKey: "k",
+      fetchFn: courseFetch({ "req-1": 0.9, "req-2": 0.9 }, "continue", 0.85),
+      minConfidence: 0.95,
+    });
+    const result = await judge(okCourse);
+    expect(result.judged).toBe(true);
+    expect(result.nextAction).toBe("verify_before_proceeding");
+    expect(result.reasons).toContain("low_confidence");
+  });
+
+  test("override cannot lower below 0.8 floor: minConfidence 0.3 still demotes 0.7", async () => {
+    const judge = createCourseCheckJudge({
+      apiKey: "k",
+      fetchFn: courseFetch({ "req-1": 0.9, "req-2": 0.9 }, "continue", 0.7),
+      minConfidence: 0.3,
+    });
+    const result = await judge(okCourse);
+    expect(result.nextAction).toBe("verify_before_proceeding");
+    expect(result.reasons).toContain("low_confidence");
+  });
+
+  test("raised bar still passes when confidence meets it", async () => {
+    const judge = createCourseCheckJudge({
+      apiKey: "k",
+      fetchFn: courseFetch({ "req-1": 0.9, "req-2": 0.9 }, "continue", 0.95),
+      minConfidence: 0.95,
+    });
+    const result = await judge(okCourse);
+    expect(result.nextAction).toBe("continue");
+  });
+});

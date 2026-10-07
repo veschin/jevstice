@@ -13,9 +13,9 @@ plan/types -> parallel client/catalog/extension -> integration proof -> parallel
 | 2 | Catalog/classification/topic+skill+model routing | JevCatalogWorker | DONE (library, DEFERRED from MVP runtime) — commit 8b4c8ff | tsc clean, 34/34 |
 | 3 | omp extension controller + entry | JevExtensionWorker | DONE — commit pending with integration | 18/18; live-smoked |
 | 4 | Integration proof | JevIntegrator | DONE 2026-10-07 (superseded runs: final 128/128, tsc clean, guard clean, live probe ok) | evidence/ |
-| 5 | Independent reviews | JevCodeReview + JevBehaviorReview | ROUND 2 RUNNING — FIXES_READY sent | B1-B7 + code findings 1-5 + overrides R1-R6 + SDK transport landed → CLEAR both |
-| 6 | Docs + final implementation commit | JevIntegrator | PENDING | after both CLEAR |
-| 7 | AC9 dogfooding | JevIntegrator | PENDING — after CLEAR; genuine corrections consumed by fix round → whole-project final review through addon (distinguished from rework loop) | evidence/ac9-dogfood.md |
+| 5 | Independent reviews | JevCodeReview + JevBehaviorReview | DONE — CLEAR rounds 2,3,4,5 | all findings fixed and re-verified |
+| 6 | Docs + final implementation commit | JevIntegrator | DONE | final commit after both CLEAR |
+| 7 | AC9 dogfooding | JevIntegrator | DONE | whole-project final review through addon, live verdict recorded (insufficient_evidence 0.41, fail-closed); completion = user decision |
 | 8 | Live-Jev dev consultations (user order) | JevIntegrator | DONE | POLICY-DRAFT.md; evidence/jev-prd-review.md; evidence/jev-impl-review.md; 5 requests |
 | 9 | Template overrides (user-approved in-scope) | Extension+Client workers | DONE — awaiting round-2 review | AC10; R1-R6 implemented |
 
@@ -31,3 +31,4 @@ See PLAN.md §"FR acceptance" (FR-01..FR-16). Gate policy: failure/low-confidenc
 
 - FR-17 interaction templates (default templates versioned/tested; project-level override file; invalid override = fail-closed error; template inventory in README).
 - POLICY-DRAFT.md post-approval items: high-risk bash pattern gate, spawn budget gate, destructive-action detector, memory/skill class policy, judge-every-edit vs plan+completion decision.
+| 10 | Universal engine + course_check preset (S:U10/S:U11) | Extension+Client workers, integrator docs | DONE — reviews CLEAR rounds 3-5 | registry, presets, config controlPoints, drift judge wired, live round-trip; AC11 PASS |

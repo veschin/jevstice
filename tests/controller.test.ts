@@ -447,4 +447,237 @@ describe("jev controller", () => {
 		await controller.submitDecision(validDecisionInput());
 		expect(stopResult(await runStop(harness))?.decision).toBeUndefined();
 	});
+
+	const COURSE_OPTIONS = [
+		{ id: "continue", label: "Continue", meaning: "keep going" },
+		{ id: "return_to_requirement", label: "Return", meaning: "re-read requirement" },
+		{ id: "replan", label: "Replan", meaning: "new plan" },
+		{ id: "ask_user", label: "Ask", meaning: "escalate" },
+		{ id: "verify_before_proceeding", label: "Verify", meaning: "run checks first" },
+	];
+
+	function courseInput(overrides: Record<string, unknown> = {}) {
+		return {
+			stage: "course_check",
+			task: "REQ-1 user quote: login must persist",
+			proposal: "mid-progress status",
+			evidence: [evidence("execution", "tests pass")],
+			options: COURSE_OPTIONS,
+			...overrides,
+		};
+	}
+
+	test("course_check: end-to-end verdict mapping (record/redirect/escalate, counter burn)", async () => {
+		const harness = makeFakePi();
+		let next: DecisionResult = judgeResult({ selectedOption: "continue" });
+		const controller = createJevController({ judge: async () => next });
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "requirement work", systemPrompt: [] });
+
+		// fixed option set enforced when no template override
+		const bad = await controller.submitDecision(courseInput({ options: OPTIONS }));
+		expect(bad.verdict).toBe("insufficient_evidence");
+		expect(bad.judged).toBe(false);
+
+		// continue: recorded, approves nothing
+		const cont = await controller.submitDecision(courseInput());
+		expect(cont.verdict).toBe("approve");
+		expect(controller.getState().lastCourseCheck?.selectedOption).toBe("continue");
+		expect(controller.getState().approvals.some(a => a.stage === "course_check")).toBe(false);
+
+		// return_to_requirement: revise + same-session feedback + counter burn
+		next = judgeResult({ selectedOption: "return_to_requirement" });
+		const redirect = await controller.submitDecision(courseInput());
+		expect(redirect.verdict).toBe("revise");
+		expect(redirect.reasons.join(" ")).toContain("return_to_requirement");
+		expect(harness.sentMessages.length).toBeGreaterThan(0);
+
+		// verify_before_proceeding recorded
+		next = judgeResult({ selectedOption: "verify_before_proceeding" });
+		await controller.submitDecision(courseInput());
+		expect(controller.getState().lastCourseCheck?.selectedOption).toBe("verify_before_proceeding");
+
+		// ask_user (judge choice) escalates with recorded blocker
+		next = judgeResult({ selectedOption: "ask_user" });
+		const esc = await controller.submitDecision(courseInput());
+		expect(esc.verdict).toBe("ask_user");
+		expect(controller.getState().blockers.join(" ")).toContain("course_check");
+
+		// The 4th call (ask_user) exhausts the bounded-rework bound (3): escalated without
+		// a further judge call, blocker names the stage, never fake success.
+		expect(Object.values(controller.getState().iterations).reduce((a, b) => a + b, 0)).toBe(3);
+	});
+
+	test("course_check: judge error fail-closed; client-enforced low confidence arrives as verify_before_proceeding", async () => {
+		const controller = createJevController({
+			judge: async (req: DecisionRequest) => {
+				if (req.task === "transport down") throw new Error("endpoint down");
+				// Post-client normalization: floor already enforced, confidence stripped.
+				return judgeResult({ selectedOption: "verify_before_proceeding", reasons: ["low_confidence"] });
+			},
+		});
+		const errOutcome = await controller.submitDecision(courseInput({ task: "transport down" }));
+		expect(errOutcome.verdict).toBe("insufficient_evidence");
+		expect(errOutcome.judged).toBe(false);
+		expect(controller.getState().lastCourseCheck).toBeUndefined();
+
+		const low = await controller.submitDecision(courseInput());
+		expect(low.verdict).toBe("approve");
+		expect(controller.getState().lastCourseCheck?.selectedOption).toBe("verify_before_proceeding");
+		// recorded, but grants no approval
+		expect(controller.getState().approvals.length).toBe(0);
+	});
+
+	test("C1 wired course_check: per-requirement drift via injected courseCheckJudge", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({
+			judge: async () => {
+				throw new Error("standard judge must not be consulted for wired course_check");
+			},
+			courseCheckJudge: async req => {
+				expect(req.requirements.length).toBe(2);
+				expect(req.requirements[0]?.quote).toContain("login must persist");
+				return {
+					onTrack: { REQ1: true, REQ2: false },
+					nextAction: "return_to_requirement",
+					reasons: ["drift on REQ2"],
+					judged: true,
+				};
+			},
+		});
+		controller.register(harness.pi);
+		const outcome = await controller.submitDecision(
+			courseInput({
+				evidence: [
+					evidence("user", "REQ-1 user quote: login must persist"),
+					evidence("spec", "REQ-2 spec quote: export to csv"),
+					evidence("execution", "tests pass"),
+				],
+			}),
+		);
+		expect(outcome.verdict).toBe("revise");
+		expect(outcome.reasons.join(" ")).toContain("not on track: REQ2");
+		expect(harness.sentMessages.length).toBeGreaterThan(0);
+		expect(controller.getState().approvals.length).toBe(0);
+	});
+
+	test("C1 wired course_check: all on track + continue records without approval", async () => {
+		const controller = createJevController({
+			judge: async () => {
+				throw new Error("must not be called");
+			},
+			courseCheckJudge: async () => ({
+				onTrack: { REQ1: true },
+				nextAction: "continue",
+				reasons: [],
+				judged: true,
+			}),
+		});
+		const outcome = await controller.submitDecision(
+			courseInput({ evidence: [evidence("user", "REQ-1 user quote: login must persist"), evidence("execution", "tests pass")] }),
+		);
+		expect(outcome.verdict).toBe("approve");
+		expect(outcome.selectedOption).toBe("continue");
+		expect(controller.getState().lastCourseCheck?.selectedOption).toBe("continue");
+		expect(controller.getState().approvals.length).toBe(0);
+	});
+
+	test("C1 wired course_check: duplicate requirement ids deduped deterministically, none dropped", async () => {
+		let seen: Array<{ id: string; quote: string }> = [];
+		const controller = createJevController({
+			judge: async () => {
+				throw new Error("must not be called");
+			},
+			courseCheckJudge: async req => {
+				seen = req.requirements;
+				return { onTrack: { REQ: true, "REQ#2": true }, nextAction: "continue", reasons: [], judged: true };
+			},
+		});
+		const outcome = await controller.submitDecision(
+			courseInput({
+				evidence: [
+					evidence("user", "REQ user quote: login must persist"),
+					evidence("user", "REQ user quote: login must persist"), // exact duplicate -> merged
+					evidence("spec", "REQ spec quote: session expiry differs"), // same id, different quote -> REQ#2
+					evidence("execution", "tests pass"),
+				],
+			}),
+		);
+		expect(outcome.verdict).toBe("approve");
+		expect(seen.map(r => r.id)).toEqual(["test", "test#2"]);
+		expect(seen[1]?.quote).toContain("session expiry");
+	});
+
+	test("C1 wired course_check: fail-closed on judge throw and unjudged result", async () => {
+		let mode: "throw" | "unjudged" = "throw";
+		const controller = createJevController({
+			judge: async () => {
+				throw new Error("must not be called");
+			},
+			courseCheckJudge: async () => {
+				if (mode === "throw") throw new Error("endpoint down");
+				return { onTrack: {}, nextAction: "continue", reasons: [], judged: false };
+			},
+		});
+		const thrown = await controller.submitDecision(courseInput());
+		expect(thrown.verdict).toBe("insufficient_evidence");
+		expect(thrown.judged).toBe(false);
+		expect(controller.getState().lastCourseCheck).toBeUndefined();
+		mode = "unjudged";
+		const unjudged = await controller.submitDecision(courseInput());
+		expect(unjudged.verdict).toBe("insufficient_evidence");
+		expect(controller.getState().lastCourseCheck).toBeUndefined();
+	});
+
+	test("C1 wired course_check: requirement-less submission rejected before judge", async () => {
+		let called = false;
+		const controller = createJevController({
+			judge: async () => {
+				throw new Error("must not be called");
+			},
+			courseCheckJudge: async () => {
+				called = true;
+				return { onTrack: {}, nextAction: "continue", reasons: [], judged: true };
+			},
+		});
+		const outcome = await controller.submitDecision(
+			courseInput({ evidence: [evidence("execution", "tests pass")] }),
+		);
+		expect(outcome.verdict).toBe("insufficient_evidence");
+		expect(called).toBe(false);
+	});
+
+	test("registry: config-declared on_demand control point fires end-to-end, grants no approval", async () => {
+		const controller = createJevController({
+			judge: async (req: DecisionRequest) => {
+				expect(req.stage as string).toBe("risk_assessment");
+				return judgeResult({});
+			},
+			template: {
+				controlPoints: {
+					risk_assessment: { trigger: "on_demand", instructions: "weigh blast radius" },
+				},
+			},
+		});
+		const outcome = await controller.submitDecision({
+			stage: "risk_assessment",
+			task: "migration cutover",
+			proposal: "phased plan",
+			evidence: [evidence("log", "dry-run ok")],
+			options: OPTIONS,
+		});
+		expect(outcome.verdict).toBe("approve");
+		expect(controller.getState().approvals.length).toBe(0);
+	});
+
+	test("templateError state fails closed on every submission (config corruption mid-session)", async () => {
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			templateError: 'controlPoints.cut_files must declare trigger "on_demand" (gate triggers are a roadmap item)',
+		});
+		const outcome = await controller.submitDecision(validDecisionInput());
+		expect(outcome.verdict).toBe("insufficient_evidence");
+		expect(outcome.judged).toBe(false);
+		expect(outcome.reasons.join(" ")).toContain("fail-closed");
+	});
 });

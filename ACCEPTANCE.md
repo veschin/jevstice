@@ -76,5 +76,12 @@ Observed: PASS as final-review form (live verdict through addon judged=true: ins
 GIVEN defaults versioned in package (stage instructions, thresholds, capability lists, option sets).
 WHEN a project `.omp/jev.config.json` or user `~/.omp/agent/jev.config.json` override exists.
 THEN valid overrides merge per-key and take effect (tool questions/thresholds change); invalid override (bad JSON/types/range/unknown stage) → explicit fail-closed error naming file and problem — never silent fallback; absent file → defaults unchanged.
-Evidence: `tests/config.test.ts` (10 tests: precedence, trust-split, fail-closed naming file, defaults-when-absent) + round-2 reviewer verification (R1-R6).
-Observed: PASS (implemented per rulings; reviewers verified).
+Evidence: tests/config.test.ts (precedence, trust-split, fail-closed naming file, defaults-when-absent) + reviewers round 2/3 verification (R1-R6).
+Observed: PASS.
+
+## AC11 — Course-check loop (FR-18, user course correction)
+GIVEN an executor working under stated requirements (verbatim user/spec quotes).
+WHEN the executor submits stage=course_check with current action + requirement quotes + progress evidence.
+THEN the judge returns per-requirement drift answers (still on track?) and a next-action from the fixed set [continue, return_to_requirement, replan, ask_user, verify_before_proceeding]; return_to_requirement/replan push same-session feedback and count toward bounded rework; ask_user escalates; continue/verify record without approving; judge failure/low confidence never resolves to continue.
+Evidence: tests/controller.test.ts (drift revise + not-on-track ids + feedback + no-approval; fail-closed; requirement-less rejection), tests/client.test.ts (createCourseCheckJudge body/fail-closed), live run in evidence/ac1-omp-smoke.log (course_check section: approve/verify_before_proceeding, reasons [low_confidence], confidence 0.74, judged=true — floor enforced live).
+Observed: PASS (drift Noul per requirement + fixed next-action wired in production path; reviewers round 3 CLEAR + round 4 wiring scope).

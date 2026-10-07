@@ -1,6 +1,6 @@
-# Jev - decision judge for oh my pi
+# Jev — course-check judge for oh my pi
 
-Jev (TypeSafe systemone, `jev-latest` = jev-1.13.0) is a type-safe decision model: it answers Noul/Choice/Score questions - it never generates text. This package wires it into omp as the architect/lead judge: the main model and task agents validate important decisions, code reviews, completion claims, and route skills/models/topics through fixed option sets.
+Jev (TypeSafe systemone, `jev-latest` = jev-1.13.0) is a type-safe decision model: it answers Noul/Choice/Score questions — it never generates text. This package wires it into omp so the executor answers THROUGH the judge: **am I working correctly / have I drifted from the requirements / what to do next** (`course_check` stage: per-requirement drift Noul + next-action from a fixed set [continue, return_to_requirement, replan, ask_user, verify_before_proceeding]). File-mutation gating (plan/completion) remains as a backstop, not the product's face.
 
 Status, observed coverage, and honest limits: see `PLAN.md` and `PRD.md`.
 
@@ -57,6 +57,10 @@ Defaults (stage instructions, option sets, thresholds, capability defaults) are 
 ```
 
 Trust model: config files are trusted input from the person running omp; a project file shapes prompts but cannot weaken the approval floor (`confidenceThreshold` may only raise it above 0.8; precedence user > project for the threshold, project > user for prompt-shaping keys). Invalid override → the extension refuses to register `jev_decision` with the file path and problem — never a silent fallback.
+
+## Control points (universal engine)
+
+All decision stages are presets of one declarative engine. Built-in presets: `understanding_review`, `direction_review` (trigger: mutation gate), `completion_review` (trigger: session stop), `course_check` (on-demand drift check + next action). Custom control points can be declared in `jev.config.json` under `controlPoints` — currently `trigger: "on_demand"` only (advisory: verdicts are recorded and fed back in-session, they never grant approvals); declaring gate triggers is rejected with an explicit error (roadmap). Engine services shared by every preset: fail-closed verdict handling, digest/fingerprint staleness, bounded rework, same-session feedback.
 
 ## Known limits
 

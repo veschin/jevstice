@@ -123,6 +123,26 @@ describe("jev template config", () => {
 		expect(() => validateTemplateConfig(PROJECT_FILE, { capabilities: ["ok", ""] })).toThrow(/capabilities/);
 	});
 
+	test("controlPoints: on_demand accepted, gate triggers fail-closed naming file+key", () => {
+		const cfg = validateTemplateConfig(PROJECT_FILE, {
+			controlPoints: {
+				risk_assessment: { trigger: "on_demand", instructions: "weigh blast radius" },
+			},
+		});
+		expect(cfg.controlPoints?.risk_assessment?.trigger).toBe("on_demand");
+		try {
+			validateTemplateConfig(PROJECT_FILE, {
+				controlPoints: { cut_files: { trigger: "mutation_gate" } },
+			});
+			expect.unreachable();
+		} catch (err) {
+			expect(err).toBeInstanceOf(JevConfigError);
+			expect((err as Error).message).toContain(PROJECT_FILE);
+			expect((err as Error).message).toContain("cut_files");
+			expect((err as Error).message).toContain("on_demand");
+		}
+	});
+
 	test("merge is per-key and keeps untouched keys", () => {
 		const user: JevTemplateConfig = {
 			stages: {

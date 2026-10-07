@@ -32,10 +32,11 @@ export type DecisionStage =
   | "understanding_review" // FR-05
   | "direction_review" // FR-06
   | "completion_review" // FR-07
+  | "course_check" // universal engine: on-demand on-track check (advisory-to-binding)
   | "important_decision" // FR-10: main-model decision gate
   | "code_review" // FR-10: code review gate
   | "subagent_handoff" // FR-11: validate dispatch and acceptance
-  | "refactor_check"; // FR-13: capability preservation
+  | "refactor_check"; // FR-13: capability preservation + FR-18 course_check (see control-points registry)
 
 /** Fixed option set presented to the judge (FR-08). */
 export interface DecisionOption {
@@ -98,6 +99,39 @@ export interface MultiLabelResult {
 }
 
 export type MultiLabelJudge = (request: MultiLabelRequest) => Promise<MultiLabelResult>;
+
+// ---------- Course check (FR-18) ----------
+
+export const COURSE_CHECK_NEXT_ACTIONS = [
+  "continue",
+  "return_to_requirement",
+  "replan",
+  "ask_user",
+  "verify_before_proceeding",
+] as const;
+
+export type CourseCheckNextAction = (typeof COURSE_CHECK_NEXT_ACTIONS)[number];
+
+export interface CourseCheckRequest {
+  /** Verbatim requirement statement(s) under which the executor works. */
+  requirements: { id: string; quote: string }[];
+  /** Current action + progress summary. */
+  currentAction: string;
+  /** Progress evidence (execution/code/log quotes) + requirement provenance. */
+  evidence: Evidence[];
+}
+
+export interface CourseCheckResult {
+  /** Per-requirement drift verdict: true = still on track. */
+  onTrack: Record<string, boolean>;
+  nextAction: CourseCheckNextAction;
+  reasons: string[];
+  confidence?: number;
+  /** False when the judge could not be consulted (fail-closed, nextAction is NOT auto-continue). */
+  judged: boolean;
+}
+
+export type CourseCheckJudge = (request: CourseCheckRequest) => Promise<CourseCheckResult>;
 
 // ---------- TypeSafe systemone wire types (S:API, verified from docs.typesafe.ai/api) ----------
 

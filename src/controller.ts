@@ -16,7 +16,13 @@
  */
 import { isRecord, nonEmptyString } from "./guards.js";
 import type { JevTemplateConfig } from "./config.js";
-import { POLICY } from "./types.js";
+import {
+	type ControlPoint,
+	lookupControlPoint,
+	validateDeclaredControlPoint,
+} from "./control-points.js";
+import { STAGES } from "./stages.js";
+import { POLICY, type CourseCheckJudge, type CourseCheckResult } from "./types.js";
 import {
 	type DecisionResult,
 	type DecisionStage,
@@ -56,6 +62,8 @@ export interface JevState {
 	routedModel: string | undefined;
 	/** Applied skill-routing selection (AC2), recorded for dispatch visibility. */
 	routedSkill: string | undefined;
+	/** Latest course_check outcome — recorded, never grants an approval. */
+	lastCourseCheck: { selectedOption: string; at: number } | undefined;
 }
 
 function freshState(): JevState {
@@ -68,6 +76,7 @@ function freshState(): JevState {
 		blockers: [],
 		routedModel: undefined,
 		routedSkill: undefined,
+		lastCourseCheck: undefined,
 	};
 }
 
@@ -104,19 +113,6 @@ const EVIDENCE_KINDS: ReadonlySet<string> = new Set([
 	"log",
 	"documentation",
 ]);
-const STAGES: ReadonlySet<string> = new Set([
-	"task_classification",
-	"skill_routing",
-	"model_routing",
-	"topic_selection",
-	"understanding_review",
-	"direction_review",
-	"completion_review",
-	"important_decision",
-	"code_review",
-	"subagent_handoff",
-	"refactor_check",
-]);
 /** Completion must rest on artifact evidence, not self-report (AC4b). */
 const COMPLETION_EVIDENCE_KINDS: ReadonlySet<string> = new Set(["execution", "code", "log"]);
 // Mutation-bearing builtins (omp 18.6.3 tools/builtin-names.ts + tool sources):
@@ -131,7 +127,8 @@ const MUTATING_TOOLS: ReadonlySet<string> = new Set([
 	"memory_edit",
 	"manage_skill",
 ]);
-const PLAN_STAGES: ReadonlySet<DecisionStage> = new Set(["understanding_review", "direction_review"]);
+/** course_check redirecting options: approve+these map to revise (registry holds the full set). */
+const COURSE_CHECK_REDIRECTING: ReadonlySet<string> = new Set(["return_to_requirement", "replan"]);
 const STATE_ENTRY_TYPE = "jev.state";
 const TOOL_NAME = "jev_decision";
 
@@ -151,12 +148,12 @@ export interface ValidationResult {
 }
 
 /** Validate the executor's structured decision submission. Never throws. */
-export function validateDecisionInput(raw: unknown): ValidationResult {
+export function validateDecisionInput(raw: unknown, extraStages: ReadonlySet<string> = new Set()): ValidationResult {
 	const reasons: string[] = [];
 	if (!isRecord(raw)) return { ok: false, reasons: ["decision input must be a JSON object"] };
 	const stage = raw["stage"];
-	if (typeof stage !== "string" || !STAGES.has(stage)) {
-		reasons.push(`stage must be one of: ${[...STAGES].join(", ")}`);
+	if (typeof stage !== "string" || !(STAGES.has(stage) || extraStages.has(stage))) {
+		reasons.push(`stage must be one of: ${[...new Set([...STAGES, ...extraStages])].join(", ")}`);
 	}
 	if (!nonEmptyString(raw["task"])) reasons.push("task must be a non-empty string");
 	if (!nonEmptyString(raw["proposal"])) reasons.push("proposal must be a non-empty string");
@@ -318,6 +315,8 @@ export interface ControllerDeps {
 	template?: JevTemplateConfig;
 	/** Validation error from a config file: fail closed on every submission (R5). */
 	templateError?: string;
+	/** Per-requirement drift judge for the course_check preset (C1 wired path). */
+	courseCheckJudge?: CourseCheckJudge;
 }
 
 /** Minimal structural surface of the omp ExtensionAPI the controller needs. */
@@ -343,13 +342,17 @@ export class JevController {
 	private readonly maxReworkIterations: number;
 	private readonly now: () => number;
 	private pi: PiApi | undefined;
+	private readonly courseCheckJudge: CourseCheckJudge | undefined;
 	private template: JevTemplateConfig;
 	private templateError: string | undefined;
+	/** Config-declared on_demand control points (controlPoints key). */
+	private extraPoints: ReadonlyMap<string, ControlPoint> = new Map();
 	/** R1: never below POLICY floor; a template override may only raise it. */
 	private minConfidence: number;
 
 	constructor(deps: ControllerDeps) {
 		this.judge = deps.judge;
+		this.courseCheckJudge = deps.courseCheckJudge;
 		this.maxReworkIterations = deps.maxReworkIterations ?? POLICY.maxReworkIterations;
 		// R1: a confidenceThreshold override may only RAISE the bar above POLICY.
 		this.minConfidence = Math.max(
@@ -359,11 +362,13 @@ export class JevController {
 		this.now = deps.now ?? (() => Date.now());
 		this.template = deps.template ?? {};
 		this.templateError = deps.templateError;
+		this.extraPoints = extraPointsFromTemplate(this.template);
 	}
 
 	/** Re-validate config mid-session (R5): corruption degrades to typed fail-closed errors. */
 	setTemplateState(template: JevTemplateConfig | undefined, templateError?: string): void {
 		this.template = template ?? {};
+		this.extraPoints = extraPointsFromTemplate(this.template);
 		this.templateError = templateError;
 		if (templateError === undefined && template?.confidenceThreshold !== undefined) {
 			this.minConfidence = Math.max(POLICY.minConfidenceToApprove, template.confidenceThreshold);
@@ -431,7 +436,7 @@ export class JevController {
 		if (!isRecord(event)) return undefined;
 		const toolName = event["toolName"];
 		if (toolName === TOOL_NAME) {
-			const check = validateDecisionInput(event["input"]);
+			const check = validateDecisionInput(event["input"], this.extraStageSet());
 			if (!check.ok) {
 				return { block: true, reason: `jev_decision rejected before judging: ${check.reasons.join("; ")}` };
 			}
@@ -538,7 +543,7 @@ export class JevController {
 						const revisionHash = a["revisionHash"];
 						const workRevision = a["workRevision"];
 						const approvedAt = a["approvedAt"];
-						if (typeof stage !== "string" || !STAGES.has(stage)) return [];
+						if (typeof stage !== "string" || !(STAGES.has(stage) || this.extraStageSet().has(stage))) return [];
 						if (!nonEmptyString(revisionHash)) return [];
 						if (typeof workRevision !== "number" || !Number.isFinite(workRevision)) return [];
 						if (typeof approvedAt !== "number" || !Number.isFinite(approvedAt)) return [];
@@ -566,6 +571,7 @@ export class JevController {
 					: [],
 				routedModel: typeof data["routedModel"] === "string" ? data["routedModel"] : undefined,
 				routedSkill: typeof data["routedSkill"] === "string" ? data["routedSkill"] : undefined,
+				lastCourseCheck: undefined,
 			};
 			return;
 		}
@@ -591,13 +597,14 @@ export class JevController {
 				judged: false,
 			};
 		}
-		const check = validateDecisionInput(raw);
+		const check = validateDecisionInput(raw, this.extraStageSet());
 		if (!check.ok || check.input === undefined) {
 			return { verdict: "insufficient_evidence", reasons: check.reasons, judged: false };
 		}
 		const input = check.input;
 
-		if (input.stage === "completion_review") {
+		const point = lookupControlPoint(input.stage, this.extraPoints);
+		if (point?.requiresArtifactEvidence === true) {
 			if (!input.evidence.some(e => COMPLETION_EVIDENCE_KINDS.has(e.kind))) {
 				return {
 					verdict: "insufficient_evidence",
@@ -637,8 +644,22 @@ export class JevController {
 		}
 
 		// R3: template options replace the executor's fixed option set for this stage.
-		const templateStage = this.template.stages?.[input.stage];
+		const templateStage = this.template.stages?.[input.stage] ?? this.extraStageTemplate(input.stage);
 		const judgeOptions = templateStage?.options ?? input.options;
+		if (point?.fixedOptionIds !== undefined && templateStage?.options === undefined) {
+			const ids = new Set(judgeOptions.map(o => o.id));
+			const mismatch = [...point.fixedOptionIds].filter(id => !ids.has(id));
+			if (mismatch.length > 0 || ids.size !== judgeOptions.length) {
+				return {
+					verdict: "insufficient_evidence",
+					reasons: [
+						"this control point requires exactly its fixed options " +
+							`[...${[...(point.fixedOptionIds ?? [])].join(", ")}] (template override may replace them)`,
+					],
+					judged: false,
+				};
+			}
+		}
 		// R2: built-in evidence policy first, template instructions appended after (cap 4000).
 		let judgeProposal =
 			`${input.proposal}\n\nJev evidence policy: evidence items must quote real artifacts ` +
@@ -649,6 +670,11 @@ export class JevController {
 		}
 		// Config capabilities are DEFAULTS; caller-passed wins.
 		const capabilities = input.capabilities.length > 0 ? input.capabilities : (this.template.capabilities ?? []);
+
+		// C1 wired path: course_check preset consults the dedicated per-requirement judge.
+		if (input.stage === "course_check" && this.courseCheckJudge !== undefined) {
+			return this.submitCourseCheck(input, boundKey, used);
+		}
 
 		let rawResult: DecisionResult;
 		try {
@@ -667,10 +693,37 @@ export class JevController {
 			};
 		}
 
-		const result = normalizeJudgeResult(rawResult, judgeOptions, this.minConfidence);
+		const normalized = normalizeJudgeResult(rawResult, judgeOptions, this.minConfidence);
 		this.state.iterations[boundKey] = used + 1;
+		// course_check advisory-to-binding mapping (record, never approve anything).
+		let result = normalized;
+		if (point?.verdictMapping === "course_check" && normalized.verdict === "ask_user") {
+			// Judge itself chose ask_user: escalate with a recorded blocker.
+			result = this.escalateCourseCheck(normalized);
+		}
+		if (point?.verdictMapping === "course_check" && normalized.verdict === "approve" && normalized.selectedOption !== undefined) {
+			const picked = normalized.selectedOption;
+			if (COURSE_CHECK_REDIRECTING.has(picked)) {
+				result = {
+					verdict: "revise",
+					reasons: [...normalized.reasons, `course_check redirects: ${picked}`],
+					confidence: normalized.confidence,
+				};
+			} else if (picked === "ask_user") {
+				result = this.escalateCourseCheck(normalized);
+			} else {
+				// continue / verify_before_proceeding: record only, approves nothing.
+				this.state.lastCourseCheck = { selectedOption: picked, at: this.now() };
+			}
+		}
 
-		if (result.verdict === "approve" && result.selectedOption !== undefined) {
+		// Advisory points (course_check benign pair, config-declared on_demand) never
+		// record gate approvals; their outcomes live in state records/feedback only.
+		const skipApproval =
+			point?.trigger === "on_demand" &&
+			!(point.verdictMapping === "course_check" &&
+				(result.selectedOption === "ask_user" || COURSE_CHECK_REDIRECTING.has(result.selectedOption ?? "")));
+		if (result.verdict === "approve" && result.selectedOption !== undefined && !skipApproval) {
 			const digest = await revisionHash(input.stage, input.task, input.proposal, input.evidence);
 			// AC5 replay/supersede: an older approval of the same stage for this task with a
 			// different content digest is no longer authoritative.
@@ -704,13 +757,124 @@ export class JevController {
 		return { ...result, judged: true };
 	}
 
+	/**
+	 * C1 wired course_check: per-requirement drift (Noul) + next-action Choice in ONE request.
+	 * Verdict mapping: continue/verify_before_proceeding -> recorded (no approval);
+	 * return_to_requirement/replan -> revise + feedback; ask_user -> escalation.
+	 * Fail-closed identical: throw/unjudged/contract-violation -> insufficient_evidence, no record.
+	 */
+	private async submitCourseCheck(
+		input: ValidatedDecisionInput,
+		boundKey: string,
+		used: number,
+	): Promise<DecisionOutcome> {
+		// Deterministic dedupe: judge questions are keyed by requirement id, so duplicate
+		// ids must never silently collapse a drift check. Same id + same quote merges;
+		// same id + different quote gets a #N suffix so every distinct requirement is judged.
+		const requirements: Array<{ id: string; quote: string }> = [];
+		const seenQuotes = new Map<string, string>();
+		input.evidence
+			.filter(e => e.kind === "user" || e.kind === "spec")
+			.forEach((e, i) => {
+				const base = nonEmptyString(e.source) ? e.source : `req-${i}`;
+				if (seenQuotes.get(base) === e.quote) return;
+				let id = base;
+				for (let n = 2; requirements.some(r => r.id === id); n++) id = `${base}#${n}`;
+				seenQuotes.set(id, e.quote);
+				requirements.push({ id, quote: e.quote });
+			});
+		if (requirements.length === 0) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: ["course_check requires at least one user or spec evidence item as the requirement under check"],
+				judged: false,
+			};
+		}
+		let raw: CourseCheckResult;
+		try {
+			raw = await this.courseCheckJudge!({
+				requirements,
+				currentAction: input.proposal,
+				evidence: input.evidence,
+			});
+		} catch (err) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [`judge unavailable: ${err instanceof Error ? err.message : String(err)}`],
+				judged: false,
+			};
+		}
+		if (!isRecord(raw) || raw["judged"] !== true || typeof raw["nextAction"] !== "string") {
+			// Contract violation / judge could not be consulted: never auto-continue.
+			return {
+				verdict: "insufficient_evidence",
+				reasons: ["course_check judge returned an unjudged or malformed result; no action taken"],
+				judged: false,
+			};
+		}
+		const nextAction = raw["nextAction"] as string;
+		const onTrack = isRecord(raw["onTrack"]) ? raw["onTrack"] : {};
+		const drifted = Object.entries(onTrack)
+			.filter(([, ok]) => ok !== true)
+			.map(([id]) => id);
+		const reasons = [...(Array.isArray(raw["reasons"]) ? raw["reasons"].filter((r): r is string => typeof r === "string") : [])];
+		if (drifted.length > 0) reasons.push(`not on track: ${drifted.join(", ")}`);
+		this.state.iterations[boundKey] = used + 1;
+		if (nextAction === "continue" || nextAction === "verify_before_proceeding") {
+			this.state.lastCourseCheck = { selectedOption: nextAction, at: this.now() };
+			this.persist();
+			return {
+				verdict: "approve",
+				selectedOption: nextAction,
+				reasons,
+				confidence: typeof raw["confidence"] === "number" ? raw["confidence"] : undefined,
+				judged: true,
+			};
+		}
+		if (nextAction === "return_to_requirement" || nextAction === "replan") {
+			this.pushFeedback(`Jev course_check redirects: ${nextAction}${drifted.length > 0 ? ` (not on track: ${drifted.join(", ")})` : ""}`);
+			this.persist();
+			return { verdict: "revise", selectedOption: nextAction, reasons, judged: true };
+		}
+		// ask_user
+		const blocker = "course_check escalated to the user (ask_user chosen by the judge or rework bound).";
+		if (!this.state.blockers.includes(blocker)) this.state.blockers.push(blocker);
+		this.persist();
+		return { verdict: "ask_user", selectedOption: nextAction, reasons: [...reasons, blocker], judged: true };
+	}
+
+	/** course_check ask_user escalation: recorded blocker, never a gate grant. */
+	private escalateCourseCheck(normalized: DecisionResult): DecisionOutcome {
+		const blocker = "course_check escalated to the user (ask_user chosen by the judge or rework bound).";
+		if (!this.state.blockers.includes(blocker)) this.state.blockers.push(blocker);
+		this.persist();
+		return {
+			verdict: "ask_user",
+			reasons: [...normalized.reasons, blocker],
+			confidence: normalized.confidence,
+			judged: true,
+		};
+	}
+
 	// ----- internals -----
+
+	private extraStageSet(): Set<string> {
+		return new Set(this.extraPoints.keys());
+	}
+
+	private extraStageTemplate(stage: string): { instructions?: string; options?: DecisionOption[] } | undefined {
+		const declared = this.template.controlPoints?.[stage];
+		if (declared === undefined) return undefined;
+		return { instructions: declared.instructions, options: declared.options };
+	}
 
 	private planApproval(): ApprovalRecord | undefined {
 		// Undefined current fingerprint means no user task is established yet: no gate credit.
 		if (this.state.taskFingerprint === undefined) return undefined;
 		return this.state.approvals.find(
-			a => PLAN_STAGES.has(a.stage) && a.taskFingerprint === this.state.taskFingerprint,
+			a =>
+				lookupControlPoint(a.stage, this.extraPoints)?.trigger === "mutation_gate" &&
+				a.taskFingerprint === this.state.taskFingerprint,
 		);
 	}
 
@@ -724,7 +888,7 @@ export class JevController {
 		// completion_review must be consulted, not the first.
 		let completion: ApprovalRecord | undefined;
 		for (const a of this.state.approvals) {
-			if (a.stage === "completion_review") completion = a;
+			if (lookupControlPoint(a.stage, this.extraPoints)?.trigger === "session_stop") completion = a;
 		}
 		if (completion === undefined) {
 			missing.push("no completion_review approval at all");
@@ -754,6 +918,20 @@ export class JevController {
 	private persist(): void {
 		this.pi?.appendEntry(STATE_ENTRY_TYPE, this.state);
 	}
+}
+
+function extraPointsFromTemplate(template: JevTemplateConfig): ReadonlyMap<string, ControlPoint> {
+	const out = new Map<string, ControlPoint>();
+	const declared = template.controlPoints;
+	if (declared === undefined) return out;
+	for (const [stage, value] of Object.entries(declared)) {
+		try {
+			out.set(stage, validateDeclaredControlPoint(stage, value));
+		} catch {
+			// Invalid declarations are caught at config load; skip here (fail-closed already ran).
+		}
+	}
+	return out;
 }
 
 function hostModelIds(ctxOrList: unknown): string[] {

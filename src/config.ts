@@ -11,6 +11,7 @@
  */
 import * as fs from "node:fs";
 import { isRecord, nonEmptyString } from "./guards.js";
+import { validateDeclaredControlPoint } from "./control-points.js";
 import { STAGES } from "./stages.js";
 
 export interface StageTemplate {
@@ -26,6 +27,15 @@ export interface JevTemplateConfig {
 	confidenceThreshold?: number;
 	/** Default capability inventory applied when a submission omits capabilities. */
 	capabilities?: string[];
+	/**
+	 * Config-declared on_demand control points (roadmap: gate triggers rejected fail-closed).
+	 * They actually fire through submitDecision: advisory (record + feedback + bounded rework),
+	 * never gate-granting.
+	 */
+	controlPoints?: Record<
+		string,
+		{ trigger: "on_demand"; instructions?: string; options?: Array<{ id: string; label: string; meaning: string }> }
+	>;
 }
 
 export class JevConfigError extends Error {
@@ -87,6 +97,25 @@ export function validateTemplateConfig(file: string, raw: unknown): JevTemplateC
 		}
 		out.confidenceThreshold = t;
 	}
+	if (raw["controlPoints"] !== undefined) {
+		if (!isRecord(raw["controlPoints"])) {
+			throw new JevConfigError(file, "controlPoints must be an object keyed by stage name");
+		}
+		const points: JevTemplateConfig["controlPoints"] = {};
+		for (const [stage, value] of Object.entries(raw["controlPoints"])) {
+			if (!isRecord(value) || value["trigger"] !== "on_demand") {
+				throw new JevConfigError(
+					file,
+					`controlPoints.${stage} must declare trigger "on_demand" (gate triggers are a roadmap item)`,
+				);
+			}
+			// Structural naming/collision rules from the registry (throws with named problem).
+			validateDeclaredControlPoint(stage, value);
+			const parsed = parseStageTemplate(file, `controlPoints.${stage}`, value);
+			points[stage] = { trigger: "on_demand", instructions: parsed.instructions, options: parsed.options };
+		}
+		out.controlPoints = points;
+	}
 	if (raw["capabilities"] !== undefined) {
 		const caps = raw["capabilities"];
 		if (!Array.isArray(caps) || caps.some(c => !nonEmptyString(c))) {
@@ -108,6 +137,10 @@ export function mergeTemplateConfigs(user: JevTemplateConfig, project: JevTempla
 		// (R1 additionally clamps the effective value to max(POLICY.minConfidenceToApprove, x).)
 		confidenceThreshold: user.confidenceThreshold ?? project.confidenceThreshold,
 		capabilities: project.capabilities ?? user.capabilities,
+		controlPoints:
+			user.controlPoints === undefined && project.controlPoints === undefined
+				? undefined
+				: { ...(user.controlPoints ?? {}), ...(project.controlPoints ?? {}) },
 	};
 }
 

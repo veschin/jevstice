@@ -13,7 +13,7 @@
 import { createJevController, type ControllerDeps, type JevController, type PiApi } from "./controller.js";
 import { JevConfigError, loadJevTemplateConfig, type JevTemplateConfig } from "./config.js";
 import { isRecord } from "./guards.js";
-import { createJudge } from "./client.js";
+import { createCourseCheckJudge, createJudge } from "./client.js";
 import { POLICY, type Judge } from "./types.js";
 
 function envValue(...names: string[]): string | undefined {
@@ -31,7 +31,7 @@ function intEnv(name: string): number | undefined {
 	return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-/** Build the production judge dependency; fail-closed when unconfigured. */
+/** Build the production judge dependencies; fail-closed when unconfigured. */
 export function buildProductionJudge(env: NodeJS.ProcessEnv = process.env): Judge {
 	const apiKey = envValue("TYPESAFE_API_KEY", "JEVI_API_KEY");
 	if (apiKey === undefined || apiKey.length === 0) {
@@ -82,8 +82,24 @@ export function createJevExtension(deps: Partial<ControllerDeps> = {}) {
 			}
 			throw err;
 		}
+		// N1: the effective (R1-clamped) floor also raises the course-check demotion floor.
+		const effectiveMinConfidence = Math.max(
+			POLICY.minConfidenceToApprove,
+			template?.confidenceThreshold ?? 0,
+		);
+		const clientConfig = {
+			apiKey: envValue("TYPESAFE_API_KEY", "JEVI_API_KEY") ?? "",
+			apiUrl: envValue("TYPESAFE_API_URL", "JEVI_BASE_URL"),
+			model: envValue("JEVI_MODEL"),
+			timeoutMs: intEnv("JEVI_TIMEOUT_MS"),
+			minConfidence: effectiveMinConfidence,
+		};
 		const controller: JevController = createJevController({
 			judge: deps.judge ?? buildProductionJudge(),
+			// C1 wired by default in production; tests inject their own.
+			courseCheckJudge:
+				deps.courseCheckJudge ??
+				(deps.judge === undefined ? createCourseCheckJudge(clientConfig) : undefined),
 			template,
 			templateError,
 		});
