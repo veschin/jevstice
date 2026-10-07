@@ -403,8 +403,8 @@ function courseContractViolation(detail: string): CourseCheckResult {
 }
 
 /**
- * One systemone request: a Noul per requirement ("still on track?") plus one
- * Choice over the fixed COURSE_CHECK_NEXT_ACTIONS set. Requirement quotes go
+ * One systemone request: a Noul per requirement ("does the current work satisfy
+ * this requirement so far?") plus one Choice over the fixed COURSE_CHECK_NEXT_ACTIONS set. Requirement quotes go
  * verbatim into state only. Transport/auth/config/invalid-input problems throw
  * JevApiError (never mapped to an action); contract violations in the answer
  * body fail closed to judged:false with nextAction verify_before_proceeding;
@@ -441,7 +441,7 @@ export function createCourseCheckJudge(config: JevClientConfig): CourseCheckJudg
         id: r.id,
         instructions: {
           policy: COURSE_CHECK_POLICY,
-          question: `Is the executor still on track for this requirement? Requirement: ${r.quote}`,
+          question: `Given the progress evidence, does the current work satisfy this requirement so far? Requirement: ${r.quote}`,
         },
         criteria: {
           true: "Current action still serves this requirement as quoted.",
