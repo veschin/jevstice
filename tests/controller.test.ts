@@ -721,6 +721,72 @@ describe("jev controller", () => {
 		expect(outcome.reasons.join(" ")).toContain("fail-closed");
 	});
 
+	test("calibration rule: two consecutive mid-band approves record approval and pass stop gate", async () => {
+		const harness = makeFakePi();
+		let conf = 0.7;
+		const controller = createJevController({ judge: async () => judgeResult({ confidence: conf }) });
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
+		await approvePlan(controller);
+		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
+		const first = await controller.submitDecision(validDecisionInput());
+		expect(first.verdict).toBe("insufficient_evidence");
+		expect(first.judged).toBe(true);
+		expect(first.reasons.join(" ")).toContain("completion_pending_consecutive_approves");
+		expect(first.reasons.join(" ")).toContain("n=1/2");
+		conf = 0.75;
+		const second = await controller.submitDecision(validDecisionInput());
+		expect(second.verdict).toBe("approve");
+		expect(second.reasons.join(" ")).toContain("consecutive_approves");
+		expect(controller.getState().approvals.some(a => a.stage === "completion_review")).toBe(true);
+		expect(stopResult(await runStop(harness))?.decision).toBeUndefined();
+	});
+
+	test("calibration rule: non-approve resets the streak; 0.59 below floor never counts", async () => {
+		let mode: "mid" | "revise" | "low" = "mid";
+		const controller = createJevController({
+			judge: async () => {
+				if (mode === "revise") return { verdict: "revise", reasons: ["no"] };
+				return judgeResult({ confidence: mode === "low" ? 0.59 : 0.7 });
+			},
+		});
+		await controller.submitDecision(validDecisionInput()); // n=1
+		mode = "revise";
+		await controller.submitDecision(validDecisionInput({ proposal: "changed after revise feedback" }));
+		mode = "mid";
+		const after = await controller.submitDecision(
+			validDecisionInput({ proposal: "changed after revise feedback" }),
+		);
+		expect(after.reasons.join(" ")).toContain("n=1/2"); // streak restarted
+		// Below-floor phase on a fresh controller (bound budget already spent above).
+		mode = "low";
+		const lowController = createJevController({
+			judge: async () => judgeResult({ confidence: 0.59 }),
+		});
+		const low = await lowController.submitDecision(validDecisionInput());
+		// Normalization demotes sub-floor confidence (its own message); streak never counts.
+		expect(low.verdict).toBe("insufficient_evidence");
+		expect(low.judged).toBe(true);
+		expect(lowController.getState().consecutiveCompletionApproves).toBeUndefined();
+		expect(lowController.getState().approvals.length).toBe(0);
+	});
+
+	test("calibration rule: template raise respected (count 3 clamp)", async () => {
+		let calls = 0;
+		const controller = createJevController({
+			judge: async () => {
+				calls++;
+				return judgeResult({ confidence: 0.7 });
+			},
+			template: { completion: { consecutiveApproves: 3 } },
+		});
+		const first = await controller.submitDecision(validDecisionInput());
+		const second = await controller.submitDecision(validDecisionInput());
+		expect(first.verdict).toBe("insufficient_evidence");
+		expect(second.reasons.join(" ")).toContain("n=2/3");
+		expect(calls).toBe(2);
+	});
+
 	test("polish3: directive text present in description, block reason and pre-judge rejection", async () => {
 		const harness = makeFakePi();
 		const controller = createJevController({ judge: async () => judgeResult({}) });
@@ -740,6 +806,159 @@ describe("jev controller", () => {
 			}),
 		);
 		expect(String(rejected?.reason)).toContain("Fix the listed problems and call jev_decision again");
+	});
+
+	const ASPECTS = ["topic-a", "topic-b"];
+	const aspectInput = (overrides: Record<string, unknown> = {}) => ({
+		stage: "aspect_coverage",
+		task: "coverage check",
+		proposal: "built both aspects",
+		options: OPTIONS,
+		evidence: [evidence("code", "implemented topic-a handling fully here")],
+		aspects: ASPECTS,
+		...overrides,
+	});
+
+	test("aspect_coverage: three-way marking -> missed aspects revise with ids + completion teeth", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({
+			judge: async () => {
+				throw new Error("standard judge must not be called");
+			},
+			catalogIds: new Set(ASPECTS),
+			aspectCoverageJudge: async () => ({
+				markings: { "topic-a": "applicable_and_addressed", "topic-b": "applicable_not_addressed" },
+				reasons: ["b missed"],
+				judged: true,
+			}),
+		});
+		controller.register(harness.pi);
+		const outcome = await controller.submitDecision(aspectInput());
+		expect(outcome.verdict).toBe("revise");
+		expect(outcome.reasons.join(" ")).toContain("topic-b");
+		expect(harness.sentMessages.length).toBeGreaterThan(0);
+
+		// completion teeth: unmetStopGates names open gaps while fingerprint matches
+		const gaps = controller.getState().openAspectGaps;
+		expect(gaps?.missed).toEqual(["topic-b"]);
+		const gates = await controller.onSessionStop({
+			type: "session_stop",
+			messages: [],
+			turn_id: 1,
+			session_id: "s",
+			stop_hook_active: false,
+		});
+		// mutations not seen -> no gates; teeth apply only when completion gate is evaluated
+		expect(controller.getState().openAspectGaps?.missed).toEqual(["topic-b"]);
+
+		// resubmission clearing the gap
+		const clearing = createJevController({
+			judge: async () => {
+				throw new Error("must not be called");
+			},
+			catalogIds: new Set(ASPECTS),
+			aspectCoverageJudge: async () => ({
+				markings: { "topic-a": "applicable_and_addressed", "topic-b": "applicable_and_addressed" },
+				reasons: [],
+				judged: true,
+			}),
+		});
+		const ok = await clearing.submitDecision(aspectInput());
+		expect(ok.verdict).toBe("approve");
+		expect(ok.summary).toBe("aspect_coverage: approve — all applicable aspects addressed");
+		expect(clearing.getState().openAspectGaps).toBeUndefined();
+	});
+
+	test("aspect_coverage: not_applicable + judged approve records no approval", async () => {
+		const controller = createJevController({
+			judge: async () => {
+				throw new Error("must not be called");
+			},
+			catalogIds: new Set(ASPECTS),
+			aspectCoverageJudge: async () => ({
+				markings: { "topic-a": "applicable_and_addressed", "topic-b": "not_applicable" },
+				reasons: [],
+				judged: true,
+			}),
+		});
+		const outcome = await controller.submitDecision(aspectInput());
+		expect(outcome.verdict).toBe("approve");
+		expect(controller.getState().approvals.length).toBe(0);
+	});
+
+	test("aspect_coverage: catalog pre-check rejects unknown ids, no judge, no counter burn", async () => {
+		let called = false;
+		const controller = createJevController({
+			judge: async () => {
+				throw new Error("must not be called");
+			},
+			catalogIds: new Set(ASPECTS),
+			aspectCoverageJudge: async () => {
+				called = true;
+				return { markings: {}, reasons: [], judged: true };
+			},
+		});
+		const outcome = await controller.submitDecision(aspectInput({ aspects: ["topic-a", "bogus-id"] }));
+		expect(outcome.verdict).toBe("insufficient_evidence");
+		expect(outcome.reasons.join(" ")).toContain("bogus-id");
+		expect(outcome.judged).toBe(false);
+		expect(called).toBe(false);
+	});
+
+	test("aspect_coverage: shard boundary handled inside judge (255 cap never reaches controller)", async () => {
+		// Many aspects: controller forwards all; sharding is the judge's contract (<=255).
+		const many = Array.from({ length: 300 }, (_, i) => `topic-${i}`);
+		const seen: number[] = [];
+		const controller = createJevController({
+			judge: async () => {
+				throw new Error("must not be called");
+			},
+			catalogIds: new Set(many),
+			aspectCoverageJudge: async req => {
+				seen.push(req.aspects.length);
+				return { markings: Object.fromEntries(req.aspects.map(a => [a.id, "not_applicable"])), reasons: [], judged: true };
+			},
+		});
+		const outcome = await controller.submitDecision(aspectInput({ aspects: many }));
+		expect(outcome.verdict).toBe("approve");
+		expect(seen).toEqual([300]); // controller does not shard; judge contract owns sharding
+	});
+
+	test("aspect_coverage: judge escape / unjudged / throw all fail closed", async () => {
+		let mode: "escape" | "unjudged" | "throw" = "escape";
+		const controller = createJevController({
+			judge: async () => {
+				throw new Error("must not be called");
+			},
+			catalogIds: new Set(ASPECTS),
+			aspectCoverageJudge: async () => {
+				if (mode === "escape") return { markings: {}, reasons: ["cannot judge"], judged: false, escape: true };
+				if (mode === "unjudged") return { markings: {}, reasons: [], judged: false };
+				throw new Error("endpoint down");
+			},
+		});
+		for (mode of ["escape", "unjudged", "throw"] as const) {
+			const outcome = await controller.submitDecision(aspectInput());
+			expect(outcome.verdict).toBe("insufficient_evidence");
+			expect(outcome.judged).toBe(false);
+		}
+	});
+
+	test("aspect_coverage: unmarked aspect fails closed (judge contract violation)", async () => {
+		const controller = createJevController({
+			judge: async () => {
+				throw new Error("must not be called");
+			},
+			catalogIds: new Set(ASPECTS),
+			aspectCoverageJudge: async () => ({
+				markings: { "topic-a": "applicable_and_addressed" },
+				reasons: [],
+				judged: true,
+			}),
+		});
+		const outcome = await controller.submitDecision(aspectInput());
+		expect(outcome.verdict).toBe("insufficient_evidence");
+		expect(outcome.reasons.join(" ")).toContain("topic-b");
 	});
 
 	test("P3: duplicate + short evidence rejected pre-judge without counter burn", async () => {

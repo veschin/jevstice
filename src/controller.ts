@@ -64,6 +64,10 @@ export interface JevState {
 	routedSkill: string | undefined;
 	/** Latest course_check outcome — recorded, never grants an approval. */
 	lastCourseCheck: { selectedOption: string; at: number } | undefined;
+	/** Open aspect_coverage drift: missed aspect ids for the current task (completion teeth). */
+	openAspectGaps: { missed: string[]; taskFingerprint: string | undefined } | undefined;
+	/** Calibration-tolerant completion: consecutive mid-band approves (FR: calibration rule). */
+	consecutiveCompletionApproves: { count: number; confidences: number[]; taskFingerprint: string | undefined; workRevision: number } | undefined;
 }
 
 function freshState(): JevState {
@@ -77,6 +81,8 @@ function freshState(): JevState {
 		routedModel: undefined,
 		routedSkill: undefined,
 		lastCourseCheck: undefined,
+		openAspectGaps: undefined,
+		consecutiveCompletionApproves: undefined,
 	};
 }
 
@@ -143,6 +149,8 @@ export interface ValidatedDecisionInput {
 	options: DecisionOption[];
 	evidence: Evidence[];
 	capabilities: string[];
+	/** Claimed-aspect catalog ids for the aspect_coverage preset. */
+	aspects: string[];
 }
 
 export interface ValidationResult {
@@ -199,6 +207,9 @@ export function validateDecisionInput(raw: unknown, extraStages: ReadonlySet<str
 			});
 		});
 	}
+	const aspects = Array.isArray(raw["aspects"])
+		? raw["aspects"].filter((a): a is string => typeof a === "string" && a.trim().length > 0)
+		: [];
 	const capabilities = Array.isArray(raw["capabilities"])
 		? raw["capabilities"].filter((c): c is string => typeof c === "string" && c.trim().length > 0)
 		: [];
@@ -213,6 +224,7 @@ export function validateDecisionInput(raw: unknown, extraStages: ReadonlySet<str
 			options,
 			evidence,
 			capabilities,
+			aspects,
 		},
 	};
 }
@@ -307,6 +319,31 @@ export function coverageGaps(capabilities: string[], evidence: Evidence[]): stri
 	});
 }
 
+// ---------- aspect_coverage (forgotten-aspect detection, user order) ----------
+
+export type AspectMarking =
+	| "applicable_and_addressed"
+	| "applicable_not_addressed"
+	| "not_applicable";
+
+export interface AspectCoverageRequest {
+	aspects: Array<{ id: string; text: string }>;
+	currentAction: string;
+	evidence: Evidence[];
+}
+
+export interface AspectCoverageResult {
+	markings: Record<string, AspectMarking>;
+	reasons: string[];
+	confidence?: number;
+	/** False when the judge could not be consulted (fail-closed; never a mapping). */
+	judged: boolean;
+	/** Meta-option escape: judge cannot mark this batch -> insufficient_evidence. */
+	escape?: boolean;
+}
+
+export type AspectCoverageJudge = (request: AspectCoverageRequest) => Promise<AspectCoverageResult>;
+
 // ---------- controller ----------
 
 export interface ControllerDeps {
@@ -321,6 +358,10 @@ export interface ControllerDeps {
 	templateError?: string;
 	/** Per-requirement drift judge for the course_check preset (C1 wired path). */
 	courseCheckJudge?: CourseCheckJudge;
+	/** Three-way aspect marking judge for the aspect_coverage preset. */
+	aspectCoverageJudge?: AspectCoverageJudge;
+	/** Valid catalog topic ids for the aspects[] pre-check (built in index from the catalog). */
+	catalogIds?: ReadonlySet<string>;
 }
 
 /** Minimal structural surface of the omp ExtensionAPI the controller needs. */
@@ -347,16 +388,23 @@ export class JevController {
 	private readonly now: () => number;
 	private pi: PiApi | undefined;
 	private readonly courseCheckJudge: CourseCheckJudge | undefined;
+	private readonly aspectCoverageJudge: AspectCoverageJudge | undefined;
+	private readonly catalogIds: ReadonlySet<string>;
 	private template: JevTemplateConfig;
 	private templateError: string | undefined;
 	/** Config-declared on_demand control points (controlPoints key). */
 	private extraPoints: ReadonlyMap<string, ControlPoint> = new Map();
 	/** R1: never below POLICY floor; a template override may only raise it. */
 	private minConfidence: number;
+	/** Calibration-tolerant completion: template/config may only RAISE these (Math.max clamp). */
+	private readonly completionConsecutiveApproves: number;
+	private readonly completionConfidenceFloor: number;
 
 	constructor(deps: ControllerDeps) {
 		this.judge = deps.judge;
 		this.courseCheckJudge = deps.courseCheckJudge;
+		this.aspectCoverageJudge = deps.aspectCoverageJudge;
+		this.catalogIds = deps.catalogIds ?? new Set();
 		this.maxReworkIterations = deps.maxReworkIterations ?? POLICY.maxReworkIterations;
 		// R1: a confidenceThreshold override may only RAISE the bar above POLICY.
 		this.minConfidence = Math.max(
@@ -367,6 +415,16 @@ export class JevController {
 		this.template = deps.template ?? {};
 		this.templateError = deps.templateError;
 		this.extraPoints = extraPointsFromTemplate(this.template);
+		this.completionConsecutiveApproves = Math.max(
+			POLICY.completionConsecutiveApproves,
+			(deps.template as { completion?: { consecutiveApproves?: number } } | undefined)?.completion
+				?.consecutiveApproves ?? 0,
+		);
+		this.completionConfidenceFloor = Math.max(
+			POLICY.completionConfidenceFloor,
+			(deps.template as { completion?: { confidenceFloor?: number } } | undefined)?.completion
+				?.confidenceFloor ?? 0,
+		);
 	}
 
 	/** Re-validate config mid-session (R5): corruption degrades to typed fail-closed errors. */
@@ -593,6 +651,8 @@ export class JevController {
 				routedModel: typeof data["routedModel"] === "string" ? data["routedModel"] : undefined,
 				routedSkill: typeof data["routedSkill"] === "string" ? data["routedSkill"] : undefined,
 				lastCourseCheck: undefined,
+				openAspectGaps: undefined,
+				consecutiveCompletionApproves: undefined,
 			};
 			return;
 		}
@@ -631,7 +691,10 @@ export class JevController {
 				line = `${stage}: ask_user — escalate to the user`;
 				break;
 			default:
-				line = `${stage}: insufficient_evidence — judge not consulted or answer unusable; fix the request`;
+				line =
+					outcome.judged
+						? `${stage}: insufficient_evidence — judge answered insufficient_evidence (confidence ${outcome.confidence ?? "n/a"}) — improve evidence and re-submit`
+						: `${stage}: insufficient_evidence — judge not consulted or answer unusable; fix the request`;
 		}
 		return { ...outcome, summary: line };
 	}
@@ -759,6 +822,36 @@ export class JevController {
 		if (input.stage === "course_check" && this.courseCheckJudge !== undefined) {
 			return this.submitCourseCheck(input, boundKey, used);
 		}
+		// aspect_coverage preset: catalog pre-check + dedicated three-way judge.
+		if (input.stage === "aspect_coverage") {
+			const unknown = input.aspects.filter(id => !this.catalogIds.has(id));
+			if (input.aspects.length === 0) {
+				return {
+					verdict: "insufficient_evidence",
+					reasons: ["aspect_coverage requires a non-empty aspects list of catalog topic ids"],
+					judged: false,
+					summary: "",
+				};
+			}
+			if (unknown.length > 0) {
+				return {
+					verdict: "insufficient_evidence",
+					reasons: [`unknown_aspect_id: ${unknown.join(", ")}`],
+					judged: false,
+					summary: "",
+				};
+			}
+			if (this.aspectCoverageJudge !== undefined) {
+				return this.submitAspectCoverage(input, boundKey, used);
+			}
+			// No judge wired: keep the pre-check result as a typed correction, fail-closed.
+			return {
+				verdict: "insufficient_evidence",
+				reasons: ["aspect_coverage judge not configured in this session"],
+				judged: false,
+				summary: "",
+			};
+		}
 
 		let rawResult: DecisionResult;
 		try {
@@ -778,7 +871,13 @@ export class JevController {
 			};
 		}
 
-		const normalized = normalizeJudgeResult(rawResult, judgeOptions, this.minConfidence);
+		// Calibration-tolerant completion: normalize with the lowered bar so mid-band
+		// approves survive; the counting block below enforces floor/count/teeth.
+		const stopStage = lookupControlPoint(input.stage, this.extraPoints)?.trigger === "session_stop";
+		const normalizeBar = stopStage
+			? Math.min(this.minConfidence, this.completionConfidenceFloor)
+			: this.minConfidence;
+		const normalized = normalizeJudgeResult(rawResult, judgeOptions, normalizeBar);
 		this.state.iterations[boundKey] = used + 1;
 		// course_check advisory-to-binding mapping (record, never approve anything).
 		let result = normalized;
@@ -804,6 +903,74 @@ export class JevController {
 
 		// Advisory points (course_check benign pair, config-declared on_demand) never
 		// record gate approvals; their outcomes live in state records/feedback only.
+		// Calibration-tolerant completion rule: 0.6<=conf<minConfidence counts toward
+		// consecutive approves (count/floor clamp raise-only); reset on non-approve, work
+		// bump or task change; below-floor never counts.
+		if (
+			stopStage &&
+			result.verdict === "approve" &&
+			result.confidence !== undefined &&
+			result.confidence < this.completionConfidenceFloor
+		) {
+			this.state.consecutiveCompletionApproves = undefined;
+			this.persist();
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [`conf=${result.confidence} below calibration floor ${this.completionConfidenceFloor}`],
+				confidence: result.confidence,
+				judged: true,
+				summary: "",
+			};
+		}
+		if (
+			stopStage &&
+			result.verdict === "approve" &&
+			result.confidence !== undefined &&
+			result.confidence < this.minConfidence
+		) {
+			const prev = this.state.consecutiveCompletionApproves;
+			const fresh =
+				prev === undefined ||
+				prev.taskFingerprint !== this.state.taskFingerprint ||
+				prev.workRevision !== this.state.workRevision;
+			const streak = fresh
+				? {
+						count: 0,
+						confidences: [] as number[],
+						taskFingerprint: this.state.taskFingerprint,
+						workRevision: this.state.workRevision,
+					}
+				: prev;
+			streak.count += 1;
+			streak.confidences.push(result.confidence);
+			this.state.consecutiveCompletionApproves = streak;
+			if (streak.count < this.completionConsecutiveApproves) {
+				this.persist();
+				return {
+					verdict: "insufficient_evidence",
+					reasons: [
+						"completion_pending_consecutive_approves",
+						`n=${streak.count}/${this.completionConsecutiveApproves}`,
+						`conf=${result.confidence}`,
+					],
+					confidence: result.confidence,
+					judged: true,
+					summary: "",
+				};
+			}
+			result = {
+				...result,
+				reasons: [
+					"consecutive_approves",
+					`n=${streak.count}`,
+					`conf=${streak.confidences.join(", ")}`,
+					...result.reasons,
+				],
+			};
+		} else if (stopStage && result.verdict !== "approve") {
+			this.state.consecutiveCompletionApproves = undefined;
+		}
+
 		const skipApproval =
 			point?.trigger === "on_demand" &&
 			!(point.verdictMapping === "course_check" &&
@@ -948,6 +1115,80 @@ export class JevController {
 		};
 	}
 
+	/** aspect_coverage three-way marking: missed aspects -> revise; else recorded, no approval. */
+	private async submitAspectCoverage(
+		input: ValidatedDecisionInput,
+		boundKey: string,
+		used: number,
+	): Promise<DecisionOutcome> {
+		let raw: AspectCoverageResult;
+		try {
+			raw = await this.aspectCoverageJudge!({
+				aspects: input.aspects.map(id => ({ id, text: id })),
+				currentAction: input.proposal,
+				evidence: input.evidence,
+			});
+		} catch (err) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [`judge unavailable: ${err instanceof Error ? err.message : String(err)}`],
+				judged: false,
+				summary: "",
+			};
+		}
+		if (
+			!isRecord(raw) ||
+			raw["judged"] !== true ||
+			raw["escape"] === true ||
+			!isRecord(raw["markings"])
+		) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: ["aspect_coverage judge returned an unjudged, escaped or malformed result; no mapping applied"],
+				judged: false,
+				summary: "",
+			};
+		}
+		const markings = raw["markings"] as Record<string, string>;
+		const unknownIds = input.aspects.filter(id => !(id in markings));
+		if (unknownIds.length > 0) {
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [`aspect_coverage judge did not mark: ${unknownIds.join(", ")}`],
+				judged: false,
+				summary: "",
+			};
+		}
+		const missed = input.aspects.filter(id => markings[id] === "applicable_not_addressed");
+		this.state.iterations[boundKey] = used + 1;
+		const reasons = [
+			...(Array.isArray(raw["reasons"]) ? raw["reasons"].filter((r): r is string => typeof r === "string") : []),
+		];
+		if (missed.length > 0) {
+			// Open drift recorded against the current task: completion teeth (unmetStopGates).
+			this.state.openAspectGaps = { missed, taskFingerprint: this.state.taskFingerprint };
+			reasons.push(`missed aspects: ${missed.join(", ")}`);
+			this.pushFeedback(`Jev aspect_coverage: applicable but not addressed — ${missed.join(", ")}`);
+			this.persist();
+			return {
+				verdict: "revise",
+				reasons,
+				confidence: typeof raw["confidence"] === "number" ? raw["confidence"] : undefined,
+				judged: true,
+				summary: `aspect_coverage: revise — applicable_not_addressed: ${missed.join(", ")}`,
+			};
+		}
+		this.state.openAspectGaps = undefined;
+		this.persist();
+		return {
+			verdict: "approve",
+			reasons,
+			confidence: typeof raw["confidence"] === "number" ? raw["confidence"] : undefined,
+			judged: true,
+			summary: "aspect_coverage: approve — all applicable aspects addressed",
+		};
+	}
+
 	/** course_check ask_user escalation: recorded blocker, never a gate grant. */
 	private escalateCourseCheck(normalized: DecisionResult): DecisionOutcome {
 		const blocker = "course_check escalated to the user (ask_user chosen by the judge or rework bound).";
@@ -1009,6 +1250,12 @@ export class JevController {
 			missing.push(
 				`completion_review approval is stale: work revision ${this.state.workRevision} > approved ${completion.workRevision}`,
 			);
+		}
+		// aspect_coverage teeth: an open drift for the CURRENT task blocks completion until
+		// a fresh aspect_coverage submission clears it (advisory preset, no own stop gate).
+		const gaps = this.state.openAspectGaps;
+		if (gaps !== undefined && gaps.taskFingerprint === this.state.taskFingerprint && gaps.missed.length > 0) {
+			missing.push(`aspects not addressed: ${gaps.missed.join(", ")}`);
 		}
 		return missing;
 	}

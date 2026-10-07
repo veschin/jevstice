@@ -36,7 +36,8 @@ export type DecisionStage =
   | "important_decision" // FR-10: main-model decision gate
   | "code_review" // FR-10: code review gate
   | "subagent_handoff" // FR-11: validate dispatch and acceptance
-  | "refactor_check"; // FR-13: capability preservation + FR-18 course_check (see control-points registry)
+  | "refactor_check" // FR-13: capability preservation
+  | "aspect_coverage"; // universal engine: forgotten-aspect three-way coverage check + FR-18 course_check (see control-points registry)
 
 /** Fixed option set presented to the judge (FR-08). */
 export interface DecisionOption {
@@ -205,4 +206,8 @@ export const POLICY = {
   defaultApiUrl: "https://api.typesafe.ai/v1/systemone",
   /** Model used for judge inference; never substituted by another provider. */
   defaultModel: "jev-latest",
+  /** Calibration-tolerant completion: consecutive approves needed when 0.6<=conf<0.8. */
+  completionConsecutiveApproves: 2,
+  /** Lower confidence bound that still counts toward consecutive completion approves. */
+  completionConfidenceFloor: 0.6,
 } as const;

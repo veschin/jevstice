@@ -13,7 +13,8 @@
 import { createJevController, type ControllerDeps, type JevController, type PiApi } from "./controller.js";
 import { JevConfigError, loadJevTemplateConfig, type JevTemplateConfig } from "./config.js";
 import { isRecord } from "./guards.js";
-import { createCourseCheckJudge, createJudge } from "./client.js";
+import { createCourseCheckJudge, createJudge, createMultiLabelJudge } from "./client.js";
+import { loadTopicCatalog } from "./catalog.js";
 import { POLICY, type Judge } from "./types.js";
 
 function envValue(...names: string[]): string | undefined {
@@ -94,12 +95,63 @@ export function createJevExtension(deps: Partial<ControllerDeps> = {}) {
 			timeoutMs: intEnv("JEVI_TIMEOUT_MS"),
 			minConfidence: effectiveMinConfidence,
 		};
+		// aspect_coverage wiring: catalog ids pre-check + multi-label applicability judge;
+		// "addressed" derives from evidence text mentioning the aspect (label words).
+		let catalogIds: ReadonlySet<string> = new Set();
+		let aspectTexts: ReadonlyMap<string, string> = new Map();
+		try {
+			const catalog = loadTopicCatalog();
+			catalogIds = new Set(catalog.map(t => t.id));
+			aspectTexts = new Map(catalog.map(t => [t.id, t.label]));
+		} catch {
+			// Catalog unavailable: pre-check accepts nothing; wired judge stays undefined.
+		}
+		const multiLabelJudge = deps.judge === undefined ? createMultiLabelJudge(clientConfig) : undefined;
+		const aspectCoverageJudge =
+			deps.aspectCoverageJudge ??
+			(multiLabelJudge === undefined
+				? undefined
+				: async req => {
+						const result = await multiLabelJudge({
+							stage: "aspect_coverage",
+							task: req.currentAction,
+							evidence: req.evidence,
+							items: req.aspects.map(a => ({ id: a.id, text: aspectTexts.get(a.id) ?? a.text })),
+						});
+						if (result.verdict === "insufficient_evidence" || result.verdict === "ask_user") {
+							return { markings: {}, reasons: result.reasons, confidence: result.confidence, judged: false, escape: true };
+						}
+						const corpus = req.evidence.map(e => `${e.source} ${e.quote}`).join("\n").toLowerCase();
+						const markings: Record<string, "applicable_and_addressed" | "applicable_not_addressed" | "not_applicable"> = {};
+						for (const a of req.aspects) {
+							if (result.applicable[a.id] !== true) {
+								markings[a.id] = "not_applicable";
+							} else {
+								const labelWords = (aspectTexts.get(a.id) ?? a.text)
+									.toLowerCase()
+									.split(/[^\p{L}\p{N}]+/u)
+									.filter(w => w.length > 3);
+								markings[a.id] =
+									labelWords.some(w => corpus.includes(w))
+										? "applicable_and_addressed"
+										: "applicable_not_addressed";
+							}
+						}
+						return {
+							markings,
+							reasons: result.reasons,
+							confidence: result.confidence,
+							judged: true,
+						};
+					});
 		const controller: JevController = createJevController({
 			judge: deps.judge ?? buildProductionJudge(),
 			// C1 wired by default in production; tests inject their own.
 			courseCheckJudge:
 				deps.courseCheckJudge ??
 				(deps.judge === undefined ? createCourseCheckJudge(clientConfig) : undefined),
+			aspectCoverageJudge,
+			catalogIds,
 			template,
 			templateError,
 		});

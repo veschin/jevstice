@@ -15,7 +15,7 @@
 import type { DecisionStage } from "./types.js";
 
 export type ControlPointTrigger = "mutation_gate" | "session_stop" | "on_demand";
-export type VerdictMapping = "standard" | "course_check";
+export type VerdictMapping = "standard" | "course_check" | "aspect_coverage";
 
 export interface ControlPoint {
 	stage: DecisionStage;
@@ -59,6 +59,11 @@ export const CONTROL_POINT_REGISTRY: Readonly<Record<string, ControlPoint>> = {
 		trigger: "on_demand",
 		fixedOptionIds: COURSE_CHECK_OPTION_IDS,
 		verdictMapping: "course_check",
+	},
+	aspect_coverage: {
+		stage: "aspect_coverage",
+		trigger: "on_demand",
+		verdictMapping: "aspect_coverage",
 	},
 };
 

@@ -32,6 +32,8 @@ export interface JevTemplateConfig {
 	 * They actually fire through submitDecision: advisory (record + feedback + bounded rework),
 	 * never gate-granting.
 	 */
+	/** Calibration-tolerant completion: may only RAISE POLICY defaults (controller clamps). */
+	completion?: { consecutiveApproves?: number; confidenceFloor?: number };
 	controlPoints?: Record<
 		string,
 		{ trigger: "on_demand"; instructions?: string; options?: Array<{ id: string; label: string; meaning: string }> }
@@ -97,6 +99,27 @@ export function validateTemplateConfig(file: string, raw: unknown): JevTemplateC
 		}
 		out.confidenceThreshold = t;
 	}
+	if (raw["completion"] !== undefined) {
+		if (!isRecord(raw["completion"])) {
+			throw new JevConfigError(file, "completion must be an object");
+		}
+		const completion: { consecutiveApproves?: number; confidenceFloor?: number } = {};
+		const ca = raw["completion"]["consecutiveApproves"];
+		if (ca !== undefined) {
+			if (typeof ca !== "number" || !Number.isInteger(ca) || ca < 1) {
+				throw new JevConfigError(file, "completion.consecutiveApproves must be an integer >= 1");
+			}
+			completion.consecutiveApproves = ca;
+		}
+		const cf = raw["completion"]["confidenceFloor"];
+		if (cf !== undefined) {
+			if (typeof cf !== "number" || !Number.isFinite(cf) || cf < 0 || cf > 1) {
+				throw new JevConfigError(file, "completion.confidenceFloor must be a number in 0..1");
+			}
+			completion.confidenceFloor = cf;
+		}
+		out.completion = completion;
+	}
 	if (raw["controlPoints"] !== undefined) {
 		if (!isRecord(raw["controlPoints"])) {
 			throw new JevConfigError(file, "controlPoints must be an object keyed by stage name");
@@ -137,6 +160,13 @@ export function mergeTemplateConfigs(user: JevTemplateConfig, project: JevTempla
 		// (R1 additionally clamps the effective value to max(POLICY.minConfidenceToApprove, x).)
 		confidenceThreshold: user.confidenceThreshold ?? project.confidenceThreshold,
 		capabilities: project.capabilities ?? user.capabilities,
+		completion:
+			user.completion === undefined && project.completion === undefined
+				? undefined
+				: {
+						consecutiveApproves: project.completion?.consecutiveApproves ?? user.completion?.consecutiveApproves,
+						confidenceFloor: project.completion?.confidenceFloor ?? user.completion?.confidenceFloor,
+					},
 		controlPoints:
 			user.controlPoints === undefined && project.controlPoints === undefined
 				? undefined
