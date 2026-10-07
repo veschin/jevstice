@@ -458,7 +458,7 @@ export function createMultiLabelJudge(config: JevClientConfig): MultiLabelJudge 
       };
       let parsed: JevApiResponse;
       try {
-        parsed = await systemOne(client, body);
+        parsed = await systemOneWithTransportRetry(client, body, config);
       } catch (err) {
         if (err instanceof JevApiError && err.code !== "bad_payload") throw err;
         return failClosed("contract violation");
@@ -591,7 +591,7 @@ export function createCourseCheckJudge(config: JevClientConfig): CourseCheckJudg
     };
 
     const client = createSDKClient(config);
-    const parsed = await systemOne(client, body);
+    const parsed = await systemOneWithTransportRetry(client, body, config);
     const answers = parsed.answers as Record<string, unknown>;
 
     const actionAnswer = answers["next_action"];

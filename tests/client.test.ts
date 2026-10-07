@@ -1314,3 +1314,34 @@ describe("client: transport retry", () => {
 		await expect(judge(okReq)).rejects.toThrow(JevApiError);
 	});
 });
+
+describe("client: transport retry coverage", () => {
+	test("the multi-label judge retries transport failures like the main judge", async () => {
+		let calls = 0;
+		const fetchFn = (async () => {
+			calls++;
+			if (calls <= 2) throw new Error("The socket connection was closed unexpectedly");
+			return jsonResponse({
+				model: "jev-1.13.0",
+				answers: {
+					item_a: { type: "noul", noul: 0.9 },
+					item_b: { type: "noul", noul: 0.1 },
+				},
+				usage: { input_tokens: 10, output_tokens: 5 },
+			});
+		}) as unknown as typeof fetch;
+		const judge = createMultiLabelJudge({ apiKey: "k", fetchFn, retryDelayMs: 0, maxRetries: 3 });
+		const result = await judge({
+			stage: "topic_selection",
+			task: "t",
+			evidence: [{ kind: "user", source: "s", quote: "a quote long enough to pass" }],
+			items: [
+				{ id: "item_a", text: "first candidate" },
+				{ id: "item_b", text: "second candidate" },
+			],
+		});
+		expect(result.applicable["item_a"]).toBe(true);
+		expect(result.applicable["item_b"]).toBe(false);
+		expect(calls).toBe(3);
+	});
+});
