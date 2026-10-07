@@ -3,11 +3,14 @@
  * Drafted before implementation (TDD); runs under `bun test`.
  */
 import { describe, expect, test } from "bun:test";
-import { createJevController, type JevState } from "../src/controller.js";
+import { createJevController, type HandoffRecord, type JevState } from "../src/controller.js";
+import { FRAME_FIX_PREFIX, SERVICE_OPTION_FIX } from "../src/client.js";
+import { isRecord } from "../src/guards.js";
 import type {
 	AspectCoverageRequest,
 	AspectCoverageResult,
 	AspectMarking,
+	ClaimCheckRequest,
 	CourseCheckResult,
 	DecisionRequest,
 	DecisionResult,
@@ -61,11 +64,25 @@ function makeFakePi(): FakePiHarness {
 		},
 		sendUserMessage(_content, _options) {},
 	};
+	/**
+	 * Host merge semantics (runner.ts emit*): the first handler that returns `block: true`
+	 * short-circuits the event, otherwise defined fields of every result merge with last-wins
+	 * (that is how `before_subagent_spawn` picks model/note). A fake that returned only the last
+	 * handler's result would hide a routing result behind a later handoff handler.
+	 */
 	async function emit(event: string, ev: unknown, ctx?: unknown): Promise<unknown> {
 		const hs = handlers.get(event) ?? [];
-		let last: unknown;
-		for (const h of hs) last = await h(ev, ctx);
-		return last;
+		let merged: Record<string, unknown> | undefined;
+		for (const h of hs) {
+			const result = await h(ev, ctx);
+			if (!isRecord(result)) continue;
+			if (result["block"] === true) return result;
+			for (const [key, value] of Object.entries(result)) {
+				if (value === undefined) continue;
+				merged = { ...(merged ?? {}), [key]: value };
+			}
+		}
+		return merged;
 	}
 	return { pi, emit, getTool: () => registeredTool, appended, sentMessages };
 }
@@ -107,7 +124,9 @@ async function approvePlan(controller: { submitDecision(input: unknown): Promise
 	return controller.submitDecision(
 		validDecisionInput({
 			stage: "understanding_review",
-			proposal: "Plan: implement feature X in module M.",
+			// Grounded by construction: the plan-stage pre-check requires one evidence quote
+			// (>= 20 chars) to appear verbatim inside the proposal.
+			proposal: 'Claim: module M satisfies the requirement "Implement feature X for the dashboard".',
 			evidence: [evidence("user", "Implement feature X for the dashboard"), evidence("execution", "dry-run plan output ok")],
 		}),
 	);
@@ -500,6 +519,28 @@ describe("jev controller", () => {
 		controller2.onSessionStart(saved.map(a => ({ customType: a.customType, data: a.data as JevState })));
 		// the restored fresh course check keeps the completion boundary satisfied
 		expect(stopResult(await runStop(harness2))?.decision).toBeUndefined();
+		// FR-11: a well-formed handoff record survives, malformed ones are dropped (never trusted)
+		const validHandoff: HandoffRecord = {
+			phase: "acceptance",
+			verdict: "revise",
+			judged: true,
+			confidence: 0.9,
+			reasons: ["incomplete"],
+			blocked: true,
+			at: 1,
+		};
+		controller2.onSessionStart([{ customType: "jev.state", data: { lastHandoff: validHandoff } }]);
+		expect(controller2.getState().lastHandoff).toEqual(validHandoff);
+		for (const malformed of [
+			{ phase: "bogus", judged: true, blocked: false, at: 1 },
+			{ phase: "dispatch", judged: "yes", blocked: false, at: 1 },
+			{ phase: "dispatch", judged: true, blocked: "no", at: 1 },
+			{ phase: "dispatch", judged: true, blocked: false, at: Number.NaN },
+			{ phase: "dispatch", verdict: "maybe", judged: true, blocked: false, at: 1 },
+		]) {
+			controller2.onSessionStart([{ customType: "jev.state", data: { lastHandoff: malformed } }]);
+			expect(controller2.getState().lastHandoff).toBeUndefined();
+		}
 	});
 
 	test("stop_hook_active pass records explicit unresolved blocker, never fake success", async () => {
@@ -1569,7 +1610,8 @@ describe("jev controller: plan-stage directive text", () => {
 		const controller = createJevController({ judge: async () => judgeResult({}) });
 		controller.register(harness.pi);
 		const description = String(harness.getTool()?.description);
-		expect(description).toContain("claims checked against the quoted evidence");
+		expect(description).toContain("a claim checked against the quoted evidence");
+		expect(description).toContain("write a claim and ask whether the quoted evidence supports it");
 		expect(description).toContain("insufficient_evidence");
 	});
 });
@@ -1733,5 +1775,622 @@ describe("jev controller: skill and model routing (FR-02, FR-03)", () => {
 		expect(out.judged).toBe(false);
 		expect(out.reasons.join(" ")).toContain("routing.skills");
 		expect(controller.getState().routedSkill).toBeUndefined();
+	});
+});
+
+describe("jev controller: consultation forcing (grounding pre-check for plan stages)", () => {
+	const PLAN_EVIDENCE: Evidence[] = [
+		evidence("user", "Implement feature X for the dashboard"),
+		evidence("spec", "the plan must add module M and wire it into the dashboard"),
+	];
+	const totalIterations = (controller: { getState(): JevState }): number =>
+		Object.values(controller.getState().iterations).reduce((a, b) => a + b, 0);
+
+	test("ungrounded plan submission is refused before any judge call: fix named, no rework, gate shut", async () => {
+		const harness = makeFakePi();
+		let calls = 0;
+		const controller = createJevController({
+			judge: async () => {
+				calls++;
+				return judgeResult({});
+			},
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
+		const outcome = await controller.submitDecision(
+			validDecisionInput({
+				stage: "understanding_review",
+				proposal: "Plan: add module M and wire it into the dashboard.",
+				evidence: PLAN_EVIDENCE,
+			}),
+		);
+		expect(calls).toBe(0);
+		expect(outcome.judged).toBe(false);
+		expect(outcome.verdict).toBe("insufficient_evidence");
+		expect(outcome.reasons.join(" ")).toContain("proposal_not_grounded_in_evidence");
+		expect(outcome.reasons.join(" ")).toContain("verbatim");
+		expect(outcome.summary).toContain("proposal_not_grounded_in_evidence");
+		expect(totalIterations(controller)).toBe(0);
+		const gate = blockResult(
+			await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} }),
+		);
+		expect(gate?.block).toBe(true);
+	});
+
+	test("the same submission grounded in a verbatim quote is judged", async () => {
+		const calls: DecisionRequest[] = [];
+		const controller = createJevController({
+			judge: async req => {
+				calls.push(req);
+				return judgeResult({});
+			},
+		});
+		const outcome = await controller.submitDecision(
+			validDecisionInput({
+				stage: "understanding_review",
+				proposal:
+					'Claim: adding module M satisfies "Implement feature X for the dashboard"; the quoted spec fixes the requirement.',
+				evidence: PLAN_EVIDENCE,
+			}),
+		);
+		expect(calls).toHaveLength(1);
+		expect(outcome.verdict).toBe("approve");
+		expect(outcome.judged).toBe(true);
+	});
+
+	test("a quote shorter than 20 characters does not ground a plan", async () => {
+		const controller = createJevController({
+			judge: async () => {
+				throw new Error("must not be called");
+			},
+		});
+		const outcome = await controller.submitDecision(
+			validDecisionInput({
+				stage: "direction_review",
+				proposal: "Plan: add module M (short).",
+				evidence: [evidence("user", "add module M"), evidence("spec", "the plan adds module M and wires it in")],
+			}),
+		);
+		expect(outcome.judged).toBe(false);
+		expect(outcome.reasons.join(" ")).toContain("proposal_not_grounded_in_evidence");
+	});
+
+	test("grounding composes with the requirement-evidence check without duplicating messages", async () => {
+		const controller = createJevController({
+			judge: async () => {
+				throw new Error("must not be called");
+			},
+		});
+		const outcome = await controller.submitDecision(
+			validDecisionInput({
+				stage: "understanding_review",
+				proposal: "Plan: run the test suite and report.",
+				evidence: [evidence("execution", "$ bun test run — 42 passing suites")],
+			}),
+		);
+		const joined = outcome.reasons.join(" ");
+		expect(joined).toContain("proposal_not_grounded_in_evidence");
+		expect(joined).toContain("no_requirement_evidence");
+		expect(outcome.reasons.filter(r => r.includes("proposal_not_grounded_in_evidence"))).toHaveLength(1);
+	});
+
+	test("grounding is a plan-stage rule: completion_review judges an ungrounded proposal as before", async () => {
+		const controller = createJevController({ judge: async () => judgeResult({}) });
+		const outcome = await controller.submitDecision(validDecisionInput());
+		expect(outcome.judged).toBe(true);
+		expect(outcome.verdict).toBe("approve");
+		expect(outcome.reasons.join(" ")).not.toContain("proposal_not_grounded_in_evidence");
+	});
+});
+
+describe("jev controller: claim_check preset (per-claim support in one request)", () => {
+	const CLAIMS = [
+		"the multi-label path already judges items in one request",
+		"the wiring decision needs four separate consultations",
+	] as const;
+	const claimInput = (overrides: Record<string, unknown> = {}) => ({
+		stage: "claim_check",
+		task: "Decide how to wire the per-claim judge",
+		proposal: "Claims from the wiring decision, each checked against the quoted measurement.",
+		options: OPTIONS,
+		evidence: [
+			evidence(
+				"execution",
+				"Parallel per-claim questions in ONE request (multi-label/Noul) | per-claim yes/no, decisive",
+				"evidence/consultation-forcing.md",
+			),
+		],
+		claims: CLAIMS,
+		...overrides,
+	});
+	const marking = (supported: Record<string, boolean>) => async () => ({ supported, reasons: [], judged: true });
+
+	test("one request, one verdict per claim: summary and state carry them, unsupported -> revise", async () => {
+		const requests: ClaimCheckRequest[] = [];
+		const controller = createJevController({
+			judge: async () => {
+				throw new Error("the standard judge must not be called");
+			},
+			claimCheckJudge: async req => {
+				requests.push(req);
+				return { supported: { "claim-1": true, "claim-2": false }, reasons: [], judged: true };
+			},
+		});
+		const outcome = await controller.submitDecision(claimInput());
+		expect(requests).toHaveLength(1);
+		expect(requests[0]?.claims.map(c => c.text)).toEqual([...CLAIMS]);
+		expect(outcome.verdict).toBe("revise");
+		expect(outcome.judged).toBe(true);
+		expect(outcome.summary).toContain("claim_check: 1/2 supported");
+		expect(outcome.summary).toContain("claim-2");
+		expect(controller.getState().lastClaimCheck?.claims.map(c => [c.id, c.supported])).toEqual([
+			["claim-1", true],
+			["claim-2", false],
+		]);
+	});
+
+	test("all claims supported -> approve, and no gate approval is recorded (never gate-granting)", async () => {
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			claimCheckJudge: marking({ "claim-1": true, "claim-2": true }),
+		});
+		const before = controller.getState().approvals.length;
+		const outcome = await controller.submitDecision(claimInput());
+		expect(outcome.verdict).toBe("approve");
+		expect(outcome.summary).toBe("claim_check: 2/2 supported");
+		expect(controller.getState().approvals).toHaveLength(before);
+	});
+
+	test("an unmarkable claim fails closed, names the claim and keeps no marking", async () => {
+		const controller = createJevController({
+			judge: async () => {
+				throw new Error("must not be called");
+			},
+			claimCheckJudge: marking({ "claim-1": true }),
+		});
+		const outcome = await controller.submitDecision(claimInput());
+		expect(outcome.verdict).toBe("insufficient_evidence");
+		expect(outcome.judged).toBe(false);
+		expect(outcome.reasons.join(" ")).toContain("claim-2");
+		expect(outcome.reasons.join(" ")).toContain("four separate consultations");
+		expect(controller.getState().lastClaimCheck).toBeUndefined();
+	});
+
+	test("a judge error fails closed as insufficient_evidence, never a marking", async () => {
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			claimCheckJudge: async () => {
+				throw new Error("endpoint down");
+			},
+		});
+		const outcome = await controller.submitDecision(claimInput());
+		expect(outcome.verdict).toBe("insufficient_evidence");
+		expect(outcome.judged).toBe(false);
+		expect(outcome.reasons.join(" ")).toContain("judge unavailable");
+		expect(controller.getState().lastClaimCheck).toBeUndefined();
+	});
+
+	test("fewer than two claims is refused before any judge call", async () => {
+		let called = 0;
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			claimCheckJudge: async () => {
+				called++;
+				return { supported: {}, reasons: [], judged: true };
+			},
+		});
+		const outcome = await controller.submitDecision(claimInput({ claims: ["only one claim here"] }));
+		expect(called).toBe(0);
+		expect(outcome.judged).toBe(false);
+		expect(outcome.reasons.join(" ")).toContain("at least 2 claims");
+	});
+
+	test("per-claim markings persist and restore with the session", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			claimCheckJudge: marking({ "claim-1": true, "claim-2": false }),
+		});
+		controller.register(harness.pi);
+		await controller.submitDecision(claimInput());
+		const entries = harness.appended.filter(e => e.customType === "jev.state");
+		expect(entries.length).toBeGreaterThan(0);
+		const restored = createJevController({ judge: async () => judgeResult({}) });
+		restored.onSessionStart([{ customType: "jev.state", data: entries[entries.length - 1]?.data }]);
+		expect(restored.getState().lastClaimCheck?.claims).toEqual([
+			{ id: "claim-1", text: CLAIMS[0], supported: true },
+			{ id: "claim-2", text: CLAIMS[1], supported: false },
+		]);
+	});
+});
+
+describe("jev controller: consultation protocol in the tool description", () => {
+	test("the description states the protocol the product enforces", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({ judge: async () => judgeResult({}) });
+		controller.register(harness.pi);
+		const description = String(harness.getTool()?.description);
+		expect(description).toContain("one decision per request");
+		expect(description).toContain("3-6 short non-duplicate quotes");
+		expect(description).toContain("at least one requirement quote (kind user or spec)");
+		expect(description).toContain("2-4 real alternatives whose meanings state what choosing them commits you to");
+		expect(description).toContain("refused before any judge call");
+		expect(description).toContain("An abstention is not a verdict");
+		expect(description).toContain("claim_check");
+		expect(harness.getTool()?.parameters).toBeDefined();
+	});
+
+	test("the claims parameter is documented for the claim_check stage", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({ judge: async () => judgeResult({}) });
+		controller.register(harness.pi);
+		const params = harness.getTool()?.parameters as
+			| { properties?: Record<string, { description?: string }> }
+			| undefined;
+		expect(params?.properties?.["claims"]?.description).toContain("claim_check");
+	});
+});
+
+describe("jev controller: frame-escape advice (a rejected option set names the fix)", () => {
+	test("a service-option escape surfaces the actionable fix, not only a verdict", async () => {
+		const controller = createJevController({
+			judge: async () => ({
+				verdict: "insufficient_evidence",
+				reasons: [
+					"meta_option",
+					"ALL_OPTIONS_WRONG",
+					"meta_reason:options_wrong_premise",
+					`${FRAME_FIX_PREFIX}${SERVICE_OPTION_FIX["ALL_OPTIONS_WRONG"]}`,
+				],
+				confidence: 0.97,
+			}),
+		});
+		const outcome = await controller.submitDecision(validDecisionInput());
+		expect(outcome.summary).toContain("the judge rejected the offered option set");
+		expect(outcome.summary).toContain(SERVICE_OPTION_FIX["ALL_OPTIONS_WRONG"] as string);
+	});
+
+	test("a non-escape insufficient_evidence keeps its generic summary", async () => {
+		const controller = createJevController({
+			judge: async () => ({ verdict: "insufficient_evidence", reasons: ["judge_insufficient_evidence"], confidence: 0.5 }),
+		});
+		const outcome = await controller.submitDecision(validDecisionInput());
+		expect(outcome.summary).toContain("judge answered insufficient_evidence");
+	});
+});
+
+describe("jev controller: subagent handoff (FR-11)", () => {
+	const REQUIREMENT = "Implement feature X for the dashboard and keep the existing export working.";
+	const WORK_ORDER = "Add module M implementing feature X and run the dashboard test suite.";
+	/** Owner-wired handoff gate: the stage is configured, so the checks fire (PRD GAP:3 default off). */
+	const WIRED = { stages: { subagent_handoff: { instructions: "Judge the hand-off only from the quoted material." } } };
+
+	function handoffHarness(
+		respond: (req: DecisionRequest) => DecisionResult | Promise<DecisionResult>,
+		template?: { stages: { subagent_handoff: { instructions: string } } },
+	) {
+		const calls: DecisionRequest[] = [];
+		const harness = makeFakePi();
+		const controller = createJevController({
+			template,
+			judge: async req => {
+				calls.push(req);
+				return respond(req);
+			},
+		});
+		controller.register(harness.pi);
+		return { harness, controller, calls };
+	}
+
+	/** Lead agent hands a work order to a task agent: prompt, task tool call, then the spawn event. */
+	async function dispatch(harness: FakePiHarness): Promise<BlockResult> {
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: REQUIREMENT, systemPrompt: [] });
+		await harness.emit("tool_call", {
+			type: "tool_call",
+			toolCallId: "t1",
+			toolName: "task",
+			input: { task: WORK_ORDER, agent: "task" },
+		});
+		return blockResult(
+			await harness.emit("before_subagent_spawn", {
+				type: "before_subagent_spawn",
+				agent: "task",
+				invocationKind: "task",
+				patterns: ["@task"],
+				spawnKey: "t1:0",
+			}),
+		);
+	}
+
+	async function acceptResult(harness: FakePiHarness, controller: { handoffAcceptanceSettled(): Promise<void> }, text: string) {
+		await harness.emit("tool_result", {
+			type: "tool_result",
+			toolName: "task",
+			toolCallId: "t1",
+			input: { task: WORK_ORDER },
+			content: [{ type: "text", text }],
+			isError: false,
+		});
+		await controller.handoffAcceptanceSettled();
+	}
+
+	test("a confident negative verdict refuses the spawn and records the block", async () => {
+		const { harness, controller, calls } = handoffHarness(
+			() => ({ verdict: "revise", reasons: ["the work order omits the export requirement"], confidence: 0.93 }),
+			WIRED,
+		);
+		const res = await dispatch(harness);
+		expect(res.block).toBe(true);
+		expect(String(res.reason)).toContain("omits the export requirement");
+		const record = controller.getState().lastHandoff;
+		expect(record?.phase).toBe("dispatch");
+		expect(record?.judged).toBe(true);
+		expect(record?.verdict).toBe("revise");
+		expect(record?.blocked).toBe(true);
+		expect(controller.getState().blockers.join(" ")).toContain("refused the dispatch");
+		// the judge saw the handoff stage with both quotes: the requirement and the work order
+		expect(calls.length).toBe(1);
+		expect(calls[0]?.stage).toBe("subagent_handoff");
+		expect(calls[0]?.evidence.some(e => e.quote.includes("keep the existing export working"))).toBe(true);
+		expect(calls[0]?.evidence.some(e => e.quote.includes(WORK_ORDER))).toBe(true);
+	});
+
+	test("an abstention lets the spawn through and records the uncertainty", async () => {
+		const { harness, controller } = handoffHarness(
+			() => ({ verdict: "insufficient_evidence", reasons: ["insufficient_evidence"], confidence: 0.31 }),
+			WIRED,
+		);
+		const res = await dispatch(harness);
+		expect(res.block).toBeUndefined();
+		const record = controller.getState().lastHandoff;
+		expect(record?.judged).toBe(true);
+		expect(record?.verdict).toBe("insufficient_evidence");
+		expect(record?.blocked).toBe(false);
+		expect(controller.getState().blockers).toEqual([]);
+		expect(harness.sentMessages.some(m => JSON.stringify(m.payload).includes("handoff"))).toBe(true);
+	});
+
+	test("a throwing judge neither blocks nor approves; the failure is recorded", async () => {
+		const { harness, controller } = handoffHarness(() => {
+			throw new Error("socket connection was closed unexpectedly");
+		}, WIRED);
+		const res = await dispatch(harness);
+		expect(res.block).toBeUndefined();
+		const record = controller.getState().lastHandoff;
+		expect(record?.judged).toBe(false);
+		expect(record?.verdict).toBeUndefined();
+		expect(record?.reasons.join(" ")).toContain("socket connection was closed");
+		expect(controller.getState().blockers).toEqual([]);
+	});
+
+	test("a negative below the confidence floor (or without one) is not a block", async () => {
+		const low = handoffHarness(() => ({ verdict: "revise", reasons: ["maybe"], confidence: 0.35 }), WIRED);
+		expect((await dispatch(low.harness)).block).toBeUndefined();
+		expect(low.controller.getState().lastHandoff?.verdict).toBe("revise");
+		expect(low.controller.getState().lastHandoff?.blocked).toBe(false);
+		const absent = handoffHarness(() => ({ verdict: "revise", reasons: ["no confidence reported"] }), WIRED);
+		expect((await dispatch(absent.harness)).block).toBeUndefined();
+		expect(absent.controller.getState().blockers).toEqual([]);
+	});
+
+	test("the acceptance-side verdict is recorded from the task result hook", async () => {
+		const { harness, controller, calls } = handoffHarness(
+			() => ({ verdict: "revise", reasons: ["the report shows no run of the export test"], confidence: 0.91 }),
+			WIRED,
+		);
+		await dispatch(harness);
+		await acceptResult(harness, controller, "Implemented module M; ran the dashboard suite.");
+		const record = controller.getState().lastHandoff;
+		expect(record?.phase).toBe("acceptance");
+		expect(record?.judged).toBe(true);
+		expect(record?.verdict).toBe("revise");
+		expect(controller.getState().blockers.join(" ")).toContain("did not accept the delegated result");
+		expect(calls.at(-1)?.evidence.some(e => e.quote.includes("Implemented module M"))).toBe(true);
+		expect(harness.sentMessages.some(m => JSON.stringify(m.payload).includes("did not accept"))).toBe(true);
+	});
+
+	test("an accepted result records the verdict without a blocker", async () => {
+		const { harness, controller } = handoffHarness(() => judgeResult({ selectedOption: "approve", confidence: 0.95 }), WIRED);
+		await dispatch(harness);
+		await acceptResult(harness, controller, "Implemented module M; the dashboard suite passes.");
+		expect(controller.getState().lastHandoff?.phase).toBe("acceptance");
+		expect(controller.getState().lastHandoff?.verdict).toBe("approve");
+		expect(controller.getState().blockers).toEqual([]);
+		expect(controller.getState().pendingHandoffs).toEqual({});
+	});
+
+	test("unwired gate or no captured work order changes nothing", async () => {
+		const unwired = handoffHarness(() => ({ verdict: "revise", reasons: ["deficient"], confidence: 0.99 }));
+		expect((await dispatch(unwired.harness)).block).toBeUndefined();
+		expect(unwired.calls.length).toBe(0);
+		expect(unwired.controller.getState().lastHandoff).toBeUndefined();
+		expect(unwired.controller.getState().pendingHandoffs).toEqual({});
+		// wired, but the spawn has no preceding task tool call: recorded uncertainty, no consultation
+		const wired = handoffHarness(() => ({ verdict: "revise", reasons: ["deficient"], confidence: 0.99 }), WIRED);
+		await wired.harness.emit("before_agent_start", { type: "before_agent_start", prompt: REQUIREMENT, systemPrompt: [] });
+		const res = blockResult(
+			await wired.harness.emit("before_subagent_spawn", {
+				type: "before_subagent_spawn",
+				agent: "task",
+				invocationKind: "task",
+				patterns: ["@task"],
+			}),
+		);
+		expect(res.block).toBeUndefined();
+		expect(wired.calls.length).toBe(0);
+		expect(wired.controller.getState().lastHandoff?.judged).toBe(false);
+		expect(wired.controller.getState().lastHandoff?.reasons.join(" ")).toContain("no work order captured");
+	});
+
+	test("an eval spawn is not judged: no work order and no consultation", async () => {
+		const { harness, controller, calls } = handoffHarness(
+			() => ({ verdict: "revise", reasons: ["deficient"], confidence: 0.99 }),
+			WIRED,
+		);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: REQUIREMENT, systemPrompt: [] });
+		await harness.emit("tool_call", {
+			type: "tool_call",
+			toolCallId: "t1",
+			toolName: "task",
+			input: { task: WORK_ORDER },
+		});
+		const res = blockResult(
+			await harness.emit("before_subagent_spawn", {
+				type: "before_subagent_spawn",
+				agent: "smol",
+				invocationKind: "eval",
+				patterns: ["@smol"],
+			}),
+		);
+		expect(res.block).toBeUndefined();
+		expect(calls.length).toBe(0);
+		expect(controller.getState().lastHandoff).toBeUndefined();
+		// the captured order is left for the task-side spawn, not spent on the eval spawn
+		expect(Object.keys(controller.getState().pendingHandoffs)).toEqual(["t1"]);
+	});
+
+	test("a template option set without the refusal id leaves the gate advisory", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({
+			template: {
+				stages: {
+					subagent_handoff: {
+						instructions: "Owner option set without a refusal option.",
+						options: [
+							{ id: "go", label: "Go", meaning: "proceed" },
+							{ id: "hold", label: "Hold", meaning: "pause and report" },
+						],
+					},
+				},
+			},
+			judge: async () => ({ verdict: "revise", reasons: ["deficient"], confidence: 0.99 }),
+		});
+		controller.register(harness.pi);
+		const res = await dispatch(harness);
+		expect(res.block).toBeUndefined();
+		expect(controller.getState().lastHandoff?.verdict).toBe("revise");
+		expect(controller.getState().lastHandoff?.blocked).toBe(false);
+		expect(controller.getState().blockers).toEqual([]);
+	});
+
+	test("an answer after the dispatch deadline never blocks and never pins a refusal", async () => {
+		const harness = makeFakePi();
+		let answer: ((result: DecisionResult) => void) | undefined;
+		// Deadline 0: the timer fires on the next tick while the judge stays pending, so the
+		// deadline wins deterministically - no wall-clock sleep and no fake clock to leak.
+		const controller = createJevController({
+			template: WIRED,
+			handoffDispatchDeadlineMs: 0,
+			judge: () =>
+				new Promise<DecisionResult>(resolve => {
+					answer = resolve;
+				}),
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: REQUIREMENT, systemPrompt: [] });
+		await harness.emit("tool_call", {
+			type: "tool_call",
+			toolCallId: "t1",
+			toolName: "task",
+			input: { task: WORK_ORDER },
+		});
+		const res = blockResult(await dispatch(harness));
+		expect(res.block).toBeUndefined();
+		expect(controller.getState().lastHandoff?.judged).toBe(false);
+		expect(controller.getState().lastHandoff?.reasons.join(" ")).toContain(
+			"did not answer before the dispatch deadline",
+		);
+		// the host already dropped this handler's result at its own ceiling and let the spawn
+		// through: the late negative must not be recorded as a refusal that applied
+		answer?.({ verdict: "revise", reasons: ["too late"], confidence: 0.99 });
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(controller.getState().blockers).toEqual([]);
+		expect(controller.getState().lastHandoff?.blocked).toBe(false);
+	});
+
+	test("a captured order never survives a new task fingerprint", async () => {
+		const harness = makeFakePi();
+		const calls: DecisionRequest[] = [];
+		const controller = createJevController({
+			template: WIRED,
+			judge: async req => {
+				calls.push(req);
+				return { verdict: "insufficient_evidence", reasons: ["abstain"], confidence: 0.3 };
+			},
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: REQUIREMENT, systemPrompt: [] });
+		await harness.emit("tool_call", {
+			type: "tool_call",
+			toolCallId: "t1",
+			toolName: "task",
+			input: { task: WORK_ORDER },
+		});
+		expect(Object.keys(controller.getState().pendingHandoffs)).toEqual(["t1"]);
+		// the user moves on: an order captured for the previous task must not judge a new one
+		await harness.emit("before_agent_start", {
+			type: "before_agent_start",
+			prompt: "Now port the same dashboard feature to the mobile client.",
+			systemPrompt: [],
+		});
+		expect(controller.getState().pendingHandoffs).toEqual({});
+		const res = blockResult(
+			await harness.emit("before_subagent_spawn", {
+				type: "before_subagent_spawn",
+				agent: "task",
+				invocationKind: "task",
+				patterns: ["@task"],
+				spawnKey: "t1:0",
+			}),
+		);
+		expect(res.block).toBeUndefined();
+		expect(calls.length).toBe(0);
+		expect(controller.getState().lastHandoff?.reasons.join(" ")).toContain("no work order captured");
+	});
+
+	test("a phantom order past the age bound does not disarm a fresh dispatch", async () => {
+		const harness = makeFakePi();
+		const calls: DecisionRequest[] = [];
+		let clock = 1_000_000;
+		const controller = createJevController({
+			template: WIRED,
+			now: () => clock,
+			judge: async req => {
+				calls.push(req);
+				return judgeResult({ selectedOption: "approve", confidence: 0.95 });
+			},
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: REQUIREMENT, systemPrompt: [] });
+		// a task call refused before execution never emits tool_result, so this entry would linger
+		await harness.emit("tool_call", {
+			type: "tool_call",
+			toolCallId: "refused",
+			toolName: "task",
+			input: { task: "order that was refused before it reached the host" },
+		});
+		clock += 600_001; // past HANDOFF_ORDER_MAX_AGE_MS
+		await harness.emit("tool_call", {
+			type: "tool_call",
+			toolCallId: "fresh",
+			toolName: "task",
+			input: { task: WORK_ORDER },
+		});
+		expect(Object.keys(controller.getState().pendingHandoffs)).toEqual(["fresh"]);
+		const res = blockResult(
+			await harness.emit("before_subagent_spawn", {
+				type: "before_subagent_spawn",
+				agent: "task",
+				invocationKind: "task",
+				patterns: ["@task"],
+				spawnKey: "fresh:0",
+			}),
+		);
+		expect(res.block).toBeUndefined();
+		expect(controller.getState().lastHandoff?.judged).toBe(true);
+		expect(calls.length).toBe(1);
+		expect(calls[0]?.evidence.some(e => e.quote.includes(WORK_ORDER))).toBe(true);
+		expect(calls[0]?.evidence.some(e => e.quote.includes("refused before it reached the host"))).toBe(false);
 	});
 });

@@ -11,6 +11,10 @@
  *  - session_stop: consulted by the session_stop gate (completion preset).
  *  - on_demand: fires only when the executor submits it via jev_decision
  *    (course_check preset; config-declared custom points are on_demand only).
+ *
+ * subagent_handoff (FR-11) is an on_demand preset that the controller ALSO consults itself at
+ * the task-tool boundary (dispatch before_subagent_spawn, acceptance tool_result), and only
+ * while the owner configures that stage: the PRD marks the policy unconfirmed (GAP:3).
  */
 import type { DecisionStage } from "./types.js";
 
@@ -72,10 +76,27 @@ export const CONTROL_POINT_REGISTRY: Readonly<Record<string, ControlPoint>> = {
 		trigger: "on_demand",
 		verdictMapping: "standard",
 	},
+	// FR-11: the lead agent's delegation to a task agent. The controller consults the point
+	// itself at the task-tool boundary (dispatch + acceptance); the executor may also submit
+	// it. Advisory: it grants no gate approval (on_demand never does) and blocks a spawn only
+	// on a judged explicit negative at or above the confidence floor.
+	subagent_handoff: {
+		stage: "subagent_handoff",
+		trigger: "on_demand",
+		verdictMapping: "standard",
+	},
 	aspect_coverage: {
 		stage: "aspect_coverage",
 		trigger: "on_demand",
 		verdictMapping: "aspect_coverage",
+	},
+	// Universal engine: several claims judged in ONE request, one verdict per claim, each
+	// judged only from the quoted evidence. Advisory (on_demand never grants a gate); the
+	// measured strongest regime, made first-class instead of hand-rolled per call.
+	claim_check: {
+		stage: "claim_check",
+		trigger: "on_demand",
+		verdictMapping: "standard",
 	},
 };
 

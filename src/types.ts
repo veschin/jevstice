@@ -37,7 +37,8 @@ export type DecisionStage =
   | "code_review" // FR-10: code review gate
   | "subagent_handoff" // FR-11: validate dispatch and acceptance
   | "refactor_check" // FR-13: capability preservation
-  | "aspect_coverage"; // universal engine: forgotten-aspect three-way coverage check + FR-18 course_check (see control-points registry)
+  | "aspect_coverage" // universal engine: forgotten-aspect three-way coverage check + FR-18 course_check (see control-points registry)
+  | "claim_check"; // universal engine: per-claim support marking against quoted evidence (measured decisive per-claim regime)
 
 /** Fixed option set presented to the judge (FR-08). */
 export interface DecisionOption {
@@ -171,6 +172,27 @@ export interface AspectCoverageResult {
 }
 
 export type AspectCoverageJudge = (request: AspectCoverageRequest) => Promise<AspectCoverageResult>;
+
+// ---------- Claim check (per-claim support marking; claim_check preset) ----------
+
+export interface ClaimCheckRequest {
+  stage: DecisionStage;
+  /** Which decision the claims belong to (context only; claims are judged from the evidence). */
+  task: string;
+  /** Claims under judgment (2..N), each marked against the quoted evidence. */
+  claims: Array<{ id: string; text: string }>;
+  evidence: Evidence[];
+}
+
+export interface ClaimCheckResult {
+  /** Per-claim marking: true = the quoted evidence supports the claim as stated. */
+  supported: Record<string, boolean>;
+  reasons: string[];
+  /** False when the judge could not be consulted (fail-closed; never a partial marking). */
+  judged: boolean;
+}
+
+export type ClaimCheckJudge = (request: ClaimCheckRequest) => Promise<ClaimCheckResult>;
 
 // ---------- TypeSafe systemone wire types (S:API, verified from docs.typesafe.ai/api) ----------
 

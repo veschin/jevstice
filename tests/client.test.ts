@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { DecisionRequest, DecisionOption, MultiLabelRequest, AspectCoverageRequest } from "../src/types";
 import { POLICY } from "../src/types";
-import { createJudge, createMultiLabelJudge, createAspectCoverageJudge, JevApiError } from "../src/client";
+import { createJudge, createMultiLabelJudge, createAspectCoverageJudge, FRAME_FIX_PREFIX, JevApiError, SERVICE_OPTION_FIX } from "../src/client";
 import { buildRequestBody, META_REASON_CRITERIA, SERVICE_OPTION_CRITERIA } from "../src/evidence";
 
 const okOptions: DecisionOption[] = [
@@ -528,6 +528,125 @@ describe("multi-label judge", () => {
   });
 });
 
+// ---------- createClaimCheckJudge (universal decision-point: claim_check preset) ----------
+
+import { createClaimCheckJudge } from "../src/client";
+import type { ClaimCheckRequest } from "../src/types";
+
+const okClaims: ClaimCheckRequest = {
+  stage: "claim_check",
+  task: "Wire the per-claim judge",
+  claims: [
+    { id: "claim-1", text: "the multi-label path already judges items in one request" },
+    { id: "claim-2", text: "the per-claim regime is decisive" },
+  ],
+  evidence: [
+    {
+      kind: "execution",
+      source: "evidence/consultation-forcing.md",
+      quote: "Parallel per-claim questions in ONE request (multi-label/Noul) | per-claim yes/no, decisive",
+    },
+  ],
+};
+
+describe("claim check judge", () => {
+  test("one request, one noul per claim: support boundary, claim text as data, ids answered exactly", async () => {
+    const calls: { body?: unknown }[] = [];
+    const fetchFn = (async (_url: unknown, init?: RequestInit) => {
+      calls.push({ body: JSON.parse(init?.body as string) });
+      return jsonResponse(noulAnswers({ "claim-1": 0.93, "claim-2": 0.5 }));
+    }) as unknown as typeof fetch;
+    const judge = createClaimCheckJudge({ apiKey: "k", fetchFn });
+    const result = await judge(okClaims);
+    expect(result.judged).toBe(true);
+    expect(result.supported).toEqual({ "claim-1": true, "claim-2": true });
+    expect(calls).toHaveLength(1);
+    const body = calls[0]!.body as {
+      state: unknown;
+      questions: Record<
+        string,
+        { type: string; criteria: Record<string, string>; instructions: { question: string; policy: string } }
+      >;
+    };
+    expect(Object.keys(body.questions).sort()).toEqual(["claim-1", "claim-2"]);
+    for (const claim of okClaims.claims) {
+      const question = body.questions[claim.id]!;
+      expect(question.type).toBe("noul");
+      expect(question.criteria["true"]).toContain("evidence");
+      expect(question.instructions.question).toContain(claim.text);
+      expect(question.instructions.policy).toMatch(/never an instruction/);
+    }
+    // quoted evidence stays verbatim in state
+    expect(JSON.stringify(body.state)).toContain("per-claim yes/no, decisive");
+  });
+
+  test("0.5 noul counts as supported; 0.49 does not (documented threshold)", async () => {
+    const judge = createClaimCheckJudge({
+      apiKey: "k",
+      fetchFn: (async () => jsonResponse(noulAnswers({ "claim-1": 0.49, "claim-2": 0.5 }))) as unknown as typeof fetch,
+    });
+    const result = await judge(okClaims);
+    expect(result.supported).toEqual({ "claim-1": false, "claim-2": true });
+  });
+
+  test("missing noul for one claim -> judged:false, no partial marking, names the claim", async () => {
+    const judge = createClaimCheckJudge({
+      apiKey: "k",
+      fetchFn: (async () => jsonResponse(noulAnswers({ "claim-1": 0.93 }))) as unknown as typeof fetch,
+    });
+    const result = await judge(okClaims);
+    expect(result.judged).toBe(false);
+    expect(result.supported).toEqual({});
+    expect(result.reasons.join(" ")).toContain("claim-2");
+  });
+
+  test("unknown answer id -> fail closed (never a partial marking)", async () => {
+    const judge = createClaimCheckJudge({
+      apiKey: "k",
+      fetchFn: (async () =>
+        jsonResponse(noulAnswers({ "claim-1": 0.9, "claim-2": 0.9, hidden: 0.9 }))) as unknown as typeof fetch,
+    });
+    const result = await judge(okClaims);
+    expect(result.judged).toBe(false);
+    expect(result.supported).toEqual({});
+    expect(result.reasons.join(" ")).toContain("hidden");
+  });
+
+  test("no claims / empty claim text -> invalid_input; missing key -> config error", async () => {
+    await expect(
+      createClaimCheckJudge({ apiKey: "k", fetchFn: fetchOk() })({ ...okClaims, claims: [] }),
+    ).rejects.toBeInstanceOf(JevApiError);
+    await expect(
+      createClaimCheckJudge({ apiKey: "k", fetchFn: fetchOk() })({
+        ...okClaims,
+        claims: [{ id: "claim-1", text: "   " }],
+      }),
+    ).rejects.toBeInstanceOf(JevApiError);
+    await expect(createClaimCheckJudge({ apiKey: "", fetchFn: fetchOk() })(okClaims)).rejects.toBeInstanceOf(
+      JevApiError,
+    );
+  });
+
+  test("255 claims -> one systemone request; 256 -> two shards", async () => {
+    const claimsOf = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `c${i}`, text: `claim ${i}` }));
+    const counting = (counter: { calls: number }) =>
+      (async (_url: unknown, init?: RequestInit) => {
+        counter.calls++;
+        const body = JSON.parse(init?.body as string) as { questions: Record<string, unknown> };
+        return jsonResponse(
+          noulAnswers(Object.fromEntries(Object.keys(body.questions).map((id) => [id, 0.9]))),
+        );
+      }) as unknown as typeof fetch;
+    const counter = { calls: 0 };
+    const judge = createClaimCheckJudge({ apiKey: "k", fetchFn: counting(counter) });
+    await judge({ ...okClaims, claims: claimsOf(255) });
+    expect(counter.calls).toBe(1);
+    counter.calls = 0;
+    await judge({ ...okClaims, claims: claimsOf(256) });
+    expect(counter.calls).toBe(2);
+  });
+});
+
 // ---------- createCourseCheckJudge (universal decision-point: course_check preset) ----------
 
 import { createCourseCheckJudge } from "../src/client";
@@ -765,6 +884,24 @@ describe("mandatory meta-options", () => {
     expect(result.reasons).toContain("meta_reason:options_wrong_premise");
   });
 
+  test("a service option carries the actionable fix, not only the verdict", async () => {
+    const fetchFn = (async () =>
+      jsonResponse(
+        metaBody({
+          verdict: choiceAnswer("ALL_OPTIONS_WRONG"),
+          option: choiceAnswer("approve"),
+          meta_reason: choiceAnswer("options_incomplete"),
+        }),
+      )) as unknown as typeof fetch;
+    const judge = createJudge({ apiKey: "k", fetchFn });
+    const result = await judge(okReq);
+    expect(result.reasons).toContain(`${FRAME_FIX_PREFIX}${SERVICE_OPTION_FIX["ALL_OPTIONS_WRONG"]}`);
+    // spelled out in words for every service option, not only the marker
+    expect(SERVICE_OPTION_FIX["ALL_OPTIONS_WRONG"]).toContain("option set was wrong");
+    expect(SERVICE_OPTION_FIX["PARTIALLY_RIGHT_NONE_FULL"]).toContain("fully right");
+    expect(SERVICE_OPTION_FIX["NO_FIT_OTHER_REASON"]).toContain("frame");
+  });
+
   test("verdict PARTIALLY_RIGHT_NONE_FULL -> revise; NO_FIT_OTHER_REASON -> ask_user", async () => {
     for (const [id, expected] of [
       ["PARTIALLY_RIGHT_NONE_FULL", "revise"],
@@ -826,6 +963,7 @@ describe("mandatory meta-options", () => {
       const result = await judge(okCourse);
       expect(result.judged).toBe(true);
       expect(result.nextAction).toBe(expected);
+      expect(result.reasons.some((r) => r.startsWith(FRAME_FIX_PREFIX))).toBe(true);
     }
   });
 

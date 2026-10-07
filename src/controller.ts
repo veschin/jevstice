@@ -7,7 +7,14 @@
  * - `session_stop` handler => {decision: "block", reason} is extension-only and maps to a
  *   continuation; `event.stop_hook_active` is true when already continuing from a stop hook
  *   (shared-events.ts:110/486) - we never block twice on the same unmet gate (finite rework).
- * - `before_subagent_spawn` => {model?, block?, reason?, note?} (extensions/types.ts:1301).
+ * - `before_subagent_spawn` => {model?, block?, reason?, note?} (extensions/types.ts:1301); the
+ *   event carries the agent name and spawn key but NOT the prompt, so the FR-11 work order is
+ *   captured from the `task` tool call input (`task`, batch `tasks[].task`, shared `context`;
+ *   omp 18.6.3 task/agents.ts + task/index.ts:821).
+ * - `tool_result` => {content?, details?, isError?, additionalContext?} fires after every tool
+ *   call (wrapper.ts:459) and CANNOT refuse one (shared-events.ts:398): a handler may only
+ *   rewrite content/details/isError, so the FR-11 acceptance verdict is recorded and fed back
+ *   into the session, never a block.
  * - `before_agent_start` carries the already-transformed prompt (task fingerprint source).
  * - `pi.appendEntry(customType, data)` persists non-LLM state; `ctx.sessionManager.getEntries()`
  *   reads it back on session start (session-manager.ts:3419, 653-676).
@@ -28,6 +35,8 @@ import {
 	COURSE_CHECK_NEXT_ACTIONS,
 	type AspectCoverageJudge,
 	type AspectCoverageResult,
+	type ClaimCheckJudge,
+	type ClaimCheckResult,
 	type CourseCheckJudge,
 	type CourseCheckResult,
 	type MultiLabelJudge,
@@ -55,6 +64,14 @@ export interface ApprovalRecord {
 	approvedAt: number;
 }
 
+/** One claim as marked by the judge (claim_check preset); text is the caller's own words. */
+export interface ClaimCheckMarking {
+	id: string;
+	text: string;
+	/** True when the quoted evidence states or entails the claim. */
+	supported: boolean;
+}
+
 export interface JevState {
 	approvals: ApprovalRecord[];
 	/** Judge consultations per `${taskFingerprint}:${stage}` - bounded rework (FR-12). */
@@ -71,6 +88,11 @@ export interface JevState {
 	routedSkill: string | undefined;
 	/** Latest judged course_check continue/verify record; completion requires a fresh one (task+work bound). */
 	lastCourseCheck: { selectedOption: string; at: number; taskFingerprint: string | undefined; workRevision: number } | undefined;
+	/**
+	 * Latest claim_check marking: one entry per submitted claim, in submission order
+	 * (advisory, never a gate grant). Undefined until a claim_check is marked.
+	 */
+	lastClaimCheck: { claims: ClaimCheckMarking[]; at: number; taskFingerprint: string | undefined; workRevision: number } | undefined;
 	/** Open aspect_coverage drift: missed aspect ids for the current task (completion teeth). */
 	openAspectGaps: { missed: string[]; taskFingerprint: string | undefined } | undefined;
 	/** Calibration-tolerant completion: consecutive mid-band approves, bound to task+work+exact content digest. */
@@ -86,6 +108,20 @@ export interface JevState {
 	taskType: string | undefined;
 	/** FR-04 record: catalog topic ids the judge marked applicable at task start. */
 	selectedTopics: string[] | undefined;
+	/** FR-11: latest before_agent_start prompt - the requirement the handoff judge is shown. */
+	taskPrompt: string | undefined;
+	/**
+	 * FR-11: work orders of the task tool calls in flight, keyed by toolCallId, captured at
+	 * tool_call because before_subagent_spawn carries no prompt and no toolCallId (spawnKey may
+	 * be the agent name or `${toolCallId}:${index}`). `usedBySpawn` marks an order a spawn has
+	 * already been judged against, so a sibling spawn is never judged on someone else's order.
+	 * Cleared when the task fingerprint changes and aged out after HANDOFF_ORDER_MAX_AGE_MS, so a
+	 * call that never reaches execution cannot disarm the check. Transient: never restored from
+	 * session entries.
+	 */
+	pendingHandoffs: Record<string, { text: string; at: number; usedBySpawn: boolean }>;
+	/** FR-11: last handoff judgement (dispatch or acceptance) - recorded, never a silent no-op. */
+	lastHandoff: HandoffRecord | undefined;
 }
 
 function freshState(): JevState {
@@ -98,11 +134,15 @@ function freshState(): JevState {
 		routedModel: undefined,
 		routedSkill: undefined,
 		lastCourseCheck: undefined,
+		lastClaimCheck: undefined,
 		openAspectGaps: undefined,
 		consecutiveCompletionApproves: undefined,
 		submissionDigests: {},
 		taskType: undefined,
 		selectedTopics: undefined,
+		taskPrompt: undefined,
+		pendingHandoffs: {},
+		lastHandoff: undefined,
 	};
 }
 
@@ -131,6 +171,20 @@ export interface SpawnRouteResult {
 	block?: boolean;
 	reason?: string;
 	note?: string;
+}
+
+/** FR-11 record of one handoff consultation: dispatch (before_subagent_spawn) or acceptance (tool_result). */
+export interface HandoffRecord {
+	phase: "dispatch" | "acceptance";
+	/** Judge verdict when a consultation happened; absent when it never did. */
+	verdict?: DecisionVerdict;
+	/** True when the judge answered (an unusable answer is still a consultation, not a failure). */
+	judged: boolean;
+	confidence?: number;
+	reasons: string[];
+	/** A spawn was refused on this record (dispatch only; the acceptance hook cannot refuse). */
+	blocked: boolean;
+	at: number;
 }
 
 // ---------- tool input validation ----------
@@ -162,6 +216,77 @@ const MUTATING_TOOLS: ReadonlySet<string> = new Set([
 ]);
 /** course_check redirecting options: approve+these map to revise (registry holds the full set). */
 const COURSE_CHECK_REDIRECTING: ReadonlySet<string> = new Set(["return_to_requirement", "replan"]);
+/**
+ * Marker the client puts in `reasons` on a frame escape, followed by the service option id,
+ * the companion meta_reason and the actionable fix (client.ts FRAME_FIX_PREFIX). Same literal
+ * as HANDOFF_FRAME_ESCAPE_REASON below: the controller depends on the contract, not the module.
+ */
+const FRAME_ESCAPE_REASON = "meta_option";
+const FRAME_FIX_PREFIX = "frame_fix: ";
+/**
+ * Plan stages: a proposal that quotes no evidence is not judgeable (live 0.14-0.26 against
+ * 0.79-0.96 for the same plan phrased as a claim). The check is a pre-judge refusal, so a
+ * submission defect never burns a consultation or a rework iteration.
+ */
+const GROUNDING_MIN_QUOTE_CHARS = 20;
+const GROUNDING_PROBLEM = "proposal_not_grounded_in_evidence";
+const GROUNDING_FIX =
+	`quote at least one submitted evidence item (>= ${GROUNDING_MIN_QUOTE_CHARS} characters) verbatim ` +
+	"inside the proposal and state what it supports, so the plan is a claim checked against evidence";
+/** claim_check preset: N independent decisions in one request start at two claims. */
+const CLAIM_CHECK_MIN_CLAIMS = 2;
+/** Fix named when a claim cannot be marked: it must be answerable from the quoted evidence. */
+const CLAIM_CHECK_FIX =
+	"quote evidence that states or directly entails each claim; a claim is judged only from the quoted evidence";
+/** Claim text shown in fixed-template lines: the caller's words, capped for readability. */
+const CLAIM_EXCERPT_CHARS = 80;
+/**
+ * FR-11 handoff options, shared by the dispatch and acceptance sides (a `stages.subagent_handoff`
+ * template may replace them, R3). The option ids carry consequence: the controller reads an
+ * explicit `revise` verdict as the negative; an `approve` is never required for the work to pass,
+ * and a template that overrides the options without keeping `revise` leaves the gate advisory
+ * (HANDOFF_REFUSAL_OPTION below).
+ */
+const HANDOFF_OPTIONS: DecisionOption[] = [
+	{
+		id: "approve",
+		label: "Hand-off is sound",
+		meaning: "the work order or the returned result matches the quoted requirement and is complete enough to proceed",
+	},
+	{
+		id: "revise",
+		label: "Hand-off is deficient",
+		meaning: "the work order or result contradicts or omits part of the quoted requirement; name the deficiency",
+	},
+];
+/** Option id that expresses the refusal: the offered set must name it for the gate to have teeth. */
+const HANDOFF_REFUSAL_OPTION = "revise";
+/**
+ * Marker the client puts in `reasons` when the judge rejected the caller's frame instead of
+ * judging the hand-off (client.ts: "meta_option", serviceId, metaReason; asserted in
+ * tests/client.test.ts). A frame rejection is never an explicit negative about the work, so it
+ * can record but never block.
+ */
+const HANDOFF_FRAME_ESCAPE_REASON = "meta_option";
+/**
+ * Dispatch deadline for the FR-11 handoff consult. The host runs `before_subagent_spawn`
+ * handlers under a 30s timeout and DROPS the handler result on timeout, letting the spawn
+ * proceed (runner.ts EXTENSION_HANDLER_TIMEOUT_MS = 30_000, no onFailure for this event), while
+ * this handler keeps running: a negative that arrives after that ceiling would be recorded as a
+ * refusal that never applied. Live endpoint latency has been measured at 33s against the
+ * resetting edge, so the gate decides well before the host gives up.
+ */
+const HANDOFF_DISPATCH_DEADLINE_MS = 25_000;
+/**
+ * Age bound for a captured work order. A `task` tool call refused between capture and execution
+ * (a foreign `tool_call` block, a preflight refusal or an approval deny - wrapper.ts:284-327
+ * throws before `execute`) never emits `tool_result`, so its order would linger and disarm the
+ * dispatch check for the rest of the session; it is also cleared outright when the task changes.
+ * Two minutes is far longer than any real dispatch and far shorter than a task.
+ */
+const HANDOFF_ORDER_MAX_AGE_MS = 120_000;
+/** Evidence quotes are capped for cost; the kept prefix stays verbatim and the source says it was capped. */
+const HANDOFF_QUOTE_CAP = 4000;
 const STATE_ENTRY_TYPE = "jev.state";
 const TOOL_NAME = "jev_decision";
 
@@ -174,6 +299,8 @@ export interface ValidatedDecisionInput {
 	capabilities: string[];
 	/** Claimed-aspect catalog ids for the aspect_coverage preset. */
 	aspects: string[];
+	/** Claim texts for the claim_check preset (each judged separately against the evidence). */
+	claims: string[];
 }
 
 export interface ValidationResult {
@@ -236,6 +363,9 @@ export function validateDecisionInput(raw: unknown, extraStages: ReadonlySet<str
 	const capabilities = Array.isArray(raw["capabilities"])
 		? raw["capabilities"].filter((c): c is string => typeof c === "string" && c.trim().length > 0)
 		: [];
+	const claims = Array.isArray(raw["claims"])
+		? raw["claims"].filter((c): c is string => typeof c === "string" && c.trim().length > 0)
+		: [];
 	if (reasons.length > 0) return { ok: false, reasons };
 	return {
 		ok: true,
@@ -248,6 +378,7 @@ export function validateDecisionInput(raw: unknown, extraStages: ReadonlySet<str
 			evidence,
 			capabilities,
 			aspects,
+			claims,
 		},
 	};
 }
@@ -342,11 +473,18 @@ export interface ControllerDeps {
 	courseCheckJudge?: CourseCheckJudge;
 	/** Three-way aspect marking judge: the aspect_coverage preset AND judged completion capability coverage (requireAll). */
 	aspectCoverageJudge?: AspectCoverageJudge;
+	/** Per-claim support judge: the claim_check preset (N claims, one request, one verdict per claim). */
+	claimCheckJudge?: ClaimCheckJudge;
 	/** Valid catalog topic ids for the aspects[] pre-check (built in index from the catalog). */
 	catalogIds?: ReadonlySet<string>;
 	/** FR-01/FR-04 wiring: the catalog and the marking judge for the automatic task-start checks. */
 	catalog?: CatalogTopic[];
 	multiLabelJudge?: MultiLabelJudge;
+	/**
+	 * FR-11 dispatch consult deadline; must stay under the host's 30s handler timeout
+	 * (HANDOFF_DISPATCH_DEADLINE_MS). Exposed for tests only.
+	 */
+	handoffDispatchDeadlineMs?: number;
 }
 
 /** Minimal structural surface of the omp ExtensionAPI the controller needs. */
@@ -374,11 +512,14 @@ export class JevController {
 	private pi: PiApi | undefined;
 	private readonly courseCheckJudge: CourseCheckJudge | undefined;
 	private readonly aspectCoverageJudge: AspectCoverageJudge | undefined;
+	private readonly claimCheckJudge: ClaimCheckJudge | undefined;
 	private readonly catalogIds: ReadonlySet<string>;
 	private readonly catalog: CatalogTopic[] | undefined;
 	private readonly multiLabelJudge: MultiLabelJudge | undefined;
 	/** In-flight advisory catalog checks; never awaited by the task path. */
 	private catalogChecks: Promise<void> | undefined;
+	/** In-flight FR-11 acceptance consult; never awaited by the tool_result path. */
+	private handoffAcceptance: Promise<void> | undefined;
 	private template: JevTemplateConfig;
 	private templateError: string | undefined;
 	/** Config-declared on_demand control points (controlPoints key). */
@@ -388,15 +529,19 @@ export class JevController {
 	/** Calibration-tolerant completion: template/config may only RAISE these (Math.max clamp). */
 	private completionConsecutiveApproves!: number;
 	private completionConfidenceFloor!: number;
+	/** FR-11 dispatch consult deadline (under the host's 30s handler timeout). */
+	private readonly handoffDispatchDeadlineMs: number;
 
 	constructor(deps: ControllerDeps) {
 		this.judge = deps.judge;
 		this.courseCheckJudge = deps.courseCheckJudge;
 		this.aspectCoverageJudge = deps.aspectCoverageJudge;
+		this.claimCheckJudge = deps.claimCheckJudge;
 		this.catalogIds = deps.catalogIds ?? new Set();
 		this.catalog = deps.catalog;
 		this.multiLabelJudge = deps.multiLabelJudge;
 		this.maxReworkIterations = deps.maxReworkIterations ?? POLICY.maxReworkIterations;
+		this.handoffDispatchDeadlineMs = deps.handoffDispatchDeadlineMs ?? HANDOFF_DISPATCH_DEADLINE_MS;
 		// R1: a confidenceThreshold override may only RAISE the bar above POLICY.
 		this.minConfidence = Math.max(
 			deps.minConfidence ?? POLICY.minConfidenceToApprove,
@@ -446,9 +591,16 @@ export class JevController {
 				"first, do not report the block to the user. " +
 				"Submit a structured important decision, review or completion claim to the Jev judge. " +
 				"Required before any file-mutating work and before finishing work. " +
-				"Plan-stage proposals read as claims checked against the quoted evidence: state what the plan " +
-				"asserts and which quote supports it. An open plan summary with no quotable anchor is answered " +
-				"insufficient_evidence (live: 0.14-0.26 against 0.79 for the same plan phrased as a claim). " +
+				"Consultation protocol (it decides the answer quality; live: 0.14-0.26 ungrounded against " +
+				"0.79-0.96 for the same material phrased as a claim): one decision per request — write a claim " +
+				"and ask whether the quoted evidence supports it, never an open request to approve a summary; " +
+				"3-6 short non-duplicate quotes, and on plan stages at least one requirement quote (kind user or " +
+				"spec) appearing verbatim inside the proposal, so the plan is a claim checked against the quoted " +
+				"evidence; 2-4 real alternatives whose meanings state what choosing them commits you to. " +
+				"A plan-stage proposal that quotes no evidence is refused before any judge call, consuming no " +
+				"rework, with the fix named. An abstention is not a verdict: insufficient_evidence means better " +
+				"evidence is needed, not the same request again, and a judge-chosen service option means the " +
+				"offered set was wrong, not that the work failed. " +
 				"Write your own text - task, proposal, option labels and meanings - in English; quoted " +
 				"evidence keeps the original wording of its source verbatim. " +
 				"Provide fixed options " +
@@ -458,7 +610,12 @@ export class JevController {
 				"Run stage=course_check at the task/plan boundary, after every work mutation and before claiming " +
 				"completion: the completion gate requires a fresh judged course_check with option continue " +
 				"(verify_before_proceeding never unlocks). Pass `aspects` (catalog topic ids) with " +
-				"stage=aspect_coverage to check for forgotten aspects.",
+				"stage=aspect_coverage to check for forgotten aspects. " +
+				"Use stage=claim_check for several claims at once: pass 2+ claim texts in `claims` and each is " +
+				"judged separately against the quoted evidence in ONE request, returning one verdict per claim; " +
+				"it is advisory (it never unlocks a gate) and a claim the judge cannot mark is named and fails " +
+				"closed. Options and the proposal stay required by the schema but are not judged on claim_check " +
+				"(the claim judge reads `task`, `claims` and `evidence`).",
 			parameters: {
 				type: "object",
 				properties: {
@@ -487,6 +644,12 @@ export class JevController {
 						items: { type: "string" },
 						description: "catalog topic ids to mark for the aspect_coverage stage",
 					},
+					claims: {
+						type: "array",
+						items: { type: "string" },
+						description:
+							"2+ claim texts for stage=claim_check; each is judged separately against the quoted evidence",
+					},
 				},
 				required: ["stage", "task", "proposal", "options", "evidence"],
 			},
@@ -507,6 +670,12 @@ export class JevController {
 		pi.on("before_agent_start", event => this.onBeforeAgentStart(event));
 		pi.on("session_stop", event => this.onSessionStop(event));
 		pi.on("before_subagent_spawn", (event, ctx) => this.onBeforeSubagentSpawn(event, ctx));
+		// FR-11 dispatch side: a separate handler so the model-routing result stays deterministic
+		// even when the judge consult runs long enough to hit the host's handler timeout (a
+		// timed-out handler result is dropped whole, routing included).
+		pi.on("before_subagent_spawn", (event, ctx) => this.onHandoffDispatch(event, ctx));
+		// FR-11 acceptance side: `tool_result` is the only hook that observes a task result.
+		pi.on("tool_result", (event, ctx) => this.onTaskResult(event, ctx));
 	}
 
 	// ----- event handlers (also directly test-invokable) -----
@@ -529,6 +698,12 @@ export class JevController {
 						`Fix the listed problems and call ${TOOL_NAME} again.`,
 				};
 			}
+			return undefined;
+		}
+		if (toolName === "task") {
+			// FR-11: capture the work order now - before_subagent_spawn carries the agent name
+			// but not the prompt, and tool_call is the only hook that sees the task tool input.
+			this.captureHandoffWorkOrder(event);
 			return undefined;
 		}
 		if (typeof toolName === "string" && MUTATING_TOOLS.has(toolName)) {
@@ -570,6 +745,11 @@ export class JevController {
 		const fp = await fingerprint(event["prompt"]);
 		if (fp !== this.state.taskFingerprint) {
 			this.state.taskFingerprint = fp;
+			// FR-11: the requirement the handoff judge quotes for this task (same source as the
+			// fingerprint, so the two can never describe different prompts).
+			this.state.taskPrompt = event["prompt"];
+			// A stale work order can never legitimately judge a spawn of the new task.
+			this.state.pendingHandoffs = {};
 			this.persist();
 			// Advisory and non-blocking: a task must not wait on judge latency. Measured live:
 			// the checks took 33s against a resetting endpoint, which no task start should pay.
@@ -681,6 +861,265 @@ export class JevController {
 		this.persist();
 	}
 
+	// ----- FR-11 handoff (dispatch + acceptance) -----
+
+	/**
+	 * Wiring switch (user-owned): the handoff gate fires only when the owner configured the
+	 * `subagent_handoff` stage. FR-11 is an unconfirmed policy (PRD GAP:3) and POLICY-DRAFT
+	 * lists spawn judging as a post-approval item, so without that config the session behaves
+	 * exactly as before: no consultation, no state captured, no block. The stage is registered,
+	 * so the executor may still submit it through jev_decision at any time.
+	 */
+	private handoffWired(): boolean {
+		return this.template.stages?.["subagent_handoff"] !== undefined;
+	}
+
+	/**
+	 * Drop captured work orders older than HANDOFF_ORDER_MAX_AGE_MS. A `task` tool call refused
+	 * between capture and execution (foreign `tool_call` block, preflight refusal, approval deny:
+	 * wrapper.ts:284-327 throws before `execute`) never emits `tool_result`, so its order would
+	 * otherwise linger and disarm the dispatch check; aging it out also keeps a phantom order from
+	 * judging a later spawn.
+	 */
+	private pruneStaleHandoffOrders(): void {
+		const cutoff = this.now() - HANDOFF_ORDER_MAX_AGE_MS;
+		for (const [key, entry] of Object.entries(this.state.pendingHandoffs)) {
+			if (entry.at < cutoff) delete this.state.pendingHandoffs[key];
+		}
+	}
+
+	/**
+	 * Capture the work order of a task tool call for the dispatch check, keyed by toolCallId.
+	 * Only while the gate is wired: an unwired gate leaves the session state untouched. The entry
+	 * is retired when that call settles (onTaskResult); the spawn event carries no toolCallId, so
+	 * exact attribution to a call is not possible without host support - see onHandoffDispatch.
+	 */
+	private captureHandoffWorkOrder(event: Record<string, unknown>): void {
+		if (!this.handoffWired()) return;
+		const text = taskWorkOrder(event["input"]);
+		if (text === undefined) return;
+		this.pruneStaleHandoffOrders();
+		const toolCallId = typeof event["toolCallId"] === "string" ? event["toolCallId"] : "";
+		this.state.pendingHandoffs[toolCallId] = { text, at: this.now(), usedBySpawn: false };
+	}
+
+	/**
+	 * FR-11 dispatch side (before_subagent_spawn): judge the work order the lead agent is about
+	 * to hand to a task agent against the requirement captured at task start. Refuses the spawn
+	 * ONLY on a judged verdict that is explicitly negative (revise) at or above the confidence
+	 * floor, with the offered option set naming that refusal, and with the answer arriving before
+	 * the deadline below. An abstention, a low-confidence answer, a judge error, a frame-escape
+	 * answer, a missing requirement, an unattributable work order or an unwired gate let the spawn
+	 * through and are recorded - the owner measured that a gate which blocks on an abstention
+	 * becomes a permanent block.
+	 */
+	async onHandoffDispatch(event: unknown, _ctx?: unknown): Promise<SpawnRouteResult | undefined> {
+		if (!this.handoffWired() || !isRecord(event)) return undefined;
+		// eval spawns (agent() calls) carry no captured work order: nothing judgeable here.
+		if (event["invocationKind"] !== "task") return undefined;
+		this.pruneStaleHandoffOrders();
+		const ids = Object.keys(this.state.pendingHandoffs);
+		const id = ids.length === 1 ? ids[0] : undefined;
+		const order = id !== undefined ? this.state.pendingHandoffs[id] : undefined;
+		if (id === undefined || order === undefined || order.usedBySpawn) {
+			const gap =
+				ids.length === 0
+					? "no work order captured from the task tool call"
+					: order?.usedBySpawn === true
+						? "the captured work order was already used by a sibling spawn of the same task call"
+						: "several task calls are in flight and the spawn event carries no toolCallId to " +
+							"attribute one work order to this spawn";
+			this.recordHandoffUncertainty("dispatch", gap);
+			return undefined;
+		}
+		// Consume before judging: one captured order per spawn, never reused for a sibling.
+		order.usedBySpawn = true;
+		const requirement = this.state.taskPrompt;
+		if (requirement === undefined) {
+			this.recordHandoffUncertainty("dispatch", "no user requirement captured for this task yet");
+			return undefined;
+		}
+		const workOrder = cappedQuote(order.text).quote;
+		const proposal =
+			"Claim under judgment: this work order is an adequate assignment for a task agent - it asks for the " +
+			"work the quoted user requirement needs, stays within it, and names a result the agent can hand back.\n\n" +
+			`Work order handed over by the lead agent (verbatim):\n${workOrder}`;
+		const evidence: Evidence[] = [
+			handoffEvidence("user", "session task prompt (the requirement)", requirement),
+			handoffEvidence("spec", "task tool call input (the work order)", order.text),
+		];
+		// A late answer must never block: the host already dropped this handler's result at its
+		// own ceiling (see HANDOFF_DISPATCH_DEADLINE_MS) and proceeded with the spawn.
+		let settled: { record: HandoffRecord; negative: boolean } | undefined;
+		let deadline: Timer | undefined;
+		try {
+			settled = await Promise.race([
+				this.judgeHandoff("dispatch", proposal, evidence),
+				new Promise<undefined>(resolve => {
+					deadline = setTimeout(() => resolve(undefined), this.handoffDispatchDeadlineMs);
+				}),
+			]);
+		} finally {
+			clearTimeout(deadline);
+		}
+		if (settled === undefined) {
+			this.recordHandoffUncertainty(
+				"dispatch",
+				`the judge did not answer before the dispatch deadline (${this.handoffDispatchDeadlineMs}ms, ` +
+					"under the host's handler timeout)",
+			);
+			return undefined;
+		}
+		const { record, negative } = settled;
+		if (negative) {
+			const reason =
+				`Jev handoff check refused the dispatch: ${record.reasons.join(" ")} ` +
+				`(judge revise at confidence ${record.confidence}). ` +
+				"Rewrite the work order so it covers the quoted requirement, then dispatch again - " +
+				"or escalate to the user.";
+			this.blockHandoff(record, reason);
+			return { block: true, reason };
+		}
+		this.state.lastHandoff = record;
+		this.pushFeedback(`Jev handoff (${handoffLine(record)}). The delegation proceeds.`);
+		this.persist();
+		return undefined;
+	}
+
+	/**
+	 * FR-11 acceptance side (tool_result): when a task tool call settles, consult the judge about
+	 * the result before the lead agent builds on it. `tool_result` cannot refuse a call (the host
+	 * only lets a handler rewrite content/details/isError), so a confident negative is recorded as
+	 * an unresolved blocker and pushed back into the same session. The consult is not awaited: the
+	 * measured judge latency against a resetting endpoint (33s) must not delay the delegated
+	 * result reaching the model.
+	 */
+	onTaskResult(event: unknown, _ctx?: unknown): undefined {
+		if (!this.handoffWired() || !isRecord(event) || event["toolName"] !== "task") return undefined;
+		const toolCallId = typeof event["toolCallId"] === "string" ? event["toolCallId"] : undefined;
+		const order = toolCallId !== undefined ? this.state.pendingHandoffs[toolCallId] : undefined;
+		// Retire the order of the call that settled, consumed by a spawn or not.
+		if (toolCallId !== undefined) delete this.state.pendingHandoffs[toolCallId];
+		const requirement = this.state.taskPrompt;
+		if (requirement === undefined) {
+			this.recordHandoffUncertainty("acceptance", "no user requirement captured for this task yet");
+			return undefined;
+		}
+		const reported = resultText(event);
+		if (reported.length === 0) {
+			this.recordHandoffUncertainty(
+				"acceptance",
+				`the task result carried no report text${event["isError"] === true ? " (the call failed)" : ""}`,
+			);
+			return undefined;
+		}
+		this.handoffAcceptance = this.runHandoffAcceptance(requirement, order?.text, reported).catch(() => {});
+		return undefined;
+	}
+
+	/** Await the in-flight acceptance consult (test seam; the tool_result path never blocks on it). */
+	async handoffAcceptanceSettled(): Promise<void> {
+		await this.handoffAcceptance?.catch(() => {});
+	}
+
+	private async runHandoffAcceptance(requirement: string, workOrder: string | undefined, reported: string): Promise<void> {
+		const evidence: Evidence[] = [handoffEvidence("user", "session task prompt (the requirement)", requirement)];
+		if (workOrder !== undefined) {
+			evidence.push(handoffEvidence("spec", "task tool call input (the work order)", workOrder));
+		}
+		// The delegated agent's own report is self-report, not artifact evidence (FR-16): the source
+		// says so, and a report-only acceptance claim is exactly what the judge may abstain on.
+		evidence.push(
+			handoffEvidence("log", "task tool result (the delegated agent's own report, not artifact-verified)", reported),
+		);
+		const proposal =
+			"Claim under judgment: the returned result satisfies the quoted user requirement and is supported by " +
+			"what the delegated agent reported; nothing the requirement asks for is missing or contradicted.\n\n" +
+			(workOrder !== undefined ? `Work order the agent was given (verbatim):\n${cappedQuote(workOrder).quote}\n\n` : "") +
+			`Result reported by the task agent (verbatim):\n${cappedQuote(reported).quote}`;
+		const { record, negative } = await this.judgeHandoff("acceptance", proposal, evidence);
+		if (negative) {
+			this.blockHandoff(
+				record,
+				`Jev handoff check did not accept the delegated result: ${record.reasons.join(" ")} ` +
+					`(judge revise at confidence ${record.confidence}). ` +
+					"Rework it or re-dispatch before building on it.",
+			);
+			return;
+		}
+		this.state.lastHandoff = record;
+		this.pushFeedback(`Jev handoff (${handoffLine(record)}).`);
+		this.persist();
+	}
+
+	/**
+	 * One handoff consultation. Never throws: a judge error is an unjudged record (it approves
+	 * nothing and blocks nothing). The negative is read from the verdict - the question the client
+	 * fixes for every caller - and is only decisive when the offered option set names the refusal,
+	 * the judge did not reject the frame instead (HANDOFF_FRAME_ESCAPE_REASON) and the confidence
+	 * is a real number at or above the floor and inside 0..1 (normalizeJudgeResult range-checks
+	 * confidence on the approve branch only, so a malformed 1.5 revise must not count).
+	 */
+	private async judgeHandoff(
+		phase: HandoffRecord["phase"],
+		proposal: string,
+		evidence: Evidence[],
+	): Promise<{ record: HandoffRecord; negative: boolean }> {
+		const options = this.template.stages?.["subagent_handoff"]?.options ?? HANDOFF_OPTIONS;
+		const base: HandoffRecord = { phase, judged: false, reasons: [], blocked: false, at: this.now() };
+		let raw: unknown;
+		try {
+			raw = await this.judge({
+				stage: "subagent_handoff",
+				task:
+					phase === "dispatch"
+						? "Validate the work order the lead agent is about to hand to a task agent, before dispatch (FR-11)."
+						: "Validate the result a task agent returned, before the lead agent accepts it and builds on it (FR-11).",
+				proposal,
+				options,
+				evidence,
+			});
+		} catch (err) {
+			return {
+				record: { ...base, reasons: [`judge unavailable: ${err instanceof Error ? err.message : String(err)}`] },
+				negative: false,
+			};
+		}
+		const result = normalizeJudgeResult(raw, options, this.minConfidence);
+		const negative =
+			result.verdict === "revise" &&
+			options.some(o => o.id === HANDOFF_REFUSAL_OPTION) &&
+			!result.reasons.includes(HANDOFF_FRAME_ESCAPE_REASON) &&
+			result.confidence !== undefined &&
+			result.confidence >= this.minConfidence &&
+			result.confidence <= 1;
+		return {
+			record: {
+				...base,
+				judged: true,
+				verdict: result.verdict,
+				confidence: result.confidence,
+				reasons: result.reasons,
+			},
+			negative,
+		};
+	}
+
+	/** Unjudged handoff outcome: recorded in state and surfaced, never a block (owner constraint). */
+	private recordHandoffUncertainty(phase: HandoffRecord["phase"], note: string): void {
+		this.state.lastHandoff = { phase, judged: false, reasons: [note], blocked: false, at: this.now() };
+		this.persist();
+		this.pushFeedback(`Jev handoff (${phase}) not judged: ${note}. The work proceeds.`);
+	}
+
+	/** Confident negative: recorded as an explicit unresolved blocker (same shape as the gate blockers). */
+	private blockHandoff(record: HandoffRecord, reason: string): void {
+		this.state.lastHandoff = { ...record, blocked: true };
+		if (!this.state.blockers.includes(reason)) this.state.blockers.push(reason);
+		this.persist();
+		this.pushFeedback(reason);
+	}
+
 	/** Restore persisted state from session custom entries (session continuity, no cache claims). */
 	onSessionStart(entries: ReadonlyArray<{ customType?: unknown; data?: unknown }>): void {
 		for (let i = entries.length - 1; i >= 0; i--) {
@@ -724,6 +1163,7 @@ export class JevController {
 				routedModel: typeof data["routedModel"] === "string" ? data["routedModel"] : undefined,
 				routedSkill: typeof data["routedSkill"] === "string" ? data["routedSkill"] : undefined,
 				lastCourseCheck: restoreCourseCheck(data["lastCourseCheck"]),
+				lastClaimCheck: restoreClaimCheck(data["lastClaimCheck"]),
 				openAspectGaps: restoreAspectGaps(data["openAspectGaps"]),
 				submissionDigests: restoreDigests(data["submissionDigests"]),
 				taskType: typeof data["taskType"] === "string" ? data["taskType"] : undefined,
@@ -731,6 +1171,10 @@ export class JevController {
 					? (data["selectedTopics"] as unknown[]).filter((t): t is string => typeof t === "string")
 					: undefined,
 				consecutiveCompletionApproves: undefined,
+				taskPrompt: typeof data["taskPrompt"] === "string" ? data["taskPrompt"] : undefined,
+				// Transient by nature: a restart mid-call loses the captured orders, nothing else.
+				pendingHandoffs: {},
+				lastHandoff: restoreHandoffRecord(data["lastHandoff"]),
 			};
 			return;
 		}
@@ -757,6 +1201,11 @@ export class JevController {
 		const taskText = isRecord(raw) && typeof raw["task"] === "string" ? raw["task"] : "";
 		const fp = this.state.taskFingerprint ?? (taskText.length > 0 ? await fingerprint(taskText) : "");
 		const used = this.state.iterations[`${fp}:${stage}`] ?? 0;
+		// A frame escape (the judge rejected the offered option set) must surface the fix the
+		// client attached, not only a verdict: the executor has to change the frame, not re-ask.
+		const frameFix = outcome.reasons.includes(FRAME_ESCAPE_REASON)
+			? outcome.reasons.find(r => r.startsWith(FRAME_FIX_PREFIX))
+			: undefined;
 		let line: string;
 		switch (outcome.verdict) {
 			case "approve":
@@ -769,10 +1218,15 @@ export class JevController {
 				line = `${stage}: ask_user — escalate to the user`;
 				break;
 			default:
-				line =
-					outcome.judged
+				if (frameFix !== undefined) {
+					line =
+						`${stage}: insufficient_evidence — the judge rejected the offered option set; ` +
+						frameFix.slice(FRAME_FIX_PREFIX.length);
+				} else {
+					line = outcome.judged
 						? `${stage}: insufficient_evidence — judge answered insufficient_evidence (confidence ${outcome.confidence ?? "n/a"}) — improve evidence and re-submit`
 						: `${stage}: insufficient_evidence — judge not consulted or answer unusable; fix the request`;
+				}
 		}
 		return { ...outcome, summary: line };
 	}
@@ -832,9 +1286,31 @@ export class JevController {
 		if (planStage && !input.evidence.some(e => e.kind === "user" || e.kind === "spec")) {
 			problems.push("no_requirement_evidence");
 		}
-		if (problems.includes("no_requirement_evidence") || problems.length >= 2) {
+		// Grounding (plan stages): at least one evidence quote of >= GROUNDING_MIN_QUOTE_CHARS
+		// characters must appear verbatim inside the proposal. This is what forces the claim
+		// shape; an ungrounded plan question is answered insufficient_evidence at 0.14-0.26,
+		// which reads as judge failure but is a submission defect - so it is refused here, with
+		// the fix named, before any judge call and before the rework counter moves.
+		if (planStage && !input.evidence.some(e => {
+			const quote = e.quote.trim();
+			return quote.length >= GROUNDING_MIN_QUOTE_CHARS && input.proposal.includes(quote);
+		})) {
+			problems.push(`${GROUNDING_PROBLEM}: ${GROUNDING_FIX}`);
+		}
+		const blockingProblem = problems.some(
+			p => p === "no_requirement_evidence" || p.startsWith(GROUNDING_PROBLEM),
+		);
+		if (blockingProblem || problems.length >= 2) {
 			interrupted();
-			return { verdict: "insufficient_evidence", reasons: problems, judged: false, summary: "" };
+			// The fix travels with the refusal: the executor reads the summary line first.
+			return {
+				verdict: "insufficient_evidence",
+				reasons: problems,
+				judged: false,
+				summary:
+					`${input.stage}: insufficient_evidence — refused before judging (no judge call, ` +
+					`no rework consumed): ${problems.join("; ")}`,
+			};
 		}
 
 		const point = lookupControlPoint(input.stage, this.extraPoints);
@@ -952,6 +1428,32 @@ export class JevController {
 				judged: false,
 				summary: "",
 			};
+		}
+
+		// claim_check preset: N claims, one request, one verdict per claim. Advisory like the
+		// other on_demand presets - it never records a gate approval.
+		if (input.stage === "claim_check") {
+			if (input.claims.length < CLAIM_CHECK_MIN_CLAIMS) {
+				return {
+					verdict: "insufficient_evidence",
+					reasons: [
+						`claim_check needs at least ${CLAIM_CHECK_MIN_CLAIMS} claims: pass the claim texts in ` +
+							"`claims` (each is judged separately against the quoted evidence)",
+					],
+					judged: false,
+					summary: "",
+				};
+			}
+			if (this.claimCheckJudge === undefined) {
+				// No wired judge: keep the pre-check result as a typed correction, fail-closed.
+				return {
+					verdict: "insufficient_evidence",
+					reasons: ["claim_check judge not configured in this session"],
+					judged: false,
+					summary: "",
+				};
+			}
+			return this.submitClaimCheck(input, boundKey, used);
 		}
 
 		let rawResult: DecisionResult;
@@ -1400,6 +1902,95 @@ export class JevController {
 		};
 	}
 
+	/**
+	 * claim_check preset: one request, one Noul per claim, claim ids answered exactly. The
+	 * per-claim verdicts land in the summary and in state (bound to task+work revision) and
+	 * never record a gate approval. Fail-closed: an unjudged, unmarkable or unknown answer is
+	 * insufficient_evidence naming the claim, keeps no marking and consumes the bounded budget,
+	 * so a broken consultation cannot loop. Every claim supported consumes nothing (nothing was
+	 * sent back); an unsupported claim is a revise with the claims named.
+	 */
+	private async submitClaimCheck(
+		input: ValidatedDecisionInput,
+		boundKey: string,
+		used: number,
+	): Promise<DecisionOutcome> {
+		const claims = input.claims.map((text, i) => ({ id: `claim-${i + 1}`, text }));
+		const consume = (): void => {
+			this.state.iterations[boundKey] = used + 1;
+			this.persist();
+		};
+		const failClosed = (detail: string): DecisionOutcome => {
+			consume();
+			return {
+				verdict: "insufficient_evidence",
+				reasons: [`claim_check: ${detail}`, `fix: ${CLAIM_CHECK_FIX}`],
+				judged: false,
+				summary: "",
+			};
+		};
+		let raw: ClaimCheckResult;
+		try {
+			raw = await this.claimCheckJudge!({
+				stage: "claim_check",
+				task: input.task,
+				claims,
+				evidence: input.evidence,
+			});
+		} catch (err) {
+			return failClosed(`judge unavailable: ${err instanceof Error ? err.message : String(err)}`);
+		}
+		if (!isRecord(raw) || raw["judged"] !== true || !isRecord(raw["supported"])) {
+			return failClosed("judge returned an unjudged or malformed result; no claim marking kept");
+		}
+		const marked = raw["supported"] as Record<string, unknown>;
+		const unmarkable = claims.filter(c => typeof marked[c.id] !== "boolean");
+		if (unmarkable.length > 0) {
+			return failClosed(
+				`the judge could not mark ${unmarkable.map(c => `${c.id} (${claimExcerpt(c.text)})`).join(", ")}; ` +
+					"an unmarkable claim is insufficient_evidence, not a verdict",
+			);
+		}
+		const expectedIds = claims.map(c => c.id).sort();
+		const actualIds = Object.keys(marked).sort();
+		if (expectedIds.length !== actualIds.length || expectedIds.some((id, i) => id !== actualIds[i])) {
+			return failClosed(
+				`marked claim ids must be exactly the submitted claims (${expectedIds.join(", ")}); ` +
+					`got ${actualIds.join(", ")}`,
+			);
+		}
+		const results: ClaimCheckMarking[] = claims.map(c => ({
+			id: c.id,
+			text: c.text,
+			supported: marked[c.id] === true,
+		}));
+		this.state.lastClaimCheck = {
+			claims: results,
+			at: this.now(),
+			taskFingerprint: this.state.taskFingerprint,
+			workRevision: this.state.workRevision,
+		};
+		const unsupported = results.filter(r => !r.supported);
+		if (unsupported.length === 0) {
+			this.persist();
+			return {
+				verdict: "approve",
+				reasons: [`claim_check: every claim supported by the quoted evidence (${results.length})`],
+				judged: true,
+				summary: `claim_check: ${results.length}/${results.length} supported`,
+			};
+		}
+		consume();
+		const named = unsupported.map(r => `${r.id} (${claimExcerpt(r.text)})`).join(", ");
+		this.pushFeedback(`Jev claim_check: claim(s) not supported by the quoted evidence — ${named}`);
+		return {
+			verdict: "revise",
+			reasons: [`claim_check: not supported by the quoted evidence: ${named}`],
+			judged: true,
+			summary: `claim_check: ${results.length - unsupported.length}/${results.length} supported — not supported: ${named}`,
+		};
+	}
+
 	/** aspect_coverage three-way marking: missed aspects -> revise; else recorded, no approval. */
 	private async submitAspectCoverage(
 		input: ValidatedDecisionInput,
@@ -1692,6 +2283,27 @@ function restoreCourseCheck(raw: unknown): JevState["lastCourseCheck"] {
 	};
 }
 
+/** Validate a persisted claim-check marking: malformed entries are dropped, never trusted. */
+function restoreClaimCheck(raw: unknown): JevState["lastClaimCheck"] {
+	if (!isRecord(raw) || !Array.isArray(raw["claims"])) return undefined;
+	if (typeof raw["at"] !== "number" || !Number.isFinite(raw["at"])) return undefined;
+	if (typeof raw["workRevision"] !== "number" || !Number.isFinite(raw["workRevision"])) return undefined;
+	const claims: ClaimCheckMarking[] = [];
+	for (const c of raw["claims"]) {
+		if (!isRecord(c) || !nonEmptyString(c["id"]) || typeof c["text"] !== "string" || typeof c["supported"] !== "boolean") {
+			return undefined;
+		}
+		claims.push({ id: c["id"], text: c["text"], supported: c["supported"] });
+	}
+	if (claims.length === 0) return undefined;
+	return {
+		claims,
+		at: raw["at"],
+		taskFingerprint: typeof raw["taskFingerprint"] === "string" ? raw["taskFingerprint"] : undefined,
+		workRevision: raw["workRevision"],
+	};
+}
+
 function extraPointsFromTemplate(template: JevTemplateConfig): ReadonlyMap<string, ControlPoint> {
 	const out = new Map<string, ControlPoint>();
 	const declared = template.controlPoints;
@@ -1704,6 +2316,84 @@ function extraPointsFromTemplate(template: JevTemplateConfig): ReadonlyMap<strin
 		}
 	}
 	return out;
+}
+
+/** Validate a persisted handoff record: malformed entries are dropped, never trusted. */
+function restoreHandoffRecord(raw: unknown): HandoffRecord | undefined {
+	if (!isRecord(raw)) return undefined;
+	if (raw["phase"] !== "dispatch" && raw["phase"] !== "acceptance") return undefined;
+	if (typeof raw["judged"] !== "boolean" || typeof raw["blocked"] !== "boolean") return undefined;
+	if (typeof raw["at"] !== "number" || !Number.isFinite(raw["at"])) return undefined;
+	const verdict = raw["verdict"];
+	if (verdict !== undefined && (typeof verdict !== "string" || !VERDICTS.has(verdict))) return undefined;
+	return {
+		phase: raw["phase"],
+		verdict: verdict as DecisionVerdict | undefined,
+		judged: raw["judged"],
+		confidence: typeof raw["confidence"] === "number" ? raw["confidence"] : undefined,
+		reasons: Array.isArray(raw["reasons"]) ? raw["reasons"].filter((r): r is string => typeof r === "string") : [],
+		blocked: raw["blocked"],
+		at: raw["at"],
+	};
+}
+
+/**
+ * Work-order text of a `task` tool call, verbatim: the flat `task`, the batch `tasks[].task`
+ * items and the shared `context` (omp 18.6.3 task/agent contract).
+ */
+function taskWorkOrder(raw: unknown): string | undefined {
+	if (!isRecord(raw)) return undefined;
+	const parts: string[] = [];
+	if (nonEmptyString(raw["task"])) parts.push(raw["task"].trim());
+	const batch = raw["tasks"];
+	if (Array.isArray(batch)) {
+		for (const item of batch) {
+			if (isRecord(item) && nonEmptyString(item["task"])) parts.push(item["task"].trim());
+		}
+	}
+	if (nonEmptyString(raw["context"])) parts.push(raw["context"].trim());
+	return parts.length > 0 ? parts.join("\n\n") : undefined;
+}
+
+/** Text blocks of a tool result event, in order (image and other blocks carry no judging material). */
+function resultText(event: Record<string, unknown>): string {
+	const content = event["content"];
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((b): b is Record<string, unknown> => isRecord(b) && b["type"] === "text" && nonEmptyString(b["text"]))
+		.map(b => (b["text"] as string).trim())
+		.filter(text => text.length > 0)
+		.join("\n");
+}
+
+/** Verbatim prefix of a quote, capped for cost; `truncated` lets the source string report the cut. */
+function cappedQuote(text: string): { quote: string; truncated: boolean } {
+	const trimmed = text.trim();
+	return { quote: trimmed.slice(0, HANDOFF_QUOTE_CAP), truncated: trimmed.length > HANDOFF_QUOTE_CAP };
+}
+
+/** Judge evidence item for a handoff consultation: the quote stays verbatim even when capped. */
+function handoffEvidence(kind: Evidence["kind"], source: string, text: string): Evidence {
+	const { quote, truncated } = cappedQuote(text);
+	return {
+		kind,
+		source: truncated ? `${source} (verbatim prefix, truncated at ${HANDOFF_QUOTE_CAP} characters)` : source,
+		quote,
+	};
+}
+
+/** Claim text in a fixed-template line: the caller's own words, whitespace-joined and capped. */
+function claimExcerpt(text: string): string {
+	const flat = text.trim().replace(/\s+/g, " ");
+	return flat.length > CLAIM_EXCERPT_CHARS ? `${flat.slice(0, CLAIM_EXCERPT_CHARS)}…` : flat;
+}
+
+/** One-line fixed-template summary of a handoff record (no generated prose). */
+function handoffLine(record: HandoffRecord): string {
+	const verdict = record.judged ? (record.verdict ?? "unusable answer") : "not judged";
+	const confidence = record.confidence !== undefined ? `, confidence ${record.confidence}` : "";
+	const reasons = record.reasons.length > 0 ? ` - ${record.reasons.join(" ")}` : "";
+	return `${record.phase}: ${verdict}${confidence}${reasons}`;
 }
 
 function hostModelIds(ctxOrList: unknown): string[] {

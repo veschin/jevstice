@@ -108,3 +108,61 @@
 - Live check against the real endpoint: the routing path runs end to end, the judge abstained on a
   one-line evidence set (0.33 skill, 0.67 model) and nothing was applied - the honest outcome.
 - 249/249 tests, `tsc --noEmit` clean.
+
+## 0.5.0 - 2026-10-07
+
+- Consultation forcing (owner order: "чем лучше продукт форсит условия, тем лучше будет результат"),
+  implementing the measured regimes recorded in `evidence/consultation-forcing.md`:
+  - Plan stages (`understanding_review` / `direction_review`) gained a pre-judge grounding check: a
+    proposal that does not quote one submitted evidence item (>= 20 characters) verbatim is refused
+    BEFORE any judge call, consuming no rework, and the refusal names the fix. Rationale: an
+    ungrounded plan question is answered insufficient_evidence at 0.14-0.26 and reads as judge
+    failure, while the same material phrased as a claim reaches 0.79-0.96. It composes with the
+    existing requirement-evidence and duplicate/short-quote checks without duplicating their
+    messages, and a pre-check refusal now carries a summary line naming its problems instead of a
+    bare verdict.
+  - `claim_check`: new `on_demand` preset for the measured strongest regime - 2..N claims judged in
+    ONE request, one Noul per claim, one verdict per claim. A dedicated judge keeps that per-claim
+    question form with claim-support wording; the existing multi-label path is not reused because
+    its question asks whether an item applies to the task, which is a different question (a live
+    direction_review consultation approved the dedicated-Noul design, 0.85). Per-claim results land
+    in the submission summary and in session state (`lastClaimCheck`, restored across restarts);
+    unsupported claims come back as `revise` naming them; an unmarkable claim fails closed as
+    `insufficient_evidence` naming that claim; never gate-granting. Fewer than two claims is
+    refused before any judge call.
+  - The registered tool description now states the consultation protocol: one decision per request;
+    a claim checked against quoted evidence; 3-6 short non-duplicate quotes with at least one
+    requirement quote on plan stages; 2-4 alternatives whose meanings state what choosing them
+    commits to; the product's own pre-check refuses an ungrounded proposal before any judge call;
+    and an abstention is not a verdict.
+  - Escape options carry the fix: `ALL_OPTIONS_WRONG` / `PARTIALLY_RIGHT_NONE_FULL` /
+    `NO_FIT_OTHER_REASON` reasons now name what to change (replace or restate the options, reframe
+    the claim), and the summary line of an `insufficient_evidence` frame escape carries it too.
+- README documents the protocol and the new preset; the grounding rule is part of the plan-gate
+  bullet.
+
+FR-11 sub-agent hand-off gate (Jev sits in the lead-agent -> task-agent delegation path):
+  - New `subagent_handoff` control point (`on_demand`, `verdictMapping: standard`) and the two
+    boundary checks behind it: dispatch (work order judged against the requirement captured at task
+    start) and acceptance (returned result judged against the same requirement plus the work order).
+    Wired only when the config declares `stages.subagent_handoff` - the policy is unconfirmed
+    (PRD GAP:3) and POLICY-DRAFT lists spawn judging as a post-approval item, so an unwired config
+    behaves exactly as before.
+  - Blocking is deliberately narrow: only a judged `revise` at or above the confidence floor, with
+    the offered option set naming the refusal and no frame-escape marker, refuses a spawn. An
+    abstention, judge error, low confidence, missing requirement, frame escape, unattributable work
+    order or an answer past the 25s internal deadline records the uncertainty and lets the spawn
+    through (host handler timeout is 30s and drops a late result, so a late negative must never be
+    recorded as a refusal that applied). A live consultation put the judge's own choice at
+    explicit-negative-only 0.92; the claim itself was not approved (0.45), which is why the gate
+    stays opt-in.
+  - Acceptance rides `tool_result` (the only hook that observes a task result, and one that cannot
+    refuse a call): a confident negative becomes an unresolved blocker plus same-session feedback,
+    and the consult is not awaited so judge latency cannot delay the result reaching the model.
+  - Work orders are captured from the `task` tool call keyed by toolCallId, consumed one per spawn,
+    retired when the call settles, cleared when the task changes and aged out after 2 minutes -
+    a call refused before execution (block/preflight/deny) never emits `tool_result` and must not
+    disarm the check. Attribution stays conservative: with several calls in flight the spawn event
+    carries no toolCallId, so the spawn is not judged at all.
+  - `bun test` 283/283 (12 of them this slice), `tsc --noEmit` clean, no API key in logs.
+- Release totals: 283/283 tests (+22 consultation forcing, +12 FR-11 hand-off), `tsc --noEmit` clean.
