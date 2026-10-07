@@ -13,8 +13,8 @@
 import { createJevController, type ControllerDeps, type JevController, type PiApi } from "./controller.js";
 import { JevConfigError, loadJevTemplateConfig, type JevTemplateConfig } from "./config.js";
 import { isRecord } from "./guards.js";
-import { createAspectCoverageJudge, createCourseCheckJudge, createJudge } from "./client.js";
-import { loadTopicCatalog } from "./catalog.js";
+import { createAspectCoverageJudge, createCourseCheckJudge, createJudge, createMultiLabelJudge } from "./client.js";
+import { loadTopicCatalog, type CatalogTopic } from "./catalog.js";
 import { memoizedKeyResolver } from "./apikey.js";
 import { POLICY, type Judge } from "./types.js";
 
@@ -108,8 +108,10 @@ export function createJevExtension(deps: Partial<ControllerDeps> = {}) {
 		// Catalog labels inform the judge; mentioning a label never proves preservation.
 		let catalogIds: ReadonlySet<string> = new Set();
 		let aspectTexts: ReadonlyMap<string, string> = new Map();
+		let catalogTopics: CatalogTopic[] | undefined;
 		try {
 			const catalog = loadTopicCatalog();
+			catalogTopics = catalog;
 			catalogIds = new Set(catalog.map(t => t.id));
 			aspectTexts = new Map(catalog.map(t => [t.id, t.label]));
 		} catch {
@@ -134,6 +136,11 @@ export function createJevExtension(deps: Partial<ControllerDeps> = {}) {
 				(deps.judge === undefined ? async req => createCourseCheckJudge(await withKey())(req) : undefined),
 			aspectCoverageJudge,
 			catalogIds,
+			// FR-01/FR-04: automatic task-start checks; advisory, they never block.
+			catalog: catalogTopics,
+			multiLabelJudge:
+				deps.multiLabelJudge ??
+				(deps.judge === undefined ? async req => createMultiLabelJudge(await withKey())(req) : undefined),
 			template,
 			templateError,
 		});

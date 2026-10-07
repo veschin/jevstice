@@ -21,6 +21,7 @@ import {
 	lookupControlPoint,
 	validateDeclaredControlPoint,
 } from "./control-points.js";
+import { classifyTaskType, selectTopics, type CatalogTopic } from "./catalog.js";
 import { STAGES } from "./stages.js";
 import {
 	POLICY,
@@ -29,6 +30,7 @@ import {
 	type AspectCoverageResult,
 	type CourseCheckJudge,
 	type CourseCheckResult,
+	type MultiLabelJudge,
 } from "./types.js";
 import {
 	type DecisionResult,
@@ -80,6 +82,10 @@ export interface JevState {
 	 * many cheap iterations; three honest answers must not close a stage forever).
 	 */
 	submissionDigests: Record<string, string>;
+	/** FR-01 record: task type the judge assigned at task start (undefined = not established). */
+	taskType: string | undefined;
+	/** FR-04 record: catalog topic ids the judge marked applicable at task start. */
+	selectedTopics: string[] | undefined;
 }
 
 function freshState(): JevState {
@@ -95,6 +101,8 @@ function freshState(): JevState {
 		openAspectGaps: undefined,
 		consecutiveCompletionApproves: undefined,
 		submissionDigests: {},
+		taskType: undefined,
+		selectedTopics: undefined,
 	};
 }
 
@@ -336,6 +344,9 @@ export interface ControllerDeps {
 	aspectCoverageJudge?: AspectCoverageJudge;
 	/** Valid catalog topic ids for the aspects[] pre-check (built in index from the catalog). */
 	catalogIds?: ReadonlySet<string>;
+	/** FR-01/FR-04 wiring: the catalog and the marking judge for the automatic task-start checks. */
+	catalog?: CatalogTopic[];
+	multiLabelJudge?: MultiLabelJudge;
 }
 
 /** Minimal structural surface of the omp ExtensionAPI the controller needs. */
@@ -364,6 +375,10 @@ export class JevController {
 	private readonly courseCheckJudge: CourseCheckJudge | undefined;
 	private readonly aspectCoverageJudge: AspectCoverageJudge | undefined;
 	private readonly catalogIds: ReadonlySet<string>;
+	private readonly catalog: CatalogTopic[] | undefined;
+	private readonly multiLabelJudge: MultiLabelJudge | undefined;
+	/** In-flight advisory catalog checks; never awaited by the task path. */
+	private catalogChecks: Promise<void> | undefined;
 	private template: JevTemplateConfig;
 	private templateError: string | undefined;
 	/** Config-declared on_demand control points (controlPoints key). */
@@ -379,6 +394,8 @@ export class JevController {
 		this.courseCheckJudge = deps.courseCheckJudge;
 		this.aspectCoverageJudge = deps.aspectCoverageJudge;
 		this.catalogIds = deps.catalogIds ?? new Set();
+		this.catalog = deps.catalog;
+		this.multiLabelJudge = deps.multiLabelJudge;
 		this.maxReworkIterations = deps.maxReworkIterations ?? POLICY.maxReworkIterations;
 		// R1: a confidenceThreshold override may only RAISE the bar above POLICY.
 		this.minConfidence = Math.max(
@@ -554,7 +571,58 @@ export class JevController {
 		if (fp !== this.state.taskFingerprint) {
 			this.state.taskFingerprint = fp;
 			this.persist();
+			// Advisory and non-blocking: a task must not wait on judge latency. Measured live:
+			// the checks took 33s against a resetting endpoint, which no task start should pay.
+			this.catalogChecks = this.runCatalogChecks(event["prompt"]);
+			void this.catalogChecks.catch(() => {});
 		}
+	}
+
+	/** Await the in-flight advisory catalog checks (test seam; the task path never blocks on them). */
+	async catalogChecksSettled(): Promise<void> {
+		await this.catalogChecks?.catch(() => {});
+	}
+
+	/**
+	 * Catalog checks at task start (FR-01, FR-04): the system classifies the task and marks
+	 * the applicable plan topics through the judge. Advisory by design - an abstention, a
+	 * judge failure or an unwired dependency records uncertainty and never blocks; the owner's
+	 * measured constraint is that a check which blocks on abstention becomes a permanent block.
+	 */
+	private async runCatalogChecks(task: string): Promise<void> {
+		if (this.catalog === undefined || this.catalog.length === 0) return;
+		const evidence: Evidence[] = [{ kind: "user", source: "task prompt", quote: task }];
+		const notes: string[] = [];
+		try {
+			const classified = await classifyTaskType(task, evidence, this.judge);
+			this.state.taskType =
+				classified.verdict === "approve" && classified.selectedOption !== undefined
+					? classified.selectedOption
+					: undefined;
+			if (this.state.taskType === undefined) notes.push(`task type not established (${classified.reasons.join(", ")})`);
+		} catch (err) {
+			this.state.taskType = undefined;
+			notes.push(`task type unavailable: ${err instanceof Error ? err.message : String(err)}`);
+		}
+		if (this.multiLabelJudge !== undefined) {
+			try {
+				const selection = await selectTopics({ task, evidence, catalog: this.catalog, judge: this.multiLabelJudge });
+				this.state.selectedTopics = selection.selected.map(t => t.id);
+				if (selection.outcome !== "selected") notes.push(`topics not established (${selection.outcome})`);
+			} catch (err) {
+				this.state.selectedTopics = undefined;
+				notes.push(`topics unavailable: ${err instanceof Error ? err.message : String(err)}`);
+			}
+		}
+		this.persist();
+		const parts = [
+			this.state.taskType !== undefined ? `task type ${this.state.taskType}` : undefined,
+			this.state.selectedTopics !== undefined && this.state.selectedTopics.length > 0
+				? `applicable topics ${this.state.selectedTopics.join(", ")}`
+				: undefined,
+			...notes,
+		].filter((s): s is string => s !== undefined);
+		if (parts.length > 0) this.pushFeedback(`Jev catalog: ${parts.join("; ")}`);
 	}
 
 	async onSessionStop(event: unknown): Promise<StopGateResult | undefined> {
@@ -658,6 +726,10 @@ export class JevController {
 				lastCourseCheck: restoreCourseCheck(data["lastCourseCheck"]),
 				openAspectGaps: restoreAspectGaps(data["openAspectGaps"]),
 				submissionDigests: restoreDigests(data["submissionDigests"]),
+				taskType: typeof data["taskType"] === "string" ? data["taskType"] : undefined,
+				selectedTopics: Array.isArray(data["selectedTopics"])
+					? (data["selectedTopics"] as unknown[]).filter((t): t is string => typeof t === "string")
+					: undefined,
 				consecutiveCompletionApproves: undefined,
 			};
 			return;

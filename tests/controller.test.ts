@@ -1605,3 +1605,62 @@ describe("jev controller: gates.completion switch", () => {
 		expect(String(res.reason)).toContain("course_check");
 	});
 });
+
+describe("jev controller: catalog checks at task start (FR-01, FR-04)", () => {
+	const catalog = [
+		{ id: "backend", label: "backend / API", excellence: ["handles failure modes"], pitfalls: ["no timeouts"], source: "test" },
+		{ id: "ui", label: "ui", excellence: ["empty states"], pitfalls: ["no loading state"], source: "test" },
+	];
+
+	test("the judge's task type and applicable topics are recorded and surfaced", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({
+			judge: async () => judgeResult({ selectedOption: "development" }),
+			catalog,
+			multiLabelJudge: async () => ({ verdict: "approve", applicable: { backend: true, ui: false }, reasons: [] }),
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "build the orders API", systemPrompt: [] });
+		await controller.catalogChecksSettled();
+		expect(controller.getState().taskType).toBe("development");
+		expect(controller.getState().selectedTopics).toEqual(["backend"]);
+		const feedback = harness.sentMessages.map(m => String((m.payload as { content?: unknown }).content)).join(" | ");
+		expect(feedback).toContain("task type development");
+		expect(feedback).toContain("applicable topics backend");
+	});
+
+	test("abstention and a failing marking judge record uncertainty without blocking the task", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({
+			judge: async () => ({ verdict: "insufficient_evidence", reasons: ["low_confidence"], confidence: 0.2 }),
+			catalog,
+			multiLabelJudge: async () => {
+				throw new Error("endpoint down");
+			},
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "build the orders API", systemPrompt: [] });
+		await controller.catalogChecksSettled();
+		expect(controller.getState().taskType).toBeUndefined();
+		expect(controller.getState().selectedTopics).toBeUndefined();
+		expect(controller.getState().taskFingerprint).toBeDefined();
+		const feedback = harness.sentMessages.map(m => String((m.payload as { content?: unknown }).content)).join(" | ");
+		expect(feedback).toContain("not established");
+		expect(feedback).toContain("topics unavailable");
+	});
+
+	test("no wired catalog means no consultation at task start", async () => {
+		const harness = makeFakePi();
+		let called = 0;
+		const controller = createJevController({
+			judge: async () => {
+				called++;
+				return judgeResult({});
+			},
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "task", systemPrompt: [] });
+		expect(called).toBe(0);
+		expect(controller.getState().taskType).toBeUndefined();
+	});
+});

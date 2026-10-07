@@ -78,3 +78,19 @@
   ("do not continue rework"), which deadlocked the owner, while PRD 1.1 asks for many cheap
   iterations. Identical repeats are still refused, so the anti-loop property is unchanged.
 - 238/238 tests, `tsc --noEmit` clean.
+
+## 0.4.0 - 2026-10-07
+
+- FR-01 and FR-04 wired into the runtime: at the start of a new task the extension classifies the
+  task and marks the applicable plan topics through the judge over the bundled catalog, records both
+  in session state and delivers them as same-session feedback. Advisory and non-blocking - the task
+  starts immediately (measured 0 ms) and the checks land in the background; an abstention, a judge
+  failure or an unwired catalog records uncertainty instead of stopping the work.
+- Live proof (real endpoint, fake host): `Jev catalog: task type development; applicable topics
+  algorithm, architecture, backend, data, general, infrastructure, research, security` for a REST
+  API task - obtained 0 ms after the task start.
+- The wiring follows the judge's own parallel verdict per requirement: the requirements establish
+  that the checks run automatically, and do NOT establish that candidate lists are discovered from
+  the environment. FR-02/FR-03 (skill and model routing) therefore wait for an owner-held candidate
+  list in the config.
+- 242/242 tests, `tsc --noEmit` clean.

@@ -29,6 +29,14 @@ TYPESAFE_API_KEY="$(pass show token/jev)" bun ~/.omp/agent/extensions/jevstice/s
 All submissions to the judge are written in English: the executor's own text (task, proposal,
 option labels and meanings) is English, while quoted evidence keeps its source wording verbatim.
 
+## Catalog checks
+
+At the start of a new task the extension classifies it (development / analytics / query) and marks
+the applicable plan topics through the judge against the bundled catalog. Both results are recorded
+in session state and delivered as same-session feedback. The checks are advisory and non-blocking:
+the task starts immediately, and an abstention, a judge failure or an unwired catalog records
+uncertainty instead of stopping the work.
+
 ## Gates
 
 - **plan** (`understanding_review` / `direction_review`): file mutations blocked until the
