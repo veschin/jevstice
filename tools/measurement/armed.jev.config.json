@@ -1,0 +1,71 @@
+{
+  "gates": {
+    "mutation": true,
+    "completion": true,
+    "handoffAcceptance": true
+  },
+  "routing": {
+    "skills": [
+      {
+        "id": "systematic-debugging",
+        "label": "systematic-debugging",
+        "meaning": "find the cause of a failure by hypothesis and evidence before proposing any fix"
+      },
+      {
+        "id": "test-driven-development",
+        "label": "test-driven-development",
+        "meaning": "write the failing test first, then the smallest change that makes it pass"
+      },
+      {
+        "id": "doc-standards",
+        "label": "doc-standards",
+        "meaning": "write a document in its recognised standard format instead of an invented structure"
+      },
+      {
+        "id": "ready-first",
+        "label": "ready-first",
+        "meaning": "search for a ready solution before writing new code or adding a dependency"
+      },
+      {
+        "id": "architect-partner",
+        "label": "architect-partner",
+        "meaning": "design or research a subsystem with every decision locked and quote-anchored"
+      },
+      {
+        "id": "harden-plan",
+        "label": "harden-plan",
+        "meaning": "harden a plan against a curated requirement and pitfall checklist"
+      },
+      {
+        "id": "web-research-protocol",
+        "label": "web-research-protocol",
+        "meaning": "answer a decision-critical question from primary sources with citations"
+      },
+      {
+        "id": "integrity-auditor",
+        "label": "integrity-auditor",
+        "meaning": "audit a paper or report for image, numerical and logic integrity problems"
+      }
+    ],
+    "models": [
+      {
+        "id": "deepseek/deepseek-flash",
+        "label": "deepseek-flash",
+        "meaning": "cheap and fast working model; suits mechanical edits, searches, test runs and routine code, but it tends to do extra or wrong work on open tasks"
+      },
+      {
+        "id": "zai/glm-5.3-flash",
+        "label": "glm-5.3-flash",
+        "meaning": "middle ground: stronger reasoning than deepseek-flash at a modest latency cost"
+      },
+      {
+        "id": "zai/glm-5.3",
+        "label": "glm-5.3",
+        "meaning": "strongest reasoning available to this owner and the slowest; reserve it for design, hard debugging and review"
+      }
+    ]
+  },
+  "courseCheck": {
+    "everyMutations": 1
+  }
+}

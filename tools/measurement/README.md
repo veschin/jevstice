@@ -18,6 +18,10 @@ bun run tools/measurement/run.ts --set core
 # drift set: 3 six-requirement tasks, per-requirement machine verdicts (the second measurement)
 bun run tools/measurement/run.ts --set drift
 
+# three arms on one long task, the third with the gates armed by a project config
+bun run tools/measurement/run.ts --set refactor --only duration --arms control,addon,armed \
+  --config armed=tools/measurement/armed.jev.config.json --repeats 5 --seed 20261008
+
 # hard set: the failure-search task (12 requirements that live in a shipped SPEC.md)
 bun run tools/measurement/run.ts --set hard --only ledger
 
@@ -93,6 +97,32 @@ or the token usage. Every request and response is written verbatim to
 `evidence/measurement-<date>/raw/judge-<task>.{request,response}.json` and reproduced in the log.
 Transport failures (the endpoint resets sockets intermittently) are retried with backoff and
 recorded verbatim as observations.
+
+**Arms.** `--arms a,b,c` selects which arms run (default `control,addon`). `control` loads no
+extension; `addon` and `armed` both load `-e src/index.ts`, and `armed` additionally gets a per-arm
+config:
+
+- `--config <arm>=<path>` copies that JSON into the run's own scratch directory as
+  `.omp/jev.config.json`. The extension's loader merges a project config over the owner's
+  `~/.omp/agent/jev.config.json` **key by key**, so the override can flip individual switches
+  (gates, `courseCheck`) while everything else still comes from the owner's real config. The exact
+  JSON and its sha256 are printed in the log, once per arm in the header and in every run's capture.
+- `tools/measurement/armed.jev.config.json` is the armed configuration used in the "armed" runs: the
+  owner's file with only `gates.mutation: true`, `gates.completion: true`,
+  `gates.handoffAcceptance: true` and `courseCheck.everyMutations: 1` added, so the plan gate, the
+  completion gate, the acceptance side and a course check after every allowed mutation are all on.
+- The judge compares **every pair** of selected arms, each pair blind and with its own randomisation
+  from the recorded seed.
+
+**Requirement-level accounting.** With the proxy's payload dump on
+(`JEV_PROXY_DUMP_DIR`, set automatically per run), each consultation's request body is available, and
+the harness classifies it: a consultation is *requirement level* when its payload judges the task's
+requirements rather than only classifying or routing it — either structurally (the state carries a
+non-empty `requirements` array whose items quote binding statements) or textually (it names a
+requirement item `req-N`/`crit-N`/`quote-N`, a ticket section `SPEC.md §4`, or one of the task's
+declared requirement ids). The per-run line, the per-arm roll-up and the matching excerpts are in
+the log's "Observations" section, so "did the extension ever look at a requirement?" is answered
+from payload evidence rather than from a hope.
 
 **Judge-traffic accounting.** The addon's own judge consultations are HTTP calls made from inside
 the extension, so the host's event stream cannot show them. The extension (like the CLI) honours

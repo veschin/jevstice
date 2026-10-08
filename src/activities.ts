@@ -404,7 +404,7 @@ export const ACTIVITY_REGISTRY: Readonly<Record<string, Activity>> = {
 			{
 				stage: "course_check",
 				wiring: ["stage", "controller"],
-				consultedBy: "periodic consult after every N allowed mutations (controller.ts onToolCall -> runAutomaticCourseCheck)",
+				consultedBy: "periodic consult on the matching successful mutating tool_result (controller.ts onTaskResult -> runAutomaticCourseCheck)",
 				outcomeEdges: [
 					{ verdict: "approve", option: "continue", outcome: "continue" },
 					{ verdict: "approve", option: "verify_before_proceeding", outcome: "verify_before_proceeding" },

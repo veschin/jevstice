@@ -2182,7 +2182,7 @@ verify("R7", () => {
 verify("R8", () => {
   const frozenOk = readFileSync("test/report.test.ts", "utf8") === ${JSON.stringify(DURATION_REPORT_TEST_SRC)} && readFileSync("SPEC.md", "utf8") === ${JSON.stringify(DURATION_SPEC)};
   const testRun = Bun.spawnSync(["bun", "test"], { stdout: "pipe", stderr: "pipe" });
-  const allowed = ["package.json", "SPEC.md", "src/duration.ts", "src/window.ts", "src/report.ts", "test/report.test.ts", ".measure-check-duration.ts"];
+  const allowed = ["package.json", "SPEC.md", "src/duration.ts", "src/window.ts", "src/report.ts", "test/report.test.ts", ".measure-check-duration.ts", ".omp/jev.config.json"];
   const walk = (dir: string): string[] => {
     const out: string[] = [];
     for (const entry of readdirSync(dir, { withFileTypes: true })) {

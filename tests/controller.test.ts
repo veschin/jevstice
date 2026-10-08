@@ -592,6 +592,36 @@ describe("jev controller", () => {
 		expect(stopResult(await runStop(harness))?.decision).toBeUndefined();
 	});
 
+	test("plan gate allows the judge and agent messages but blocks file writes", async () => {
+		const harness = makeFakePi();
+		const controller = createJevController({ judge: gateJudge() });
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "build it", systemPrompt: [] });
+		const allowed = blockResult(await harness.emit("tool_call", {
+			type: "tool_call",
+			toolCallId: "judge",
+			toolName: "write",
+			input: { path: "xd://jev_decision", content: "{}" },
+		}));
+		expect(allowed.block).toBeUndefined();
+		const message = blockResult(await harness.emit("tool_call", {
+			type: "tool_call",
+			toolCallId: "peer-message",
+			toolName: "write",
+			input: { path: "agent://JudgeDeviceGateFix", content: "blocked by the gate" },
+		}));
+		expect(message.block).toBeUndefined();
+		for (const path of ["work.txt", "xd://other_tool", "xd://jev_decision/extra"]) {
+			const result = blockResult(await harness.emit("tool_call", {
+				type: "tool_call",
+				toolCallId: `blocked-${path}`,
+				toolName: "write",
+				input: { path, content: "x" },
+			}));
+			expect(result.block).toBe(true);
+		}
+	});
+
 
 	function courseInput(overrides: Record<string, unknown> = {}) {
 		return {
@@ -2994,6 +3024,175 @@ describe("jev controller: activities framework", () => {
 		expect(outcome.reasons.join(" ")).toContain("req-1, req-2");
 	});
 
+	test("automatic course check judges a completed mutation with its result, not an attempted call", async () => {
+		const harness = makeFakePi();
+		const requests: CourseCheckRequest[] = [];
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			courseCheckJudge: async request => {
+				requests.push(request);
+				return {
+					onTrack: { task: false },
+					nextAction: "return_to_requirement",
+					reasons: ["observed output contradicts the task"],
+					confidence: 0.9,
+					judged: true,
+				};
+			},
+			template: { gates: { mutation: false }, courseCheck: { everyMutations: 1 } },
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", {
+			type: "before_agent_start",
+			prompt: "Preserve the existing output format when changing the formatter.",
+		});
+		await harness.emit("tool_call", { type: "tool_call", toolCallId: "mutation-1", toolName: "bash", input: {} });
+		await controller.automaticCourseChecksSettled();
+		expect(requests).toHaveLength(0);
+		await harness.emit("tool_result", {
+			type: "tool_result",
+			toolCallId: "mutation-1",
+			toolName: "bash",
+			content: [{ type: "text", text: "Expected: 1s; received: bad maxUnits: undefined" }],
+			isError: false,
+		});
+		await controller.automaticCourseChecksSettled();
+		expect(requests).toHaveLength(1);
+		expect(requests[0]?.evidence.some(item => item.quote.includes("bad maxUnits: undefined"))).toBe(true);
+		expect(harness.sentMessages.some(message => JSON.stringify(message.payload).includes("return_to_requirement"))).toBe(true);
+	});
+
+	test("no automatic consult runs for an errored, unmatched or non-mutating tool result", async () => {
+		const harness = makeFakePi();
+		let calls = 0;
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			courseCheckJudge: async () => {
+				calls++;
+				return { onTrack: { task: true }, nextAction: "continue", reasons: ["ok"], confidence: 0.9, judged: true };
+			},
+			template: { gates: { mutation: false }, courseCheck: { everyMutations: 1 } },
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", {
+			type: "before_agent_start",
+			prompt: "work task: implement feature X",
+			systemPrompt: [],
+		});
+		// A mutating call that FAILED produced no work to judge: its result runs no consult.
+		await harness.emit("tool_call", { type: "tool_call", toolCallId: "fail-1", toolName: "edit", input: {} });
+		await harness.emit("tool_result", {
+			type: "tool_result",
+			toolCallId: "fail-1",
+			toolName: "edit",
+			content: [{ type: "text", text: "edit failed: file changed on disk" }],
+			isError: true,
+		});
+		// A read-only tool's result matches no captured mutation (its call was never captured).
+		await harness.emit("tool_call", { type: "tool_call", toolCallId: "read-1", toolName: "read", input: {} });
+		await harness.emit("tool_result", {
+			type: "tool_result",
+			toolCallId: "read-1",
+			toolName: "read",
+			content: [{ type: "text", text: "file contents" }],
+			isError: false,
+		});
+		// A mutating result whose id matches no captured call is ignored, not attributed to one.
+		await harness.emit("tool_call", { type: "tool_call", toolCallId: "some-1", toolName: "write", input: {} });
+		await harness.emit("tool_result", {
+			type: "tool_result",
+			toolCallId: "other-id",
+			toolName: "write",
+			content: [{ type: "text", text: "wrote file" }],
+			isError: false,
+		});
+		await controller.automaticCourseChecksSettled();
+		expect(calls).toBe(0);
+		expect(controller.getState().lastAutoCourseCheck).toBeUndefined();
+	});
+
+	test("a late result of a previous task never feeds the new task's automatic consult", async () => {
+		const harness = makeFakePi();
+		let calls = 0;
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			courseCheckJudge: async () => {
+				calls++;
+				return { onTrack: { task: true }, nextAction: "continue", reasons: ["ok"], confidence: 0.9, judged: true };
+			},
+			template: { gates: { mutation: false }, courseCheck: { everyMutations: 1 } },
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "task one", systemPrompt: [] });
+		await harness.emit("tool_call", { type: "tool_call", toolCallId: "old-1", toolName: "edit", input: {} });
+		// The task changes before the call's result arrives: the captured mutation is dropped.
+		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "task two: different", systemPrompt: [] });
+		await harness.emit("tool_result", {
+			type: "tool_result",
+			toolCallId: "old-1",
+			toolName: "edit",
+			content: [{ type: "text", text: "applied edit old-1" }],
+			isError: false,
+		});
+		await controller.automaticCourseChecksSettled();
+		expect(calls).toBe(0);
+		expect(controller.getState().lastAutoCourseCheck).toBeUndefined();
+	});
+
+	test("a mutating result is judged from its text only; an empty result is recorded as uncertainty", async () => {
+		const harness = makeFakePi();
+		const requests: CourseCheckRequest[] = [];
+		const controller = createJevController({
+			judge: async () => judgeResult({}),
+			courseCheckJudge: async req => {
+				requests.push(req);
+				return {
+					onTrack: Object.fromEntries(req.requirements.map(r => [r.id, true] as const)),
+					nextAction: "continue",
+					reasons: ["ok"],
+					confidence: 0.9,
+					judged: true,
+				};
+			},
+			template: { gates: { mutation: false }, courseCheck: { everyMutations: 1 } },
+		});
+		controller.register(harness.pi);
+		await harness.emit("before_agent_start", {
+			type: "before_agent_start",
+			prompt: "work task: implement feature X",
+			systemPrompt: [],
+		});
+		// An image-only result carries no text to judge: uncertainty, never fabricated progress.
+		await harness.emit("tool_call", { type: "tool_call", toolCallId: "img-1", toolName: "edit", input: {} });
+		await harness.emit("tool_result", {
+			type: "tool_result",
+			toolCallId: "img-1",
+			toolName: "edit",
+			content: [{ type: "image", data: "AAAA" }],
+			isError: false,
+		});
+		await controller.automaticCourseChecksSettled();
+		expect(requests).toHaveLength(0);
+		expect(controller.getState().lastAutoCourseCheck?.judged).toBe(false);
+		expect(controller.getState().lastAutoCourseCheck?.reasons.join(" ")).toContain("no text to judge");
+		// A successful result is evidence by its text; the raw `details` payload is never sent.
+		await harness.emit("tool_call", { type: "tool_call", toolCallId: "ok-1", toolName: "bash", input: { command: "run" } });
+		await harness.emit("tool_result", {
+			type: "tool_result",
+			toolCallId: "ok-1",
+			toolName: "bash",
+			content: [{ type: "text", text: "42 passing" }],
+			details: { authorization: "Bearer SUPERSECRET" },
+			isError: false,
+		});
+		await controller.automaticCourseChecksSettled();
+		expect(requests).toHaveLength(1);
+		const request = requests[0]!;
+		expect(request.evidence.some(item => item.quote.includes("42 passing"))).toBe(true);
+		expect(request.currentAction).toContain("bash mutation");
+		expect(JSON.stringify(request)).not.toContain("SUPERSECRET");
+	});
+
 	test("everyMutations: 2 fires one automatic consult after the second allowed mutation and feeds it back", async () => {
 		const harness = makeFakePi();
 		const requests: CourseCheckRequest[] = [];
@@ -3017,11 +3216,20 @@ describe("jev controller: activities framework", () => {
 			prompt: "work task: implement feature X",
 			systemPrompt: [],
 		});
-		for (const id of ["1", "2", "3"]) {
+		// Real host order: each call is followed by its own result; the consult runs on the result.
+		const mutate = async (id: string): Promise<void> => {
 			await harness.emit("tool_call", { type: "tool_call", toolCallId: id, toolName: "edit", input: {} });
-		}
+			await harness.emit("tool_result", {
+				type: "tool_result",
+				toolCallId: id,
+				toolName: "edit",
+				content: [{ type: "text", text: `applied edit ${id}` }],
+				isError: false,
+			});
+		};
+		for (const id of ["1", "2", "3"]) await mutate(id);
 		await controller.automaticCourseChecksSettled();
-		// The third allowed mutation crossed no further multiple: exactly one consult.
+		// The third allowed mutation crossed no further multiple: exactly one consult, on mutation 2.
 		expect(requests).toHaveLength(1);
 		expect(requests[0]?.requirements).toEqual([{ id: "task", quote: "work task: implement feature X" }]);
 		const record = controller.getState().lastAutoCourseCheck;
@@ -3035,7 +3243,7 @@ describe("jev controller: activities framework", () => {
 		expect(controller.getState().lastCourseCheck).toBeUndefined();
 		expect(controller.getState().iterations).toEqual({});
 		// The fourth mutation crosses the next multiple.
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "4", toolName: "edit", input: {} });
+		await mutate("4");
 		await controller.automaticCourseChecksSettled();
 		expect(requests).toHaveLength(2);
 	});
@@ -3081,6 +3289,13 @@ describe("jev controller: activities framework", () => {
 			systemPrompt: [],
 		});
 		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
+		await harness.emit("tool_result", {
+			type: "tool_result",
+			toolCallId: "1",
+			toolName: "edit",
+			content: [{ type: "text", text: "applied edit 1" }],
+			isError: false,
+		});
 		await controller.automaticCourseChecksSettled();
 		expect(controller.getState().lastAutoCourseCheck?.judged).toBe(false);
 		expect(controller.getState().lastAutoCourseCheck?.reasons.join(" ")).toContain("judge unavailable");
@@ -3114,6 +3329,13 @@ describe("jev controller: activities framework", () => {
 		});
 		await controller.submitDecision(formalizationInput());
 		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
+		await harness.emit("tool_result", {
+			type: "tool_result",
+			toolCallId: "1",
+			toolName: "edit",
+			content: [{ type: "text", text: "applied edit 1" }],
+			isError: false,
+		});
 		await controller.automaticCourseChecksSettled();
 		expect(requests[0]?.requirements).toEqual([
 			{ id: "req-1", quote: QUOTE_1 },
@@ -3581,6 +3803,13 @@ describe("jev controller: acceptance criteria and priorities (FR-20, FR-21)", ()
 			systemPrompt: [],
 		});
 		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
+		await harness.emit("tool_result", {
+			type: "tool_result",
+			toolCallId: "1",
+			toolName: "edit",
+			content: [{ type: "text", text: "applied edit 1" }],
+			isError: false,
+		});
 		await controller.automaticCourseChecksSettled();
 		const record = controller.getState().lastAutoCourseCheck;
 		expect(record?.judged).toBe(true);

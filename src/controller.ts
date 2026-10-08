@@ -325,6 +325,20 @@ export interface OutstandingRework {
 	at: number;
 }
 
+/**
+ * One allowed mutating tool call whose work revision crossed the `courseCheck.everyMutations`
+ * period, awaiting its OWN `tool_result` so the periodic consult can judge what the mutation
+ * produced rather than the intention to mutate. Keyed by toolCallId; transient like the handoff
+ * orders (never restored, aged out, cleared with the task).
+ */
+export interface PendingMutation {
+	/** Work revision the call bumped to (the period is counted on this call). */
+	revision: number;
+	/** The mutating tool the call named, for the consult's currentAction. */
+	toolName: string;
+	at: number;
+}
+
 export interface JevState {
 	approvals: ApprovalRecord[];
 	/** Judge consultations per `${taskFingerprint}:${stage}` - bounded rework (FR-12). */
@@ -414,6 +428,15 @@ export interface JevState {
 	 * session entries.
 	 */
 	pendingHandoffs: Record<string, { text: string; at: number; usedBySpawn: boolean }>;
+	/**
+	 * Activities framework (development): the allowed mutating tool calls whose work revision
+	 * crossed the automatic course-check period, keyed by toolCallId and consumed by their own
+	 * `tool_result`. The periodic consult runs on that result (never on the call), so it judges
+	 * what the mutation produced. Cleared when the task fingerprint changes and aged out after
+	 * PENDING_MUTATION_MAX_AGE_MS, so a call whose result never arrives cannot leak or judge a
+	 * later call. Transient: never restored from session entries.
+	 */
+	pendingMutations: Record<string, PendingMutation>;
 	/** FR-11: last handoff judgement (dispatch or acceptance) - recorded, never a silent no-op. */
 	lastHandoff: HandoffRecord | undefined;
 	/** POLICY-DRAFT I: last destructive-action judgement - recorded, never a silent no-op. */
@@ -455,6 +478,7 @@ function freshState(): JevState {
 		selectedTopics: undefined,
 		taskPrompt: undefined,
 		pendingHandoffs: {},
+		pendingMutations: {},
 		lastHandoff: undefined,
 		lastDestructive: undefined,
 		reviews: {},
@@ -651,6 +675,14 @@ const PLAN_MAPPING_OPTIONS: DecisionOption[] = [
  * Two minutes is far longer than any real dispatch and far shorter than a task.
  */
 const HANDOFF_ORDER_MAX_AGE_MS = 120_000;
+/**
+ * Age bound for an allowed mutating tool call awaiting its own `tool_result` (the automatic
+ * course-check input). A call whose result never arrives (session abort, an outcome the host
+ * surfaces some other way) must neither linger nor judge a later call; the entry is cleared
+ * outright when the task changes. Measured tool results follow their call within seconds, so the
+ * same two-minute bound as the handoff orders is far longer than any real call.
+ */
+const PENDING_MUTATION_MAX_AGE_MS = 120_000;
 /** The host builds a settled background job's delivery as this custom message (session/async-job-delivery.ts). */
 const ASYNC_RESULT_MESSAGE_TYPE = "async-result";
 const STATE_ENTRY_TYPE = "jev.state";
@@ -1440,6 +1472,14 @@ export class JevController {
 			this.captureHandoffWorkOrder(event);
 			return undefined;
 		}
+		// These write targets dispatch to tools, not files: keep the judge reachable and
+		// let agents report a blocker to their parent without granting plan approval.
+		if (toolName === "write" && isRecord(event["input"])) {
+			const path = event["input"]["path"];
+			if (path === "xd://jev_decision" || (typeof path === "string" && path.startsWith("agent://") && path !== "agent://")) {
+				return undefined;
+			}
+		}
 		if (typeof toolName === "string" && MUTATING_TOOLS.has(toolName)) {
 			// Fail-closed config (R5): restored approvals never unlock mutations while the
 			// template is invalid - the gates run on defaults that were never validated.
@@ -1460,12 +1500,9 @@ export class JevController {
 					block: true,
 					reason:
 						"plan gate: mutating work requires an approved understanding_review or direction_review " +
-						`for the current task first. Call ${TOOL_NAME} with the plan stage and evidence. ` +
-						"Read-only evidence gathering remains available. " +
-						`Submit decisions with the registered ${TOOL_NAME} TOOL (tool call), not by writing files ` +
-						`(e.g. to xd://${TOOL_NAME}); ` +
-						"the block message you received does not mean the addon is unavailable. " +
-						"Your next tool call must be jev_decision (a normal registered tool call, exactly like read/write) — not a file write.",
+						`for the current task first. Call ${TOOL_NAME} if available, or write JSON arguments to ` +
+						"xd://jev_decision. Use read/glob/grep to gather evidence; bash is gated because it " +
+						"can also mutate files. Other writes remain blocked until plan approval.",
 				};
 			}
 			// Planning is incomplete while a formalized requirement has no supported plan claim
@@ -1512,9 +1549,10 @@ export class JevController {
 			}
 			this.state.workRevision += 1;
 			this.persist();
-			// Activities framework (development): the automatic course check fires in the
-			// BACKGROUND after every N allowed mutations; it never delays or blocks this call.
-			this.maybeAutomaticCourseCheck();
+			// Activities framework (development): the automatic course check runs on THIS call's
+			// matching tool_result, never here - the call has not executed yet, so a consult now
+			// could only judge the intention to mutate. The call is remembered for that result.
+			this.recordPendingMutation(event, toolName);
 		}
 		return undefined;
 	}
@@ -1534,6 +1572,8 @@ export class JevController {
 			this.state.taskPrompt = event["prompt"];
 			// A stale work order can never legitimately judge a spawn of the new task.
 			this.state.pendingHandoffs = {};
+			// A late result of the old task must never feed the new task's course check either.
+			this.state.pendingMutations = {};
 			this.persist();
 			// Advisory and non-blocking: a task must not wait on judge latency. Measured live:
 			// the checks took 33s against a resetting endpoint, which no task start should pay.
@@ -1597,8 +1637,8 @@ export class JevController {
 			if (missing.length > 0) {
 				const blocker =
 					`Jev gates still unmet after one continuation (${missing.join(", ")}). ` +
-					"Stopped WITHOUT fake success: run jev_decision with the required stage and evidence, " +
-					"or resolve with the user.";
+					"Stopped WITHOUT fake success: submit the required stage and evidence using " +
+					"jev_decision or write JSON arguments to xd://jev_decision, or resolve with the user.";
 				if (!this.state.blockers.includes(blocker)) {
 					this.state.blockers.push(blocker);
 					this.persist();
@@ -1613,8 +1653,8 @@ export class JevController {
 			decision: "block",
 			reason:
 				`Jev gate(s) not satisfied: ${missing.join("; ")}. ` +
-				`Call the ${TOOL_NAME} tool with the required stage, fixed options and quoted evidence ` +
-				"(completion needs execution/code/log evidence; refactors must evidence every original capability).",
+				`Use ${TOOL_NAME} or write JSON arguments to xd://jev_decision with the required stage, ` +
+				"fixed options and quoted evidence (completion needs execution/code/log evidence).",
 		};
 	}
 
@@ -1820,13 +1860,35 @@ export class JevController {
 	 * `before_subagent_spawn`, so retiring it here made the dispatch consult inert (F1).
 	 */
 	onTaskResult(event: unknown, _ctx?: unknown): undefined {
-		if (!this.acceptanceWired() || !isRecord(event) || event["toolName"] !== "task") return undefined;
+		if (!isRecord(event)) return undefined;
+		// Activities framework (development): the automatic course check is served by this same
+		// result event, on the matching successful result of an allowed mutating call.
+		this.onMutatingResult(event);
+		if (!this.acceptanceWired() || event["toolName"] !== "task") return undefined;
 		this.recordHandoffUncertainty(
 			"acceptance",
 			"the task tool result is the spawn acknowledgement, not the delegated result; the " +
 				"delegated result is judged when the host delivers it",
 		);
 		return undefined;
+	}
+
+	/**
+	 * Automatic course check (development): the matching `tool_result` of an allowed mutating
+	 * call consumes the entry captured at `tool_call` and schedules the consult with what the
+	 * mutation actually produced. A result that is not this call's own (unmatched id), or that
+	 * reports an error, runs no check and leaves no state behind; an errored call produced no work
+	 * to check against. The result text is read from the event's own text blocks only - never
+	 * `details`, never a JSON dump of the whole event - and `gateEvidence` caps it; a call whose
+	 * result carries no text is recorded as uncertainty, never as progress.
+	 */
+	private onMutatingResult(event: Record<string, unknown>): void {
+		const toolCallId = typeof event["toolCallId"] === "string" ? event["toolCallId"] : "";
+		const pending = this.state.pendingMutations[toolCallId];
+		if (pending === undefined) return;
+		delete this.state.pendingMutations[toolCallId];
+		if (event["isError"] === true) return;
+		this.scheduleAutomaticCourseCheck(pending.revision, pending.toolName, messageText(event));
 	}
 
 	/**
@@ -2188,6 +2250,7 @@ export class JevController {
 				taskPrompt: typeof data["taskPrompt"] === "string" ? data["taskPrompt"] : undefined,
 				// Transient by nature: a restart mid-call loses the captured orders, nothing else.
 				pendingHandoffs: {},
+				pendingMutations: {},
 				lastHandoff: restoreHandoffRecord(data["lastHandoff"]),
 				lastDestructive: restoreDestructiveRecord(data["lastDestructive"]),
 				// Review records are restored only when they validate; a malformed one is dropped, never
@@ -4887,20 +4950,44 @@ export class JevController {
 	// ----- activities framework: the automatic course check (development) -----
 
 	/**
-	 * Periodic course check (owner switch `courseCheck.everyMutations`, default off). After every
-	 * N allowed mutating tool calls the controller consults the course-check judge itself, so a
-	 * session can ask "am I still on the plan?" without the executor choosing to. The consult runs
-	 * in the BACKGROUND (measured judge latency reaches 33s against a resetting endpoint, so it
-	 * must never hold a turn) and stays advisory: no block, no gate approval, no rework budget.
+	 * Periodic course check (owner switch `courseCheck.everyMutations`, default off). The controller
+	 * consults the course-check judge itself after the N-th allowed mutation, so a session can ask
+	 * "am I still on the plan?" without the executor choosing to. The consult is served by the
+	 * mutation's OWN successful result (see onMutatingResult): it judges what the mutation produced,
+	 * not the intention to make it. Nothing is captured while the switch is off.
 	 */
-	private maybeAutomaticCourseCheck(): void {
+	private recordPendingMutation(event: Record<string, unknown>, toolName: string): void {
 		const every = this.template.courseCheck?.everyMutations ?? 0;
 		if (every <= 0) return;
 		const revision = this.state.workRevision;
 		if (revision <= 0 || revision % every !== 0) return;
-		// Chained: consults stay ordered and at most one is in flight at a time.
+		this.pruneStaleMutations();
+		const toolCallId = typeof event["toolCallId"] === "string" ? event["toolCallId"] : "";
+		this.state.pendingMutations[toolCallId] = { revision, toolName, at: this.now() };
+	}
+
+	/**
+	 * Drop awaited mutating calls whose result never arrived (session abort, an outcome the host
+	 * surfaces another way): the entry would otherwise linger for the rest of the session.
+	 */
+	private pruneStaleMutations(): void {
+		const cutoff = this.now() - PENDING_MUTATION_MAX_AGE_MS;
+		for (const [key, entry] of Object.entries(this.state.pendingMutations)) {
+			if (entry.at < cutoff) delete this.state.pendingMutations[key];
+		}
+	}
+
+	/**
+	 * Queue the consult for one consumed mutating result. It runs in the BACKGROUND (measured
+	 * judge latency reaches 33s against a resetting endpoint, so it must never hold a turn) and
+	 * stays advisory: no block, no gate approval, no rework budget. Chained so consults stay
+	 * ordered and at most one is in flight at a time.
+	 */
+	private scheduleAutomaticCourseCheck(revision: number, toolName: string, resultText: string): void {
 		const chain = this.autoCourseCheck ?? Promise.resolve();
-		this.autoCourseCheck = chain.then(() => this.runAutomaticCourseCheck(revision)).catch(() => {});
+		this.autoCourseCheck = chain
+			.then(() => this.runAutomaticCourseCheck(revision, toolName, resultText))
+			.catch(() => {});
 	}
 
 	/** Await the in-flight automatic course-check chain (test seam; the tool path never waits). */
@@ -4924,25 +5011,36 @@ export class JevController {
 	}
 
 	/**
-	 * One automatic consultation. Never throws and never blocks: a missing requirement, an
-	 * unwired judge, a judge error, an unusable answer or a sub-floor confidence is RECORDED as
-	 * uncertainty and pushed as feedback; a confident redirect or escalation is pushed back into
-	 * the same session (ask_user additionally as a recorded blocker). Nothing here records a gate
-	 * approval or satisfies the completion boundary - that still needs a deliberate course_check
-	 * with option continue bound to the current revision.
+	 * One automatic consultation, run on the mutation's own result. Never throws and never blocks:
+	 * a missing requirement, a result with no text to judge, an unwired judge, a judge error, an
+	 * unusable answer or a sub-floor confidence is RECORDED as uncertainty and pushed as feedback;
+	 * a confident redirect or escalation is pushed back into the same session (ask_user additionally
+	 * as a recorded blocker). Nothing here records a gate approval or satisfies the completion
+	 * boundary - that still needs a deliberate course_check with option continue bound to the
+	 * current revision. The consult's evidence is the mutation's own text result, never the raw
+	 * event (no `details`, no JSON dump) and never fabricated progress.
 	 */
-	private async runAutomaticCourseCheck(revision: number): Promise<void> {
+	private async runAutomaticCourseCheck(revision: number, toolName: string, resultText: string): Promise<void> {
 		const requirements = this.courseCheckRequirements();
 		const base: AutoCourseCheckRecord = { judged: false, reasons: [], workRevision: revision, at: this.now() };
 		if (requirements.length === 0) {
 			this.recordAutomaticCourseCheck({ ...base, reasons: ["no requirement captured for this task yet"] }, "no requirement to check against");
 			return;
 		}
+		if (resultText.length === 0) {
+			// An empty or non-text result (images only) carries nothing to judge: recorded as
+			// uncertainty, never as fabricated progress.
+			const note = `the ${toolName} tool result carried no text to judge`;
+			this.recordAutomaticCourseCheck({ ...base, reasons: [note] }, note);
+			return;
+		}
 		if (this.courseCheckJudge === undefined) {
 			this.recordAutomaticCourseCheck({ ...base, reasons: ["course_check judge not configured in this session"] }, "judge not wired");
 			return;
 		}
-		const evidence: Evidence[] = [];
+		const evidence: Evidence[] = [
+			mechanism.gateEvidence("execution", `${toolName} mutation result (after execution)`, resultText),
+		];
 		if (this.state.taskPrompt !== undefined) {
 			evidence.push(mechanism.gateEvidence("user", "session task prompt (the requirement)", this.state.taskPrompt));
 		}
@@ -4951,7 +5049,9 @@ export class JevController {
 		try {
 			raw = await this.courseCheckJudge({
 				requirements,
-				currentAction: `automatic course check after ${revision} allowed mutating tool call(s)`,
+				currentAction:
+					`automatic course check of the ${toolName} mutation at work revision ${revision}: ` +
+					"the mutation's own result is quoted in the evidence",
 				evidence,
 			});
 		} catch (err) {

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- An armed plan gate no longer blocks the mounted Jev decision device or messages between agents:
+  a `write` to the exact `xd://jev_decision` address can reach the judge, and `agent://` messages can
+  report blockers. File writes and other mounted addresses remain blocked until approval. Block
+  messages name both judge submission routes; `bash` stays conservatively gated.
+
+- Automatic course checks now consult Jev after the matching successful mutating tool result, quoting
+  its bounded text rather than judging an intended change before execution. Failed and textless
+  results do not establish progress. This advisory check remains opt-in and does not force an
+  executor to submit `jev_decision`; the owner's separate plan and completion switches control
+  whether those boundaries block work.
+
 - **The invisible write paths are visible to the gate.** Two paths that ran unjudged now reach a
   judgement, both opt-in and both off by default:
   - The destructive-action gate (`destructive_action`) gained a **second trigger and frame**: a

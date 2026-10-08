@@ -338,17 +338,15 @@ How each activity is armed:
   those ids and the stop boundary names them too. Without a formalization none of this is demanded
   and the gate behaves exactly as before.
 - `development` - `course_check` is always submittable and can additionally run automatically: with
-  `courseCheck.everyMutations` set, the controller consults the judge itself after every N allowed
-  mutating tool calls and feeds the verdict back into the same session. The automatic consult is
-  advisory (it never blocks, never spends the rework budget and never satisfies the completion
-  boundary) and checks against the formalized list when one exists - each item's number with the
-  verbatim source quote it names, so the judge reads the requirement itself, not a summary - else
-  against the task prompt as the single requirement. Its record keeps the three outcomes apart: an
-  answer the judge gave but that cannot be acted on (a redirect below the confidence floor, or an
-  answer contradicting its own per-requirement markings) is recorded as UNCERTAINTY
-  (`belowFloor: true`, the answer, its confidence and its reasons kept) and surfaced as such; only a
-  judge that could not be consulted at all is reported as not judged. The
-  destructive-action gate and the hand-off gate are armed by `gates.destructive.patterns` and
+  `courseCheck.everyMutations` set, the controller consults the judge after the matching successful
+  result of every Nth allowed mutating tool call and feeds the verdict back into the same session.
+  It quotes the result's text as bounded execution evidence; an errored, missing or textless result
+  cannot establish progress. The automatic consult is advisory (it never blocks, never spends the
+  rework budget and never satisfies the completion boundary) and checks against the formalized list
+  when one exists - each item's number with the verbatim source quote it names - else against the
+  task prompt as the single requirement. A sub-floor or internally inconsistent judge answer is
+  recorded as uncertainty, while a judge that could not be consulted is reported as not judged.
+  The destructive-action gate and the hand-off gate are armed by `gates.destructive.patterns` and
   `stages.subagent_handoff` respectively. The FR-13 refactoring steps live here too: submit
   `refactor_inventory` before the first code edit of the task, `refactor_marking` after the work, and
   the stop boundary names every inventory item left without an evidence-backed marking.
@@ -496,11 +494,12 @@ anything malformed.
   revision satisfies the completion gate (`verify_before_proceeding` never unlocks). Benign outcomes
   (`continue`, `verify_before_proceeding`) consume no rework; redirects, `ask_user` and failed
   consultations do. The check also runs on its own when the owner sets
-  `courseCheck.everyMutations`: after every N allowed mutating tool calls the controller consults
-  the judge in the background against the formalized requirement list when one exists - each item's
-  number with the verbatim source quote it names, so the judge reads the requirement itself - else
-  against the task prompt as the single requirement. It records the verdict and feeds it back into
-  the session. That automatic record is advisory - it never
+  `courseCheck.everyMutations`: on the matching successful result of every Nth allowed mutating tool
+  call, the controller consults the judge in the background with a bounded quote of the result.
+  It checks against the formalized requirement list when one exists - each item's number with its
+  verbatim source quote - else against the task prompt as the single requirement. It records the
+  verdict and feeds it back into the session.
+  That automatic record is advisory - it never
   blocks, spends no rework budget and does not satisfy the completion boundary, which still needs a
   deliberate `course_check` with `continue`. Its three outcomes stay apart: a judged answer that
   cannot be acted on (a `continue`/`verify_before_proceeding` below the confidence floor, or a
@@ -625,9 +624,9 @@ custom stages are a roadmap item).
 
 Two further judge consultations run automatically at task start and are not submittable stages:
 task classification (`development` / `analytics` / `query`) and plan-topic selection - the catalog
-checks above. A third automatic consultation exists at step boundaries: with
-`courseCheck.everyMutations` set, `course_check` runs by itself after every N allowed mutations (see
-the preset above).
+checks above. A third automatic consultation can run on completed mutations: with
+`courseCheck.everyMutations` set, `course_check` runs after the matching successful result of
+every Nth allowed mutation (see the preset above).
 
 ## Config
 
@@ -677,10 +676,10 @@ Per key, with its trust rule:
   project one, and the effective floor is `max(0.8, configured)`, so lowering it has no effect.
   Raising it also disables the mid-band completion streak.
 - `courseCheck` - `everyMutations` (integer >= 0, default off). User-owned like the gates: the user
-  value wins when it sets the key. With N >= 1 the controller submits a `course_check` itself after
-  every N allowed mutating tool calls, records the verdict and feeds it back into the session; 0 or
-  an absent key means the behaviour is exactly as before (the executor submits course checks
-  deliberately). The automatic consult never blocks, never spends the rework budget and never
+  value wins when it sets the key. With N >= 1 the controller submits a `course_check` itself on the
+  matching successful result of every Nth allowed mutating tool call, with its bounded text result
+  as evidence; an error result triggers no consultation. An absent key or 0 leaves deliberate
+  submissions unchanged. The automatic consult never blocks, never spends the rework budget and never
   satisfies the completion boundary. A malformed block fails closed naming the file and the key.
 - `gates` - `mutation` and `completion` booleans (both default true) plus the `destructive` block.
   Merged per key, never whole-block: a user file that declares only some switches does not drop the
@@ -706,9 +705,13 @@ Meta options cannot be removed: they are appended to every judge choice regardle
 ## Limits
 
 - The mutation gate covers the builtin tools `edit`, `write`, `ast_edit`, `bash`, `memory_edit`,
-  `manage_skill`, `learn`, `retain` and `eval`; custom/MCP/xdev tools are outside it. `learn` and
-  `retain` were added because they write the same user-level state `memory_edit` and `manage_skill`
-  do (a lesson into long-term memory, and - with `learn` - a managed skill): the live session that
+  `manage_skill`, `learn`, `retain` and `eval`; custom/MCP/xdev tools are outside it. A `write` whose
+  `path` is exactly `xd://jev_decision` dispatches to the mounted judge device and bypasses the
+  mutation gate, without granting an approval. Messages to `agent://` addresses also bypass the
+  gate so task agents can report blockers. Other `write` targets remain gated. The gate also
+  treats read-only `bash` commands as mutation-capable; use `read`, `glob` or `grep` to gather evidence
+  before plan approval. `learn` and `retain` write the same user-level state as `memory_edit` and
+  `manage_skill` (a lesson into long-term memory, and - with `learn` - a managed skill): the live session that
   made two `learn` calls wrote long-term memory and created a managed skill while the gate had
   nothing to bite. The remaining memory/context builtins (`checkpoint`, `rewind`, `context_notes`,
   `new_context`, `recall`, `reflect`) are NOT in the set, so they are not mutation-gated; the fix

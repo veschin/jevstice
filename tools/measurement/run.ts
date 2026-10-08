@@ -29,7 +29,7 @@
  *          [--only slug,median] [--repeats N] [--timeout 420] [--probe/--no-probe] [--dry-run]
  */
 import { createHash } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import {
 	APIConnectionError,
@@ -49,7 +49,8 @@ const JUDGE_MODEL = "jev-latest";
 /** Same documented boundary the repo's claim_check / multi_label judges use. */
 const NOUL_SUPPORTED_THRESHOLD = 0.5;
 
-type Arm = "control" | "addon";
+type Arm = "control" | "addon" | "armed";
+const ALL_ARMS: Arm[] = ["control", "addon", "armed"];
 
 const MODEL = flagValue("--model") || "deepseek/deepseek-flash:high";
 /** Free-text justification of the model choice, recorded verbatim in the log (--model-note). */
@@ -64,6 +65,35 @@ function flagValue(name: string): string | undefined {
 	if (i === -1) return undefined;
 	const v = process.argv[i + 1];
 	return v === undefined || v.startsWith("--") ? "" : v;
+}
+
+/** Every occurrence of a repeatable flag, in order. */
+function flagValues(name: string): string[] {
+	const out: string[] = [];
+	for (let i = 0; i < process.argv.length; i++) {
+		if (process.argv[i] !== name) continue;
+		const v = process.argv[i + 1];
+		if (v !== undefined && !v.startsWith("--")) out.push(v);
+	}
+	return out;
+}
+
+/**
+ * Per-arm config override: `--config armed=<path>` copies that JSON into the run's own
+ * `<scratch>/.omp/jev.config.json`. The extension's loader merges the project file over the user's
+ * `~/.omp/agent/jev.config.json` key by key, so an override can flip individual switches (gates,
+ * courseCheck) while everything else keeps coming from the owner's real config.
+ */
+function parseArmConfigs(entries: string[]): Partial<Record<Arm, string>> {
+	const configs: Partial<Record<Arm, string>> = {};
+	for (const entry of entries) {
+		const at = entry.indexOf("=");
+		if (at <= 0) throw new Error(`--config needs <arm>=<path> (got "${entry}")`);
+		const arm = entry.slice(0, at) as Arm;
+		if (!ALL_ARMS.includes(arm)) throw new Error(`--config arm must be one of ${ALL_ARMS.join(", ")} (got "${arm}")`);
+		configs[arm] = resolve(REPO_ROOT, entry.slice(at + 1));
+	}
+	return configs;
 }
 
 const date = new Date();
@@ -92,6 +122,20 @@ const probeEnabled = !process.argv.includes("--no-probe") && !selfTestOnly;
 const only = (flagValue("--only") ?? "").split(",").map(s => s.trim()).filter(s => s.length > 0);
 const selected = only.length > 0 ? allTasks.filter(t => only.includes(t.id)) : allTasks;
 if (selected.length === 0) throw new Error(`--only matched no task; set "${setName}" has: ${allTasks.map(t => t.id).join(", ")}`);
+const armsFlag = flagValue("--arms");
+const arms: Arm[] = armsFlag === undefined || armsFlag.length === 0 ? ["control", "addon"] : armsFlag.split(",").map(s => s.trim() as Arm);
+for (const arm of arms) {
+	if (!ALL_ARMS.includes(arm)) throw new Error(`--arms must be a subset of ${ALL_ARMS.join(", ")} (got "${arm}")`);
+}
+const armConfigs = parseArmConfigs(flagValues("--config"));
+for (const arm of Object.keys(armConfigs) as Arm[]) {
+	if (!arms.includes(arm)) throw new Error(`--config names arm "${arm}", which is not in --arms (${arms.join(", ")})`);
+}
+/** Every unordered pair of the selected arms, which is what the blind judge compares. */
+const armPairs: Array<[Arm, Arm]> = [];
+for (let i = 0; i < arms.length; i++) {
+	for (let j = i + 1; j < arms.length; j++) armPairs.push([arms[i]!, arms[j]!]);
+}
 
 const stamp = `${today.replace(/-/g, "")}-${String(date.getHours()).padStart(2, "0")}${String(date.getMinutes()).padStart(2, "0")}${String(date.getSeconds()).padStart(2, "0")}`;
 const root = `/tmp/jev-measure-${stamp}`;
@@ -217,6 +261,10 @@ interface RunCapture {
 	requirements: Record<string, "pass" | "fail" | "missing">;
 	/** Judge traffic this run made, observed by the local forwarding proxy. */
 	judgeTraffic: { calls: number; inputTokens: number; outputTokens: number; rawPath: string; detail: JudgeCall[] };
+	/** The per-arm config override copied into the run dir (arm 3), with its exact JSON for the log. */
+	armConfig?: { path: string; sha256: string; json: string };
+	/** Judge consultations whose dumped payload quoted a requirement of this task. */
+	requirementLevel: { calls: number; withPayload: number; requirementCalls: number; evidence: string[] };
 	/** Set when the run's two signals disagree (all requirements KEPT but the check verdict FAIL). */
 	instrumentWarning?: string;
 	error?: string;
@@ -364,7 +412,7 @@ function ompArgv(arm: Arm, prompt: string): string[] {
 		"json",
 		"-p",
 		"--no-extensions",
-		...(arm === "addon" ? ["-e", EXTENSION_ENTRY] : []),
+		...(arm === "control" ? [] : ["-e", EXTENSION_ENTRY]),
 		"--model",
 		MODEL,
 		"--auto-approve",
@@ -373,6 +421,58 @@ function ompArgv(arm: Arm, prompt: string): string[] {
 		String(sessionTimeoutSec),
 		prompt,
 	];
+}
+
+/**
+ * A judge consultation counts as "requirement level" when its payload judges the task's
+ * requirements rather than only classifying or routing it. Two signals, both recorded so the rule
+ * can be argued with:
+ *  - structural: the state carries a non-empty `requirements` array (each item quotes a binding
+ *    statement verbatim) - this is what the gate and course-check consults look like;
+ *  - textual: the payload names a requirement item (`req-N`, `crit-N`, `quote-N`), a ticket section
+ *    (`SPEC.md §4` / `SPEC.md section 4`), or one of the task's declared requirement ids (R1..Rn).
+ */
+function analyseRequirementLevel(dumpDir: string, task: TaskDef): RunCapture["requirementLevel"] {
+	const payloads = existsSync(dumpDir) ? readdirSync(dumpDir).filter(f => f.endsWith(".request.json")).sort() : [];
+	const textual: Array<{ name: string; pattern: RegExp }> = [
+		{ name: "requirement item id", pattern: /\b(?:req|crit|quote)-\d+\b/ },
+		{ name: "ticket section reference", pattern: /SPEC\.md\s*(?:§|section)\s*\d+/i },
+		{ name: "declared requirement id", pattern: new RegExp(`\\b(?:${(task.requirements ?? []).map(r => r.id).join("|") || "R0"})\\b`) },
+	];
+	let requirementCalls = 0;
+	const evidence: string[] = [];
+	for (const file of payloads) {
+		const text = readFileSync(join(dumpDir, file), "utf8");
+		const hits: string[] = [];
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(text);
+		} catch {
+			parsed = undefined;
+		}
+		const state = isRecord(parsed) ? parsed["state"] : undefined;
+		const requirements = isRecord(state) ? state["requirements"] : undefined;
+		if (Array.isArray(requirements) && requirements.length > 0) {
+			const first = requirements[0];
+			const quote = isRecord(first) ? (typeof first["quote"] === "string" ? first["quote"] : first["text"]) : undefined;
+			hits.push(
+				`state.requirements carries ${requirements.length} quoted requirement(s)` +
+					(typeof quote === "string" ? ` -> "${quote.replace(/\s+/g, " ").slice(0, 140)}"` : ""),
+			);
+		}
+		for (const { name, pattern } of textual) {
+			const match = pattern.exec(text);
+			if (match !== null) {
+				const at = Math.max(0, match.index - 80);
+				hits.push(`${name} (${match[0].trim()}) -> "${text.slice(at, match.index + 120).replace(/\s+/g, " ").trim()}"`);
+			}
+		}
+		if (hits.length > 0) {
+			requirementCalls++;
+			evidence.push(`${file}: ${hits.slice(0, 2).join(" | ")}`);
+		}
+	}
+	return { calls: payloads.length, withPayload: payloads.length, requirementCalls, evidence };
 }
 
 async function runArm(task: TaskDef, arm: Arm, repeat: number): Promise<RunCapture> {
@@ -386,14 +486,28 @@ async function runArm(task: TaskDef, arm: Arm, repeat: number): Promise<RunCaptu
 	const frozenBefore = new Map<string, string>();
 	for (const rel of task.frozen) frozenBefore.set(rel, sha256(readFileSync(join(dir, rel))));
 
+	// The per-arm config override (arm 3): copied into the run dir, where the extension's loader
+	// reads a project config and merges it over the owner's user config key by key.
+	let armConfig: RunCapture["armConfig"];
+	const overridePath = armConfigs[arm];
+	if (overridePath !== undefined) {
+		const text = readFileSync(overridePath, "utf8");
+		mkdirSync(join(dir, ".omp"), { recursive: true });
+		writeFileSync(join(dir, ".omp", "jev.config.json"), text, "utf8");
+		armConfig = { path: relative(REPO_ROOT, overridePath), sha256: sha256(text), json: text.trim() };
+	}
+
 	const cmd = ompArgv(arm, task.prompt);
 	const label = `${task.id}-${arm}-r${repeat}`;
+	const payloadDir = join(rawDir, "payloads", label);
+	process.env["JEV_PROXY_DUMP_DIR"] = payloadDir;
 	const proxy = await startJudgeProxy(label);
 	const proc = await spawnCapture(cmd, dir, (sessionTimeoutSec + 60) * 1000, {
 		...process.env,
 		TYPESAFE_API_URL: proxy.url,
 	});
 	proxy.stop();
+	delete process.env["JEV_PROXY_DUMP_DIR"];
 
 	mkdirSync(rawDir, { recursive: true });
 	const rawStdoutPath = join(rawDir, `${label}.stdout.jsonl`);
@@ -432,6 +546,8 @@ async function runArm(task: TaskDef, arm: Arm, repeat: number): Promise<RunCaptu
 			rawPath: relative(REPO_ROOT, rawTrafficPath),
 			detail: proxy.record.calls,
 		},
+		...(armConfig === undefined ? {} : { armConfig }),
+		requirementLevel: analyseRequirementLevel(payloadDir, task),
 	};
 
 	// Check files are written only now, so the agent could neither read nor game them.
@@ -703,10 +819,11 @@ async function judgeTask(
 	client: TypeSafeClient,
 	task: TaskDef,
 	request: Record<string, unknown>,
+	label: string,
 	observations: JudgeObservation[],
 ): Promise<JudgeOutcome> {
 	mkdirSync(rawDir, { recursive: true });
-	const requestPath = join(rawDir, `judge-${task.id}.request.json`);
+	const requestPath = join(rawDir, `judge-${label}.request.json`);
 	writeFileSync(requestPath, JSON.stringify(request, null, 2), "utf8");
 
 	const call = client.systemOne as unknown as (r: unknown) => Promise<unknown>;
@@ -722,23 +839,23 @@ async function judgeTask(
 				err instanceof RateLimitError ||
 				(err instanceof APIError && (err.status === 429 || err.status === 529 || err.status >= 500));
 			observations.push({
-				taskId: task.id,
+				taskId: label,
 				attempt: attempt + 1,
 				errorClass: err instanceof Error ? err.constructor.name : "unknown",
 				message: (err instanceof Error ? err.message : String(err)).slice(0, 400),
 				retryable,
 			});
-			log(`  judge ${task.id}: attempt ${attempt + 1} failed (${err instanceof Error ? err.constructor.name : "?"}): ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}`);
+			log(`  judge ${label}: attempt ${attempt + 1} failed (${err instanceof Error ? err.constructor.name : "?"}): ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}`);
 			if (!retryable) break;
 			await sleep(500 * 2 ** attempt + Math.floor(Math.random() * 250));
 		}
 	}
 	const outcome: JudgeOutcome = { taskId: task.id, judged: false };
 	if (raw === undefined) {
-		outcome.error = observations.filter(o => o.taskId === task.id).map(o => `${o.errorClass}: ${o.message}`).join(" | ") || "no response";
+		outcome.error = observations.filter(o => o.taskId === label).map(o => `${o.errorClass}: ${o.message}`).join(" | ") || "no response";
 		return outcome;
 	}
-	const responsePath = join(rawDir, `judge-${task.id}.response.json`);
+	const responsePath = join(rawDir, `judge-${label}.response.json`);
 	writeFileSync(responsePath, JSON.stringify(raw, null, 2), "utf8");
 	outcome.judged = true;
 	outcome.requestPath = relative(REPO_ROOT, requestPath);
@@ -783,12 +900,27 @@ async function judgeTask(
 // evidence log
 // ---------------------------------------------------------------------------
 
+interface ArmComparison {
+	pair: [Arm, Arm];
+	/** Physical arm that was shown to the judge as "A" for this comparison. */
+	aIs: Arm;
+	judge: JudgeOutcome;
+}
+
 interface TaskResult {
 	task: TaskDef;
-	/** Physical arm that was shown to the judge as "A". */
-	aIs: Arm;
-	runs: Record<Arm, RunCapture>;
-	judge: JudgeOutcome;
+	repeat: number;
+	runs: Partial<Record<Arm, RunCapture>>;
+	comparisons: ArmComparison[];
+}
+
+/** The other arm of a comparison. */
+function otherArm(pair: [Arm, Arm], arm: Arm): Arm {
+	return pair[0] === arm ? pair[1]! : pair[0]!;
+}
+
+function armOfLabel(comparison: ArmComparison, label: "A" | "B"): Arm {
+	return label === "A" ? comparison.aIs : otherArm(comparison.pair, comparison.aIs);
 }
 
 function renderRun(task: TaskDef, run: RunCapture): string {
@@ -819,6 +951,18 @@ function renderRun(task: TaskDef, run: RunCapture): string {
 		`- judge traffic observed by the local forwarding proxy: ${run.judgeTraffic.calls} call(s), ${run.judgeTraffic.inputTokens} input + ${run.judgeTraffic.outputTokens} output tokens (${run.judgeTraffic.rawPath})`,
 	);
 	for (const call of run.judgeTraffic.detail) lines.push(`  - consultation: ${summariseCall(call)}`);
+	if (run.armConfig !== undefined) {
+		lines.push(`- per-arm config override copied into the run dir as \`.omp/jev.config.json\`, from \`${run.armConfig.path}\` (sha256 ${run.armConfig.sha256}). This is the arm's treatment; the extension merges the project file over the owner's user config key by key, so only the keys below differ:`);
+		lines.push("");
+		lines.push("```json");
+		lines.push(run.armConfig.json);
+		lines.push("```");
+	}
+	lines.push(
+		`- requirement-level consultations: **${run.requirementLevel.requirementCalls}** of ${run.requirementLevel.calls} dumped payload(s) quote a requirement rather than only classifying or routing the task`,
+	);
+	for (const line of run.requirementLevel.evidence.slice(0, 10)) lines.push(`  - ${line}`);
+	if (run.requirementLevel.evidence.length > 10) lines.push(`  - (${run.requirementLevel.evidence.length - 10} more in the payload dumps)`);
 	if (run.nonJsonLines > 0) lines.push(`- non-JSON stdout lines (host noise, not counted as events): ${run.nonJsonLines}`);
 	if (run.error !== undefined) lines.push(`- harness error: ${run.error}`);
 	lines.push("");
@@ -895,160 +1039,185 @@ function renderRun(task: TaskDef, run: RunCapture): string {
 
 function renderJudge(result: TaskResult, observations: JudgeObservation[]): string {
 	const lines: string[] = [];
-	const j = result.judge;
-	lines.push(`#### judge verdict for task \`${result.task.id}\``);
+	lines.push(`#### judge verdicts for task \`${result.task.id}\` repeat ${result.repeat} (${result.comparisons.length} blind pairwise comparison(s))`);
 	lines.push("");
-	lines.push(`Blinding: run labelled **A** to the judge = arm \`${result.aIs}\`; run labelled **B** = arm \`${result.aIs === "addon" ? "control" : "addon"}\`.`);
-	lines.push("");
-	if (!j.judged) {
-		lines.push(`**THE JUDGE COULD NOT BE CONSULTED**: ${j.error}`);
-		const obs = observations.filter(o => o.taskId === result.task.id);
-		if (obs.length > 0) {
-			lines.push("");
-			lines.push("Attempts (verbatim errors):");
-			for (const o of obs) lines.push(`- attempt ${o.attempt}: \`${o.errorClass}\` retryable=${o.retryable}: ${o.message}`);
-		}
+	for (const comparison of result.comparisons) {
+		const [left, right] = comparison.pair;
+		const j = comparison.judge;
+		lines.push(`**\`${left}\` vs \`${right}\`** — blinding: the result labelled **A** is arm \`${comparison.aIs}\`, **B** is arm \`${otherArm(comparison.pair, comparison.aIs)}\`.`);
 		lines.push("");
-		return `${lines.join("\n")}\n`;
+		if (!j.judged) {
+			lines.push(`**THE JUDGE COULD NOT BE CONSULTED**: ${j.error}`);
+			const obs = observations.filter(o => o.taskId === `${result.task.id}-r${result.repeat}-${left}-vs-${right}`);
+			for (const o of obs) lines.push(`- attempt ${o.attempt}: \`${o.errorClass}\` retryable=${o.retryable}: ${o.message}`);
+			lines.push("");
+			continue;
+		}
+		lines.push(`request: \`${j.requestPath}\` (sha256 ${j.requestSha}); response: \`${j.responsePath}\``);
+		if (j.usage !== undefined) lines.push(`judge token usage: input ${j.usage.input_tokens}, output ${j.usage.output_tokens}`);
+		lines.push("");
+		lines.push(`- "which result better satisfies the task": **${j.choice ?? "(no choice returned)"}**${j.choiceConfidence !== undefined ? ` (confidence ${j.choiceConfidence})` : ""}${j.choiceProbabilities !== undefined ? `, probabilities ${JSON.stringify(j.choiceProbabilities)}` : ""}`);
+		lines.push(`- noul "result A satisfies the task" (arm \`${comparison.aIs}\`): ${j.noulA ?? "(none)"} -> ${j.supportedA === undefined ? "(no verdict)" : j.supportedA ? "satisfies" : "does not satisfy"} (threshold ${NOUL_SUPPORTED_THRESHOLD})`);
+		lines.push(`- noul "result B satisfies the task" (arm \`${otherArm(comparison.pair, comparison.aIs)}\`): ${j.noulB ?? "(none)"} -> ${j.supportedB === undefined ? "(no verdict)" : j.supportedB ? "satisfies" : "does not satisfy"} (threshold ${NOUL_SUPPORTED_THRESHOLD})`);
+		lines.push("");
+		lines.push("Raw judge response (verbatim):");
+		lines.push("");
+		lines.push("```json");
+		lines.push(JSON.stringify(j.raw, null, 2));
+		lines.push("```");
+		lines.push("");
 	}
-	lines.push(`request: \`${j.requestPath}\` (sha256 ${j.requestSha}); response: \`${j.responsePath}\``);
-	if (j.usage !== undefined) lines.push(`judge token usage: input ${j.usage.input_tokens}, output ${j.usage.output_tokens}`);
-	lines.push("");
-	lines.push(`- "which result better satisfies the task": **${j.choice ?? "(no choice returned)"}**${j.choiceConfidence !== undefined ? ` (confidence ${j.choiceConfidence})` : ""}${j.choiceProbabilities !== undefined ? `, probabilities ${JSON.stringify(j.choiceProbabilities)}` : ""}`);
-	lines.push(`- noul "result A satisfies the task": ${j.noulA ?? "(none)"} -> ${j.supportedA === undefined ? "(no verdict)" : j.supportedA ? "satisfies" : "does not satisfy"} (threshold ${NOUL_SUPPORTED_THRESHOLD})`);
-	lines.push(`- noul "result B satisfies the task": ${j.noulB ?? "(none)"} -> ${j.supportedB === undefined ? "(no verdict)" : j.supportedB ? "satisfies" : "does not satisfy"} (threshold ${NOUL_SUPPORTED_THRESHOLD})`);
-	lines.push("");
-	lines.push("Raw judge response (verbatim):");
-	lines.push("");
-	lines.push("```json");
-	lines.push(JSON.stringify(j.raw, null, 2));
-	lines.push("```");
-	lines.push("");
 	return `${lines.join("\n")}\n`;
 }
 
-function armOfLabel(result: TaskResult, label: "A" | "B"): Arm {
-	return label === "A" ? result.aIs : result.aIs === "addon" ? "control" : "addon";
-}
-
 function buildSummary(results: TaskResult[]): { table: string; conclusion: string } {
-	const rows: string[] = [
-		"| task | A shown as | judge: better | judge: A satisfies | judge: B satisfies | check control | check addon | wall control | wall addon | tokens control (in/out) | tokens addon (in/out) | judge calls control | judge calls addon (in/out tok) | winner |",
-		"| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+	const perArmRows: string[] = [
+		`| task | repeat | arm | requirements kept | check | wall | coding tokens (in/out) | judge calls | judge tokens (in/out) | requirement-level calls |`,
+		"| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
 	];
-	const requirementRows: string[] = ["| task | requirement | kind | what it demands | control | addon |", "| --- | --- | --- | --- | --- | --- |"];
-	let requirementsControlKept = 0;
-	let requirementsAddonKept = 0;
-	let requirementsTotal = 0;
-	const addonOnly: string[] = [];
-	const controlOnly: string[] = [];
-	let controlJudgeCalls = 0;
-	let addonJudgeCalls = 0;
-	let addonJudgeInput = 0;
-	let addonJudgeOutput = 0;
-	let controlWins = 0;
-	let addonWins = 0;
-	let ties = 0;
-	let controlPass = 0;
-	let addonPass = 0;
-	let controlSatisfies = 0;
-	let addonSatisfies = 0;
-	let controlMs = 0;
-	let addonMs = 0;
-	let controlTokens = 0;
-	let addonTokens = 0;
-	let judgedCount = 0;
-	for (const r of results) {
-		const control = r.runs.control;
-		const addon = r.runs.addon;
-		controlMs += control.wallMs;
-		addonMs += addon.wallMs;
-		controlTokens += control.usage.totalTokens;
-		addonTokens += addon.usage.totalTokens;
-		if (control.checkPassed) controlPass++;
-		if (addon.checkPassed) addonPass++;
-		const better = r.judge.judged ? r.judge.choice : undefined;
-		let winner = "not judged";
-		if (better === "TIE") {
-			ties++;
-			winner = "tie";
-		} else if (better === "A" || better === "B") {
-			judgedCount++;
-			const arm = armOfLabel(r, better);
-			winner = arm;
-			if (arm === "control") controlWins++;
-			else addonWins++;
-		}
-		const satLabel = (label: "A" | "B"): string => {
-			const v = label === "A" ? r.judge.supportedA : r.judge.supportedB;
-			const p = label === "A" ? r.judge.noulA : r.judge.noulB;
-			return v === undefined ? "n/a" : `${v ? "yes" : "no"} (${p?.toFixed(3)})`;
-		};
-		for (const label of ["A", "B"] as const) {
-			const supportsThis = label === "A" ? r.judge.supportedA : r.judge.supportedB;
-			if (supportsThis === true) {
-				if (armOfLabel(r, label) === "control") controlSatisfies++;
-				else addonSatisfies++;
+	const comparisonRows: string[] = [
+		"| task | repeat | comparison | A shown as | judge: better | judge confidence | satisfies (each arm) |",
+		"| --- | --- | --- | --- | --- | --- | --- |",
+	];
+	const requirementRows: string[] = [
+		`| task | repeat | requirement | kind | ${arms.map(a => a).join(" | ")} |`,
+		`| --- | --- | --- | --- | ${arms.map(() => "---").join(" | ")} |`,
+	];
+	const keptByArm: Record<string, { kept: number; total: number }> = {};
+	const droppedNotes: string[] = [];
+	const winsByArm: Record<string, number> = {};
+	const lossesByArm: Record<string, number> = {};
+	const tiesByPair: Record<string, number> = {};
+	const unjudgedByPair: Record<string, number> = {};
+	const satisfiesByArm: Record<string, { yes: number; total: number }> = {};
+	const wallByArm: Record<string, number> = {};
+	const tokensByArm: Record<string, { input: number; output: number }> = {};
+	const judgeCallsByArm: Record<string, number> = {};
+	const judgeTokensByArm: Record<string, { input: number; output: number }> = {};
+	const requirementLevelByArm: Record<string, { sessionsWithRequirementLevel: number; sessions: number; calls: number; requirementCalls: number }> = {};
+	for (const arm of arms) {
+		keptByArm[arm] = { kept: 0, total: 0 };
+		winsByArm[arm] = 0;
+		lossesByArm[arm] = 0;
+		satisfiesByArm[arm] = { yes: 0, total: 0 };
+		wallByArm[arm] = 0;
+		tokensByArm[arm] = { input: 0, output: 0 };
+		judgeCallsByArm[arm] = 0;
+		judgeTokensByArm[arm] = { input: 0, output: 0 };
+		requirementLevelByArm[arm] = { sessionsWithRequirementLevel: 0, sessions: 0, calls: 0, requirementCalls: 0 };
+	}
+	for (const result of results) {
+		for (const arm of arms) {
+			const run = result.runs[arm];
+			if (run === undefined) continue;
+			wallByArm[arm] = (wallByArm[arm] ?? 0) + run.wallMs;
+			tokensByArm[arm] = {
+				input: (tokensByArm[arm]?.input ?? 0) + run.usage.input,
+				output: (tokensByArm[arm]?.output ?? 0) + run.usage.output,
+			};
+			judgeCallsByArm[arm] = (judgeCallsByArm[arm] ?? 0) + run.judgeTraffic.calls;
+			judgeTokensByArm[arm] = {
+				input: (judgeTokensByArm[arm]?.input ?? 0) + run.judgeTraffic.inputTokens,
+				output: (judgeTokensByArm[arm]?.output ?? 0) + run.judgeTraffic.outputTokens,
+			};
+			const level = requirementLevelByArm[arm]!;
+			level.sessions++;
+			level.calls += run.requirementLevel.calls;
+			level.requirementCalls += run.requirementLevel.requirementCalls;
+			if (run.requirementLevel.requirementCalls > 0) level.sessionsWithRequirementLevel++;
+			const verdicts = (result.task.requirements ?? []).map(r => run.requirements[r.id] ?? "missing");
+			keptByArm[arm]!.kept += verdicts.filter(v => v === "pass").length;
+			keptByArm[arm]!.total += verdicts.length;
+			for (const requirement of result.task.requirements ?? []) {
+				if ((run.requirements[requirement.id] ?? "missing") !== "pass") {
+					droppedNotes.push(`${result.task.id} r${result.repeat} ${arm} dropped ${requirement.id}`);
+				}
+			}
+			perArmRows.push(
+				`| ${run.taskId} | r${run.repeat} | ${arm} | ${verdicts.filter(v => v === "pass").length}/${verdicts.length} | ${run.checkPassed ? "PASS" : "FAIL"} | ${(run.wallMs / 1000).toFixed(1)}s | ${run.usage.input}/${run.usage.output} | ${run.judgeTraffic.calls} | ${run.judgeTraffic.inputTokens}/${run.judgeTraffic.outputTokens} | ${run.requirementLevel.requirementCalls}/${run.requirementLevel.calls} |`,
+			);
+			if (result.task.requirements !== undefined) {
+				requirementRows.push(
+					`| ${run.taskId} | r${run.repeat} | ${result.task.requirements.map(r => r.id).join(" ")} | ${result.task.requirements.map(r => r.kind[0]).join(" ")} | ${result.task.requirements.map(r => (run.requirements[r.id] === "pass" ? "KEPT" : run.requirements[r.id] === "fail" ? "**DROPPED**" : "n/a")).join(" | ")} |`,
+				);
 			}
 		}
-		controlJudgeCalls += control.judgeTraffic.calls;
-		addonJudgeCalls += addon.judgeTraffic.calls;
-		addonJudgeInput += addon.judgeTraffic.inputTokens;
-		addonJudgeOutput += addon.judgeTraffic.outputTokens;
-		for (const requirement of r.task.requirements ?? []) {
-			const controlVerdict = control.requirements[requirement.id] ?? "missing";
-			const addonVerdict = addon.requirements[requirement.id] ?? "missing";
-			requirementsTotal++;
-			if (controlVerdict === "pass") requirementsControlKept++;
-			if (addonVerdict === "pass") requirementsAddonKept++;
-			if (controlVerdict !== addonVerdict) {
-				const note = `${r.task.id}/${requirement.id} (control ${controlVerdict}, addon ${addonVerdict})`;
-				if (addonVerdict === "pass") addonOnly.push(note);
-				else if (controlVerdict === "pass") controlOnly.push(note);
+		for (const comparison of result.comparisons) {
+			const pairName = comparison.pair.join("-vs-");
+			const j = comparison.judge;
+			const better = j.judged ? j.choice : undefined;
+			let verdict = "not judged";
+			if (better === "TIE") {
+				verdict = "tie";
+				tiesByPair[pairName] = (tiesByPair[pairName] ?? 0) + 1;
+			} else if (better === "A" || better === "B") {
+				const winner = armOfLabel(comparison, better);
+				const loser = otherArm(comparison.pair, winner);
+				verdict = winner;
+				winsByArm[winner] = (winsByArm[winner] ?? 0) + 1;
+				lossesByArm[loser] = (lossesByArm[loser] ?? 0) + 1;
+			} else {
+				unjudgedByPair[pairName] = (unjudgedByPair[pairName] ?? 0) + 1;
 			}
-			const label = (v: "pass" | "fail" | "missing"): string =>
-				v === "pass" ? "KEPT" : v === "fail" ? "**DROPPED**" : "not reported";
-			requirementRows.push(
-				`| ${r.task.id} | ${requirement.id} | ${requirement.kind} | ${requirement.text} | ${label(controlVerdict)} | ${label(addonVerdict)} |`,
+			for (const label of ["A", "B"] as const) {
+				const arm = armOfLabel(comparison, label);
+				const supports = label === "A" ? j.supportedA : j.supportedB;
+				if (supports === undefined) continue;
+				const bucket = satisfiesByArm[arm]!;
+				bucket.total++;
+				if (supports) bucket.yes++;
+			}
+			const satisfaction = (["A", "B"] as const)
+				.map(label => {
+					const arm = armOfLabel(comparison, label);
+					const supports = label === "A" ? j.supportedA : j.supportedB;
+					const noul = label === "A" ? j.noulA : j.noulB;
+					return `${arm}: ${supports === undefined ? "n/a" : `${supports ? "yes" : "no"} (${noul?.toFixed(3)})`}`;
+				})
+				.join(", ");
+			comparisonRows.push(
+				`| ${result.task.id} | r${result.repeat} | ${pairName} | A=${comparison.aIs} | ${better ?? "n/a"} | ${j.choiceConfidence ?? "n/a"} | ${satisfaction} |`,
 			);
 		}
-		rows.push(
-			`| ${r.task.id} | A=${r.aIs} | ${better ?? "n/a"} | ${satLabel("A")} | ${satLabel("B")} | ${control.checkPassed ? "PASS" : "FAIL"} | ${addon.checkPassed ? "PASS" : "FAIL"} | ${(control.wallMs / 1000).toFixed(1)}s | ${(addon.wallMs / 1000).toFixed(1)}s | ${control.usage.input}/${control.usage.output} | ${addon.usage.input}/${addon.usage.output} | ${control.judgeTraffic.calls} | ${addon.judgeTraffic.calls} (${addon.judgeTraffic.inputTokens}/${addon.judgeTraffic.outputTokens} tok) | ${winner} |`,
-		);
 	}
 	const n = results.length;
-	const meanControl = controlMs / n / 1000;
-	const meanAddon = addonMs / n / 1000;
-	const delta = meanAddon - meanControl;
-	const pct = meanControl > 0 ? (delta / meanControl) * 100 : 0;
 	const conclusions: string[] = [];
-	if (requirementsTotal > 0) {
+	for (const arm of arms) {
+		const kept = keptByArm[arm]!;
+		const level = requirementLevelByArm[arm]!;
 		conclusions.push(
-			`**Requirements kept** (machine-checked, per requirement, judge not involved): control ${requirementsControlKept}/${requirementsTotal}, addon ${requirementsAddonKept}/${requirementsTotal}.`,
-		);
-		conclusions.push(
-			`**Where the arms differ**: ${
-				addonOnly.length + controlOnly.length === 0
-					? "nowhere - both arms kept exactly the same requirements"
-					: `kept by the addon arm and dropped by the control arm: ${addonOnly.join(", ") || "none"}; kept by the control arm and dropped by the addon arm: ${controlOnly.join(", ") || "none"}`
-			}.`,
+			`**${arm}**: requirements kept ${kept.kept}/${kept.total} over ${n} run(s); mean wall ${((wallByArm[arm] ?? 0) / Math.max(1, n) / 1000).toFixed(1)}s; coding tokens ${tokensByArm[arm]?.input ?? 0} in / ${tokensByArm[arm]?.output ?? 0} out; judge consultations ${judgeCallsByArm[arm] ?? 0} (${judgeTokensByArm[arm]?.input ?? 0} in / ${judgeTokensByArm[arm]?.output ?? 0} out tokens); sessions reaching the requirement level ${level.sessionsWithRequirementLevel}/${level.sessions} (${level.requirementCalls} of ${level.calls} payloads quoted a requirement).`,
 		);
 	}
-	conclusions.push(
-		`**Objective checks** (independent of the judge): control ${controlPass}/${n} pass, addon ${addonPass}/${n} pass.`,
-	);
-	conclusions.push(
-		`**Blind judge**: it marked ${controlSatisfies}/${n} control results and ${addonSatisfies}/${n} addon results as satisfying the task as quoted; on "which result is better" it gave ${judgedCount} decisive preference${judgedCount === 1 ? "" : "s"} (control ${controlWins}, addon ${addonWins}) and ${ties} tie${ties === 1 ? "" : "s"}.`,
-	);
-	conclusions.push(
-		`**Cost**: mean wall time per task control ${meanControl.toFixed(1)}s vs addon ${meanAddon.toFixed(1)}s (${delta >= 0 ? "+" : ""}${delta.toFixed(1)}s, ${delta >= 0 ? "+" : ""}${pct.toFixed(0)}%); mean coding-model tokens control ${Math.round(controlTokens / n)} vs addon ${Math.round(addonTokens / n)}; judge consultations observed through the proxy control ${controlJudgeCalls}, addon ${addonJudgeCalls} (addon judge tokens ${addonJudgeInput} in / ${addonJudgeOutput} out).`,
-	);
-	if (n < 10) {
+	if (droppedNotes.length > 0) conclusions.push(`**Dropped requirements (every occurrence)**: ${droppedNotes.join("; ")}.`);
+	else conclusions.push("**Dropped requirements**: none - every declared requirement was kept in every run of every arm.");
+	for (const pair of armPairs) {
+		const name = pair.join("-vs-");
 		conclusions.push(
-			`**Sample limit**: with ${n} task${n === 1 ? "" : "s"} and a single run per arm, a difference smaller than a whole requirement would not show up, and one task flipping would change the tally; read the per-requirement table above, not this sentence, for what actually happened.`,
+			`**Judge on \`${name}\`**: wins ${winsByArm[pair[0]!] ?? 0}-${winsByArm[pair[1]!] ?? 0} recorded per arm overall (see the comparison table for the per-run mapping), ties ${tiesByPair[name] ?? 0}, not judged ${unjudgedByPair[name] ?? 0}.`,
 		);
 	}
-	return { table: `${rows.join("\n")}\n\nPer-requirement results (machine verdicts from the check scripts; the judge never sees this table):\n\n${requirementRows.join("\n")}`, conclusion: conclusions.join(" ") };
+	for (const arm of arms) {
+		const sat = satisfiesByArm[arm]!;
+		conclusions.push(`judged satisfaction for \`${arm}\`: ${sat.yes}/${sat.total}.`);
+	}
+	conclusions.push(
+		`**Sample limit**: ${n} run(s) per arm of one task; a difference smaller than a whole requirement could not show up, and the per-run tables above are the evidence, not this paragraph.`,
+	);
+	return {
+		table: `### Per run and arm (the outcome signal: requirements kept, machine-checked)
+
+${perArmRows.join("\n")}
+
+### Per requirement, per run
+
+${requirementRows.join("\n")}
+
+### Blind pairwise comparisons
+
+${comparisonRows.join("\n")}`,
+		conclusion: conclusions.join(" "),
+	};
 }
 
 /** Content digest of the extension under test: every file under src/, sorted, hashed. */
@@ -2343,7 +2512,7 @@ if (selfTestOnly) {
 
 if (dryRun) {
 	process.stdout.write(
-		`dry run: set=${setName}, ${selected.length} task(s), ${selected.length * 2 * repeats} omp sessions, out=${outFile}, seed=${seed}\n\n`,
+		`dry run: set=${setName}, ${selected.length} task(s), ${selected.length * arms.length * repeats} omp sessions, out=${outFile}, seed=${seed}\n\n`,
 	);
 	for (const t of selected) {
 		process.stdout.write(
@@ -2397,22 +2566,29 @@ try {
 
 	for (const task of selected) {
 		for (let repeat = 1; repeat <= repeats; repeat++) {
-			log(`task ${task.id} repeat ${repeat}: running both arms...`);
-			const control = await runArm(task, "control", repeat);
-			log(`  control: exit ${control.exitCode}, ${(control.wallMs / 1000).toFixed(1)}s, check ${control.checkPassed ? "PASS" : "FAIL"}, tools ${control.toolSequence.join(",") || "-"}`);
-			const addon = await runArm(task, "addon", repeat);
-			log(`  addon:   exit ${addon.exitCode}, ${(addon.wallMs / 1000).toFixed(1)}s, check ${addon.checkPassed ? "PASS" : "FAIL"}, tools ${addon.toolSequence.join(",") || "-"}`);
-
-			const aIs: Arm = prng() < 0.5 ? "control" : "addon";
-			const request = buildJudgeRequest(
-				task,
-				judgeEvidenceFor(task, aIs === "control" ? control : addon),
-				judgeEvidenceFor(task, aIs === "control" ? addon : control),
-			);
-			log(`  judging (A = ${aIs})...`);
-			const judge = await judgeTask(client, task, request, observations);
-			log(`  judge: better=${judge.choice ?? "n/a"} noulA=${judge.noulA ?? "n/a"} noulB=${judge.noulB ?? "n/a"}${judge.judged ? "" : ` UNJUDGED: ${judge.error}`}`);
-			results.push({ task, aIs, runs: { control, addon }, judge });
+			log(`task ${task.id} repeat ${repeat}: running ${arms.length} arm(s)...`);
+			const runs: Partial<Record<Arm, RunCapture>> = {};
+			for (const arm of arms) {
+				const run = await runArm(task, arm, repeat);
+				runs[arm] = run;
+				log(
+					`  ${arm.padEnd(7)}: exit ${run.exitCode}${run.timedOut ? " TIMED OUT" : ""}, ${(run.wallMs / 1000).toFixed(1)}s, check ${run.checkPassed ? "PASS" : "FAIL"}, reqs ${(task.requirements ?? []).filter(r => run.requirements[r.id] === "pass").length}/${(task.requirements ?? []).length}, judge calls ${run.judgeTraffic.calls} (requirement-level ${run.requirementLevel.requirementCalls})`,
+				);
+			}
+			const comparisons: ArmComparison[] = [];
+			for (const pair of armPairs) {
+				const aIs: Arm = prng() < 0.5 ? pair[0] : pair[1];
+				const aRun = runs[aIs]!;
+				const bRun = runs[otherArm(pair, aIs)]!;
+				const request = buildJudgeRequest(task, judgeEvidenceFor(task, aRun), judgeEvidenceFor(task, bRun));
+				log(`  judging ${pair.join(" vs ")} (A = ${aIs})...`);
+				const judge = await judgeTask(client, task, request, `${task.id}-r${repeat}-${pair[0]}-vs-${pair[1]}`, observations);
+				log(
+					`  ${pair.join(" vs ")}: better=${judge.choice ?? "n/a"}${judge.choiceConfidence === undefined ? "" : ` (conf ${judge.choiceConfidence})`} noulA=${judge.noulA ?? "n/a"} noulB=${judge.noulB ?? "n/a"}${judge.judged ? "" : ` UNJUDGED: ${judge.error}`}`,
+				);
+				comparisons.push({ pair, aIs, judge });
+			}
+			results.push({ task, repeat, runs, comparisons });
 		}
 	}
 } catch (err) {
@@ -2428,12 +2604,20 @@ try {
 	out.push("");
 	out.push("## What was measured");
 	out.push("");
-	out.push("Two arms, identical prompt and model, one fresh scratch directory per arm, both under /tmp:");
+	out.push(`${arms.length} arm(s), identical prompt and model, one fresh scratch directory per arm, all under /tmp:`);
 	out.push("");
-	out.push("| arm | command shape | extension loaded |");
+	out.push("| arm | command shape | config the extension reads |");
 	out.push("| --- | --- | --- |");
-	out.push("| control | `omp --mode json -p --no-extensions --model MODEL --auto-approve --no-session --max-time N <prompt>` | none |");
-	out.push(`| addon | the same plus \`-e ${relative(REPO_ROOT, EXTENSION_ENTRY)}\` | jevstice \`src/index.ts\` (owner's config \`~/.omp/agent/jev.config.json\`) |`);
+	out.push(`| control | \`omp --mode json -p --no-extensions --model MODEL --auto-approve --no-session --max-time N <prompt>\` | none (no extension loaded) |`);
+	for (const arm of arms) {
+		if (arm === "control") continue;
+		const overridePath = armConfigs[arm];
+		const description =
+			overridePath === undefined
+				? "the owner's `~/.omp/agent/jev.config.json` as it stands"
+				: `the owner's file merged (key by key, project wins) with \`${relative(REPO_ROOT, overridePath)}\` (sha256 ${sha256(readFileSync(overridePath, "utf8"))}); copied into every run dir of this arm as \`.omp/jev.config.json\``;
+		out.push(`| ${arm} | the control command plus \`-e ${relative(REPO_ROOT, EXTENSION_ENTRY)}\` | ${description} |`);
+	}
 	out.push("");
 	out.push(`\`--no-extensions\` is used in BOTH arms because \`~/.omp/agent/extensions/jevstice\` is a symlink to this repo: without it the addon would load in every session and there would be no control arm. Model: \`${MODEL}\`. Thinking level: taken from the model spec on the command line. Mode: \`--mode json -p\` (non-interactive, machine-readable events).`);
 	if (MODEL_NOTE.length > 0) {
@@ -2445,7 +2629,7 @@ try {
 	out.push("");
 	out.push("**Judge traffic is observed, not inferred.** The extension's own judge consultations are HTTP calls made from inside the extension and are invisible to the host's event stream, so every spawned session is given `TYPESAFE_API_URL` pointing at a throwaway in-process forwarding proxy. The proxy relays each request to the real endpoint unchanged and records one JSONL line per call (path, model, question ids, status, latency, response usage and a compact answer summary); the API key rides in the Authorization header and is never recorded. That turns \"how many judge consultations did the addon make, and what did they cost\" from a guess into a count, per run.");
 	out.push("");
-	out.push(`Judge: TypeSafe systemone \`${JUDGE_MODEL}\`, one request per task with 3 questions (one choice "which of A/B better satisfies the task", one noul per result "does this result satisfy the task as quoted", threshold ${NOUL_SUPPORTED_THRESHOLD}). The A/B labels are randomised per task from seed ${seed}; the judge never sees the command lines, arm names, timings or token usage. Judge key: present in the environment, never printed, never written to this log.`);
+	out.push(`Judge: TypeSafe systemone \`${JUDGE_MODEL}\`, one request per ARM PAIR per run with 3 questions (one choice "which of A/B better satisfies the task", one noul per result "does this result satisfy the task as quoted", threshold ${NOUL_SUPPORTED_THRESHOLD}). Every arm pair is compared (${armPairs.map(p => p.join("-vs-")).join(", ")}); the A/B labels are randomised per comparison from seed ${seed}; the judge never sees the command lines, arm names, timings or token usage. Judge key: present in the environment, never printed, never written to this log.`);
 	out.push("");
 	out.push(`**Measured revision of the extension**: \`src/\` content digest \`${revision.digest}\` over ${revision.files} files (sha256 of the sorted \`path:sha256\` manifest), git HEAD \`${gitHead}\`. The digest is taken at the start of the run: if \`src/\` changes afterwards the run is no longer reproducible, so re-check the digest before comparing two runs.`);
 	const revisionAfter = extensionRevision();
@@ -2463,7 +2647,7 @@ try {
 	out.push("## Reproduce");
 	out.push("");
 	out.push("```");
-	out.push(`$ bun run tools/measurement/run.ts --set ${setName} --out ${outFile.startsWith(REPO_ROOT) ? relative(REPO_ROOT, outFile) : outFile} --seed ${seed}${repeats > 1 ? ` --repeats ${repeats}` : ""}${only.length > 0 ? ` --only ${only.join(",")}` : ""}${rawFlag !== undefined && rawFlag.length > 0 ? ` --raw ${relative(REPO_ROOT, rawDir)}` : ""}`);
+	out.push(`$ bun run tools/measurement/run.ts --set ${setName} --out ${outFile.startsWith(REPO_ROOT) ? relative(REPO_ROOT, outFile) : outFile} --seed ${seed} --model ${MODEL} --arms ${arms.join(",")}${repeats > 1 ? ` --repeats ${repeats}` : ""}${only.length > 0 ? ` --only ${only.join(",")}` : ""}${Object.entries(armConfigs).map(([arm, path]) => ` --config ${arm}=${relative(REPO_ROOT, path!)}`).join("")}${rawFlag !== undefined && rawFlag.length > 0 ? ` --raw ${relative(REPO_ROOT, rawDir)}` : ""}`);
 	out.push("```");
 	out.push("");
 	out.push("The task checks can be validated on their own, with no omp session and no judge:");
@@ -2531,10 +2715,12 @@ try {
 	out.push("## Raw runs and judge verdicts");
 	out.push("");
 	for (const r of results) {
-		out.push(`### Task \`${r.task.id}\``);
+		out.push(`### Task \`${r.task.id}\` repeat ${r.repeat}`);
 		out.push("");
-		out.push(renderRun(r.task, r.runs.control));
-		out.push(renderRun(r.task, r.runs.addon));
+		for (const arm of arms) {
+			const run = r.runs[arm];
+			if (run !== undefined) out.push(renderRun(r.task, run));
+		}
 		out.push(renderJudge(r, observations));
 	}
 
@@ -2552,57 +2738,62 @@ try {
 	out.push("## Observations, failures and limits");
 	out.push("");
 	const resets = observations.filter(o => o.retryable);
-	const injectedByArm = (arm: Arm): Map<string, number> => {
+	const allRuns = results.flatMap(r => arms.map(arm => r.runs[arm]).filter((run): run is RunCapture => run !== undefined));
+	const injectedFor = (arm: Arm): Map<string, number> => {
 		const counts = new Map<string, number>();
 		for (const r of results) {
-			for (const m of r.runs[arm].injected) counts.set(m.customType, (counts.get(m.customType) ?? 0) + 1);
+			const run = r.runs[arm];
+			if (run === undefined) continue;
+			for (const m of run.injected) counts.set(m.customType, (counts.get(m.customType) ?? 0) + 1);
 		}
 		return counts;
 	};
 	const renderInjected = (counts: Map<string, number>): string =>
 		counts.size === 0 ? "none" : [...counts.entries()].map(([t, n]) => `\`${t}\` x${n}`).join(", ");
-	const addonInjected = injectedByArm("addon");
-	const controlInjected = injectedByArm("control");
-	const extensionInControl = [...controlInjected.keys()].filter(t => t.startsWith("jev"));
-	const addonSessions = results.reduce((s, r) => s + 1, 0);
-	const addonSessionsWithExtension = results.filter(r => r.runs.addon.injected.some(m => m.customType.startsWith("jev"))).length;
-	const decisionToolCalls = results.reduce(
-		(sum, r) => sum + r.runs.addon.toolSequence.filter(t => t === "jev_decision").length,
-		0,
-	);
 	out.push(
-		`- **What the addon actually did in these runs**: messages injected into the conversation by \`customType\` — addon arm: ${renderInjected(addonInjected)}; control arm: ${renderInjected(controlInjected)}. Only \`customType\`s starting with \`jev\` can come from this extension (the others, e.g. \`lsp-late-diagnostic\`, are the host's own); the extension therefore intervened ${[...addonInjected.entries()].filter(([t]) => t.startsWith("jev")).reduce((s, [, n]) => s + n, 0)} time(s) in the addon arm and ${extensionInControl.length === 0 ? "**0 times in the control arm (clean control)**" : `**${extensionInControl.join(", ")} — THE CONTROL ARM WAS CONTAMINATED**`}, and an extension-produced message appears in ${addonSessionsWithExtension}/${addonSessions} addon sessions (an addon session with no such message is not proof the extension was absent: the activation probe above is the authoritative check that it loaded).`,
+		`- **What each arm actually did** (messages injected by \`customType\`): ${arms.map(arm => `\`${arm}\`: ${renderInjected(injectedFor(arm))}`).join("; ")}. Only \`customType\`s starting with \`jev\` can come from this extension (the others, e.g. \`lsp-late-diagnostic\`, are the host's own), so a clean control arm shows none of them.`,
 	);
-	const controlJudgeCalls = results.reduce((s, r) => s + r.runs.control.judgeTraffic.calls, 0);
-	const addonJudgeCalls = results.reduce((s, r) => s + r.runs.addon.judgeTraffic.calls, 0);
-	const addonJudgeInput = results.reduce((s, r) => s + r.runs.addon.judgeTraffic.inputTokens, 0);
-	const addonJudgeOutput = results.reduce((s, r) => s + r.runs.addon.judgeTraffic.outputTokens, 0);
+	for (const arm of arms) {
+		if (arm === "control") continue;
+		const runs = results.map(r => r.runs[arm]).filter((run): run is RunCapture => run !== undefined);
+		const withExtension = runs.filter(run => run.injected.some(m => m.customType.startsWith("jev"))).length;
+		const calls = runs.reduce((s, run) => s + run.judgeTraffic.calls, 0);
+		const inputTokens = runs.reduce((s, run) => s + run.judgeTraffic.inputTokens, 0);
+		const outputTokens = runs.reduce((s, run) => s + run.judgeTraffic.outputTokens, 0);
+		const withRequirementLevel = runs.filter(run => run.requirementLevel.requirementCalls > 0).length;
+		const requirementCalls = runs.reduce((s, run) => s + run.requirementLevel.requirementCalls, 0);
+		const payloads = runs.reduce((s, run) => s + run.requirementLevel.calls, 0);
+		const decisionToolCalls = runs.reduce((s, run) => s + run.toolSequence.filter(t => t === "jev_decision").length, 0);
+		out.push(
+			`- **Arm \`${arm}\`**: an extension-produced message appears in ${withExtension}/${runs.length} session(s); the proxy counted ${calls} judge consultation(s) costing ${inputTokens} input + ${outputTokens} output judge tokens (the model itself called \`jev_decision\` ${decisionToolCalls} time(s), so a larger proxy count means the extension consulted the judge on its own initiative); **${withRequirementLevel}/${runs.length} session(s) reached the requirement level** — ${requirementCalls} of ${payloads} dumped payload(s) quoted a requirement rather than only classifying or routing the task (markers: req-N / crit-N / quote-N item ids, SPEC.md section N question ids).`,
+		);
+	}
+	const nonZero = allRuns.filter(c => c.exitCode !== 0);
+	const anyTimedOut = allRuns.filter(c => c.timedOut);
 	out.push(
-		`- **Judge consultations** (authoritative: the local forwarding proxy counted every request the run made, whether or not the model called a tool): control arm ${controlJudgeCalls} call(s); addon arm ${addonJudgeCalls} call(s) costing ${addonJudgeInput} input + ${addonJudgeOutput} output judge tokens. The model itself called the \`jev_decision\` tool ${decisionToolCalls} time(s) in the addon arm, so a non-zero proxy count with a zero tool count means the extension consulted the judge on its own initiative (task-start classification, gates, reviews) rather than because the model asked it to.`,
+		`- **Judge consultations per arm**: ${arms.map(arm => `\`${arm}\` ${results.reduce((s, r) => s + (r.runs[arm]?.judgeTraffic.calls ?? 0), 0)}`).join(", ")} (the control arm can only be non-zero if the host itself calls the judge).`,
 	);
 	if (observations.length === 0) {
 		out.push("- Judge transport: no failures at all - every systemone call succeeded on its first attempt.");
 	} else {
 		out.push(`- Judge transport failures (all recorded verbatim, ${resets.length} of ${observations.length} retryable):`);
 		for (const o of observations) {
-			out.push(`  - task ${o.taskId}, attempt ${o.attempt}: \`${o.errorClass}\` retryable=${o.retryable}: ${o.message}`);
+			out.push(`  - ${o.taskId}, attempt ${o.attempt}: \`${o.errorClass}\` retryable=${o.retryable}: ${o.message}`);
 		}
 	}
-	const killed = results.flatMap(r => [r.runs.control, r.runs.addon]).filter(c => c.timedOut);
 	if (revisionAfter.digest !== revision.digest || srcWrittenDuringRun.length > 0) {
-		out.push(`- **Revision**: this run is NOT single-revision - \`src/\` changed or was written inside the run window (${srcWrittenDuringRun.join(", ") || "the digest changed"}). The addon arm may have loaded two different revisions, so discard this run rather than comparing it.`);
+		out.push(`- **Revision**: this run is NOT single-revision - \`src/\` changed or was written inside the run window (${srcWrittenDuringRun.join(", ") || "the digest changed"}). The addon arms may have loaded two different revisions, so discard this run rather than comparing it.`);
 	}
-	out.push(`- Agent sessions killed at the harness time limit: ${killed.length === 0 ? "none" : killed.map(k => `${k.taskId}/${k.arm}`).join(", ")}.`);
-	const nonZero = results.flatMap(r => [r.runs.control, r.runs.addon]).filter(c => c.exitCode !== 0);
+	out.push(`- Agent sessions killed at the harness time limit: ${anyTimedOut.length === 0 ? "none" : anyTimedOut.map(k => `${k.taskId}/${k.arm}`).join(", ")}.`);
 	out.push(`- Agent sessions with a non-zero exit code: ${nonZero.length === 0 ? "none" : nonZero.map(k => `${k.taskId}/${k.arm}=${k.exitCode}`).join(", ")}.`);
 	if (fatal !== undefined) out.push(`- **FATAL**: ${fatal}`);
 	out.push("");
 	out.push("Limits of this measurement, stated plainly:");
 	out.push("");
-	out.push(`1. **Sample size**: ${selected.length} tiny mechanical tasks, ${repeats} run per arm each. This cannot detect small or probabilistic effects; one flipped task changes the tally. It says nothing about long, open-ended or design-level work, which is where the addon's gates are supposed to matter.`);
+	out.push(`1. **Sample size**: ${selected.length} task(s) in the set, ${repeats} run(s) per arm, ${arms.length} arm(s). This cannot detect small or probabilistic effects; one flipped run changes the tally, and the per-run tables - not the conclusion paragraph - are the evidence.`);
 	out.push("2. **The judge sees the objective check output**, so the per-result noul is partly a restatement of the check rather than an independent opinion. The check is the harder evidence; the judge adds a cross-check of whether the quoted evidence really shows the acceptance met.");
 	out.push("3. **Blinding is imperfect**: a run's final report may mention the judge/addon by name, which tells the judge which arm it is looking at. Wall time, token usage and command lines are withheld from the judge, but a self-identifying report is not redacted.");
-	out.push("4. **Cost**: only the coding model's token usage as reported by the host is captured. The addon's own judge consultations (arm B) are invisible to the harness - they are only visible indirectly, as extra wall time and as extra tool calls in the event stream.");
+	out.push("4. **Cost**: the coding model's token usage comes from the host's event stream; the extension's own judge consultations are counted and token-summed by the forwarding proxy, so both sides of the bill are here. What is *not* observable is whether any single consultation changed the model's behaviour - the payload dumps show what was asked and answered, not what the model did with the answer.");
 	out.push("5. **Tasks are non-interactive one-shots** (`-p`), auto-approved, with no git repository in the scratch directory: no mutation/completion gate pressure, no human in the loop, no commits. The owner's config has `gates.mutation` and `gates.completion` set to false, so what arm B adds here is the decision tool, the routing/instruction layer, and any advisory checks - not the blocking gates.");
 	out.push(`6. **Timing is wall-clock on one machine**, single run per arm, no repetition or interleaving; the machine was shared with other work during the run.`);
 	out.push("7. **The judge's own confidence is reported raw.** The repo's policy treats a choice below 0.8 confidence as insufficient to approve, so a low-confidence TIE or preference above is weaker evidence than its option id alone suggests; the raw probabilities are printed with every verdict.");
