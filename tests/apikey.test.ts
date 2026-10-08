@@ -1,63 +1,69 @@
-/**
- * Key resolution is one path for the CLI and the extension (env var, else resolver command).
- * The key is never logged; these tests assert values, not formatting.
- */
 import { describe, expect, test } from "bun:test";
-import { apiKeyCommand, apiKeyFromEnv, memoizedKeyResolver, resolveApiKey } from "../src/apikey";
-import { JevApiError } from "../src/client";
-import { buildProductionJudge } from "../src/index";
-import type { DecisionRequest } from "../src/types";
+import { memoizedApiKeyResolver, resolveApiKey } from "../src/apikey.js";
 
-const request = {
-	stage: "task_classification",
-	task: "t",
-	proposal: "p",
-	options: [
-		{ id: "a", label: "A", meaning: "a" },
-		{ id: "b", label: "B", meaning: "b" },
-	],
-	evidence: [{ kind: "user", source: "s", quote: "a quote long enough to pass" }],
-} as unknown as DecisionRequest;
+describe("T1 - the key reaches the judge client and nowhere else", () => {
+	test("the environment variable wins over the resolver command", async () => {
+		const runs: string[] = [];
+		const key = await resolveApiKey(
+			{ TYPESAFE_API_KEY: "env-key", TYPESAFE_API_KEY_COMMAND: "pass show token/jev" },
+			async command => {
+				runs.push(command);
+				return "command-key";
+			},
+		);
 
-describe("api key resolution", () => {
-	test("a direct environment variable wins over the resolver command", async () => {
-		const key = await resolveApiKey({ TYPESAFE_API_KEY: "direct", TYPESAFE_API_KEY_COMMAND: "exit 1" });
-		expect(key).toBe("direct");
+		expect(key).toBe("env-key");
+		expect(runs).toEqual([]);
 	});
 
-	test("JEVI_API_KEY is the documented fallback; an empty value is not a key", () => {
-		expect(apiKeyFromEnv({ JEVI_API_KEY: "alt" })).toBe("alt");
-		expect(apiKeyFromEnv({ TYPESAFE_API_KEY: "" })).toBeUndefined();
-		expect(apiKeyCommand({ TYPESAFE_API_KEY_COMMAND: "" })).toBeUndefined();
+	test("JEVI_API_KEY is accepted as the alternate variable and whitespace is trimmed", async () => {
+		expect(await resolveApiKey({ JEVI_API_KEY: "  jevi-key  " })).toBe("jevi-key");
 	});
 
-	test("resolver command stdout is trimmed and becomes the key", async () => {
-		expect(await resolveApiKey({ TYPESAFE_API_KEY_COMMAND: "printf '  secret\\n'" })).toBe("secret");
+	test("the resolver command's trimmed stdout is the key", async () => {
+		const runs: string[] = [];
+		const key = await resolveApiKey({ TYPESAFE_API_KEY_COMMAND: "pass show token/jev" }, async command => {
+			runs.push(command);
+			return "command-key\n";
+		});
+
+		expect(key).toBe("command-key");
+		expect(runs).toEqual(["pass show token/jev"]);
 	});
 
-	test("empty command output is not a key", async () => {
-		expect(await resolveApiKey({ TYPESAFE_API_KEY_COMMAND: "true" })).toBeUndefined();
+	test("an empty result and a failing command resolve to no key", async () => {
+		expect(await resolveApiKey({ TYPESAFE_API_KEY_COMMAND: "true" }, async () => "   \n")).toBeUndefined();
+		expect(
+			await resolveApiKey({ TYPESAFE_API_KEY_COMMAND: "false" }, async () => {
+				throw new Error("gpg: decryption failed");
+			}),
+		).toBeUndefined();
+		expect(await resolveApiKey({})).toBeUndefined();
+		expect(await resolveApiKey({ TYPESAFE_API_KEY: "   " })).toBeUndefined();
 	});
 
-	test("a failing command is a typed config error, never a silent empty key", async () => {
-		await expect(resolveApiKey({ TYPESAFE_API_KEY_COMMAND: "exit 7" })).rejects.toThrow(JevApiError);
+	test("a resolved key is memoized across calls", async () => {
+		let runs = 0;
+		const resolve = memoizedApiKeyResolver({ TYPESAFE_API_KEY_COMMAND: "pass show token/jev" }, async () => {
+			runs += 1;
+			return "command-key";
+		});
+
+		expect(await resolve()).toBe("command-key");
+		expect(await resolve()).toBe("command-key");
+		expect(runs).toBe(1);
 	});
 
-	test("memoized resolver reuses a success and retries after a failure", async () => {
-		const env: Record<string, string | undefined> = { TYPESAFE_API_KEY_COMMAND: "printf 'k1'" };
-		const resolve = memoizedKeyResolver(env);
-		expect(await resolve()).toBe("k1");
-		env["TYPESAFE_API_KEY_COMMAND"] = "printf 'k2'";
-		expect(await resolve()).toBe("k1");
+	test("a missing key is retried, so a key exported mid-session is picked up", async () => {
+		const env: Record<string, string | undefined> = { TYPESAFE_API_KEY_COMMAND: "pass show token/jev" };
+		let runs = 0;
+		const resolve = memoizedApiKeyResolver(env, async () => {
+			runs += 1;
+			return runs === 1 ? "" : "command-key";
+		});
 
-		const failing: Record<string, string | undefined> = { TYPESAFE_API_KEY_COMMAND: "exit 3" };
-		const resolveFailing = memoizedKeyResolver(failing);
-		await expect(resolveFailing()).rejects.toThrow(JevApiError);
-		failing["TYPESAFE_API_KEY_COMMAND"] = "printf 'k3'";
-		expect(await resolveFailing()).toBe("k3");
-	});
-
-	test("production judge fails closed when neither variable nor command is set", async () => {
-		await expect(buildProductionJudge({}).call(null, request)).rejects.toThrow(/unconfigured/);
+		expect(await resolve()).toBeUndefined();
+		expect(await resolve()).toBe("command-key");
+		expect(runs).toBe(2);
 	});
 });

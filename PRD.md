@@ -14,7 +14,7 @@ Each requirement specifies one independently observable behavior. The owner-requ
 
 - **FR-01 - Narrow topics.** WHEN a task requires specialized expertise, triage SHALL identify task-specific topics. [S1; J1:1]
 - **FR-02 - Simple-task decision.** WHEN a task is simple, triage SHALL explicitly say that deeper development activities are unnecessary. [S2; J1:2]
-- **FR-03 - Search relevance.** WHEN the executor submits web-search candidates, Jev SHALL be available to select relevant results and explain the selection. [S2, S3; J1:3]
+- **FR-03 - Search relevance.** WHEN the executor submits web-search candidates with evidence and a proposed reason for each, Jev SHALL select a relevant candidate-and-reason pair. [S2, S3; J1:3]
 - **FR-04 - Requirement decomposition.** DURING planning, the executor SHALL break the owner's request into individual concrete requirements. [S4; J1:4]
 - **FR-05 - Understanding check.** DURING planning, the executor SHALL submit each proposed requirement to Jev for a check against the original request. [S4; J3:2]
 - **FR-06 - Complete requirement set.** BEFORE a requirement list becomes the task PRD, the executor SHALL establish that its self-contained items collectively cover the owner's request. [S5; J1:6]

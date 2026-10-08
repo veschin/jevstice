@@ -1,295 +1,274 @@
-/**
- * The one gate/review mechanism (D1): one descriptor registry, one consult runner, and the two
- * host-order defects the live omp 18.6.3 smoke found in the hand-off gate (F1, F2).
- *
- * These tests exist because they fail when the behaviour breaks:
- *  - F1: the captured work order must survive the task tool's own `tool_result`, which omp emits
- *    BEFORE `before_subagent_spawn` (a regression retires the order and the dispatch consult
- *    silently never fires);
- *  - F2: the spawn acknowledgement must never be judged as the delegated result, and the result
- *    the host actually delivers must be judged when the acceptance side is opted in;
- *  - the registry validator: a descriptor whose refusal option is not offered, an advisory gate
- *    with a refusal path, or a deadline at the host's ceiling must be reported, so adding a gate
- *    is adding a descriptor rather than a new code path.
- */
 import { describe, expect, test } from "bun:test";
-import { CONTROL_POINT_REGISTRY } from "../src/control-points.js";
-import { createJevController } from "../src/controller.js";
-import { HOST_HANDLER_TIMEOUT_MS } from "../src/deadline.js";
-import {
-	GATE_REGISTRY,
-	decisionGate,
-	validateGateRegistry,
-	type GateDescriptor,
-} from "../src/gates.js";
-import { isRecord } from "../src/guards.js";
-import type { JevTemplateConfig } from "../src/config.js";
-import type { DecisionRequest, DecisionResult, Evidence } from "../src/types.js";
+import { DEFAULT_CONFIG } from "../src/config.js";
+import { completionGate, isConsequentialMutation, isProposeCall, mutationGate, planArtifactUrl, proposeGate } from "../src/gates.js";
+import { freshState, recordAcceptance, recordAction, registerTask, sha256, type JevState } from "../src/state.js";
+import type { JevConfig } from "../src/types.js";
 
-// ---------- a minimal host stand-in (same merge semantics as runner.ts emit*) ----------
-
-type Handler = (event: unknown, ctx?: unknown) => unknown;
-
-interface FakeToolDef {
-	name: string;
-	execute: (id: string, params: unknown, signal: unknown, onUpdate: unknown, ctx: unknown) => Promise<unknown>;
-	[key: string]: unknown;
+function config(overrides: Partial<JevConfig["gates"]> = {}): JevConfig {
+	return { ...DEFAULT_CONFIG, gates: { ...DEFAULT_CONFIG.gates, ...overrides } };
 }
 
-interface FakePiHarness {
-	pi: {
-		on(event: string, handler: Handler): void;
-		registerTool(tool: FakeToolDef): void;
-		appendEntry(customType: string, data?: unknown): void;
-		sendMessage(payload: unknown, options?: unknown): void;
-	};
-	emit(event: string, ev: unknown, ctx?: unknown): Promise<unknown>;
-	sentMessages: Array<{ payload: unknown; options?: unknown }>;
+/** A state with a registered task and one consequential change behind it. */
+function developed(): JevState {
+	const state = freshState();
+	registerTask(state, "Add the coverage report");
+	recordAction(state, { tool: "write", target: "src/report.ts", excerpt: "wrote the report" });
+	return state;
 }
 
-function makeFakePi(): FakePiHarness {
-	const handlers = new Map<string, Handler[]>();
-	const sentMessages: Array<{ payload: unknown; options?: unknown }> = [];
-	const pi: FakePiHarness["pi"] = {
-		on(event, handler) {
-			const list = handlers.get(event);
-			if (list === undefined) handlers.set(event, [handler]);
-			else list.push(handler);
-		},
-		registerTool() {},
-		appendEntry() {},
-		sendMessage(payload, options) {
-			sentMessages.push({ payload, options });
-		},
-	};
-	async function emit(event: string, ev: unknown, ctx?: unknown): Promise<unknown> {
-		let merged: Record<string, unknown> | undefined;
-		for (const handler of handlers.get(event) ?? []) {
-			const result = await handler(ev, ctx);
-			if (!isRecord(result)) continue;
-			if (result["block"] === true) return result;
-			for (const [key, value] of Object.entries(result)) {
-				if (value === undefined) continue;
-				merged = { ...(merged ?? {}), [key]: value };
-			}
-		}
-		return merged;
-	}
-	return { pi, emit, sentMessages };
-}
-
-function evidence(kind: Evidence["kind"], quote: string, source = "test"): Evidence {
-	return { kind, source, quote };
-}
-
-/** What omp's task tool returns for a background spawn (the delegated report arrives later). */
-const SPAWN_ACK = "Spawned agent `task-1`... Results auto-deliver; NEVER poll; the report will arrive as a job delivery.";
-
-const REQUIREMENT = "Keep the existing export working while you add the dashboard view.";
-const WORK_ORDER = "Implement the dashboard view module and keep the export suite green.";
-const HANDOFF_WIRED: JevTemplateConfig = { stages: { subagent_handoff: { instructions: "Judge the hand-off." } } };
-const HANDOFF_ACCEPTING: JevTemplateConfig = {
-	stages: { subagent_handoff: { instructions: "Judge the hand-off." } },
-	gates: { handoffAcceptance: true },
-};
-
-function approve(selectedOption: string, confidence = 0.95): DecisionResult {
-	return { verdict: "approve", selectedOption, reasons: ["approved"], confidence };
-}
-
-/** The real host order: task tool_call, then the tool's acknowledgement, then the spawn event. */
-async function dispatch(
-	harness: FakePiHarness,
-	source: string,
-	respond: (req: DecisionRequest) => DecisionResult,
-): Promise<DecisionRequest[]> {
-	const calls: DecisionRequest[] = [];
-	const controller = createJevController({
-		template: source === "wired" ? HANDOFF_WIRED : HANDOFF_ACCEPTING,
-		judge: async req => {
-			calls.push(req);
-			return respond(req);
-		},
-	});
-	controller.register(harness.pi);
-	await harness.emit("before_agent_start", { type: "before_agent_start", prompt: REQUIREMENT, systemPrompt: [] });
-	await harness.emit("tool_call", {
-		type: "tool_call",
-		toolCallId: "t1",
-		toolName: "task",
-		input: { task: WORK_ORDER, agent: "task" },
-	});
-	await harness.emit("tool_result", {
-		type: "tool_result",
-		toolName: "task",
-		toolCallId: "t1",
-		input: { task: WORK_ORDER },
-		content: [{ type: "text", text: SPAWN_ACK }],
-		isError: false,
-	});
-	await harness.emit("before_subagent_spawn", {
-		type: "before_subagent_spawn",
-		agent: "task",
-		invocationKind: "task",
-		patterns: ["@task"],
-		spawnKey: "t1:0",
-	});
-	return calls;
-}
-
-/** The delivery omp builds for a settled background job (session/async-job-delivery.ts). */
-async function deliver(harness: FakePiHarness, text: string): Promise<unknown> {
-	return await harness.emit("message_end", {
-		type: "message_end",
-		message: {
-			role: "custom",
-			customType: "async-result",
-			content: [{ type: "text", text }],
-			details: { jobs: [{ jobId: "job-1", type: "task", label: "task" }] },
-		},
-	});
-}
-
-describe("gate mechanism: the hand-off gate in real host order (F1, F2)", () => {
-	test("F1: the captured work order survives the task tool_result and judges the spawn", async () => {
-		const harness = makeFakePi();
-		const calls = await dispatch(harness, "wired", () => ({
-			verdict: "revise",
-			reasons: ["the work order omits the export requirement"],
-			confidence: 0.93,
-		}));
-		// The dispatch consult ran: the order was not retired by the tool's own result.
-		expect(calls).toHaveLength(1);
-		expect(calls[0]?.stage).toBe("subagent_handoff");
-		expect(calls[0]?.evidence.some(e => e.quote.includes(WORK_ORDER))).toBe(true);
-		expect(calls[0]?.evidence.some(e => e.quote.includes(REQUIREMENT))).toBe(true);
+describe("T3 - what counts as a consequential change", () => {
+	test("FR-18: working-tree changes are consequential, coordination and judge routes are not", () => {
+		expect(isConsequentialMutation("write", { path: "src/a.ts" })).toBe(true);
+		expect(isConsequentialMutation("write", { path: "vault://notes.md" })).toBe(true);
+		expect(isConsequentialMutation("write", { path: "conflict://1" })).toBe(true);
+		expect(isConsequentialMutation("edit", { paths: ["src/a.ts", "src/b.ts"] })).toBe(true);
+		expect(isConsequentialMutation("ast_edit", { paths: ["src/a.ts"] })).toBe(true);
+		expect(isConsequentialMutation("write", {})).toBe(true);
 	});
 
-	test("F2: the spawn acknowledgement is never judged as the delegated result", async () => {
-		const harness = makeFakePi();
-		const calls = await dispatch(harness, "wired", () => approve("approve"));
-		expect(calls).toHaveLength(1);
-		expect(calls.some(req => req.evidence.some(e => e.quote.includes("auto-deliver")))).toBe(false);
+	test("FR-18: the registered judge tools, agent messages and session artifacts pass", () => {
+		expect(isConsequentialMutation("write", { path: "xd://jev_consult" })).toBe(false);
+		expect(isConsequentialMutation("write", { path: "agent://helper" })).toBe(false);
+		expect(isConsequentialMutation("write", { path: "local://x-plan.md" })).toBe(false);
+		expect(isConsequentialMutation("write", { path: "proc://bg_1" })).toBe(false);
+		expect(isConsequentialMutation("write", { path: "xd://read" })).toBe(false);
+		expect(isConsequentialMutation("read", { path: "src/a.ts" })).toBe(false);
+		expect(isConsequentialMutation("web_search", { query: "x" })).toBe(false);
 	});
 
-	test("F2: the delivered result is judged when acceptance is opted in, and never blocks", async () => {
-		const harness = makeFakePi();
-		const calls: DecisionRequest[] = [];
-		let answer: DecisionResult = approve("approve");
-		const controller = createJevController({
-			template: HANDOFF_ACCEPTING,
-			judge: async req => {
-				calls.push(req);
-				return answer;
-			},
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: REQUIREMENT, systemPrompt: [] });
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "t1", toolName: "task", input: { task: WORK_ORDER } });
-		await harness.emit("tool_result", {
-			type: "tool_result",
-			toolName: "task",
-			toolCallId: "t1",
-			input: { task: WORK_ORDER },
-			content: [{ type: "text", text: SPAWN_ACK }],
-			isError: false,
-		});
-		await harness.emit("before_subagent_spawn", {
-			type: "before_subagent_spawn",
-			agent: "task",
-			invocationKind: "task",
-			patterns: ["@task"],
-			spawnKey: "t1:0",
-		});
-		expect(calls).toHaveLength(1);
-		// The delegated result arrives later, as the host's async-result delivery.
-		await deliver(harness, "Implemented the dashboard view module; the export suite passes.");
-		await controller.handoffAcceptanceSettled();
-		expect(calls).toHaveLength(2);
-		expect(calls.at(-1)?.evidence.some(e => e.quote.includes("the export suite passes"))).toBe(true);
-		expect(controller.getState().lastHandoff?.phase).toBe("acceptance");
-		expect(controller.getState().lastHandoff?.verdict).toBe("approve");
-		expect(controller.getState().blockers).toEqual([]);
-		// A confident negative on the delivered result records a blocker and still refuses nothing.
-		answer = { verdict: "revise", reasons: ["the report shows no run of the export test"], confidence: 0.91 };
-		const result = await deliver(harness, "Dashboard module added; I renamed the export helper.");
-		await controller.handoffAcceptanceSettled();
-		expect(result).toBeUndefined();
-		expect(controller.getState().blockers.join(" ")).toContain("did not accept the delegated result");
+	test("FR-18: a mounted mutating device is consequential", () => {
+		expect(isConsequentialMutation("write", { path: "xd://ast_edit", content: "{}" })).toBe(true);
+		expect(isConsequentialMutation("write", { path: "xd://bash", content: "{}" })).toBe(true);
 	});
 
-	test("acceptance stays off by default: the delivery is not judged and the state is untouched", async () => {
-		const harness = makeFakePi();
-		const calls: DecisionRequest[] = [];
-		const controller = createJevController({
-			template: HANDOFF_WIRED,
-			judge: async req => {
-				calls.push(req);
-				return approve("approve");
-			},
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: REQUIREMENT, systemPrompt: [] });
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "t1", toolName: "task", input: { task: WORK_ORDER } });
-		await harness.emit("before_subagent_spawn", {
-			type: "before_subagent_spawn",
-			agent: "task",
-			invocationKind: "task",
-			patterns: ["@task"],
-			spawnKey: "t1:0",
-		});
-		const after = controller.getState().lastHandoff;
-		await deliver(harness, "Implemented the dashboard view module; the export suite passes.");
-		await controller.handoffAcceptanceSettled();
-		expect(calls).toHaveLength(1);
-		expect(controller.getState().lastHandoff).toEqual(after);
+	test("FR-18: a shell command and a target under the legacy alias are consequential too", () => {
+		expect(isConsequentialMutation("bash", { command: "rm -rf build" })).toBe(true);
+		expect(isConsequentialMutation("write", { file_path: "src/a.ts", content: "x" })).toBe(true);
+		expect(isProposeCall("write", { file_path: "xd://propose", content: "coverage-report" })).toBe(true);
+		expect(isConsequentialMutation("write", { file_path: "xd://propose", content: "coverage-report" })).toBe(false);
 	});
 });
 
-describe("gate mechanism: the descriptor registry", () => {
-	test("the six descriptors are consistent with the control points and the host timeout", () => {
-		expect(Object.keys(GATE_REGISTRY).sort()).toEqual([
-			"architecture_review",
-			"business_review",
-			"destructive_action",
-			"plan_mutation",
-			"security_review",
-			"subagent_handoff",
-		]);
-		expect(validateGateRegistry(GATE_REGISTRY, CONTROL_POINT_REGISTRY)).toEqual([]);
+describe("T3 - the mutation gate", () => {
+	test("FR-01, FR-18: a session with no triage is held until the request is triaged", () => {
+		const verdict = mutationGate(freshState(), config(), "write", { path: "src/a.ts" });
+
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("jev_triage");
 	});
 
-	test("an inconsistent descriptor is reported instead of shipping (refusal, mode, deadline)", () => {
-		const destructive = decisionGate("destructive_action");
-		const frame = destructive.consult.frames["execution"]!;
-		const doctored: Readonly<Record<string, GateDescriptor>> = {
-			...GATE_REGISTRY,
-			destructive_action: {
-				...destructive,
-				consult: { ...destructive.consult, refusalOption: "not_offered" },
-			},
+	test("FR-02: a confirmed simple task passes the gate without the complex stages", () => {
+		const state = freshState();
+		state.simple = { fingerprint: sha256("Search the web for the release date"), request: "Search the web for the release date" };
+
+		expect(mutationGate(state, config(), "write", { path: "src/a.ts" }).block).toBe(false);
+	});
+
+	test("FR-10, FR-18: read-only tools and judge routes stay free in an untriaged session", () => {
+		const state = freshState();
+
+		expect(mutationGate(state, config(), "read", { path: "src/a.ts" }).block).toBe(false);
+		expect(mutationGate(state, config(), "web_search", { query: "release date" }).block).toBe(false);
+		expect(mutationGate(state, config(), "write", { path: "xd://jev_consult", content: "{}" }).block).toBe(false);
+		expect(mutationGate(state, config(), "write", { path: "local://x-plan.md", content: "# plan" }).block).toBe(false);
+		expect(mutationGate(state, config(), "write", { path: "agent://helper", content: "status?" }).block).toBe(false);
+	});
+
+	test("FR-18: a registered development task is held until its plan is reviewed", () => {
+		const state = freshState();
+		registerTask(state, "Add the coverage report");
+
+		const verdict = mutationGate(state, config(), "write", { path: "src/a.ts" });
+
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("jev_plan_review");
+		expect(verdict.reason).toContain("local://");
+	});
+
+	test("FR-11: a course check in flight holds consequential changes until its verdict returns", () => {
+		const state = developed();
+		state.plan = { taskFingerprint: state.task?.fingerprint ?? "", planUrl: "local://x-plan.md", planDigest: "d", confidence: 0.9 };
+		state.checkPending = true;
+
+		const verdict = mutationGate(state, config(), "write", { path: "src/a.ts" });
+
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("course check");
+	});
+
+	test("FR-07: an approved plan opens the gate, and coordination writes stay open while it is shut", () => {
+		const state = freshState();
+		const task = registerTask(state, "Add the coverage report");
+
+		expect(mutationGate(state, config(), "write", { path: "local://x-plan.md" }).block).toBe(false);
+		expect(mutationGate(state, config(), "write", { path: "xd://jev_plan_review" }).block).toBe(false);
+		expect(mutationGate(state, config(), "write", { path: "agent://helper" }).block).toBe(false);
+
+		state.plan = { taskFingerprint: task.fingerprint, planUrl: "local://x-plan.md", planDigest: sha256("plan"), confidence: 0.9 };
+		expect(mutationGate(state, config(), "write", { path: "src/a.ts" }).block).toBe(false);
+	});
+
+	test("an approval of another task does not open the gate", () => {
+		const state = developed();
+		state.plan = { taskFingerprint: sha256("some other task"), planUrl: "local://x-plan.md", planDigest: "d", confidence: 0.9 };
+
+		expect(mutationGate(state, config(), "write", { path: "src/a.ts" }).block).toBe(true);
+	});
+
+	test("a finding holds consequential changes until it is consulted", () => {
+		const state = developed();
+		state.plan = { taskFingerprint: state.task?.fingerprint ?? "", planUrl: "local://x-plan.md", planDigest: "d", confidence: 0.9 };
+		state.hold = { reason: 'the course check at revision 1 answered "off_course" (confidence 0.91)' };
+
+		const verdict = mutationGate(state, config(), "write", { path: "src/a.ts" });
+
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("off_course");
+		expect(verdict.reason).toContain("jev_consult");
+	});
+
+	test("a disabled mutation gate holds nothing", () => {
+		const state = freshState();
+		registerTask(state, "Add the coverage report");
+
+		expect(mutationGate(state, config({ mutation: false }), "write", { path: "src/a.ts" }).block).toBe(false);
+	});
+});
+
+describe("T3 - the plan-mode proposal boundary", () => {
+	test("a proposal without a plan review is blocked and names the artifact to review", () => {
+		const state = freshState();
+		registerTask(state, "Add the coverage report");
+		const input = { path: "xd://propose", content: "coverage-report" };
+
+		expect(isProposeCall("write", input)).toBe(true);
+		expect(isProposeCall("read", input)).toBe(false);
+		const verdict = proposeGate(state, config(), input);
+
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("local://coverage-report-plan.md");
+		expect(verdict.reason).toContain("jev_plan_review");
+	});
+
+	test("a proposal with no slug is blocked", () => {
+		const state = freshState();
+		const verdict = proposeGate(state, config(), { path: "xd://propose", content: "   " });
+
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("slug");
+	});
+
+	test("FR-07: a title that cannot be a file name is blocked with the same reason", () => {
+		const verdict = proposeGate(freshState(), config(), { path: "xd://propose", content: "src/plan.md" });
+
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("slug");
+	});
+
+	test("FR-07: the proposal title is normalized the way plan mode normalizes it", () => {
+		const state = freshState();
+		const task = registerTask(state, "Coverage report");
+		state.plan = {
+			taskFingerprint: task.fingerprint,
+			planUrl: planArtifactUrl("Coverage-report"),
+			planDigest: sha256("plan body"),
+			confidence: 0.93,
 		};
-		expect(validateGateRegistry(doctored, CONTROL_POINT_REGISTRY).map(p => p.code)).toContain(
-			"refusal_option_not_offered",
-		);
-		// An advisory gate would be a descriptor without a refusal path: only a review may be advisory.
-		const advisory: Readonly<Record<string, GateDescriptor>> = {
-			...GATE_REGISTRY,
-			destructive_action: { ...destructive, mode: "advisory" },
+
+		const spaced = proposeGate(state, config(), { path: "xd://propose", content: "Coverage report" });
+
+		expect(spaced.block).toBe(false);
+		expect(spaced.url).toBe("local://Coverage-report-plan.md");
+	});
+
+	test("FR-07: a trailing -plan and a trailing .md in the title are not doubled", () => {
+		const state = freshState();
+		const task = registerTask(state, "Coverage report");
+		state.plan = {
+			taskFingerprint: task.fingerprint,
+			planUrl: "local://coverage-report-plan.md",
+			planDigest: "d",
+			confidence: 0.9,
 		};
-		expect(validateGateRegistry(advisory, CONTROL_POINT_REGISTRY).map(p => p.code)).toContain(
-			"advisory_without_refusal_path_shape",
-		);
-		// The deadline must beat the host's handler timeout, or the gate never decides.
-		const slow: Readonly<Record<string, GateDescriptor>> = {
-			...GATE_REGISTRY,
-			destructive_action: {
-				...destructive,
-				consult: { ...destructive.consult, frames: { execution: { ...frame, deadlineMs: HOST_HANDLER_TIMEOUT_MS } } },
-			},
+
+		expect(proposeGate(state, config(), { path: "xd://propose", content: "coverage-report-plan" }).block).toBe(false);
+		expect(proposeGate(state, config(), { path: "xd://propose", content: "coverage-report.md" }).block).toBe(false);
+	});
+
+	test("an approved artifact of the current task opens the boundary and reports its URL", () => {
+		const state = freshState();
+		const task = registerTask(state, "Add the coverage report");
+		state.plan = {
+			taskFingerprint: task.fingerprint,
+			planUrl: planArtifactUrl("coverage-report"),
+			planDigest: sha256("plan body"),
+			confidence: 0.93,
 		};
-		expect(validateGateRegistry(slow, CONTROL_POINT_REGISTRY).map(p => p.code)).toContain(
-			"deadline_at_or_above_host_timeout",
-		);
+
+		const verdict = proposeGate(state, config(), { path: "xd://propose", content: "coverage-report" });
+
+		expect(verdict.block).toBe(false);
+		expect(verdict.url).toBe("local://coverage-report-plan.md");
+	});
+
+	test("a proposal of a different artifact than the approved one is blocked", () => {
+		const state = freshState();
+		const task = registerTask(state, "Add the coverage report");
+		state.plan = { taskFingerprint: task.fingerprint, planUrl: planArtifactUrl("other"), planDigest: "d", confidence: 0.9 };
+
+		const verdict = proposeGate(state, config(), { path: "xd://propose", content: "coverage report" });
+
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("local://other-plan.md");
+	});
+});
+
+describe("T5 - the completion boundary", () => {
+	test("FR-17: a read-only session and a task that changed nothing never enter the gate", () => {
+		expect(completionGate(freshState(), DEFAULT_CONFIG).applies).toBe(false);
+
+		const state = freshState();
+		registerTask(state, "Answer a question");
+		expect(completionGate(state, DEFAULT_CONFIG).applies).toBe(false);
+	});
+
+	test("FR-14, FR-15: developed work cannot settle while an acceptance aspect is missing", () => {
+		const state = developed();
+
+		const gate = completionGate(state, DEFAULT_CONFIG);
+
+		expect(gate.applies).toBe(true);
+		expect(gate.reason).toContain("business");
+		expect(gate.reason).toContain("architecture");
+		expect(gate.reason).toContain("jev_acceptance");
+
+		recordAcceptance(state, { aspect: "business", revision: state.revision, label: "serves_business_need", approved: true, confidence: 0.9 });
+		expect(completionGate(state, DEFAULT_CONFIG).reason).toContain("architecture");
+
+		recordAcceptance(state, { aspect: "architecture", revision: state.revision, label: "sound_for_next_change", approved: true, confidence: 0.9 });
+		expect(completionGate(state, DEFAULT_CONFIG).reason).toBeUndefined();
+	});
+
+	test("FR-14: a subsequent change invalidates a stale acceptance", () => {
+		const state = developed();
+		recordAcceptance(state, { aspect: "business", revision: state.revision, label: "serves_business_need", approved: true, confidence: 0.9 });
+		recordAcceptance(state, { aspect: "architecture", revision: state.revision, label: "sound_for_next_change", approved: true, confidence: 0.9 });
+		recordAction(state, { tool: "edit", target: "src/report.ts", excerpt: "more work" });
+
+		expect(completionGate(state, DEFAULT_CONFIG).reason).toContain("business");
+	});
+
+	test("a finding holds the completion boundary as well", () => {
+		const state = developed();
+		state.hold = { reason: 'the developer review answered "defect"' };
+
+		const gate = completionGate(state, DEFAULT_CONFIG);
+
+		expect(gate.applies).toBe(true);
+		expect(gate.reason).toContain("defect");
+	});
+
+	test("a disabled completion gate lets the session settle", () => {
+		expect(completionGate(developed(), config({ completion: false })).applies).toBe(false);
 	});
 });

@@ -1,3931 +1,534 @@
-/**
- * Behavioral tests for the Jev decision controller (extension slice).
- * Drafted before implementation (TDD); runs under `bun test`.
- */
 import { describe, expect, test } from "bun:test";
-import { createJevController, type DestructiveRecord, type HandoffRecord, type JevState } from "../src/controller.js";
-import { FRAME_FIX_PREFIX, SERVICE_OPTION_FIX } from "../src/client.js";
-import type { JevTemplateConfig } from "../src/config.js";
-import { isRecord } from "../src/guards.js";
-import type {
-	AcceptanceCriteriaRequest,
-	AcceptanceCriteriaResult,
-	AspectCoverageRequest,
-	AspectCoverageResult,
-	AspectMarking,
-	ClaimCheckRequest,
-	CourseCheckRequest,
-	CourseCheckResult,
-	DecisionRequest,
-	DecisionResult,
-	Evidence,
-	PriorityClass,
-	PriorityRequest,
-	PriorityResult,
-	RequirementsFormalizationRequest,
-} from "../src/types.js";
-import { ACTIVITY_REGISTRY, PLAN_MAPPING_APPROVED_OPTION } from "../src/activities.js";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { DEFAULT_CONFIG } from "../src/config.js";
+import { createJevController } from "../src/controller.js";
+import type { Judge, JudgeQuestion } from "../src/judge.js";
+import { POLICY, type JevConfig } from "../src/types.js";
+import {
+	answeringJudge,
+	blockReason,
+	fakeArtifacts,
+	fakeCtx,
+	fakePi,
+	fakeZod,
+	stopDecision,
+	stopEvent,
+	switchableCtx,
+	toolCallEvent,
+	toolFailed,
+	toolResultEvent,
+	until,
+	type FakeAnswer,
+	type FakeAnswerSource,
+	type FakePi,
+	type SwitchableHost,
+} from "./helpers.js";
 
-// ---------- fakes ----------
-
-type Handler = (event: unknown, ctx?: unknown) => unknown;
-
-interface FakeToolDef {
-	name: string;
-	execute: (id: string, params: unknown, signal: unknown, onUpdate: unknown, ctx: unknown) => Promise<unknown>;
-	[key: string]: unknown;
+interface Options {
+	interval?: number;
+	mode?: "interval" | "completion";
+	mutation?: boolean;
+	completion?: boolean;
 }
 
-interface FakePi {
-	on(event: string, handler: Handler): void;
-	registerTool(tool: FakeToolDef): void;
-	appendEntry(customType: string, data?: unknown): void;
-	sendMessage(payload: unknown, options?: unknown): void;
-	sendUserMessage(content: unknown, options?: unknown): void;
-}
-
-interface FakePiHarness {
-	pi: FakePi;
-	emit(event: string, ev: unknown, ctx?: unknown): Promise<unknown>;
-	getTool(): FakeToolDef | undefined;
-	appended: Array<{ customType: string; data: unknown }>;
-	sentMessages: Array<{ payload: unknown; options?: unknown }>;
-}
-
-function makeFakePi(): FakePiHarness {
-	const handlers = new Map<string, Handler[]>();
-	let registeredTool: FakeToolDef | undefined;
-	const appended: Array<{ customType: string; data: unknown }> = [];
-	const sentMessages: Array<{ payload: unknown; options?: unknown }> = [];
-	const pi: FakePi = {
-		on(event, handler) {
-			if (!handlers.has(event)) handlers.set(event, []);
-			handlers.get(event)!.push(handler);
-		},
-		registerTool(tool) {
-			registeredTool = tool;
-		},
-		appendEntry(customType, data) {
-			appended.push({ customType, data });
-		},
-		sendMessage(payload, options) {
-			sentMessages.push({ payload, options });
-		},
-		sendUserMessage(_content, _options) {},
-	};
-	/**
-	 * Host merge semantics (runner.ts emit*): the first handler that returns `block: true`
-	 * short-circuits the event, otherwise defined fields of every result merge with last-wins
-	 * (that is how `before_subagent_spawn` picks model/note). A fake that returned only the last
-	 * handler's result would hide a routing result behind a later handoff handler.
-	 */
-	async function emit(event: string, ev: unknown, ctx?: unknown): Promise<unknown> {
-		const hs = handlers.get(event) ?? [];
-		let merged: Record<string, unknown> | undefined;
-		for (const h of hs) {
-			const result = await h(ev, ctx);
-			if (!isRecord(result)) continue;
-			if (result["block"] === true) return result;
-			for (const [key, value] of Object.entries(result)) {
-				if (value === undefined) continue;
-				merged = { ...(merged ?? {}), [key]: value };
-			}
-		}
-		return merged;
-	}
-	return { pi, emit, getTool: () => registeredTool, appended, sentMessages };
-}
-
-function evidence(kind: Evidence["kind"], quote: string, source = "test"): Evidence {
-	return { kind, source, quote };
-}
-
-const OPTIONS = [
-	{ id: "a", label: "Option A", meaning: "do A" },
-	{ id: "b", label: "Option B", meaning: "do B" },
-];
-
-const COURSE_OPTIONS = [
-	{ id: "continue", label: "Continue", meaning: "keep going" },
-	{ id: "return_to_requirement", label: "Return", meaning: "re-read requirement" },
-	{ id: "replan", label: "Replan", meaning: "new plan" },
-	{ id: "ask_user", label: "Ask", meaning: "escalate" },
-	{ id: "verify_before_proceeding", label: "Verify", meaning: "run checks first" },
-];
-
-function validDecisionInput(overrides: Record<string, unknown> = {}) {
+function config(options: Options = {}): JevConfig {
 	return {
-		stage: "completion_review",
-		task: "Implement feature X",
-		proposal: "Feature X implemented: module added, tests pass.",
-		options: OPTIONS,
-		evidence: [evidence("execution", "$ bun test — 42 passing, 0 failing"), evidence("code", "export function x() {}")],
-		...overrides,
+		gates: { mutation: options.mutation ?? true, completion: options.completion ?? true },
+		courseCheck: {
+			mode: options.mode ?? DEFAULT_CONFIG.courseCheck.mode,
+			interval: options.interval ?? DEFAULT_CONFIG.courseCheck.interval,
+		},
+		problems: [],
 	};
 }
 
-function judgeResult(partial: Partial<DecisionResult>): DecisionResult {
-	return { verdict: "approve", selectedOption: "a", reasons: ["ok"], confidence: 0.95, ...partial };
+/** A registered controller over a fake host, with the judge answers the test provides. */
+function controllerFor(table: Record<string, FakeAnswerSource>, options: Options = {}) {
+	const fake = answeringJudge(table);
+	const pi = fakePi();
+	createJevController({ judge: fake.judge, config: config(options), zod: fakeZod() }).register(pi.api);
+	return { pi, calls: fake.calls };
 }
 
-/** Grant the plan gate so mutating tool calls are allowed (AC4a). */
-async function approvePlan(controller: { submitDecision(input: unknown): Promise<unknown> }): Promise<unknown> {
-	return controller.submitDecision(
-		validDecisionInput({
-			stage: "understanding_review",
-			// Grounded by construction: the plan-stage pre-check requires one evidence quote
-			// (>= 20 chars) to appear verbatim inside the proposal.
-			proposal: 'Claim: module M satisfies the requirement "Implement feature X for the dashboard".',
-			evidence: [evidence("user", "Implement feature X for the dashboard"), evidence("execution", "dry-run plan output ok")],
-		}),
-	);
-}
+const TRIAGE_DEEP: FakeAnswer = { probability: 0.95 };
+const PLAN_SERVES: FakeAnswer = { label: "serves", confidence: 0.93 };
+const ON_COURSE: FakeAnswer = { label: "on_course", confidence: 0.9 };
+const FOLLOWS: FakeAnswer = { label: "follows", confidence: 0.94 };
 
-/** Judge answering every gate stage with the fixed happy-path option (course_check: continue). */
-function gateJudge(): (req: DecisionRequest) => Promise<DecisionResult> {
-	return async req =>
-		req.stage === "course_check" ? judgeResult({ selectedOption: "continue" }) : judgeResult({});
-}
+/** The approving option of an acceptance question, whichever aspect it asks about. */
+const APPROVING_ACCEPTANCE: Record<string, string> = {
+	business: "serves_business_need",
+	architecture: "sound_for_next_change",
+};
 
-/** Minimal on-track course_check submission (requirement id "REQ" via the evidence source). */
-function courseCheckGateInput(overrides: Record<string, unknown> = {}) {
+function approvingAcceptance(question: JudgeQuestion): FakeAnswer {
 	return {
-		stage: "course_check",
-		task: "on-track check",
-		proposal: "continuing the approved plan; evidence attached and checks green",
-		options: COURSE_OPTIONS,
-		evidence: [evidence("user", "requirement quote: implement feature X for the dashboard", "REQ")],
-		...overrides,
+		label: Object.values(APPROVING_ACCEPTANCE).find(candidate => question.options?.[candidate] !== undefined),
+		confidence: 0.92,
 	};
 }
 
-interface StopResult { decision?: string; reason?: string }
+const PLAN_ARTIFACT = "local://x-plan.md";
+const PLAN_EVIDENCE = [{ kind: "user", quote: "report the coverage of the last run" }];
 
-// Narrow controller stop result fields with runtime checks (unknown from fake emit).
-function stopResult(v: unknown): StopResult {
-	if (typeof v !== "object" || v === null) return {};
-	const o = v as Record<string, unknown>; // homogeneous local fake result; fields narrowed below
-	const out: StopResult = {};
-	if (typeof o.decision === "string") out.decision = o.decision;
-	if (typeof o.reason === "string") out.reason = o.reason;
-	return out;
+async function triaged(pi: FakePi, ctx: unknown, request = "Report the coverage of the last run"): Promise<void> {
+	await pi.callTool("jev_triage", { request }, ctx);
 }
 
-interface BlockResult { block?: boolean; reason?: string }
-
-// Narrow tool_call gate result fields with runtime checks.
-function blockResult(v: unknown): BlockResult {
-	if (typeof v !== "object" || v === null) return {};
-	const o = v as Record<string, unknown>; // homogeneous local fake result; fields narrowed below
-	const out: BlockResult = {};
-	if (typeof o.block === "boolean") out.block = o.block;
-	if (typeof o.reason === "string") out.reason = o.reason;
-	return out;
+async function planned(pi: FakePi, ctx: unknown): Promise<void> {
+	await pi.callTool("jev_plan_review", { plan: PLAN_ARTIFACT, claim: "the plan delivers the report", evidence: PLAN_EVIDENCE }, ctx);
 }
 
-async function runStop(harness: FakePiHarness, stopHookActive = false): Promise<StopResult> {
-	return stopResult(await harness.emit("session_stop", {
-		type: "session_stop",
-		messages: [],
-		turn_id: 1,
-		session_id: "s1",
-		stop_hook_active: stopHookActive,
-	}));
-}
+describe("T1 - the registered surface", () => {
+	test("T1, T2, T3, T5: the judge tools are registered and nothing is consulted at registration", () => {
+		const { pi, calls } = controllerFor({});
 
-// ---------- tests ----------
+		expect([...pi.tools.keys()].sort()).toEqual([
+			"jev_acceptance",
+			"jev_consult",
+			"jev_plan_review",
+			"jev_requirements",
+			"jev_review",
+			"jev_search_relevance",
+			"jev_triage",
+		]);
+		expect(calls).toHaveLength(0);
+		expect(pi.messages).toHaveLength(0);
+	});
+});
 
-describe("jev controller", () => {
-	test("read-only session stops freely (evidence gathering stays possible)", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: async () => judgeResult({}) });
-		controller.register(harness.pi);
-		const res = (await runStop(harness));
-		expect(res?.decision).toBeUndefined();
+describe("T2 - a read-only question costs nothing (FR-10, constraint on S2/S13/S14)", () => {
+	test("a plain web search and a read are neither gated nor consulted", async () => {
+		const { pi, calls } = controllerFor({});
+		const ctx = fakeCtx();
+
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("web_search", { query: "release date" }), ctx))).toBeUndefined();
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("read", { path: "src/a.ts" }), ctx))).toBeUndefined();
+		await pi.emit("tool_result", toolResultEvent("web_search", { query: "release date" }, "results"), ctx);
+		await pi.emit("tool_result", toolResultEvent("read", { path: "src/a.ts" }, "contents"), ctx);
+
+		expect(calls).toHaveLength(0);
+		expect(pi.messages).toHaveLength(0);
 	});
 
-	test("mutations without completion approval => session_stop blocks with reasons", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: async () => judgeResult({}) });
-		controller.register(harness.pi);
-		const gate = blockResult(
-			await harness.emit("tool_call", { type: "tool_call", toolCallId: "0", toolName: "edit", input: {} }),
-		);
-		expect(gate?.block).toBe(true);
-		expect(String(gate?.reason)).toContain("plan gate");
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
-		await approvePlan(controller);
-		expect(
-			blockResult(await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} }))
-				?.block,
-		).toBeUndefined();
-		const res = (await runStop(harness));
-		expect(res?.decision).toBe("block");
-		expect(String(res?.reason)).toContain("completion_review");
-		expect(String(res?.reason)).toContain("jev_decision");
+	test("T5: a read-only session settles without any acceptance call", async () => {
+		const { pi, calls } = controllerFor({});
+		const ctx = fakeCtx();
+
+		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
+		expect(calls).toHaveLength(0);
+	});
+});
+
+describe("T3 - the plan-mode boundary (FR-07, FR-18)", () => {
+	test("FR-18: a development task holds working-tree changes until the plan artifact is reviewed, then allows the proposal", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "coverage-report-plan.md": "# Coverage report\n\n1. Collect the numbers\n" }) });
+		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP, plan: PLAN_SERVES });
+
+		// Before any triage nothing passes: an untriaged session holds its first consequential change.
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/report.ts", content: "x" }), ctx))).toContain("jev_triage");
+
+		expect(toolFailed(await pi.callTool("jev_triage", { request: "Report the coverage of the last run" }, ctx))).toBe(false);
+
+		// A registered development task holds consequential changes.
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/report.ts", content: "x" }), ctx))).toContain("jev_plan_review");
+
+		// The plan artifact, the judge routes and agent messages pass the gate.
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "local://coverage-report-plan.md", content: "# plan" }), ctx))).toBeUndefined();
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "agent://helper", content: "status?" }), ctx))).toBeUndefined();
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("jev_consult", {}), ctx))).toBeUndefined();
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "xd://jev_consult", content: "{}" }), ctx))).toBeUndefined();
+
+		expect(toolFailed(await pi.callTool("jev_plan_review", { plan: "local://coverage-report-plan.md", claim: "the plan delivers the report", evidence: PLAN_EVIDENCE }, ctx))).toBe(false);
+
+		// The approved plan opens the working tree and the proposal of that artifact.
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/report.ts", content: "x" }), ctx))).toBeUndefined();
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "xd://propose", content: "coverage-report" }), ctx))).toBeUndefined();
 	});
 
-	test("approved completion with evidence-backed proposal allows stop", async () => {
-		const harness = makeFakePi();
-		let calls = 0;
-		const controller = createJevController({
-			judge: async (req: DecisionRequest) => {
-				if (req.stage === "completion_review") calls++;
-				return req.stage === "course_check" ? judgeResult({ selectedOption: "continue" }) : judgeResult({});
-			},
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
-		await approvePlan(controller);
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
-		const blocked = (await runStop(harness));
-		expect(blocked?.decision).toBe("block");
-		const outcome = await controller.submitDecision(validDecisionInput());
-		expect(outcome.verdict).toBe("approve");
-		expect(calls).toBe(1);
-		// completion alone does not unlock: the mutation must be followed by a fresh course check
-		const withoutCheck = (await runStop(harness));
-		expect(withoutCheck?.decision).toBe("block");
-		expect(String(withoutCheck?.reason)).toContain("course_check");
-		await controller.submitDecision(courseCheckGateInput());
-		const allowed = (await runStop(harness));
-		expect(allowed?.decision).toBeUndefined();
+	test("FR-07: proposing a plan that was never reviewed is blocked", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({}) });
+		const { pi } = controllerFor({});
+
+		const held = await pi.emit("tool_call", toolCallEvent("write", { path: "xd://propose", content: "coverage-report" }), ctx);
+
+		expect(blockReason(held)).toContain("jev_plan_review");
+		expect(blockReason(held)).toContain("local://coverage-report-plan.md");
 	});
 
-	test("stale approval: work changed after approval re-blocks stop", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: gateJudge() });
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
-		await approvePlan(controller);
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
-		await controller.submitDecision(validDecisionInput());
-		await controller.submitDecision(courseCheckGateInput());
-		expect(stopResult(await runStop(harness))?.decision).toBeUndefined();
-		// new work lands after the approval: completion AND course check both go stale
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "2", toolName: "write", input: {} });
-		const res = (await runStop(harness));
-		expect(res?.decision).toBe("block");
-		expect(String(res?.reason)).toContain("stale");
+	test("FR-07: changing the plan artifact invalidates the approval", async () => {
+		const artifactsDir = await fakeArtifacts({ "coverage-report-plan.md": "# Coverage report\n" });
+		const ctx = fakeCtx({ artifactsDir });
+		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP, plan: PLAN_SERVES });
+
+		await triaged(pi, ctx);
+		await pi.callTool("jev_plan_review", { plan: "local://coverage-report-plan.md", claim: "the plan delivers the report", evidence: PLAN_EVIDENCE }, ctx);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "xd://propose", content: "coverage-report" }), ctx))).toBeUndefined();
+
+		await writeFile(join(artifactsDir, "local", "coverage-report-plan.md"), "# A different plan\n", "utf8");
+
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "xd://propose", content: "coverage-report" }), ctx))).toContain("changed after the plan review");
+	});
+});
+
+describe("T4 - implementation course checks (FR-11, FR-12, FR-13)", () => {
+	test("FR-11: with an interval of two, one check runs after the second successful action and carries its result", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": "# plan\n" }) });
+		const { pi, calls } = controllerFor({ needs_development: TRIAGE_DEEP, plan: PLAN_SERVES, direction: ON_COURSE }, { interval: 2 });
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
+		const before = calls.length;
+
+		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 10 bytes to src/a.ts"), ctx);
+		expect(calls.length).toBe(before);
+
+		await pi.emit("tool_result", toolResultEvent("edit", { path: "src/a.ts" }, "applied 2 hunks"), ctx);
+		expect(await until(() => calls.length > before)).toBe(true);
+
+		const check = calls[calls.length - 1];
+		expect(check?.questions.map(question => question.name)).toEqual(["direction"]);
+		expect(JSON.stringify(check?.state)).toContain("applied 2 hunks");
+		expect(await until(() => pi.messages.some(message => message.customType === "jev.course_check"))).toBe(true);
 	});
 
-	test("changed task (new user prompt) invalidates prior approval", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: gateJudge() });
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "task one", systemPrompt: [] });
-		await approvePlan(controller);
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
-		await controller.submitDecision(validDecisionInput());
-		await controller.submitDecision(courseCheckGateInput());
-		expect(stopResult(await runStop(harness))?.decision).toBeUndefined();
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "task two: different", systemPrompt: [] });
-		const res = (await runStop(harness));
-		expect(res?.decision).toBe("block");
-		expect(String(res?.reason)).toContain("task changed");
+	test("FR-11: failed and read-only calls do not advance the interval", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": "# plan\n" }) });
+		const { pi, calls } = controllerFor({ needs_development: TRIAGE_DEEP, plan: PLAN_SERVES, direction: ON_COURSE }, { interval: 2 });
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
+		const before = calls.length;
+
+		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "EACCES: permission denied", true), ctx);
+		await pi.emit("tool_result", toolResultEvent("read", { path: "src/a.ts" }, "contents"), ctx);
+		await pi.emit("tool_result", toolResultEvent("web_search", { query: "x" }, "results"), ctx);
+		await pi.emit("tool_result", toolResultEvent("write", { path: "agent://helper" }, "message delivered"), ctx);
+
+		expect(calls.length).toBe(before);
+
+		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 bytes"), ctx);
+		expect(calls.length).toBe(before);
 	});
 
-	test("unavailable judge never approves and never records approval", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({
-			judge: async (req: DecisionRequest) => {
-				if (req.stage === "completion_review") throw new Error("ECONNREFUSED");
-				return judgeResult({});
-			},
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
-		await approvePlan(controller);
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
-		const outcome = await controller.submitDecision(validDecisionInput());
-		expect(outcome.verdict).toBe("insufficient_evidence");
-		expect(outcome.reasons.join(" ")).toContain("judge unavailable");
-		expect(stopResult(await runStop(harness))?.decision).toBe("block");
+	test("FR-18, FR-11: a shell command is held like any other change and advances the interval", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": "# plan\n" }) });
+		const { pi, calls } = controllerFor({ needs_development: TRIAGE_DEEP, plan: PLAN_SERVES, direction: ON_COURSE }, { interval: 1 });
+		await triaged(pi, ctx);
+
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("bash", { command: "rm -rf build" }), ctx))).toContain("jev_plan_review");
+
+		await planned(pi, ctx);
+		await pi.emit("tool_result", toolResultEvent("bash", { command: "npm run build" }, "built in 2s"), ctx);
+
+		expect(await until(() => calls.some(call => call.questions[0]?.name === "direction"))).toBe(true);
+		expect(JSON.stringify(calls[calls.length - 1]?.state)).toContain("npm run build");
+		expect(JSON.stringify(calls[calls.length - 1]?.state)).toContain("built in 2s");
 	});
 
-	test("invalid evidence: malformed input rejected before judge call", async () => {
-		let called = false;
-		const controller = createJevController({
-			judge: async () => {
-				called = true;
-				return judgeResult({});
-			},
-		});
-		const bad = await controller.submitDecision(validDecisionInput({ evidence: [] }));
-		expect(bad.verdict).toBe("insufficient_evidence");
-		expect(called).toBe(false);
-		const badKind = await controller.submitDecision(
-			validDecisionInput({ evidence: [{ kind: "rumor", source: "x", quote: "y" }] }),
-		);
-		expect(badKind.verdict).toBe("insufficient_evidence");
-		const noQuote = await controller.submitDecision(
-			validDecisionInput({ evidence: [{ kind: "code", source: "x", quote: "" }] }),
-		);
-		expect(noQuote.verdict).toBe("insufficient_evidence");
-		expect(called).toBe(false);
+	test("FR-10, FR-11: a session that registered no task accrues no actions, no hold and no call", async () => {
+		const ctx = fakeCtx();
+		const { pi, calls } = controllerFor({ direction: { label: "off_course", confidence: 0.9 } }, { interval: 1 });
+
+		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 bytes"), ctx);
+		await pi.emit("tool_result", toolResultEvent("bash", { command: "rm -rf build" }, ""), ctx);
+
+		expect(calls).toHaveLength(0);
+		expect(pi.messages).toHaveLength(0);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/b.ts", content: "x" }), ctx))).toContain("jev_triage");
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("bash", { command: "rm -rf build" }), ctx))).toContain("jev_triage");
 	});
 
-	test("completion requires execution/code/log evidence, report text alone insufficient", async () => {
-		let called = false;
-		const controller = createJevController({
-			judge: async () => {
-				called = true;
-				return judgeResult({});
-			},
-		});
-		const outcome = await controller.submitDecision(
-			validDecisionInput({ evidence: [evidence("user", "I think it is done")] }),
-		);
-		expect(outcome.verdict).toBe("insufficient_evidence");
-		expect(outcome.reasons.join(" ")).toContain("execution");
-		expect(called).toBe(false);
-	});
-
-	test("an identical resubmission exhausts the bound; changed content is new work", async () => {
-		let calls = 0;
-		const controller = createJevController({
-			judge: async () => {
-				calls++;
-				return { verdict: "revise", reasons: [`nope ${calls}`] };
-			},
-			maxReworkIterations: 3,
-		});
-		const submission = validDecisionInput();
-		for (let i = 0; i < 3; i++) {
-			const r = await controller.submitDecision(submission);
-			expect(r.verdict).toBe("revise");
-		}
-		expect(calls).toBe(3);
-		const repeat = await controller.submitDecision(submission);
-		expect(repeat.verdict).toBe("ask_user");
-		expect(calls).toBe(3); // identical repeat refused, no further judge calls
-		expect(controller.getState().blockers.length).toBeGreaterThan(0);
-
-		// PRD 1.1 asks for many cheap iterations: a genuinely different submission is not
-		// rework and must not inherit the exhausted budget (no self-inflicted deadlock).
-		const changed = await controller.submitDecision(validDecisionInput({ proposal: "a different framing entirely" }));
-		expect(changed.verdict).toBe("revise");
-		expect(calls).toBe(4);
-	});
-
-	test("completion capability coverage: coverage judge with requireAll over the union inventory; caller cannot narrow", async () => {
-		const markings: Record<string, AspectMarking> = {
-			"csv-export": "applicable_not_addressed",
-			"auth-retry": "applicable_and_addressed",
-		};
-		let seen: AspectCoverageRequest | undefined;
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			template: { capabilities: ["csv-export"] },
-			aspectCoverageJudge: async req => {
-				seen = req;
-				return { markings: { ...markings }, reasons: ["judged"], judged: true };
-			},
-		});
-		const denied = await controller.submitDecision(
-			validDecisionInput({ capabilities: ["auth-retry"] }),
-		);
-		expect(denied.verdict).toBe("revise");
-		expect(denied.reasons.join(" ")).toContain("csv-export");
-		expect(seen?.requireAll).toBe(true);
-		expect([...(seen?.aspects.map(a => a.id) ?? [])].sort()).toEqual(["auth-retry", "csv-export"]);
-		// once the coverage judge marks every declared capability addressed, completion proceeds
-		markings["csv-export"] = "applicable_and_addressed";
-		const ok = await controller.submitDecision(validDecisionInput({ capabilities: ["auth-retry"] }));
-		expect(ok.verdict).toBe("approve");
-		// caller cannot narrow the template inventory by omitting capabilities
-		markings["csv-export"] = "applicable_not_addressed";
-		const narrowed = await controller.submitDecision(validDecisionInput());
-		expect(narrowed.verdict).toBe("revise");
-		expect(narrowed.reasons.join(" ")).toContain("csv-export");
-	});
-
-	test("completion capability coverage: not_applicable cannot satisfy a required capability", async () => {
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			template: { capabilities: ["csv-export"] },
-			aspectCoverageJudge: async () => ({
-				markings: { "csv-export": "not_applicable" },
-				reasons: ["judged"],
-				judged: true,
-			}),
-		});
-		const denied = await controller.submitDecision(validDecisionInput());
-		expect(denied.verdict).toBe("revise");
-		expect(denied.reasons.join(" ")).toContain("csv-export");
-	});
-
-	test("completion capability coverage fails closed: no wired judge, escape, unjudged, throw", async () => {
-		const noJudge = createJevController({
-			judge: async () => judgeResult({}),
-			template: { capabilities: ["csv-export"] },
-		});
-		const unwired = await noJudge.submitDecision(validDecisionInput());
-		expect(unwired.verdict).toBe("insufficient_evidence");
-		expect(unwired.judged).toBe(false);
-		expect(noJudge.getState().approvals.length).toBe(0);
-
-		let mode: "escape" | "unjudged" | "throw" = "escape";
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			template: { capabilities: ["csv-export"] },
-			aspectCoverageJudge: async (): Promise<AspectCoverageResult> => {
-				if (mode === "escape") return { markings: {}, reasons: ["meta_option"], judged: true, escape: true };
-				if (mode === "unjudged") return { markings: {}, reasons: ["bad_payload"], judged: false };
-				throw new Error("coverage endpoint down");
-			},
-		});
-		for (mode of ["escape", "unjudged", "throw"] as const) {
-			const outcome = await controller.submitDecision(validDecisionInput());
-			expect(outcome.verdict).toBe("insufficient_evidence");
-			expect(controller.getState().approvals.length).toBe(0);
-		}
-	});
-
-	test("low-confidence judge approval is demoted, never records approval", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({
-			judge: async (req: DecisionRequest) =>
-				req.stage === "completion_review" ? judgeResult({ confidence: 0.4 }) : judgeResult({}),
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
-		await approvePlan(controller);
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
-		const outcome = await controller.submitDecision(validDecisionInput());
-		expect(outcome.verdict).toBe("insufficient_evidence");
-		expect(stopResult(await runStop(harness))?.decision).toBe("block");
-	});
-
-	test("malformed judge payload never approves", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({
-			judge: async () => ({ verdict: "approve", reasons: [] }), // no selectedOption
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
-		await approvePlan(controller);
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
-		const outcome = await controller.submitDecision(validDecisionInput());
-		expect(outcome.verdict).toBe("insufficient_evidence");
-	});
-
-	test("tool_call pre-validation blocks malformed jev_decision input before execution", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: async () => judgeResult({}) });
-		controller.register(harness.pi);
-		const res = blockResult(await harness.emit("tool_call", {
-			type: "tool_call",
-			toolCallId: "1",
-			toolName: "jev_decision",
-			input: { stage: "completion_review" },
-		}));
-		expect(res?.block).toBe(true);
-		expect(String(res?.reason)).toContain("evidence");
-	});
-
-	test("subagent model routing only among host-listed models", () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: async () => judgeResult({}) });
-		controller.register(harness.pi);
-		// no routing decision yet => no interference
-		const none = controller.onBeforeSubagentSpawn(
-			{ type: "before_subagent_spawn", agent: "task", invocationKind: "task", patterns: ["x/y"] },
-			["a/b", "c/d"],
-		);
-		expect(none).toBeUndefined();
-		controller.rememberModelRouting("m1/fast");
-		const ok = controller.onBeforeSubagentSpawn(
-			{ type: "before_subagent_spawn", agent: "task", invocationKind: "task", patterns: ["x/y"] },
-			["m1/fast", "c/d"],
-		);
-		expect(ok?.model).toBe("m1/fast");
-		const blocked = controller.onBeforeSubagentSpawn(
-			{ type: "before_subagent_spawn", agent: "task", invocationKind: "task", patterns: ["x/y"] },
-			["c/d"],
-		);
-		expect(blocked?.block).toBe(true);
-		expect(String(blocked?.reason)).toContain("m1/fast");
-	});
-
-	test("session continuity: state restored from jev.state custom entries", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: gateJudge() });
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
-		await approvePlan(controller);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
-		await approvePlan(controller);
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
-		await controller.submitDecision(validDecisionInput());
-		await controller.submitDecision(courseCheckGateInput());
-		const saved = harness.appended.filter(a => a.customType === "jev.state");
-		expect(saved.length).toBeGreaterThan(0);
-		// simulate restart: new controller, same session entries
-		const harness2 = makeFakePi();
-		const controller2 = createJevController({ judge: gateJudge() });
-		controller2.register(harness2.pi);
-		controller2.onSessionStart(saved.map(a => ({ customType: a.customType, data: a.data as JevState })));
-		// the restored fresh course check keeps the completion boundary satisfied
-		expect(stopResult(await runStop(harness2))?.decision).toBeUndefined();
-		// FR-11: a well-formed handoff record survives, malformed ones are dropped (never trusted)
-		const validHandoff: HandoffRecord = {
-			phase: "acceptance",
-			verdict: "revise",
-			judged: true,
-			confidence: 0.9,
-			reasons: ["incomplete"],
-			blocked: true,
-			at: 1,
-		};
-		controller2.onSessionStart([{ customType: "jev.state", data: { lastHandoff: validHandoff } }]);
-		expect(controller2.getState().lastHandoff).toEqual(validHandoff);
-		for (const malformed of [
-			{ phase: "bogus", judged: true, blocked: false, at: 1 },
-			{ phase: "dispatch", judged: "yes", blocked: false, at: 1 },
-			{ phase: "dispatch", judged: true, blocked: "no", at: 1 },
-			{ phase: "dispatch", judged: true, blocked: false, at: Number.NaN },
-			{ phase: "dispatch", verdict: "maybe", judged: true, blocked: false, at: 1 },
-		]) {
-			controller2.onSessionStart([{ customType: "jev.state", data: { lastHandoff: malformed } }]);
-			expect(controller2.getState().lastHandoff).toBeUndefined();
-		}
-	});
-
-	test("stop_hook_active pass records explicit unresolved blocker, never fake success", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: async () => judgeResult({}) });
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
-		await approvePlan(controller);
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
-		const res = (await runStop(harness, true));
-		expect(res?.decision).toBeUndefined();
-		expect(controller.getState().blockers.join(" ")).toContain("completion_review");
-	});
-
-	test("plan gate: mutations blocked before plan approval, allowed after; full flow stops clean", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: gateJudge() });
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "build it", systemPrompt: [] });
-		// read-only tools stay allowed under the gate (AC4)
-		expect(controller.onToolCall({ type: "tool_call", toolCallId: "r", toolName: "read", input: {} })).toBeUndefined();
-		for (const mutating of ["edit", "write", "ast_edit", "bash", "memory_edit", "manage_skill"]) {
-			const res = blockResult(
-				await harness.emit("tool_call", { type: "tool_call", toolCallId: `m-${mutating}`, toolName: mutating, input: {} }),
-			);
-			expect(res?.block).toBe(true);
-		}
-		const reasonSample = blockResult(
-			await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} }),
-		);
-		expect(String(reasonSample?.reason)).toContain("plan gate");
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
-		await approvePlan(controller);
-		expect(
-			blockResult(await harness.emit("tool_call", { type: "tool_call", toolCallId: "2", toolName: "edit", input: {} }))
-				?.block,
-		).toBeUndefined();
-		await controller.submitDecision(validDecisionInput());
-		await controller.submitDecision(courseCheckGateInput());
-		expect(stopResult(await runStop(harness))?.decision).toBeUndefined();
-	});
-
-	test("plan gate allows the judge and agent messages but blocks file writes", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: gateJudge() });
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "build it", systemPrompt: [] });
-		const allowed = blockResult(await harness.emit("tool_call", {
-			type: "tool_call",
-			toolCallId: "judge",
-			toolName: "write",
-			input: { path: "xd://jev_decision", content: "{}" },
-		}));
-		expect(allowed.block).toBeUndefined();
-		const message = blockResult(await harness.emit("tool_call", {
-			type: "tool_call",
-			toolCallId: "peer-message",
-			toolName: "write",
-			input: { path: "agent://JudgeDeviceGateFix", content: "blocked by the gate" },
-		}));
-		expect(message.block).toBeUndefined();
-		for (const path of ["work.txt", "xd://other_tool", "xd://jev_decision/extra"]) {
-			const result = blockResult(await harness.emit("tool_call", {
-				type: "tool_call",
-				toolCallId: `blocked-${path}`,
-				toolName: "write",
-				input: { path, content: "x" },
-			}));
-			expect(result.block).toBe(true);
-		}
-	});
-
-
-	function courseInput(overrides: Record<string, unknown> = {}) {
-		return {
-			stage: "course_check",
-			task: "REQ-1 user quote: login must persist",
-			proposal: "mid-progress status",
-			evidence: [evidence("execution", "tests pass")],
-			options: COURSE_OPTIONS,
-			...overrides,
-		};
-	}
-
-	test("course_check: end-to-end verdict mapping (record/redirect/escalate, rework-only burn)", async () => {
-		const harness = makeFakePi();
-		let next: DecisionResult = judgeResult({ selectedOption: "continue" });
-		const controller = createJevController({ judge: async () => next });
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "requirement work", systemPrompt: [] });
-
-		// fixed option set enforced when no template override
-		const bad = await controller.submitDecision(courseInput({ options: OPTIONS }));
-		expect(bad.verdict).toBe("insufficient_evidence");
-		expect(bad.judged).toBe(false);
-
-		// continue: recorded, approves nothing, consumes no rework
-		const cont = await controller.submitDecision(courseInput());
-		expect(cont.verdict).toBe("approve");
-		expect(controller.getState().lastCourseCheck?.selectedOption).toBe("continue");
-		expect(controller.getState().approvals.some(a => a.stage === "course_check")).toBe(false);
-		expect(Object.values(controller.getState().iterations).reduce((a, b) => a + b, 0)).toBe(0);
-
-		// return_to_requirement: revise + same-session feedback + rework burn
-		next = judgeResult({ selectedOption: "return_to_requirement" });
-		const redirect = await controller.submitDecision(courseInput());
-		expect(redirect.verdict).toBe("revise");
-		expect(redirect.reasons.join(" ")).toContain("return_to_requirement");
-		expect(Object.values(controller.getState().iterations).reduce((a, b) => a + b, 0)).toBe(1);
-
-		// verify_before_proceeding recorded without consuming rework
-		next = judgeResult({ selectedOption: "verify_before_proceeding" });
-		await controller.submitDecision(courseInput());
-		expect(controller.getState().lastCourseCheck?.selectedOption).toBe("verify_before_proceeding");
-		expect(Object.values(controller.getState().iterations).reduce((a, b) => a + b, 0)).toBe(1);
-
-		// ask_user (judge choice) escalates with recorded blocker and burns rework
-		next = judgeResult({ selectedOption: "ask_user" });
-		const esc = await controller.submitDecision(courseInput());
-		expect(esc.verdict).toBe("ask_user");
-		expect(controller.getState().blockers.join(" ")).toContain("course_check");
-		expect(Object.values(controller.getState().iterations).reduce((a, b) => a + b, 0)).toBe(2);
-	});
-
-	test("generic course_check: judge error fail-closed, burns rework; verify_before_proceeding recorded without approval", async () => {
-		const controller = createJevController({
-			judge: async (req: DecisionRequest) => {
-				if (req.task === "transport down") throw new Error("endpoint down");
-				return judgeResult({ selectedOption: "verify_before_proceeding", confidence: 0.9 });
-			},
-		});
-		const errOutcome = await controller.submitDecision(courseInput({ task: "transport down" }));
-		expect(errOutcome.verdict).toBe("insufficient_evidence");
-		expect(errOutcome.judged).toBe(false);
-		expect(controller.getState().lastCourseCheck).toBeUndefined();
-		// the failed consultation is rework
-		expect(Object.values(controller.getState().iterations).reduce((a, b) => a + b, 0)).toBe(1);
-
-		const low = await controller.submitDecision(courseInput());
-		expect(low.verdict).toBe("approve");
-		expect(controller.getState().lastCourseCheck?.selectedOption).toBe("verify_before_proceeding");
-		// recorded, but grants no approval and consumes no rework
-		expect(controller.getState().approvals.length).toBe(0);
-		expect(Object.values(controller.getState().iterations).reduce((a, b) => a + b, 0)).toBe(1);
-	});
-
-	test("C1 wired course_check: per-requirement drift via injected courseCheckJudge", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({
-			judge: async () => {
-				throw new Error("standard judge must not be consulted for wired course_check");
-			},
-			courseCheckJudge: async req => {
-				expect(req.requirements.map(r => r.id)).toEqual(["REQ1", "REQ2"]);
-				expect(req.requirements[0]?.quote).toContain("login must persist");
-				return {
-					onTrack: { REQ1: true, REQ2: false },
-					nextAction: "return_to_requirement",
-					reasons: ["drift on REQ2"],
-					judged: true,
-				};
-			},
-		});
-		controller.register(harness.pi);
-		const outcome = await controller.submitDecision(
-			courseInput({
-				evidence: [
-					evidence("user", "REQ-1 user quote: login must persist", "REQ1"),
-					evidence("spec", "REQ-2 spec quote: export to csv", "REQ2"),
-					evidence("execution", "tests pass"),
-				],
-			}),
-		);
-		expect(outcome.verdict).toBe("revise");
-		expect(outcome.reasons.join(" ")).toContain("not on track: REQ2");
-		expect(controller.getState().approvals.length).toBe(0);
-	});
-
-	test("C1 wired course_check: all on track + continue records without approval", async () => {
-		const controller = createJevController({
-			judge: async () => {
-				throw new Error("must not be called");
-			},
-			courseCheckJudge: async req => ({
-				onTrack: Object.fromEntries(req.requirements.map(r => [r.id, true] as const)),
-				nextAction: "continue",
-				reasons: [],
-				judged: true,
-				confidence: 0.9,
-			}),
-		});
-		const outcome = await controller.submitDecision(
-			courseInput({ evidence: [evidence("user", "REQ-1 user quote: login must persist", "REQ1"), evidence("execution", "tests pass")] }),
-		);
-		expect(outcome.verdict).toBe("approve");
-		expect(outcome.selectedOption).toBe("continue");
-		expect(controller.getState().lastCourseCheck?.selectedOption).toBe("continue");
-		expect(controller.getState().approvals.length).toBe(0);
-	});
-
-	test("C1 wired course_check: duplicate requirement ids deduped deterministically, none dropped", async () => {
-		let seen: Array<{ id: string; quote: string }> = [];
-		const controller = createJevController({
-			judge: async () => {
-				throw new Error("must not be called");
-			},
-			courseCheckJudge: async req => {
-				seen = req.requirements;
-				return {
-					onTrack: Object.fromEntries(req.requirements.map(r => [r.id, true] as const)),
-					nextAction: "continue",
-					reasons: [],
-					judged: true,
-					confidence: 0.9,
-				};
-			},
-		});
-		const outcome = await controller.submitDecision(
-			courseInput({
-				evidence: [
-					evidence("user", "REQ user quote: login sessions must persist across restarts"),
-					evidence("user", "REQ user quote: login sessions must persist across restarts"), // exact duplicate -> merged
-					evidence("spec", "REQ spec quote: session expiry policy differs by tier"), // same id, different quote -> #2
-					evidence("execution", "dry-run output: all checks green"),
-				],
-			}),
-		);
-		expect(outcome.verdict).toBe("approve");
-		expect(seen.map(r => r.id)).toEqual(["test", "test#2"]);
-		expect(seen[1]?.quote).toContain("session expiry");
-	});
-
-	test("polish5: drift ids named in summary; zero-drift summary unchanged", async () => {
-		let drift = true;
-		const controller = createJevController({
-			judge: async () => {
-				throw new Error("must not be called");
-			},
-			courseCheckJudge: async req => ({
-				onTrack: Object.fromEntries(req.requirements.map(r => [r.id, !drift] as const)),
-				nextAction: "return_to_requirement",
-				reasons: [],
-				judged: true,
-				confidence: 0.9,
-			}),
-		});
-		const drifted = await controller.submitDecision(
-			courseInput({
-				evidence: [
-					evidence("user", "REQ1 user quote: login sessions persist", "REQ1"),
-					evidence("spec", "REQ2 spec quote: csv export columns", "REQ2"),
-					evidence("execution", "dry-run output: all checks green"),
-				],
-			}),
-		);
-		expect(drifted.summary).toBe("course_check: revise — return_to_requirement: back to requirement (drifted: REQ1, REQ2)");
-
-		drift = false;
-		const redirect = { ...courseInput(), proposal: "second look, everything aligned" };
-		const zero = await controller.submitDecision({
-			...redirect,
-			evidence: [
-				evidence("user", "REQ1 user quote: login sessions persist", "REQ1"),
-				evidence("execution", "dry-run output: all checks green"),
-			],
-		});
-		expect(zero.summary).toBe("course_check: revise — return_to_requirement: back to requirement");
-	});
-
-	test("C1 wired course_check: fail-closed on judge throw and unjudged result", async () => {
-		let mode: "throw" | "unjudged" = "throw";
-		const controller = createJevController({
-			judge: async () => {
-				throw new Error("must not be called");
-			},
-			courseCheckJudge: async () => {
-				if (mode === "throw") throw new Error("endpoint down");
-				return { onTrack: {}, nextAction: "continue", reasons: [], judged: false };
-			},
-		});
-		const thrown = await controller.submitDecision(courseInput());
-		expect(thrown.verdict).toBe("insufficient_evidence");
-		expect(thrown.judged).toBe(false);
-		expect(controller.getState().lastCourseCheck).toBeUndefined();
-		mode = "unjudged";
-		const unjudged = await controller.submitDecision(courseInput());
-		expect(unjudged.verdict).toBe("insufficient_evidence");
-		expect(controller.getState().lastCourseCheck).toBeUndefined();
-	});
-
-	test("C1 wired course_check: requirement-less submission rejected before judge", async () => {
-		let called = false;
-		const controller = createJevController({
-			judge: async () => {
-				throw new Error("must not be called");
-			},
-			courseCheckJudge: async () => {
-				called = true;
-				return { onTrack: {}, nextAction: "continue", reasons: [], judged: true };
-			},
-		});
-		const outcome = await controller.submitDecision(
-			courseInput({ evidence: [evidence("execution", "tests pass")] }),
-		);
-		expect(outcome.verdict).toBe("insufficient_evidence");
-		expect(called).toBe(false);
-	});
-
-	test("registry: config-declared on_demand control point fires end-to-end, grants no approval", async () => {
-		const controller = createJevController({
-			judge: async (req: DecisionRequest) => {
-				expect(req.stage as string).toBe("risk_assessment");
-				return judgeResult({});
-			},
-			template: {
-				controlPoints: {
-					risk_assessment: { trigger: "on_demand", instructions: "weigh blast radius" },
-				},
-			},
-		});
-		const outcome = await controller.submitDecision({
-			stage: "risk_assessment",
-			task: "migration cutover",
-			proposal: "phased plan",
-			evidence: [evidence("log", "dry-run ok")],
-			options: OPTIONS,
-		});
-		expect(outcome.verdict).toBe("approve");
-		expect(controller.getState().approvals.length).toBe(0);
-	});
-
-	test("templateError state fails closed on every submission (config corruption mid-session)", async () => {
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			templateError: 'controlPoints.cut_files must declare trigger "on_demand" (gate triggers are a roadmap item)',
-		});
-		const outcome = await controller.submitDecision(validDecisionInput());
-		expect(outcome.verdict).toBe("insufficient_evidence");
-		expect(outcome.judged).toBe(false);
-		expect(outcome.reasons.join(" ")).toContain("fail-closed");
-	});
-
-	test("round6/7: openAspectGaps restored from persisted state keeps completion teeth", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({
-			judge: async () => {
-				throw new Error("must not be called");
-			},
-			catalogIds: new Set(ASPECTS),
-			aspectCoverageJudge: async () => ({
-				markings: { "topic-a": "applicable_and_addressed", "topic-b": "applicable_not_addressed" },
-				reasons: [],
-				judged: true,
-			}),
-		});
-		controller.register(harness.pi);
-		await controller.submitDecision(
-			aspectInput({
-				evidence: [evidence("spec", "REQ spec quote covering both aspects here"), evidence("execution", "dry-run output ok")],
-			}),
-		);
-		expect(controller.getState().openAspectGaps?.missed).toBeDefined();
-		const saved = harness.appended.filter(a => a.customType === "jev.state");
-		const harness2 = makeFakePi();
-		const controller2 = createJevController({ judge: async () => judgeResult({}) });
-		controller2.register(harness2.pi);
-		const last = saved[saved.length - 1]?.data;
-		controller2.onSessionStart([{ customType: "jev.state", data: last }]);
-		expect(controller2.getState().openAspectGaps?.missed).toBeDefined();
-	});
-
-	test("round6/7 F1: raised threshold keeps single strict bar, no streak credit", async () => {
-		const controller = createJevController({
-			judge: async () => judgeResult({ confidence: 0.65 }),
-			template: { confidenceThreshold: 0.9 },
-		});
-		const first = await controller.submitDecision(validDecisionInput());
-		const second = await controller.submitDecision(validDecisionInput());
-		expect(first.verdict).toBe("insufficient_evidence");
-		expect(second.verdict).toBe("insufficient_evidence");
-		expect(controller.getState().approvals.length).toBe(0);
-		expect(controller.getState().consecutiveCompletionApproves).toBeUndefined();
-	});
-
-	test("P3: duplicate + short evidence rejected pre-judge without counter burn", async () => {
-		const harness = makeFakePi();
-		let conf = 0.7;
-		const controller = createJevController({
-			judge: async (req: DecisionRequest) =>
-				req.stage === "course_check"
-					? judgeResult({ selectedOption: "continue" })
-					: judgeResult({ confidence: req.stage === "understanding_review" ? 0.95 : conf }),
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
-		await approvePlan(controller);
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
-		const first = await controller.submitDecision(validDecisionInput());
-		expect(first.verdict).toBe("insufficient_evidence");
-		expect(first.judged).toBe(true);
-		expect(first.reasons.join(" ")).toContain("completion_pending_consecutive_approves");
-		expect(first.reasons.join(" ")).toContain("n=1/2");
-		conf = 0.75;
-		const second = await controller.submitDecision(validDecisionInput());
-		expect(second.verdict).toBe("approve");
-		expect(second.reasons.join(" ")).toContain("consecutive_approves");
-		expect(controller.getState().approvals.some(a => a.stage === "completion_review")).toBe(true);
-		await controller.submitDecision(courseCheckGateInput());
-		expect(stopResult(await runStop(harness))?.decision).toBeUndefined();
-	});
-
-	test("calibration rule: non-approve resets the streak; 0.59 below floor never counts", async () => {
-		let mode: "mid" | "revise" | "low" = "mid";
-		const controller = createJevController({
-			judge: async () => {
-				if (mode === "revise") return { verdict: "revise", reasons: ["no"] };
-				return judgeResult({ confidence: mode === "low" ? 0.59 : 0.7 });
-			},
-		});
-		await controller.submitDecision(validDecisionInput()); // n=1
-		mode = "revise";
-		await controller.submitDecision(validDecisionInput({ proposal: "changed after revise feedback" }));
-		mode = "mid";
-		const after = await controller.submitDecision(
-			validDecisionInput({ proposal: "changed after revise feedback" }),
-		);
-		expect(after.reasons.join(" ")).toContain("n=1/2"); // streak restarted
-		// Below-floor phase on a fresh controller (bound budget already spent above).
-		mode = "low";
-		const lowController = createJevController({
-			judge: async () => judgeResult({ confidence: 0.59 }),
-		});
-		const low = await lowController.submitDecision(validDecisionInput());
-		// Normalization demotes sub-floor confidence (its own message); streak never counts.
-		expect(low.verdict).toBe("insufficient_evidence");
-		expect(low.judged).toBe(true);
-		expect(lowController.getState().consecutiveCompletionApproves).toBeUndefined();
-		expect(lowController.getState().approvals.length).toBe(0);
-	});
-
-	test("calibration rule: template raise respected (count 3 clamp)", async () => {
-		let calls = 0;
-		const controller = createJevController({
-			judge: async () => {
-				calls++;
-				return judgeResult({ confidence: 0.7 });
-			},
-			template: { completion: { consecutiveApproves: 3 } },
-		});
-		const first = await controller.submitDecision(validDecisionInput());
-		const second = await controller.submitDecision(validDecisionInput());
-		expect(first.verdict).toBe("insufficient_evidence");
-		expect(second.reasons.join(" ")).toContain("n=2/3");
-		expect(calls).toBe(2);
-	});
-
-	const ASPECTS = ["topic-a", "topic-b"];
-	const aspectInput = (overrides: Record<string, unknown> = {}) => ({
-		stage: "aspect_coverage",
-		task: "coverage check",
-		proposal: "built both aspects",
-		options: OPTIONS,
-		evidence: [evidence("code", "implemented topic-a handling fully here")],
-		aspects: ASPECTS,
-		...overrides,
-	});
-
-	test("aspect_coverage: three-way marking -> missed aspects revise with ids + completion teeth", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({
-			judge: async () => {
-				throw new Error("standard judge must not be called");
-			},
-			catalogIds: new Set(ASPECTS),
-			aspectCoverageJudge: async () => ({
-				markings: { "topic-a": "applicable_and_addressed", "topic-b": "applicable_not_addressed" },
-				reasons: ["b missed"],
-				judged: true,
-			}),
-		});
-		controller.register(harness.pi);
-		const outcome = await controller.submitDecision(aspectInput());
-		expect(outcome.verdict).toBe("revise");
-		expect(outcome.reasons.join(" ")).toContain("topic-b");
-
-		// completion teeth: unmetStopGates names open gaps while fingerprint matches
-		const gaps = controller.getState().openAspectGaps;
-		expect(gaps?.missed).toEqual(["topic-b"]);
-		const gates = await controller.onSessionStop({
-			type: "session_stop",
-			messages: [],
-			turn_id: 1,
-			session_id: "s",
-			stop_hook_active: false,
-		});
-		// mutations not seen -> no gates; teeth apply only when completion gate is evaluated
-		expect(controller.getState().openAspectGaps?.missed).toEqual(["topic-b"]);
-
-		// resubmission clearing the gap
-		const clearing = createJevController({
-			judge: async () => {
-				throw new Error("must not be called");
-			},
-			catalogIds: new Set(ASPECTS),
-			aspectCoverageJudge: async () => ({
-				markings: { "topic-a": "applicable_and_addressed", "topic-b": "applicable_and_addressed" },
-				reasons: [],
-				judged: true,
-			}),
-		});
-		const ok = await clearing.submitDecision(aspectInput());
-		expect(ok.verdict).toBe("approve");
-		expect(ok.summary).toBe("aspect_coverage: approve — all applicable aspects addressed");
-		expect(clearing.getState().openAspectGaps).toBeUndefined();
-	});
-
-	test("aspect_coverage: not_applicable + judged approve records no approval", async () => {
-		const controller = createJevController({
-			judge: async () => {
-				throw new Error("must not be called");
-			},
-			catalogIds: new Set(ASPECTS),
-			aspectCoverageJudge: async () => ({
-				markings: { "topic-a": "applicable_and_addressed", "topic-b": "not_applicable" },
-				reasons: [],
-				judged: true,
-			}),
-		});
-		const outcome = await controller.submitDecision(aspectInput());
-		expect(outcome.verdict).toBe("approve");
-		expect(controller.getState().approvals.length).toBe(0);
-	});
-
-	test("aspect_coverage: catalog pre-check rejects unknown ids, no judge, no counter burn", async () => {
-		let called = false;
-		const controller = createJevController({
-			judge: async () => {
-				throw new Error("must not be called");
-			},
-			catalogIds: new Set(ASPECTS),
-			aspectCoverageJudge: async () => {
-				called = true;
-				return { markings: {}, reasons: [], judged: true };
-			},
-		});
-		const outcome = await controller.submitDecision(aspectInput({ aspects: ["topic-a", "bogus-id"] }));
-		expect(outcome.verdict).toBe("insufficient_evidence");
-		expect(outcome.reasons.join(" ")).toContain("bogus-id");
-		expect(outcome.judged).toBe(false);
-		expect(called).toBe(false);
-	});
-
-	test("aspect_coverage: judge escape / unjudged / throw all fail closed", async () => {
-		let mode: "escape" | "unjudged" | "throw" = "escape";
-		const controller = createJevController({
-			judge: async () => {
-				throw new Error("must not be called");
-			},
-			catalogIds: new Set(ASPECTS),
-			aspectCoverageJudge: async () => {
-				if (mode === "escape") return { markings: {}, reasons: ["cannot judge"], judged: false, escape: true };
-				if (mode === "unjudged") return { markings: {}, reasons: [], judged: false };
-				throw new Error("endpoint down");
-			},
-		});
-		for (mode of ["escape", "unjudged", "throw"] as const) {
-			const outcome = await controller.submitDecision(aspectInput());
-			expect(outcome.verdict).toBe("insufficient_evidence");
-			expect(outcome.judged).toBe(false);
-		}
-	});
-
-	test("aspect_coverage: unmarked aspect fails closed (judge contract violation)", async () => {
-		const controller = createJevController({
-			judge: async () => {
-				throw new Error("must not be called");
-			},
-			catalogIds: new Set(ASPECTS),
-			aspectCoverageJudge: async () => ({
-				markings: { "topic-a": "applicable_and_addressed" },
-				reasons: [],
-				judged: true,
-			}),
-		});
-		const outcome = await controller.submitDecision(aspectInput());
-		expect(outcome.verdict).toBe("insufficient_evidence");
-		expect(outcome.reasons.join(" ")).toContain("topic-b");
-	});
-
-	test("P3: duplicate + short evidence rejected pre-judge without counter burn", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: async () => judgeResult({}) });
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
-		await approvePlan(controller);
-		const before = Object.values(controller.getState().iterations).reduce((a, b) => a + b, 0);
-		const outcome = await controller.submitDecision(
-			validDecisionInput({
-				evidence: [
-					evidence("execution", "same quote repeated twice here"),
-					evidence("log", "same quote repeated twice here"),
-					evidence("code", "tiny"),
-				],
-			}),
-		);
-		expect(outcome.verdict).toBe("insufficient_evidence");
-		expect(outcome.judged).toBe(false);
-		expect(outcome.reasons.join(" ")).toContain("duplicate_evidence_quote#1");
-		expect(outcome.reasons.join(" ")).toContain("quote_too_short");
-		const after = Object.values(controller.getState().iterations).reduce((a, b) => a + b, 0);
-		expect(after).toBe(before);
-	});
-
-	test("P3: plan stage without requirement evidence rejected", async () => {
-		const controller = createJevController({ judge: async () => judgeResult({}) });
-		const outcome = await controller.submitDecision(
-			validDecisionInput({
-				stage: "understanding_review",
-				proposal: "Plan: implement feature X in module M.",
-				evidence: [evidence("execution", "$ bun test run — 42 passing suites")],
-			}),
-		);
-		expect(outcome.verdict).toBe("insufficient_evidence");
-		expect(outcome.reasons).toContain("no_requirement_evidence");
-	});
-
-	test("P3: single short quote still judged with warnings populated", async () => {
-		const controller = createJevController({ judge: async () => judgeResult({}) });
-		const outcome = await controller.submitDecision(
-			validDecisionInput({ evidence: [evidence("execution", "tiny"), evidence("code", "export function x() {}")] }),
-		);
-		expect(outcome.verdict).toBe("approve");
-		expect(outcome.judged).toBe(true);
-		expect(outcome.warnings?.[0]).toContain("quote_too_short");
-	});
-
-	test("P2: summary templates across verdicts, meaning verbatim, tool text parses", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: async () => judgeResult({}) });
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
-
-		const approve = await controller.submitDecision(validDecisionInput());
-		expect(approve.summary).toBe("completion_review: approve — a: do A");
-
-		const revising = createJevController({ judge: async () => ({ verdict: "revise", reasons: ["no"] }) });
-		const rev = await revising.submitDecision(validDecisionInput());
-		expect(rev.summary).toContain("completion_review: revise — sent back with reasons (iteration 1/3)");
-
-		const bounded = createJevController({
-			judge: async () => ({ verdict: "revise", reasons: ["no"] }),
-			maxReworkIterations: 1,
-		});
-		const repeat = validDecisionInput();
-		await bounded.submitDecision(repeat);
-		const esc = await bounded.submitDecision(repeat);
-		expect(esc.verdict).toBe("ask_user");
-		expect(esc.summary).toBe("completion_review: ask_user — escalate to the user");
-
-		const bad = await controller.submitDecision({ stage: "completion_review" });
-		expect(bad.summary).toContain("insufficient_evidence — judge not consulted");
-
-		const tool = harness.getTool();
-		expect(tool).toBeDefined();
-		const result = (await tool!.execute("id", validDecisionInput(), undefined, undefined, undefined)) as {
-			content: Array<{ type: string; text: string }>;
-		};
-		const text = result.content[0]?.text ?? "";
-		const firstLine = text.split("\n")[0] ?? "";
-		expect(firstLine).toBe("completion_review: approve — a: do A");
-		const parsed = JSON.parse(text.slice(text.indexOf("{"))) as { verdict: string; summary: string };
-		expect(parsed.verdict).toBe("approve");
-		expect(parsed.summary).toBe(firstLine);
-	});
-
-	// ---------- remediation: read-only completion gate, course-check freshness, streak binding ----------
-
-	test("read-only active task: stop demands plan, fresh course_check and completion once a task exists", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: gateJudge() });
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "analyze module M and report findings", systemPrompt: [] });
-		const noPlan = await runStop(harness);
-		expect(noPlan?.decision).toBe("block");
-		expect(String(noPlan?.reason)).toContain("plan-stage approval");
-		await controller.submitDecision(
-			validDecisionInput({
-				stage: "understanding_review",
-				proposal: "Plan: analyze module M and report findings to the user.",
-				evidence: [evidence("user", "analyze module M and report findings"), evidence("execution", "dry-run analysis checklist output")],
-			}),
-		);
-		const noCheck = await runStop(harness);
-		expect(noCheck?.decision).toBe("block");
-		expect(String(noCheck?.reason)).toContain("course_check");
-		await controller.submitDecision(courseCheckGateInput());
-		const noCompletion = await runStop(harness);
-		expect(noCompletion?.decision).toBe("block");
-		expect(String(noCompletion?.reason)).toContain("completion_review");
-		await controller.submitDecision(validDecisionInput());
-		expect((await runStop(harness))?.decision).toBeUndefined();
-	});
-
-	test("work mutation after course_check makes it stale; fresh re-check re-unlocks", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: gateJudge() });
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
-		await approvePlan(controller);
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
-		await controller.submitDecision(courseCheckGateInput());
-		await controller.submitDecision(validDecisionInput());
-		expect((await runStop(harness))?.decision).toBeUndefined();
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "2", toolName: "write", input: {} });
-		const stale = await runStop(harness);
-		expect(stale?.decision).toBe("block");
-		expect(String(stale?.reason)).toContain("course_check");
-		await controller.submitDecision(courseCheckGateInput());
-		await controller.submitDecision(validDecisionInput());
-		expect((await runStop(harness))?.decision).toBeUndefined();
-	});
-
-	test("verify_before_proceeding is recorded but never satisfies the completion course check", async () => {
-		const harness = makeFakePi();
-		let pick = "verify_before_proceeding";
-		const controller = createJevController({
-			judge: async (req: DecisionRequest) =>
-				judgeResult({ selectedOption: req.stage === "course_check" ? pick : "a" }),
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
-		await approvePlan(controller);
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
-		const rec = await controller.submitDecision(courseCheckGateInput());
-		expect(rec.verdict).toBe("approve");
-		expect(controller.getState().lastCourseCheck?.selectedOption).toBe("verify_before_proceeding");
-		await controller.submitDecision(validDecisionInput());
-		const blocked = await runStop(harness);
-		expect(blocked?.decision).toBe("block");
-		expect(String(blocked?.reason)).toContain("course_check");
-		pick = "continue";
-		await controller.submitDecision(courseCheckGateInput());
-		expect((await runStop(harness))?.decision).toBeUndefined();
-	});
-
-	test("course_check rework bound: only redirects and failures consume it; benign never does", async () => {
-		let mode: "continue" | "redirect" | "fail" | "verify" = "continue";
-		let calls = 0;
-		const controller = createJevController({
-			judge: async () => {
-				calls++;
-				if (mode === "fail") throw new Error("endpoint down");
-				const selected = mode === "redirect" ? "return_to_requirement" : mode === "verify" ? "verify_before_proceeding" : "continue";
-				return judgeResult({ selectedOption: selected });
-			},
-		});
-		const burn = () => Object.values(controller.getState().iterations).reduce((a, b) => a + b, 0);
-		mode = "continue";
-		for (let i = 0; i < 5; i++) await controller.submitDecision(courseCheckGateInput());
-		expect(burn()).toBe(0);
-		mode = "redirect";
-		await controller.submitDecision(courseCheckGateInput());
-		expect(burn()).toBe(1);
-		mode = "fail";
-		const failed = await controller.submitDecision(courseCheckGateInput());
-		expect(failed.verdict).toBe("insufficient_evidence");
-		expect(burn()).toBe(2);
-		mode = "verify";
-		await controller.submitDecision(courseCheckGateInput());
-		expect(burn()).toBe(2);
-		mode = "redirect";
-		await controller.submitDecision(courseCheckGateInput());
-		expect(burn()).toBe(3);
-		const exhausted = await controller.submitDecision(courseCheckGateInput());
-		expect(exhausted.verdict).toBe("ask_user");
-		expect(calls).toBe(9); // bound reached, no further judge calls
-		expect(controller.getState().blockers.join(" ")).toContain("course_check");
-	});
-
-	test("wired course_check validates result contract: fixed action, exact onTrack keys, finite confidence at/above floor; drift never continues", async () => {
-		const cases: Array<{ result: CourseCheckResult; why: string }> = [
-			{ result: { onTrack: { REQ: true }, nextAction: "continue", reasons: [], judged: true }, why: "confidence missing" },
-			{ result: { onTrack: { REQ: true }, nextAction: "continue", reasons: [], judged: true, confidence: Number.NaN }, why: "confidence NaN" },
-			{ result: { onTrack: { REQ: true }, nextAction: "continue", reasons: [], judged: true, confidence: 0.5 }, why: "confidence below floor" },
-			{ result: { onTrack: {}, nextAction: "continue", reasons: [], judged: true, confidence: 0.9 }, why: "onTrack missing requirement" },
-			{ result: { onTrack: { REQ: true, EXTRA: true }, nextAction: "continue", reasons: [], judged: true, confidence: 0.9 }, why: "onTrack extra key" },
-			{ result: { onTrack: { REQ: false }, nextAction: "continue", reasons: [], judged: true, confidence: 0.9 }, why: "drift must not continue" },
+	test("FR-13, FR-11: an off-course verdict holds the changes until the executor consults", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": "# plan\n" }) });
+		const { pi, calls } = controllerFor(
 			{
-				// deliberately outside the fixed action union: a contract violation
-				result: { onTrack: { REQ: true }, nextAction: "proceed", reasons: [], judged: true, confidence: 0.9 } as unknown as CourseCheckResult,
-				why: "unknown next action",
+				needs_development: TRIAGE_DEEP,
+				plan: PLAN_SERVES,
+				direction: { label: "off_course", confidence: 0.9 },
+				consult: { label: "fix", confidence: 0.91 },
+				resolves_hold: { probability: 0.93 },
 			},
-		];
-		for (const c of cases) {
-			const controller = createJevController({
-				judge: async () => {
-					throw new Error("must not be called");
-				},
-				courseCheckJudge: async () => c.result,
-			});
-			const outcome = await controller.submitDecision(courseCheckGateInput());
-			expect(outcome.verdict, c.why).toBe("insufficient_evidence");
-			expect(controller.getState().lastCourseCheck, c.why).toBeUndefined();
-		}
-		const ok = createJevController({
-			judge: async () => {
-				throw new Error("must not be called");
-			},
-			courseCheckJudge: async req => ({
-				onTrack: Object.fromEntries(req.requirements.map(r => [r.id, true] as const)),
-				nextAction: "continue",
-				reasons: ["judged"],
-				judged: true,
-				confidence: 0.6, // exactly at the floor still counts
-			}),
-		});
-		const good = await ok.submitDecision(courseCheckGateInput());
-		expect(good.verdict).toBe("approve");
-		expect(ok.getState().lastCourseCheck?.selectedOption).toBe("continue");
-	});
-
-	test("typed completionCandidate: counted only at completion and default bar; promotion after streak records the approval", async () => {
-		const midBand: DecisionResult = {
-			verdict: "insufficient_evidence",
-			reasons: ["raw approve demoted: mid-band"],
-			confidence: 0.7,
-			completionCandidate: { selectedOption: "a" },
-		};
-		const controller = createJevController({ judge: async () => midBand });
-		// non-completion stage: the same shape is a plain insufficient, never counted
-		const other = await controller.submitDecision({
-			stage: "task_classification",
-			task: "classify the workload",
-			proposal: "development task classification",
-			options: OPTIONS,
-			evidence: [evidence("user", "classify this workload request for the dashboard")],
-		});
-		expect(other.verdict).toBe("insufficient_evidence");
-		expect(controller.getState().consecutiveCompletionApproves).toBeUndefined();
-		// completion: first candidate counts toward the streak
-		const first = await controller.submitDecision(validDecisionInput());
-		expect(first.verdict).toBe("insufficient_evidence");
-		expect(first.reasons.join(" ")).toContain("n=1/2");
-		expect(controller.getState().consecutiveCompletionApproves?.count).toBe(1);
-		// changed content is a new revision: the streak restarts
-		const changedProposal = "Feature X implemented differently: module rewritten end to end.";
-		const changed = await controller.submitDecision(validDecisionInput({ proposal: changedProposal }));
-		expect(changed.reasons.join(" ")).toContain("n=1/2");
-		// same content again completes the streak and promotes the candidate
-		const promoted = await controller.submitDecision(validDecisionInput({ proposal: changedProposal }));
-		expect(promoted.verdict).toBe("approve");
-		expect(promoted.selectedOption).toBe("a");
-		expect(promoted.reasons.join(" ")).toContain("consecutive_approves");
-		expect(controller.getState().approvals.some(a => a.stage === "completion_review")).toBe(true);
-	});
-
-	test("completionCandidate validation: unoffered option, sub-floor confidence and reason strings never count", async () => {
-		const unoffered = createJevController({
-			judge: async () => ({
-				verdict: "insufficient_evidence",
-				reasons: ["mid-band"],
-				confidence: 0.7,
-				completionCandidate: { selectedOption: "zz" },
-			}),
-		});
-		const r1 = await unoffered.submitDecision(validDecisionInput());
-		expect(r1.verdict).toBe("insufficient_evidence");
-		expect(r1.reasons.join(" ")).not.toContain("completion_pending");
-		expect(unoffered.getState().consecutiveCompletionApproves).toBeUndefined();
-
-		const subFloor = createJevController({
-			judge: async () => ({
-				verdict: "insufficient_evidence",
-				reasons: ["mid-band"],
-				confidence: 0.5,
-				completionCandidate: { selectedOption: "a" },
-			}),
-		});
-		const r2 = await subFloor.submitDecision(validDecisionInput());
-		expect(r2.verdict).toBe("insufficient_evidence");
-		expect(subFloor.getState().consecutiveCompletionApproves).toBeUndefined();
-
-		const sneaky = createJevController({
-			judge: async () => ({
-				verdict: "insufficient_evidence",
-				reasons: ["completionCandidate selectedOption a mid-band approve"],
-				confidence: 0.7,
-			}),
-		});
-		const r3 = await sneaky.submitDecision(validDecisionInput());
-		expect(r3.verdict).toBe("insufficient_evidence");
-		expect(sneaky.getState().consecutiveCompletionApproves).toBeUndefined();
-	});
-
-	test("raised completion config applies on template reload", async () => {
-		const controller = createJevController({ judge: async () => judgeResult({ confidence: 0.7 }) });
-		const first = await controller.submitDecision(validDecisionInput());
-		expect(first.reasons.join(" ")).toContain("n=1/2");
-		controller.setTemplateState({ completion: { consecutiveApproves: 3 } });
-		const second = await controller.submitDecision(validDecisionInput());
-		expect(second.verdict).toBe("insufficient_evidence");
-		expect(second.reasons.join(" ")).toContain("n=2/3");
-	});
-
-	test("completion streak breaks on revise, invalid submission and judge errors", async () => {
-		let mode: "mid" | "revise" | "throw" = "mid";
-		const controller = createJevController({
-			judge: async () => {
-				if (mode === "revise") return { verdict: "revise", reasons: ["rework needed"] };
-				if (mode === "throw") throw new Error("transport down");
-				return {
-					verdict: "insufficient_evidence",
-					reasons: ["mid-band"],
-					confidence: 0.7,
-					completionCandidate: { selectedOption: "a" },
-				};
-			},
-			maxReworkIterations: 10, // interruptions are under test here, not the bound
-		});
-		const proposal = "Feature X implemented: module added, tests pass.";
-		await controller.submitDecision(validDecisionInput({ proposal }));
-		expect(controller.getState().consecutiveCompletionApproves?.count).toBe(1);
-		mode = "revise";
-		await controller.submitDecision(validDecisionInput({ proposal: "adjusted after revise feedback" }));
-		expect(controller.getState().consecutiveCompletionApproves).toBeUndefined();
-		mode = "mid";
-		await controller.submitDecision(validDecisionInput({ proposal: "adjusted after revise feedback" }));
-		expect(controller.getState().consecutiveCompletionApproves?.count).toBe(1); // restarted
-		await controller.submitDecision(validDecisionInput({ proposal: "adjusted after revise feedback", evidence: [] }));
-		expect(controller.getState().consecutiveCompletionApproves).toBeUndefined();
-		await controller.submitDecision(validDecisionInput({ proposal: "adjusted after revise feedback" }));
-		expect(controller.getState().consecutiveCompletionApproves?.count).toBe(1);
-		mode = "throw";
-		await controller.submitDecision(validDecisionInput({ proposal: "adjusted after revise feedback" }));
-		expect(controller.getState().consecutiveCompletionApproves).toBeUndefined();
-	});
-
-	test("invalid template blocks mutations and stop even with restored approvals", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: gateJudge() });
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
-		await approvePlan(controller);
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
-		await controller.submitDecision(validDecisionInput());
-		await controller.submitDecision(courseCheckGateInput());
-		expect(stopResult(await runStop(harness))?.decision).toBeUndefined();
-		const saved = harness.appended.filter(a => a.customType === "jev.state");
-		// restart: approvals (and the fresh course check) restore; stop stays free
-		const harness2 = makeFakePi();
-		const controller2 = createJevController({ judge: gateJudge() });
-		controller2.register(harness2.pi);
-		controller2.onSessionStart(saved.map(a => ({ customType: a.customType, data: a.data as JevState })));
-		expect(stopResult(await runStop(harness2))?.decision).toBeUndefined();
-		// config turns invalid mid-session: restored approvals no longer unlock anything
-		controller2.setTemplateState(undefined, "jev.config.json: controlPoints.cut_files must declare trigger on_demand");
-		const mutation = blockResult(await harness2.emit("tool_call", { type: "tool_call", toolCallId: "2", toolName: "write", input: {} }));
-		expect(mutation?.block).toBe(true);
-		expect(String(mutation?.reason)).toContain("fail-closed");
-		const stop = await runStop(harness2);
-		expect(stop?.decision).toBe("block");
-		expect(String(stop?.reason)).toContain("fail-closed");
-		const outcome = await controller2.submitDecision(validDecisionInput());
-		expect(outcome.verdict).toBe("insufficient_evidence");
-		expect(outcome.judged).toBe(false);
-	});
-});
-
-describe("jev controller: rework loop with approach variation (PRD 19)", () => {
-	test("a repeated approach is refused before any judge call and names the approaches spent", async () => {
-		let calls = 0;
-		const controller = createJevController({
-			judge: async () => {
-				calls++;
-				return { verdict: "revise", reasons: [`nope ${calls}`] };
-			},
-			maxReworkIterations: 3,
-		});
-		const first = await controller.submitDecision(validDecisionInput({ approach: "tighten the trigger" }));
-		expect(first.verdict).toBe("revise");
-		expect(calls).toBe(1);
-
-		// The same approach in different words is not a new attempt: refused pre-judge, no burn.
-		const repeat = await controller.submitDecision(
-			validDecisionInput({
-				approach: "  Tighten the   trigger ",
-				proposal: "a completely different wording of the very same move",
-			}),
+			{ interval: 1 },
 		);
-		expect(repeat.verdict).toBe("insufficient_evidence");
-		expect(repeat.judged).toBe(false);
-		expect(calls).toBe(1);
-		expect(repeat.reasons.join(" ")).toContain("approach_already_spent");
-		expect(repeat.reasons.join(" ")).toContain('"tighten the trigger"');
-		expect(repeat.summary).toContain("refused before judging");
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
 
-		// A different approach is a new attempt, even over unchanged wording.
-		const second = await controller.submitDecision(validDecisionInput({ approach: "split into narrower items" }));
-		expect(second.verdict).toBe("revise");
-		expect(calls).toBe(2);
-	});
+		await pi.emit("tool_result", toolResultEvent("write", { path: "src/other.ts" }, "Successfully wrote 3 bytes"), ctx);
+		expect(await until(() => calls.some(call => call.questions[0]?.name === "direction"))).toBe(true);
+		expect(await until(() => pi.messages.some(message => message.customType === "jev.course_check" && message.content.includes("off_course")))).toBe(true);
 
-	test("exhausting the N attempts escalates with ask_user and surfaces the journal as an OPEN item", async () => {
-		let calls = 0;
-		const harness = makeFakePi();
-		const controller = createJevController({
-			judge: async () => {
-				calls++;
-				return { verdict: "revise", reasons: [`judge rejected attempt ${calls}`] };
-			},
-			maxReworkIterations: 3,
-		});
-		controller.register(harness.pi);
-		const approaches = ["tighten the trigger", "split into narrower items", "state the outcome plus the evidence"];
-		for (const approach of approaches) {
-			const outcome = await controller.submitDecision(validDecisionInput({ approach }));
-			expect(outcome.verdict).toBe("revise");
-		}
-		expect(calls).toBe(3);
+		const held = await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx);
+		expect(blockReason(held)).toContain("off_course");
 
-		const exhausted = await controller.submitDecision(validDecisionInput({ approach: "ask the user instead" }));
-		expect(exhausted.verdict).toBe("ask_user");
-		expect(exhausted.judged).toBe(false);
-		expect(calls).toBe(3); // nothing further is judged once the bound is spent
-		const escalated = exhausted.reasons.join(" ");
-		for (const approach of approaches) expect(escalated).toContain(approach);
-		expect(escalated).toContain("judge rejected attempt 1");
-		expect(escalated).toContain("OPEN item");
-		expect(controller.getState().blockers.join(" ")).toContain("rework bound exhausted");
-		expect(Object.values(controller.getState().reworkJournal).every(j => j.open)).toBe(true);
-		const escalatedFeedback = harness.sentMessages
-			.map(m => (isRecord(m.payload) && typeof m.payload["content"] === "string" ? m.payload["content"] : ""))
-			.join("\n");
-		expect(escalatedFeedback).toContain("rework bound exhausted");
-	});
-
-	test("a rejected attempt lands in the journal and the feedback names the attempt and the next change", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({
-			judge: async () => ({ verdict: "revise", reasons: ["the claim is not supported by the quoted source"] }),
-			maxReworkIterations: 3,
-		});
-		controller.register(harness.pi);
-		const first = await controller.submitDecision(validDecisionInput({ approach: "tighten the trigger" }));
-		expect(first.summary).toContain('attempt 1/3 with approach "tighten the trigger"');
-		const second = await controller.submitDecision(validDecisionInput({ approach: "split into narrower items" }));
-		expect(second.verdict).toBe("revise");
-		expect(second.summary).toContain("attempt 2/3");
-
-		const journal = controller.getState().reworkJournal[Object.keys(controller.getState().reworkJournal)[0]!]!;
-		expect(journal.attempts.map(a => a.attempt)).toEqual([1, 2]);
-		expect(journal.attempts.map(a => a.approach)).toEqual(["tighten the trigger", "split into narrower items"]);
-		expect(journal.attempts.map(a => a.verdict)).toEqual(["revise", "revise"]);
-		expect(journal.attempts[1]!.reasons.join(" ")).toContain("not supported by the quoted source");
-		expect(journal.open).toBe(false);
-
-		const feedback = harness.sentMessages
-			.map(m => (isRecord(m.payload) && typeof m.payload["content"] === "string" ? m.payload["content"] : ""))
-			.filter(t => t.includes("rework attempt 2/3"));
-		expect(feedback.length).toBe(1);
-		expect(feedback[0]).toContain('"tighten the trigger"'); // the approaches already spent
-		expect(feedback[0]).toContain("DIFFERENT approach"); // what the next attempt must change
-	});
-
-	test("the journal survives a session restart: a spent approach stays spent", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: async () => ({ verdict: "revise", reasons: ["no"] }) });
-		controller.register(harness.pi);
-		await controller.submitDecision(validDecisionInput({ approach: "tighten the trigger" }));
-		const saved = harness.appended.filter(a => a.customType === "jev.state");
-		expect(saved.length).toBeGreaterThan(0);
-
-		let calls = 0;
-		const restarted = createJevController({
-			judge: async () => {
-				calls++;
-				return { verdict: "revise", reasons: ["no"] };
-			},
-		});
-		restarted.onSessionStart(saved.map(a => ({ customType: a.customType, data: a.data as JevState })));
-		expect(Object.keys(restarted.getState().reworkJournal).length).toBe(1);
-		const repeat = await restarted.submitDecision(validDecisionInput({ approach: "Tighten the trigger" }));
-		expect(repeat.verdict).toBe("insufficient_evidence");
-		expect(calls).toBe(0);
-	});
-
-	test("a malformed approach is refused before the judge call", async () => {
-		let called = false;
-		const controller = createJevController({
-			judge: async () => {
-				called = true;
-				return judgeResult({});
-			},
-		});
-		const blank = await controller.submitDecision(validDecisionInput({ approach: "   " }));
-		expect(blank.verdict).toBe("insufficient_evidence");
-		expect(blank.reasons.join(" ")).toContain("approach must be a non-empty string");
-		const wrongType = await controller.submitDecision(validDecisionInput({ approach: 42 }));
-		expect(wrongType.verdict).toBe("insufficient_evidence");
-		expect(called).toBe(false);
-	});
-
-	test("an approach-free submission keeps the digest budget and the loop stays untouched", async () => {
-		let calls = 0;
-		const controller = createJevController({
-			judge: async () => {
-				calls++;
-				return { verdict: "revise", reasons: ["no"] };
-			},
-			maxReworkIterations: 3,
-		});
-		const submission = validDecisionInput();
-		for (let i = 0; i < 3; i++) await controller.submitDecision(submission);
-		const changed = await controller.submitDecision(validDecisionInput({ proposal: "a different framing entirely" }));
-		expect(changed.verdict).toBe("revise");
-		expect(calls).toBe(4);
-		expect(Object.keys(controller.getState().reworkJournal).length).toBe(0);
-	});
-
-});
-
-describe("jev controller: gates.mutation switch", () => {
-	test("gates.mutation=false lifts the plan gate for every mutating tool", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: gateJudge(), template: { gates: { mutation: false } } });
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "build it", systemPrompt: [] });
-		for (const mutating of ["edit", "write", "ast_edit", "bash", "memory_edit", "manage_skill"]) {
-			const res = blockResult(
-				await harness.emit("tool_call", { type: "tool_call", toolCallId: `m-${mutating}`, toolName: mutating, input: {} }),
-			);
-			expect(res.block).toBeUndefined();
-		}
-	});
-
-	test("gates.mutation=false: the stop gate drops the plan-approval requirement, keeps completion", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: gateJudge(), template: { gates: { mutation: false } } });
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "build it", systemPrompt: [] });
-		const res = await runStop(harness);
-		expect(res.decision).toBe("block");
-		expect(String(res.reason)).not.toContain("plan-stage approval");
-		expect(String(res.reason)).toContain("completion_review");
-	});
-
-	test("without the switch the plan gate still blocks", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: gateJudge() });
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "build it", systemPrompt: [] });
-		const res = blockResult(
-			await harness.emit("tool_call", { type: "tool_call", toolCallId: "m", toolName: "edit", input: {} }),
-		);
-		expect(res.block).toBe(true);
-	});
-});
-
-describe("jev controller: eval coverage", () => {
-	test("eval is blocked by the plan gate like the other mutation-capable builtins", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: gateJudge() });
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "build it", systemPrompt: [] });
-		const res = blockResult(
-			await harness.emit("tool_call", { type: "tool_call", toolCallId: "e", toolName: "eval", input: {} }),
-		);
-		expect(res.block).toBe(true);
-		expect(String(res.reason)).toContain("plan gate");
-	});
-});
-
-describe("jev controller: gates.completion switch", () => {
-	test("gates.completion=false lets the session stop with no approvals recorded", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: gateJudge(), template: { gates: { completion: false } } });
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "build it", systemPrompt: [] });
-		const res = await runStop(harness);
-		expect(res.decision).toBeUndefined();
-	});
-
-	test("without the switch the stop gate still demands completion evidence", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: gateJudge() });
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "build it", systemPrompt: [] });
-		const res = await runStop(harness);
-		expect(res.decision).toBe("block");
-		expect(String(res.reason)).toContain("course_check");
-	});
-});
-
-describe("jev controller: catalog checks at task start (FR-01, FR-04)", () => {
-	const catalog = [
-		{ id: "backend", label: "backend / API", excellence: ["handles failure modes"], pitfalls: ["no timeouts"], source: "test" },
-		{ id: "ui", label: "ui", excellence: ["empty states"], pitfalls: ["no loading state"], source: "test" },
-	];
-
-	test("the judge's task type and applicable topics are recorded and surfaced", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({
-			judge: async () => judgeResult({ selectedOption: "development" }),
-			catalog,
-			multiLabelJudge: async () => ({ verdict: "approve", applicable: { backend: true, ui: false }, reasons: [] }),
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "build the orders API", systemPrompt: [] });
-		await controller.catalogChecksSettled();
-		expect(controller.getState().taskType).toBe("development");
-		expect(controller.getState().selectedTopics).toEqual(["backend"]);
-		const feedback = harness.sentMessages.map(m => String((m.payload as { content?: unknown }).content)).join(" | ");
-		expect(feedback).toContain("task type development");
-		expect(feedback).toContain("applicable topics backend");
-	});
-
-	test("abstention and a failing marking judge record uncertainty without blocking the task", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({
-			judge: async () => ({ verdict: "insufficient_evidence", reasons: ["low_confidence"], confidence: 0.2 }),
-			catalog,
-			multiLabelJudge: async () => {
-				throw new Error("endpoint down");
-			},
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "build the orders API", systemPrompt: [] });
-		await controller.catalogChecksSettled();
-		expect(controller.getState().taskType).toBeUndefined();
-		expect(controller.getState().selectedTopics).toBeUndefined();
-		expect(controller.getState().taskFingerprint).toBeDefined();
-		const feedback = harness.sentMessages.map(m => String((m.payload as { content?: unknown }).content)).join(" | ");
-		expect(feedback).toContain("not established");
-		expect(feedback).toContain("topics unavailable");
-	});
-
-	test("no wired catalog means no consultation at task start", async () => {
-		const harness = makeFakePi();
-		let called = 0;
-		const controller = createJevController({
-			judge: async () => {
-				called++;
-				return judgeResult({});
-			},
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "task", systemPrompt: [] });
-		expect(called).toBe(0);
-		expect(controller.getState().taskType).toBeUndefined();
-	});
-});
-
-describe("jev controller: skill and model routing (FR-02, FR-03)", () => {
-	const routing = {
-		skills: [{ id: "harden-plan", label: "harden-plan", meaning: "apply the plan hardening pack" }],
-		models: [
-			{ id: "cheap/fast", label: "cheap", meaning: "fast cheap model" },
-			{ id: "strong/slow", label: "strong", meaning: "slow thorough model" },
-		],
-	};
-
-	test("the judge's skill choice is recorded and the candidate set is the owner's", async () => {
-		let seen: string[] = [];
-		const controller = createJevController({
-			judge: async req => {
-				seen = req.options.map(o => o.id);
-				return judgeResult({ selectedOption: "harden-plan" });
-			},
-			template: { routing },
-		});
-		const out = await controller.submitDecision(validDecisionInput({ stage: "skill_routing" }));
-		expect(seen).toEqual(["harden-plan"]);
-		expect(out.verdict).toBe("approve");
-		expect(controller.getState().routedSkill).toBe("harden-plan");
-	});
-
-	test("the judge's model choice is enforced at the next spawn", async () => {
-		const controller = createJevController({
-			judge: async () => judgeResult({ selectedOption: "cheap/fast" }),
-			template: { routing },
-		});
-		const out = await controller.submitDecision(validDecisionInput({ stage: "model_routing" }));
-		expect(out.verdict).toBe("approve");
-		expect(controller.getState().routedModel).toBe("cheap/fast");
-		const applied = controller.onBeforeSubagentSpawn({ type: "before_subagent_spawn" }, ["cheap/fast", "other/model"]);
-		expect(applied?.model).toBe("cheap/fast");
-	});
-
-	test("a model outside the allowlist never reaches the judge", async () => {
-		let seen: string[] = [];
-		const controller = createJevController({
-			judge: async req => {
-				seen = req.options.map(o => o.id);
-				return judgeResult({ selectedOption: "cheap/fast" });
-			},
-			template: { routing: { ...routing, allowlist: ["cheap/fast"] } },
-		});
-		const out = await controller.submitDecision(validDecisionInput({ stage: "model_routing" }));
-		expect(seen).toEqual(["cheap/fast"]);
-		expect(out.verdict).toBe("approve");
-		expect(controller.getState().routedModel).toBe("cheap/fast");
-	});
-
-	test("an abstaining judge applies no routing", async () => {
-		const controller = createJevController({
-			judge: async () => ({ verdict: "insufficient_evidence", reasons: ["low_confidence"], confidence: 0.3 }),
-			template: { routing },
-		});
-		const out = await controller.submitDecision(validDecisionInput({ stage: "model_routing" }));
-		expect(out.verdict).toBe("insufficient_evidence");
-		expect(controller.getState().routedModel).toBeUndefined();
-	});
-
-	test("without a routing config the stage refuses explicitly instead of approving nothing", async () => {
-		const controller = createJevController({ judge: async () => judgeResult({}) });
-		const out = await controller.submitDecision(validDecisionInput({ stage: "skill_routing" }));
-		expect(out.verdict).toBe("insufficient_evidence");
-		expect(out.judged).toBe(false);
-		expect(out.reasons.join(" ")).toContain("routing.skills");
-		expect(controller.getState().routedSkill).toBeUndefined();
-	});
-});
-
-describe("jev controller: consultation forcing (grounding pre-check for plan stages)", () => {
-	const PLAN_EVIDENCE: Evidence[] = [
-		evidence("user", "Implement feature X for the dashboard"),
-		evidence("spec", "the plan must add module M and wire it into the dashboard"),
-	];
-	const totalIterations = (controller: { getState(): JevState }): number =>
-		Object.values(controller.getState().iterations).reduce((a, b) => a + b, 0);
-
-	test("ungrounded plan submission is refused before any judge call: fix named, no rework, gate shut", async () => {
-		const harness = makeFakePi();
-		let calls = 0;
-		const controller = createJevController({
-			judge: async () => {
-				calls++;
-				return judgeResult({});
-			},
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "work task: implement feature X", systemPrompt: [] });
-		const outcome = await controller.submitDecision(
-			validDecisionInput({
-				stage: "understanding_review",
-				proposal: "Plan: add module M and wire it into the dashboard.",
-				evidence: PLAN_EVIDENCE,
-			}),
-		);
-		expect(calls).toBe(0);
-		expect(outcome.judged).toBe(false);
-		expect(outcome.verdict).toBe("insufficient_evidence");
-		expect(outcome.reasons.join(" ")).toContain("proposal_not_grounded_in_evidence");
-		expect(outcome.reasons.join(" ")).toContain("verbatim");
-		expect(outcome.summary).toContain("proposal_not_grounded_in_evidence");
-		expect(totalIterations(controller)).toBe(0);
-		const gate = blockResult(
-			await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} }),
-		);
-		expect(gate?.block).toBe(true);
-	});
-
-	test("the same submission grounded in a verbatim quote is judged", async () => {
-		const calls: DecisionRequest[] = [];
-		const controller = createJevController({
-			judge: async req => {
-				calls.push(req);
-				return judgeResult({});
-			},
-		});
-		const outcome = await controller.submitDecision(
-			validDecisionInput({
-				stage: "understanding_review",
-				proposal:
-					'Claim: adding module M satisfies "Implement feature X for the dashboard"; the quoted spec fixes the requirement.',
-				evidence: PLAN_EVIDENCE,
-			}),
-		);
-		expect(calls).toHaveLength(1);
-		expect(outcome.verdict).toBe("approve");
-		expect(outcome.judged).toBe(true);
-	});
-
-	test("a quote shorter than 20 characters does not ground a plan", async () => {
-		const controller = createJevController({
-			judge: async () => {
-				throw new Error("must not be called");
-			},
-		});
-		const outcome = await controller.submitDecision(
-			validDecisionInput({
-				stage: "direction_review",
-				proposal: "Plan: add module M (short).",
-				evidence: [evidence("user", "add module M"), evidence("spec", "the plan adds module M and wires it in")],
-			}),
-		);
-		expect(outcome.judged).toBe(false);
-		expect(outcome.reasons.join(" ")).toContain("proposal_not_grounded_in_evidence");
-	});
-
-	test("grounding composes with the requirement-evidence check without duplicating messages", async () => {
-		const controller = createJevController({
-			judge: async () => {
-				throw new Error("must not be called");
-			},
-		});
-		const outcome = await controller.submitDecision(
-			validDecisionInput({
-				stage: "understanding_review",
-				proposal: "Plan: run the test suite and report.",
-				evidence: [evidence("execution", "$ bun test run — 42 passing suites")],
-			}),
-		);
-		const joined = outcome.reasons.join(" ");
-		expect(joined).toContain("proposal_not_grounded_in_evidence");
-		expect(joined).toContain("no_requirement_evidence");
-		expect(outcome.reasons.filter(r => r.includes("proposal_not_grounded_in_evidence"))).toHaveLength(1);
-	});
-
-	test("grounding is a plan-stage rule: completion_review judges an ungrounded proposal as before", async () => {
-		const controller = createJevController({ judge: async () => judgeResult({}) });
-		const outcome = await controller.submitDecision(validDecisionInput());
-		expect(outcome.judged).toBe(true);
-		expect(outcome.verdict).toBe("approve");
-		expect(outcome.reasons.join(" ")).not.toContain("proposal_not_grounded_in_evidence");
-	});
-});
-
-describe("jev controller: claim_check preset (per-claim support in one request)", () => {
-	const CLAIMS = [
-		"the multi-label path already judges items in one request",
-		"the wiring decision needs four separate consultations",
-	] as const;
-	const claimInput = (overrides: Record<string, unknown> = {}) => ({
-		stage: "claim_check",
-		task: "Decide how to wire the per-claim judge",
-		proposal: "Claims from the wiring decision, each checked against the quoted measurement.",
-		options: OPTIONS,
-		evidence: [
-			evidence(
-				"execution",
-				"Parallel per-claim questions in ONE request (multi-label/Noul) | per-claim yes/no, decisive",
-				"evidence/consultation-forcing.md",
-			),
-		],
-		claims: CLAIMS,
-		...overrides,
-	});
-	const marking = (supported: Record<string, boolean>) => async () => ({ supported, reasons: [], judged: true });
-
-	test("one request, one verdict per claim: summary and state carry them, unsupported -> revise", async () => {
-		const requests: ClaimCheckRequest[] = [];
-		const controller = createJevController({
-			judge: async () => {
-				throw new Error("the standard judge must not be called");
-			},
-			claimCheckJudge: async req => {
-				requests.push(req);
-				return { supported: { "claim-1": true, "claim-2": false }, reasons: [], judged: true };
-			},
-		});
-		const outcome = await controller.submitDecision(claimInput());
-		expect(requests).toHaveLength(1);
-		expect(requests[0]?.claims.map(c => c.text)).toEqual([...CLAIMS]);
-		expect(outcome.verdict).toBe("revise");
-		expect(outcome.judged).toBe(true);
-		expect(outcome.summary).toContain("claim_check: 1/2 supported");
-		expect(outcome.summary).toContain("claim-2");
-		expect(controller.getState().lastClaimCheck?.claims.map(c => [c.id, c.supported])).toEqual([
-			["claim-1", true],
-			["claim-2", false],
-		]);
-	});
-
-	test("all claims supported -> approve, and no gate approval is recorded (never gate-granting)", async () => {
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			claimCheckJudge: marking({ "claim-1": true, "claim-2": true }),
-		});
-		const before = controller.getState().approvals.length;
-		const outcome = await controller.submitDecision(claimInput());
-		expect(outcome.verdict).toBe("approve");
-		expect(outcome.summary).toBe("claim_check: 2/2 supported");
-		expect(controller.getState().approvals).toHaveLength(before);
-	});
-
-	test("an unmarkable claim fails closed, names the claim and keeps no marking", async () => {
-		const controller = createJevController({
-			judge: async () => {
-				throw new Error("must not be called");
-			},
-			claimCheckJudge: marking({ "claim-1": true }),
-		});
-		const outcome = await controller.submitDecision(claimInput());
-		expect(outcome.verdict).toBe("insufficient_evidence");
-		expect(outcome.judged).toBe(false);
-		expect(outcome.reasons.join(" ")).toContain("claim-2");
-		expect(outcome.reasons.join(" ")).toContain("four separate consultations");
-		expect(controller.getState().lastClaimCheck).toBeUndefined();
-	});
-
-	test("a judge error fails closed as insufficient_evidence, never a marking", async () => {
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			claimCheckJudge: async () => {
-				throw new Error("endpoint down");
-			},
-		});
-		const outcome = await controller.submitDecision(claimInput());
-		expect(outcome.verdict).toBe("insufficient_evidence");
-		expect(outcome.judged).toBe(false);
-		expect(outcome.reasons.join(" ")).toContain("judge unavailable");
-		expect(controller.getState().lastClaimCheck).toBeUndefined();
-	});
-
-	test("fewer than two claims is refused before any judge call", async () => {
-		let called = 0;
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			claimCheckJudge: async () => {
-				called++;
-				return { supported: {}, reasons: [], judged: true };
-			},
-		});
-		const outcome = await controller.submitDecision(claimInput({ claims: ["only one claim here"] }));
-		expect(called).toBe(0);
-		expect(outcome.judged).toBe(false);
-		expect(outcome.reasons.join(" ")).toContain("at least 2 claims");
-	});
-
-	test("per-claim markings persist and restore with the session", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			claimCheckJudge: marking({ "claim-1": true, "claim-2": false }),
-		});
-		controller.register(harness.pi);
-		await controller.submitDecision(claimInput());
-		const entries = harness.appended.filter(e => e.customType === "jev.state");
-		expect(entries.length).toBeGreaterThan(0);
-		const restored = createJevController({ judge: async () => judgeResult({}) });
-		restored.onSessionStart([{ customType: "jev.state", data: entries[entries.length - 1]?.data }]);
-		expect(restored.getState().lastClaimCheck?.claims).toEqual([
-			{ id: "claim-1", text: CLAIMS[0], supported: true },
-			{ id: "claim-2", text: CLAIMS[1], supported: false },
-		]);
-	});
-});
-
-describe("jev controller: frame-escape advice (a rejected option set names the fix)", () => {
-	test("a service-option escape surfaces the actionable fix, not only a verdict", async () => {
-		const controller = createJevController({
-			judge: async () => ({
-				verdict: "insufficient_evidence",
-				reasons: [
-					"meta_option",
-					"ALL_OPTIONS_WRONG",
-					"meta_reason:options_wrong_premise",
-					`${FRAME_FIX_PREFIX}${SERVICE_OPTION_FIX["ALL_OPTIONS_WRONG"]}`,
-				],
-				confidence: 0.97,
-			}),
-		});
-		const outcome = await controller.submitDecision(validDecisionInput());
-		expect(outcome.summary).toContain("the judge rejected the offered option set");
-		expect(outcome.summary).toContain(SERVICE_OPTION_FIX["ALL_OPTIONS_WRONG"] as string);
-	});
-
-	test("a frame escape that maps to revise or ask_user carries the fix in the summary line", async () => {
-		const cases: Array<[string, DecisionResult["verdict"], string]> = [
-			["PARTIALLY_RIGHT_NONE_FULL", "revise", "sent back with reasons"],
-			["NO_FIT_OTHER_REASON", "ask_user", "escalate to the user"],
-		];
-		for (const [service, verdict, base] of cases) {
-			const fix = SERVICE_OPTION_FIX[service] as string;
-			const controller = createJevController({
-				judge: async () => ({
-					verdict,
-					reasons: ["meta_option", service, "meta_reason:options_incomplete", `${FRAME_FIX_PREFIX}${fix}`],
-					confidence: 0.97,
-				}),
-			});
-			const outcome = await controller.submitDecision(validDecisionInput());
-			expect(outcome.verdict).toBe(verdict);
-			expect(outcome.summary).toContain(base);
-			expect(outcome.summary).toContain(fix);
-		}
-	});
-
-	test("a non-escape insufficient_evidence keeps its generic summary", async () => {
-		const controller = createJevController({
-			judge: async () => ({ verdict: "insufficient_evidence", reasons: ["judge_insufficient_evidence"], confidence: 0.5 }),
-		});
-		const outcome = await controller.submitDecision(validDecisionInput());
-		expect(outcome.summary).toContain("judge answered insufficient_evidence");
-	});
-});
-
-describe("jev controller: subagent handoff (FR-11)", () => {
-	const REQUIREMENT = "Implement feature X for the dashboard and keep the existing export working.";
-	const WORK_ORDER = "Add module M implementing feature X and run the dashboard test suite.";
-	/** Owner-wired handoff gate: the stage is configured, so the checks fire (PRD GAP:3 default off). */
-	const WIRED = { stages: { subagent_handoff: { instructions: "Judge the hand-off only from the quoted material." } } };
-
-	function handoffHarness(
-		respond: (req: DecisionRequest) => DecisionResult | Promise<DecisionResult>,
-		template?: { stages: { subagent_handoff: { instructions: string } } },
-	) {
-		const calls: DecisionRequest[] = [];
-		const harness = makeFakePi();
-		const controller = createJevController({
-			template,
-			judge: async req => {
-				calls.push(req);
-				return respond(req);
-			},
-		});
-		controller.register(harness.pi);
-		return { harness, controller, calls };
-	}
-
-	/** Lead agent hands a work order to a task agent: prompt, task tool call, then the spawn event. */
-	async function dispatch(harness: FakePiHarness): Promise<BlockResult> {
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: REQUIREMENT, systemPrompt: [] });
-		await harness.emit("tool_call", {
-			type: "tool_call",
-			toolCallId: "t1",
-			toolName: "task",
-			input: { task: WORK_ORDER, agent: "task" },
-		});
-		return blockResult(
-			await harness.emit("before_subagent_spawn", {
-				type: "before_subagent_spawn",
-				agent: "task",
-				invocationKind: "task",
-				patterns: ["@task"],
-				spawnKey: "t1:0",
-			}),
-		);
-	}
-
-	test("a confident negative verdict refuses the spawn and records the block", async () => {
-		const { harness, controller, calls } = handoffHarness(
-			() => ({ verdict: "revise", reasons: ["the work order omits the export requirement"], confidence: 0.93 }),
-			WIRED,
-		);
-		const res = await dispatch(harness);
-		expect(res.block).toBe(true);
-		expect(String(res.reason)).toContain("omits the export requirement");
-		const record = controller.getState().lastHandoff;
-		expect(record?.phase).toBe("dispatch");
-		expect(record?.judged).toBe(true);
-		expect(record?.verdict).toBe("revise");
-		expect(record?.blocked).toBe(true);
-		expect(controller.getState().blockers.join(" ")).toContain("refused the dispatch");
-		// the judge saw the handoff stage with both quotes: the requirement and the work order
-		expect(calls.length).toBe(1);
-		expect(calls[0]?.stage).toBe("subagent_handoff");
-		expect(calls[0]?.evidence.some(e => e.quote.includes("keep the existing export working"))).toBe(true);
-		expect(calls[0]?.evidence.some(e => e.quote.includes(WORK_ORDER))).toBe(true);
-	});
-
-	test("an abstention lets the spawn through and records the uncertainty", async () => {
-		const { harness, controller } = handoffHarness(
-			() => ({ verdict: "insufficient_evidence", reasons: ["insufficient_evidence"], confidence: 0.31 }),
-			WIRED,
-		);
-		const res = await dispatch(harness);
-		expect(res.block).toBeUndefined();
-		const record = controller.getState().lastHandoff;
-		expect(record?.judged).toBe(true);
-		expect(record?.verdict).toBe("insufficient_evidence");
-		expect(record?.blocked).toBe(false);
-		expect(controller.getState().blockers).toEqual([]);
-		expect(harness.sentMessages.some(m => JSON.stringify(m.payload).includes("handoff"))).toBe(true);
-	});
-
-	test("a throwing judge neither blocks nor approves; the failure is recorded", async () => {
-		const { harness, controller } = handoffHarness(() => {
-			throw new Error("socket connection was closed unexpectedly");
-		}, WIRED);
-		const res = await dispatch(harness);
-		expect(res.block).toBeUndefined();
-		const record = controller.getState().lastHandoff;
-		expect(record?.judged).toBe(false);
-		expect(record?.verdict).toBeUndefined();
-		expect(record?.reasons.join(" ")).toContain("socket connection was closed");
-		expect(controller.getState().blockers).toEqual([]);
-	});
-
-	test("a negative below the confidence floor (or without one) is not a block", async () => {
-		const low = handoffHarness(() => ({ verdict: "revise", reasons: ["maybe"], confidence: 0.35 }), WIRED);
-		expect((await dispatch(low.harness)).block).toBeUndefined();
-		expect(low.controller.getState().lastHandoff?.verdict).toBe("revise");
-		expect(low.controller.getState().lastHandoff?.blocked).toBe(false);
-		const absent = handoffHarness(() => ({ verdict: "revise", reasons: ["no confidence reported"] }), WIRED);
-		expect((await dispatch(absent.harness)).block).toBeUndefined();
-		expect(absent.controller.getState().blockers).toEqual([]);
-	});
-
-	test("an eval spawn is not judged: no work order and no consultation", async () => {
-		const { harness, controller, calls } = handoffHarness(
-			() => ({ verdict: "revise", reasons: ["deficient"], confidence: 0.99 }),
-			WIRED,
-		);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: REQUIREMENT, systemPrompt: [] });
-		await harness.emit("tool_call", {
-			type: "tool_call",
-			toolCallId: "t1",
-			toolName: "task",
-			input: { task: WORK_ORDER },
-		});
-		const res = blockResult(
-			await harness.emit("before_subagent_spawn", {
-				type: "before_subagent_spawn",
-				agent: "smol",
-				invocationKind: "eval",
-				patterns: ["@smol"],
-			}),
-		);
-		expect(res.block).toBeUndefined();
-		expect(calls.length).toBe(0);
-		expect(controller.getState().lastHandoff).toBeUndefined();
-		// the captured order is left for the task-side spawn, not spent on the eval spawn
-		expect(Object.keys(controller.getState().pendingHandoffs)).toEqual(["t1"]);
-	});
-
-	test("a template option set without the refusal id leaves the gate advisory", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({
-			template: {
-				stages: {
-					subagent_handoff: {
-						instructions: "Owner option set without a refusal option.",
-						options: [
-							{ id: "go", label: "Go", meaning: "proceed" },
-							{ id: "hold", label: "Hold", meaning: "pause and report" },
-						],
-					},
-				},
-			},
-			judge: async () => ({ verdict: "revise", reasons: ["deficient"], confidence: 0.99 }),
-		});
-		controller.register(harness.pi);
-		const res = await dispatch(harness);
-		expect(res.block).toBeUndefined();
-		expect(controller.getState().lastHandoff?.verdict).toBe("revise");
-		expect(controller.getState().lastHandoff?.blocked).toBe(false);
-		expect(controller.getState().blockers).toEqual([]);
-	});
-
-	test("an answer after the dispatch deadline never blocks and never pins a refusal", async () => {
-		const harness = makeFakePi();
-		let answer: ((result: DecisionResult) => void) | undefined;
-		// Deadline 0: the timer fires on the next tick while the judge stays pending, so the
-		// deadline wins deterministically - no wall-clock sleep and no fake clock to leak.
-		const controller = createJevController({
-			template: WIRED,
-			handoffDispatchDeadlineMs: 0,
-			judge: () =>
-				new Promise<DecisionResult>(resolve => {
-					answer = resolve;
-				}),
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: REQUIREMENT, systemPrompt: [] });
-		await harness.emit("tool_call", {
-			type: "tool_call",
-			toolCallId: "t1",
-			toolName: "task",
-			input: { task: WORK_ORDER },
-		});
-		const res = blockResult(await dispatch(harness));
-		expect(res.block).toBeUndefined();
-		expect(controller.getState().lastHandoff?.judged).toBe(false);
-		expect(controller.getState().lastHandoff?.reasons.join(" ")).toContain(
-			"did not answer before the dispatch deadline",
-		);
-		// the host already dropped this handler's result at its own ceiling and let the spawn
-		// through: the late negative must not be recorded as a refusal that applied
-		answer?.({ verdict: "revise", reasons: ["too late"], confidence: 0.99 });
-		await Promise.resolve();
-		await Promise.resolve();
-		expect(controller.getState().blockers).toEqual([]);
-		expect(controller.getState().lastHandoff?.blocked).toBe(false);
-	});
-
-	test("a captured order never survives a new task fingerprint", async () => {
-		const harness = makeFakePi();
-		const calls: DecisionRequest[] = [];
-		const controller = createJevController({
-			template: WIRED,
-			judge: async req => {
-				calls.push(req);
-				return { verdict: "insufficient_evidence", reasons: ["abstain"], confidence: 0.3 };
-			},
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: REQUIREMENT, systemPrompt: [] });
-		await harness.emit("tool_call", {
-			type: "tool_call",
-			toolCallId: "t1",
-			toolName: "task",
-			input: { task: WORK_ORDER },
-		});
-		expect(Object.keys(controller.getState().pendingHandoffs)).toEqual(["t1"]);
-		// the user moves on: an order captured for the previous task must not judge a new one
-		await harness.emit("before_agent_start", {
-			type: "before_agent_start",
-			prompt: "Now port the same dashboard feature to the mobile client.",
-			systemPrompt: [],
-		});
-		expect(controller.getState().pendingHandoffs).toEqual({});
-		const res = blockResult(
-			await harness.emit("before_subagent_spawn", {
-				type: "before_subagent_spawn",
-				agent: "task",
-				invocationKind: "task",
-				patterns: ["@task"],
-				spawnKey: "t1:0",
-			}),
-		);
-		expect(res.block).toBeUndefined();
-		expect(calls.length).toBe(0);
-		expect(controller.getState().lastHandoff?.reasons.join(" ")).toContain("no work order captured");
-	});
-
-	test("a phantom order past the age bound does not disarm a fresh dispatch", async () => {
-		const harness = makeFakePi();
-		const calls: DecisionRequest[] = [];
-		let clock = 1_000_000;
-		const controller = createJevController({
-			template: WIRED,
-			now: () => clock,
-			judge: async req => {
-				calls.push(req);
-				return judgeResult({ selectedOption: "approve", confidence: 0.95 });
-			},
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: REQUIREMENT, systemPrompt: [] });
-		// a task call refused before execution never emits tool_result, so this entry would linger
-		await harness.emit("tool_call", {
-			type: "tool_call",
-			toolCallId: "refused",
-			toolName: "task",
-			input: { task: "order that was refused before it reached the host" },
-		});
-		clock += 600_001; // past HANDOFF_ORDER_MAX_AGE_MS
-		await harness.emit("tool_call", {
-			type: "tool_call",
-			toolCallId: "fresh",
-			toolName: "task",
-			input: { task: WORK_ORDER },
-		});
-		expect(Object.keys(controller.getState().pendingHandoffs)).toEqual(["fresh"]);
-		const res = blockResult(
-			await harness.emit("before_subagent_spawn", {
-				type: "before_subagent_spawn",
-				agent: "task",
-				invocationKind: "task",
-				patterns: ["@task"],
-				spawnKey: "fresh:0",
-			}),
-		);
-		expect(res.block).toBeUndefined();
-		expect(controller.getState().lastHandoff?.judged).toBe(true);
-		expect(calls.length).toBe(1);
-		expect(calls[0]?.evidence.some(e => e.quote.includes(WORK_ORDER))).toBe(true);
-		expect(calls[0]?.evidence.some(e => e.quote.includes("refused before it reached the host"))).toBe(false);
-	});
-});
-
-describe("jev controller: FR-10 stages", () => {
-	test("important_decision and code_review are submittable and never grant an approval", async () => {
-		for (const stage of ["important_decision", "code_review"] as const) {
-			const controller = createJevController({ judge: async () => judgeResult({}) });
-			const out = await controller.submitDecision(validDecisionInput({ stage }));
-			expect(out.verdict).toBe("approve");
-			expect(controller.getState().approvals.length).toBe(0);
-		}
-	});
-
-	test("the removed refactor_check name is rejected as an unknown stage", async () => {
-		const controller = createJevController({ judge: async () => judgeResult({}) });
-		const out = await controller.submitDecision(validDecisionInput({ stage: "refactor_check" as never }));
-		expect(out.verdict).toBe("insufficient_evidence");
-		expect(out.judged).toBe(false);
-		expect(out.reasons.join(" ")).toContain("stage must be one of");
-	});
-});
-
-describe("jev controller: destructive-action gate (POLICY-DRAFT I)", () => {
-	const COMMAND = "rm -rf /var/lib/dashboard-cache";
-	const TASK = "Clean up the dashboard project and keep the existing export working.";
-	/** Owner-armed gate, plan gate lifted so the tests exercise the destructive consult alone. */
-	const WIRED: JevTemplateConfig = {
-		gates: { mutation: false, destructive: { patterns: ["rm -rf", "git push --force", "drop table"] } },
-	};
-
-	function destructiveHarness(
-		respond: (req: DecisionRequest) => DecisionResult | Promise<DecisionResult>,
-		template: JevTemplateConfig = WIRED,
-	) {
-		const calls: DecisionRequest[] = [];
-		const harness = makeFakePi();
-		const controller = createJevController({
-			template,
-			judge: async req => {
-				calls.push(req);
-				return respond(req);
-			},
-		});
-		controller.register(harness.pi);
-		return { harness, controller, calls };
-	}
-
-	async function runBash(harness: FakePiHarness, command: string): Promise<BlockResult> {
-		return blockResult(
-			await harness.emit("tool_call", {
-				type: "tool_call",
-				toolCallId: "b1",
-				toolName: "bash",
-				input: { command },
-			}),
-		);
-	}
-
-	test("a matching command judged explicitly negative is refused before it runs", async () => {
-		const { harness, controller, calls } = destructiveHarness(() => ({
-			verdict: "revise",
-			reasons: ["recursive force-delete of a system path is irreversible"],
-			confidence: 0.93,
-		}));
-		await harness.emit("before_agent_start", {
-			type: "before_agent_start",
-			prompt: TASK,
-			systemPrompt: [],
-		});
-		const res = await runBash(harness, COMMAND);
-		expect(res.block).toBe(true);
-		expect(String(res.reason)).toContain("irreversible");
-		const record = controller.getState().lastDestructive;
-		expect(record?.judged).toBe(true);
-		expect(record?.verdict).toBe("revise");
-		expect(record?.blocked).toBe(true);
-		expect(record?.pattern).toBe("rm -rf");
-		expect(controller.getState().blockers.join(" ")).toContain("destructive-action gate refused");
-		// the judge saw the destructive stage, with the command and the session task as evidence
-		expect(calls.length).toBe(1);
-		expect(calls[0]?.stage).toBe("destructive_action");
-		expect(calls[0]?.evidence.some(e => e.quote.includes(COMMAND))).toBe(true);
-		expect(calls[0]?.evidence.some(e => e.quote.includes("keep the existing export working"))).toBe(true);
-	});
-
-	test("an abstention, a judge error and a low-confidence negative all let the command run", async () => {
-		const abstain = destructiveHarness(() => ({
-			verdict: "insufficient_evidence",
-			reasons: ["insufficient_evidence"],
-			confidence: 0.31,
-		}));
-		expect((await runBash(abstain.harness, COMMAND)).block).toBeUndefined();
-		expect(abstain.controller.getState().lastDestructive?.judged).toBe(true);
-		expect(abstain.controller.getState().lastDestructive?.blocked).toBe(false);
-		expect(abstain.controller.getState().blockers).toEqual([]);
-		expect(abstain.harness.sentMessages.some(m => JSON.stringify(m.payload).includes("destructive"))).toBe(true);
-
-		const throwing = destructiveHarness(() => {
-			throw new Error("socket connection was closed unexpectedly");
-		});
-		expect((await runBash(throwing.harness, COMMAND)).block).toBeUndefined();
-		expect(throwing.controller.getState().lastDestructive?.judged).toBe(false);
-		expect(throwing.controller.getState().lastDestructive?.reasons.join(" ")).toContain(
-			"socket connection was closed",
-		);
-		expect(throwing.controller.getState().blockers).toEqual([]);
-
-		for (const confidence of [0.35, undefined]) {
-			const low = destructiveHarness(() => ({
-				verdict: "revise",
-				reasons: ["maybe"],
-				...(confidence !== undefined ? { confidence } : {}),
-			}));
-			expect((await runBash(low.harness, COMMAND)).block).toBeUndefined();
-			expect(low.controller.getState().lastDestructive?.verdict).toBe("revise");
-			expect(low.controller.getState().lastDestructive?.blocked).toBe(false);
-			expect(low.controller.getState().blockers).toEqual([]);
-		}
-	});
-
-	test("a non-matching command is never judged (no judge call)", async () => {
-		const { harness, controller, calls } = destructiveHarness(() => ({
-			verdict: "revise",
-			reasons: ["should not be asked"],
-			confidence: 0.99,
-		}));
-		expect((await runBash(harness, "bun test")).block).toBeUndefined();
-		expect(calls.length).toBe(0);
-		expect(controller.getState().lastDestructive).toBeUndefined();
-	});
-
-	test("an absent or empty pattern list means the gate does not exist", async () => {
-		const templates: JevTemplateConfig[] = [
-			{ gates: { mutation: false } },
-			{ gates: { mutation: false, destructive: { patterns: [] } } },
-		];
-		for (const template of templates) {
-			const { harness, controller, calls } = destructiveHarness(
-				() => ({ verdict: "revise", reasons: ["no"], confidence: 0.99 }),
-				template,
-			);
-			expect((await runBash(harness, COMMAND)).block).toBeUndefined();
-			expect(calls.length).toBe(0);
-			expect(controller.getState().lastDestructive).toBeUndefined();
-		}
-	});
-
-	test("matching is literal, case-insensitive and whitespace-normalized; pattern text is never syntax", async () => {
-		const upper = destructiveHarness(() =>
-			judgeResult({ selectedOption: "approve", confidence: 0.9 }),
-		);
-		expect((await runBash(upper.harness, "sudo RM -RF /tmp/x")).block).toBeUndefined();
-		expect(upper.calls.length).toBe(1);
-
-		const literal = destructiveHarness(() => judgeResult({ selectedOption: "approve", confidence: 0.9 }), {
-			gates: { mutation: false, destructive: { patterns: ["drop table"] } },
-		});
-		expect((await runBash(literal.harness, "psql -c 'drop  table users'")).block).toBeUndefined();
-		expect(literal.calls.length).toBe(1);
-		// a metacharacter-free pattern matches its literal text only
-		expect((await runBash(literal.harness, "psql -c 'dropXtable users'")).block).toBeUndefined();
-		expect(literal.calls.length).toBe(1);
-	});
-
-	test("the plan gate still short-circuits first: an already-blocked bash call is not judged", async () => {
-		const { harness, controller, calls } = destructiveHarness(
-			() => ({ verdict: "revise", reasons: ["no"], confidence: 0.99 }),
-			{ gates: { destructive: { patterns: ["rm -rf"] } } },
-		);
-		const res = await runBash(harness, COMMAND);
-		expect(res.block).toBe(true);
-		expect(String(res.reason)).toContain("plan gate");
-		expect(calls.length).toBe(0);
-		expect(controller.getState().lastDestructive).toBeUndefined();
-	});
-
-	test("a plan approval never covers a destructive command: it is still judged fresh", async () => {
-		const { harness, controller, calls } = destructiveHarness(
-			req =>
-				req.stage === "destructive_action"
-					? { verdict: "revise", reasons: ["force-push rewrites shared history"], confidence: 0.91 }
-					: judgeResult({ selectedOption: "a", confidence: 0.95 }),
-			{ gates: { destructive: { patterns: ["git push --force"] } } },
-		);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: TASK, systemPrompt: [] });
-		await approvePlan(controller);
-		const res = await runBash(harness, "git push --force origin main");
-		expect(res.block).toBe(true);
-		expect(String(res.reason)).toContain("rewrites shared history");
-		expect(calls.filter(c => c.stage === "destructive_action").length).toBe(1);
-	});
-
-	test("an invalid config blocks the call fail-closed naming the problem, without consulting the judge", async () => {
-		const harness = makeFakePi();
-		const calls: DecisionRequest[] = [];
-		const controller = createJevController({
-			judge: async req => {
-				calls.push(req);
-				return judgeResult({});
-			},
-			templateError:
-				"/work/project/.omp/jev.config.json: gates.destructive.patterns must be an array of non-empty strings",
-		});
-		controller.register(harness.pi);
-		const res = await runBash(harness, COMMAND);
-		expect(res.block).toBe(true);
-		expect(String(res.reason)).toContain("gates.destructive.patterns");
-		expect(calls.length).toBe(0);
-	});
-
-	test("an answer after the deadline never blocks and never pins a refusal", async () => {
-		const harness = makeFakePi();
-		let answer: ((result: DecisionResult) => void) | undefined;
-		// Deadline 0: the timer fires on the next tick while the judge stays pending, so the
-		// deadline wins deterministically - no wall-clock sleep and no fake clock to leak.
-		const controller = createJevController({
-			template: WIRED,
-			destructiveDeadlineMs: 0,
-			judge: () =>
-				new Promise<DecisionResult>(resolve => {
-					answer = resolve;
-				}),
-		});
-		controller.register(harness.pi);
-		const res = await runBash(harness, COMMAND);
-		expect(res.block).toBeUndefined();
-		expect(controller.getState().lastDestructive?.judged).toBe(false);
-		expect(controller.getState().lastDestructive?.reasons.join(" ")).toContain(
-			"did not answer before the destructive-gate deadline",
-		);
-		// the host's own tool_call timeout is fail-closed, so this deadline must have taken the
-		// fail-open path; the late negative must not be recorded as a refusal that applied
-		answer?.({ verdict: "revise", reasons: ["too late"], confidence: 0.99 });
-		await Promise.resolve();
-		await Promise.resolve();
-		expect(controller.getState().blockers).toEqual([]);
-		expect(controller.getState().lastDestructive?.blocked).toBe(false);
-	});
-
-	test("a persisted destructive record survives only when well-formed", () => {
-		const harness = makeFakePi();
-		const controller = createJevController({ judge: async () => judgeResult({}) });
-		controller.register(harness.pi);
-		const valid: DestructiveRecord = {
-			pattern: "rm -rf",
-			command: COMMAND,
-			verdict: "revise",
-			judged: true,
-			confidence: 0.93,
-			reasons: ["irreversible"],
-			blocked: true,
-			at: 1,
-		};
-		controller.onSessionStart([{ customType: "jev.state", data: { lastDestructive: valid } }]);
-		expect(controller.getState().lastDestructive).toEqual(valid);
-		for (const malformed of [
-			{ command: COMMAND, judged: true, blocked: false, at: 1 },
-			{ pattern: "rm -rf", command: COMMAND, judged: "yes", blocked: false, at: 1 },
-			{ pattern: "rm -rf", command: COMMAND, judged: true, blocked: false, verdict: "bogus", at: 1 },
-		]) {
-			controller.onSessionStart([{ customType: "jev.state", data: { lastDestructive: malformed } }]);
-			expect(controller.getState().lastDestructive).toBeUndefined();
-		}
-	});
-});
-
-// ---------- activities framework: requirements_formalization, planning, automatic course check ----------
-
-describe("jev controller: activities framework", () => {
-	const QUOTE_1 = "the dashboard must show feature X after loading";
-	const QUOTE_2 = "a restart must not lose feature X";
-	const REQUIREMENT_TEXTS = ["REQ-A: the dashboard shows feature X", "REQ-B: feature X survives a restart"] as const;
-
-	const formalizationInput = (overrides: Record<string, unknown> = {}) => ({
-		stage: "requirements_formalization",
-		task: "Formalize the requirement list of this task",
-		proposal: "the numbered list derived from the two quoted user requirements",
-		options: OPTIONS,
-		evidence: [evidence("user", QUOTE_1), evidence("spec", QUOTE_2)],
-		// FR-19: every item names the submitted quote it derives from.
-		requirements: [
-			{ text: REQUIREMENT_TEXTS[0], quoteId: "quote-1" },
-			{ text: REQUIREMENT_TEXTS[1], quoteId: "quote-2" },
-		],
-		...overrides,
-	});
-
-	const planMappingInput = (overrides: Record<string, unknown> = {}) => ({
-		stage: "plan_mapping",
-		task: "Map the plan to the formalized requirements",
-		proposal: "the plan work that serves each formalized requirement",
-		options: OPTIONS,
-		evidence: [evidence("user", QUOTE_1), evidence("spec", QUOTE_2)],
-		planClaims: [
-			{ requirementId: "req-1", claim: "the plan adds the dashboard view that renders feature X" },
-			{ requirementId: "req-2", claim: "the plan persists feature X state so a restart keeps it" },
-		],
-		...overrides,
-	});
-
-	const prioritiesInput = (overrides: Record<string, unknown> = {}) => ({
-		stage: "requirement_priorities",
-		task: "Let the judge set the build order over the accepted requirements",
-		proposal: "the accepted requirement list, to be ordered by the judge",
-		options: OPTIONS,
-		evidence: [evidence("user", QUOTE_1), evidence("spec", QUOTE_2)],
-		...overrides,
-	});
-
-	/** Priority judge: one class per accepted requirement, all confidences above the floor. */
-	const rankJudge =
-		(classes: Record<string, PriorityClass> = {}) =>
-		async (req: PriorityRequest): Promise<PriorityResult> => ({
-			classes: Object.fromEntries(
-				req.requirements.map((r, i) => [r.id, classes[r.id] ?? (i === 0 ? "must_be_first" : "later")]),
-			),
-			confidences: Object.fromEntries(req.requirements.map(r => [r.id, 0.9])),
-			reasons: [],
-			judged: true,
-		});
-
-	const criteriaInput = (overrides: Record<string, unknown> = {}) => ({
-		stage: "acceptance_criteria",
-		task: "Formalize the acceptance criteria of the accepted requirements",
-		proposal: "the criteria derived from the accepted requirement list",
-		options: OPTIONS,
-		evidence: [evidence("user", QUOTE_1), evidence("spec", QUOTE_2)],
-		criteria: [
-			{ requirementId: "req-1", text: "loading the dashboard renders feature X" },
-			{ requirementId: "req-2", text: "restarting the session keeps feature X" },
-		],
-		...overrides,
-	});
-
-	/** Criteria judge: one mark per criterion, all accepted unless the map says otherwise. */
-	const criteriaJudge =
-		(marks: Record<string, boolean> = {}) =>
-		async (req: AcceptanceCriteriaRequest): Promise<AcceptanceCriteriaResult> => ({
-			marked: Object.fromEntries(req.criteria.map(c => [c.id, marks[c.id] ?? true])),
-			reasons: [],
-			judged: true,
-		});
-
-	const fullMarks = { traceable: { "req-1": true, "req-2": true }, covered: { "quote-1": true, "quote-2": true } };
-	const fullFormalizationJudge = async (): Promise<{
-		traceable: Record<string, boolean>;
-		covered: Record<string, boolean>;
-		reasons: string[];
-		judged: boolean;
-	}> => ({ ...fullMarks, reasons: [], judged: true });
-	const allClaimsSupported = async (req: ClaimCheckRequest) => ({
-		supported: Object.fromEntries(req.claims.map(c => [c.id, true] as const)),
-		reasons: [],
-		judged: true,
-	});
-	/** Plan-gate judge that also answers the single-claim plan_mapping question. */
-	const planStageJudge = (mappingVerdict: DecisionResult) => async (req: DecisionRequest) => {
-		if (req.stage === "plan_mapping") return mappingVerdict;
-		return req.stage === "course_check" ? judgeResult({ selectedOption: "continue" }) : judgeResult({});
-	};
-
-	test("a fully traced list comes back as the numbered list, per-item marked, with the coverage verdict", async () => {
-		const requests: RequirementsFormalizationRequest[] = [];
-		const controller = createJevController({
-			judge: async () => {
-				throw new Error("the standard judge must not be called");
-			},
-			requirementsFormalizationJudge: async req => {
-				requests.push(req);
-				return { ...fullMarks, reasons: [], judged: true };
-			},
-		});
-		const outcome = await controller.submitDecision(formalizationInput());
-		expect(requests).toHaveLength(1);
-		expect(requests[0]?.requirements).toEqual([
-			{ id: "req-1", text: REQUIREMENT_TEXTS[0], quoteId: "quote-1" },
-			{ id: "req-2", text: REQUIREMENT_TEXTS[1], quoteId: "quote-2" },
-		]);
-		expect(requests[0]?.quotes).toEqual([
-			{ id: "quote-1", text: QUOTE_1 },
-			{ id: "quote-2", text: QUOTE_2 },
-		]);
-		expect(outcome.verdict).toBe("approve");
-		expect(outcome.selectedOption).toBe("formalized");
-		expect(outcome.summary).toContain("formalized 2 requirement(s)");
-		expect(outcome.summary).toContain("REQ-A");
-		const record = controller.getState().lastFormalization;
-		expect(record?.complete).toBe(true);
-		// FR-19: every numbered item carries its number AND the verbatim source quote beside it.
-		expect(record?.requirements.map(r => [r.id, r.quoteId, r.quote, r.traceable])).toEqual([
-			["req-1", "quote-1", QUOTE_1, true],
-			["req-2", "quote-2", QUOTE_2, true],
-		]);
-		expect(record?.uncovered).toEqual([]);
-		// Advisory by construction: the stage never records a gate approval.
-		expect(controller.getState().approvals).toHaveLength(0);
-	});
-
-	test("an untraceable item is refused, named, and never becomes the checklist", async () => {
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			requirementsFormalizationJudge: async () => ({
-				traceable: { "req-1": true, "req-2": false },
-				covered: { "quote-1": true, "quote-2": true },
-				reasons: [],
-				judged: true,
-			}),
-		});
-		const outcome = await controller.submitDecision(formalizationInput());
-		expect(outcome.verdict).toBe("revise");
-		expect(outcome.selectedOption).toBe("item_untraceable");
-		expect(outcome.reasons.join(" ")).toContain("req-2");
-		expect(outcome.reasons.join(" ")).toContain("REQ-B");
-		expect(controller.getState().lastFormalization?.complete).toBe(false);
-		expect(controller.getState().lastFormalization?.outcome).toBe("item_untraceable");
-	});
-
-	test("a quoted source no requirement captures is named as what the quotes do not cover", async () => {
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			requirementsFormalizationJudge: async () => ({
-				traceable: { "req-1": true, "req-2": true },
-				covered: { "quote-1": true, "quote-2": false },
-				reasons: [],
-				judged: true,
-			}),
-		});
-		const outcome = await controller.submitDecision(formalizationInput());
-		expect(outcome.verdict).toBe("revise");
-		expect(outcome.selectedOption).toBe("coverage_missing");
-		expect(outcome.reasons.join(" ")).toContain("coverage missing");
-		expect(outcome.reasons.join(" ")).toContain("quote-2");
-		expect(controller.getState().lastFormalization?.uncovered).toEqual([
-			{ id: "quote-2", source: "test", excerpt: QUOTE_2 },
-		]);
-		expect(controller.getState().lastFormalization?.complete).toBe(false);
-	});
-
-	test("a judge error keeps no requirement list at all (fail-closed)", async () => {
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			requirementsFormalizationJudge: async () => {
-				throw new Error("endpoint down");
-			},
-		});
-		const outcome = await controller.submitDecision(formalizationInput());
-		expect(outcome.verdict).toBe("insufficient_evidence");
-		expect(outcome.judged).toBe(false);
-		expect(outcome.reasons.join(" ")).toContain("judge unavailable");
-		expect(controller.getState().lastFormalization).toBeUndefined();
-	});
-
-	test("without a quoted source there is nothing to be traceable to: refused before any judge call", async () => {
-		let called = 0;
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			requirementsFormalizationJudge: async () => {
-				called++;
-				return { ...fullMarks, reasons: [], judged: true };
-			},
-		});
-		const outcome = await controller.submitDecision(
-			formalizationInput({ evidence: [evidence("execution", "dry-run output ok, nothing quoted from the user")] }),
-		);
-		expect(called).toBe(0);
-		expect(outcome.judged).toBe(false);
-		expect(outcome.reasons.join(" ")).toContain("user or spec evidence");
-	});
-
-	test("planning: a formalized requirement with no plan claim leaves planning incomplete and the gate shut", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({
-			judge: planStageJudge({ verdict: "revise", reasons: ["no plan work serves the requirement"], confidence: 0.9 }),
-			requirementsFormalizationJudge: fullFormalizationJudge,
-			claimCheckJudge: allClaimsSupported,
-			priorityJudge: rankJudge(),
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", {
-			type: "before_agent_start",
-			prompt: "work task: implement feature X",
-			systemPrompt: [],
-		});
-		await approvePlan(controller);
-		await controller.submitDecision(formalizationInput());
-		// Plan approved, list formalized: the mapping is now part of the plan gate.
-		const unmapped = blockResult(
-			await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} }),
-		);
-		expect(unmapped?.block).toBe(true);
-		expect(String(unmapped?.reason)).toContain("plan mapping incomplete");
-		expect(String(unmapped?.reason)).toContain("req-1, req-2");
-		// One requirement mapped: req-2 is still missing, so planning is incomplete.
-		const partial = await controller.submitDecision(
-			planMappingInput({
-				planClaims: [{ requirementId: "req-1", claim: "the plan adds the dashboard view for feature X" }],
-			}),
-		);
-		expect(partial.verdict).toBe("revise");
-		expect(partial.selectedOption).toBe("incomplete_mapping");
-		expect(partial.reasons.join(" ")).toContain("req-2");
-		expect(controller.getState().lastPlanMapping).toMatchObject({ missing: ["req-2"], complete: false });
-		expect(
-			blockResult(await harness.emit("tool_call", { type: "tool_call", toolCallId: "2", toolName: "edit", input: {} }))
-				?.block,
-		).toBe(true);
-		// Every formalized requirement mapped and supported: the mapping is complete, but FR-21
-		// still requires the judge's order over the accepted batch before mutating work.
-		const full = await controller.submitDecision(planMappingInput());
-		expect(full.verdict).toBe("approve");
-		expect(full.summary).toContain("2/2 requirement(s) mapped");
-		expect(controller.getState().lastPlanMapping?.complete).toBe(true);
-		const noOrder = blockResult(
-			await harness.emit("tool_call", { type: "tool_call", toolCallId: "3", toolName: "edit", input: {} }),
-		);
-		expect(noOrder?.block).toBe(true);
-		expect(String(noOrder?.reason)).toContain("priority order missing");
-		// The judge sets the order over the accepted batch: the plan gate opens.
-		const ranked = await controller.submitDecision(prioritiesInput());
-		expect(ranked.verdict).toBe("approve");
-		expect(ranked.selectedOption).toBe("ranked");
-		expect(
-			blockResult(await harness.emit("tool_call", { type: "tool_call", toolCallId: "4", toolName: "edit", input: {} }))
-				?.block,
-		).toBeUndefined();
-	});
-
-	test("planning: the stop boundary names the unmapped requirements too", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({
-			judge: gateJudge(),
-			requirementsFormalizationJudge: fullFormalizationJudge,
-			claimCheckJudge: allClaimsSupported,
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", {
-			type: "before_agent_start",
-			prompt: "work task: implement feature X",
-			systemPrompt: [],
-		});
-		await approvePlan(controller);
-		await controller.submitDecision(formalizationInput());
-		const res = await runStop(harness);
-		expect(res?.decision).toBe("block");
-		expect(String(res?.reason)).toContain("plan mapping incomplete");
-	});
-
-	test("planning: a one-requirement list maps through one claim-shaped decision", async () => {
-		const controller = createJevController({
-			judge: planStageJudge(judgeResult({ selectedOption: PLAN_MAPPING_APPROVED_OPTION, confidence: 0.93 })),
-			requirementsFormalizationJudge: async () => ({
-				traceable: { "req-1": true },
-				covered: { "quote-1": true, "quote-2": true },
-				reasons: [],
-				judged: true,
-			}),
-		});
-		await controller.submitDecision(
-			formalizationInput({ requirements: [{ text: REQUIREMENT_TEXTS[0], quoteId: "quote-1" }] }),
-		);
-		const outcome = await controller.submitDecision(
-			planMappingInput({
-				planClaims: [{ requirementId: "req-1", claim: "the plan adds the dashboard view for feature X" }],
-			}),
-		);
-		expect(outcome.verdict).toBe("approve");
-		expect(outcome.summary).toContain("1/1 requirement(s) mapped");
-		expect(controller.getState().lastPlanMapping?.complete).toBe(true);
-	});
-
-	test("plan_mapping before a formalization is refused (there is no checklist to map)", async () => {
-		let calls = 0;
-		const controller = createJevController({
-			judge: async () => {
-				calls++;
-				return judgeResult({});
-			},
-		});
-		const outcome = await controller.submitDecision(planMappingInput());
-		expect(calls).toBe(0);
-		expect(outcome.judged).toBe(false);
-		expect(outcome.reasons.join(" ")).toContain("completed requirements_formalization");
-	});
-
-	test("plan_mapping names an unknown requirement id instead of silently ignoring it", async () => {
-		let judging = 0;
-		const controller = createJevController({
-			judge: async () => {
-				judging++;
-				return judgeResult({});
-			},
-			requirementsFormalizationJudge: fullFormalizationJudge,
-			claimCheckJudge: allClaimsSupported,
-		});
-		await controller.submitDecision(formalizationInput());
-		const outcome = await controller.submitDecision(
-			planMappingInput({ planClaims: [{ requirementId: "req-7", claim: "a claim about a requirement that does not exist" }] }),
-		);
-		expect(judging).toBe(0);
-		expect(outcome.judged).toBe(false);
-		expect(outcome.reasons.join(" ")).toContain("unknown_requirement_id");
-		expect(outcome.reasons.join(" ")).toContain("req-1, req-2");
-	});
-
-	test("automatic course check judges a completed mutation with its result, not an attempted call", async () => {
-		const harness = makeFakePi();
-		const requests: CourseCheckRequest[] = [];
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			courseCheckJudge: async request => {
-				requests.push(request);
-				return {
-					onTrack: { task: false },
-					nextAction: "return_to_requirement",
-					reasons: ["observed output contradicts the task"],
-					confidence: 0.9,
-					judged: true,
-				};
-			},
-			template: { gates: { mutation: false }, courseCheck: { everyMutations: 1 } },
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", {
-			type: "before_agent_start",
-			prompt: "Preserve the existing output format when changing the formatter.",
-		});
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "mutation-1", toolName: "bash", input: {} });
-		await controller.automaticCourseChecksSettled();
-		expect(requests).toHaveLength(0);
-		await harness.emit("tool_result", {
-			type: "tool_result",
-			toolCallId: "mutation-1",
-			toolName: "bash",
-			content: [{ type: "text", text: "Expected: 1s; received: bad maxUnits: undefined" }],
-			isError: false,
-		});
-		await controller.automaticCourseChecksSettled();
-		expect(requests).toHaveLength(1);
-		expect(requests[0]?.evidence.some(item => item.quote.includes("bad maxUnits: undefined"))).toBe(true);
-		expect(harness.sentMessages.some(message => JSON.stringify(message.payload).includes("return_to_requirement"))).toBe(true);
-	});
-
-	test("no automatic consult runs for an errored, unmatched or non-mutating tool result", async () => {
-		const harness = makeFakePi();
-		let calls = 0;
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			courseCheckJudge: async () => {
-				calls++;
-				return { onTrack: { task: true }, nextAction: "continue", reasons: ["ok"], confidence: 0.9, judged: true };
-			},
-			template: { gates: { mutation: false }, courseCheck: { everyMutations: 1 } },
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", {
-			type: "before_agent_start",
-			prompt: "work task: implement feature X",
-			systemPrompt: [],
-		});
-		// A mutating call that FAILED produced no work to judge: its result runs no consult.
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "fail-1", toolName: "edit", input: {} });
-		await harness.emit("tool_result", {
-			type: "tool_result",
-			toolCallId: "fail-1",
-			toolName: "edit",
-			content: [{ type: "text", text: "edit failed: file changed on disk" }],
-			isError: true,
-		});
-		// A read-only tool's result matches no captured mutation (its call was never captured).
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "read-1", toolName: "read", input: {} });
-		await harness.emit("tool_result", {
-			type: "tool_result",
-			toolCallId: "read-1",
-			toolName: "read",
-			content: [{ type: "text", text: "file contents" }],
-			isError: false,
-		});
-		// A mutating result whose id matches no captured call is ignored, not attributed to one.
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "some-1", toolName: "write", input: {} });
-		await harness.emit("tool_result", {
-			type: "tool_result",
-			toolCallId: "other-id",
-			toolName: "write",
-			content: [{ type: "text", text: "wrote file" }],
-			isError: false,
-		});
-		await controller.automaticCourseChecksSettled();
-		expect(calls).toBe(0);
-		expect(controller.getState().lastAutoCourseCheck).toBeUndefined();
-	});
-
-	test("a late result of a previous task never feeds the new task's automatic consult", async () => {
-		const harness = makeFakePi();
-		let calls = 0;
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			courseCheckJudge: async () => {
-				calls++;
-				return { onTrack: { task: true }, nextAction: "continue", reasons: ["ok"], confidence: 0.9, judged: true };
-			},
-			template: { gates: { mutation: false }, courseCheck: { everyMutations: 1 } },
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "task one", systemPrompt: [] });
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "old-1", toolName: "edit", input: {} });
-		// The task changes before the call's result arrives: the captured mutation is dropped.
-		await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "task two: different", systemPrompt: [] });
-		await harness.emit("tool_result", {
-			type: "tool_result",
-			toolCallId: "old-1",
-			toolName: "edit",
-			content: [{ type: "text", text: "applied edit old-1" }],
-			isError: false,
-		});
-		await controller.automaticCourseChecksSettled();
-		expect(calls).toBe(0);
-		expect(controller.getState().lastAutoCourseCheck).toBeUndefined();
-	});
-
-	test("a mutating result is judged from its text only; an empty result is recorded as uncertainty", async () => {
-		const harness = makeFakePi();
-		const requests: CourseCheckRequest[] = [];
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			courseCheckJudge: async req => {
-				requests.push(req);
-				return {
-					onTrack: Object.fromEntries(req.requirements.map(r => [r.id, true] as const)),
-					nextAction: "continue",
-					reasons: ["ok"],
-					confidence: 0.9,
-					judged: true,
-				};
-			},
-			template: { gates: { mutation: false }, courseCheck: { everyMutations: 1 } },
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", {
-			type: "before_agent_start",
-			prompt: "work task: implement feature X",
-			systemPrompt: [],
-		});
-		// An image-only result carries no text to judge: uncertainty, never fabricated progress.
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "img-1", toolName: "edit", input: {} });
-		await harness.emit("tool_result", {
-			type: "tool_result",
-			toolCallId: "img-1",
-			toolName: "edit",
-			content: [{ type: "image", data: "AAAA" }],
-			isError: false,
-		});
-		await controller.automaticCourseChecksSettled();
-		expect(requests).toHaveLength(0);
-		expect(controller.getState().lastAutoCourseCheck?.judged).toBe(false);
-		expect(controller.getState().lastAutoCourseCheck?.reasons.join(" ")).toContain("no text to judge");
-		// A successful result is evidence by its text; the raw `details` payload is never sent.
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "ok-1", toolName: "bash", input: { command: "run" } });
-		await harness.emit("tool_result", {
-			type: "tool_result",
-			toolCallId: "ok-1",
-			toolName: "bash",
-			content: [{ type: "text", text: "42 passing" }],
-			details: { authorization: "Bearer SUPERSECRET" },
-			isError: false,
-		});
-		await controller.automaticCourseChecksSettled();
-		expect(requests).toHaveLength(1);
-		const request = requests[0]!;
-		expect(request.evidence.some(item => item.quote.includes("42 passing"))).toBe(true);
-		expect(request.currentAction).toContain("bash mutation");
-		expect(JSON.stringify(request)).not.toContain("SUPERSECRET");
-	});
-
-	test("everyMutations: 2 fires one automatic consult after the second allowed mutation and feeds it back", async () => {
-		const harness = makeFakePi();
-		const requests: CourseCheckRequest[] = [];
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			courseCheckJudge: async req => {
-				requests.push(req);
-				return {
-					onTrack: Object.fromEntries(req.requirements.map(r => [r.id, true] as const)),
-					nextAction: "continue",
-					reasons: ["judged"],
-					confidence: 0.9,
-					judged: true,
-				};
-			},
-			template: { gates: { mutation: false }, courseCheck: { everyMutations: 2 } },
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", {
-			type: "before_agent_start",
-			prompt: "work task: implement feature X",
-			systemPrompt: [],
-		});
-		// Real host order: each call is followed by its own result; the consult runs on the result.
-		const mutate = async (id: string): Promise<void> => {
-			await harness.emit("tool_call", { type: "tool_call", toolCallId: id, toolName: "edit", input: {} });
-			await harness.emit("tool_result", {
-				type: "tool_result",
-				toolCallId: id,
-				toolName: "edit",
-				content: [{ type: "text", text: `applied edit ${id}` }],
-				isError: false,
-			});
-		};
-		for (const id of ["1", "2", "3"]) await mutate(id);
-		await controller.automaticCourseChecksSettled();
-		// The third allowed mutation crossed no further multiple: exactly one consult, on mutation 2.
-		expect(requests).toHaveLength(1);
-		expect(requests[0]?.requirements).toEqual([{ id: "task", quote: "work task: implement feature X" }]);
-		const record = controller.getState().lastAutoCourseCheck;
-		expect(record?.judged).toBe(true);
-		expect(record?.selectedOption).toBe("continue");
-		expect(record?.workRevision).toBe(2);
-		expect(harness.sentMessages.some(m => JSON.stringify(m.payload).includes("automatic course_check"))).toBe(true);
-		// Advisory: it blocks nothing and satisfies nothing (no gate approval, no fresh record).
-		expect(controller.getState().blockers).toEqual([]);
-		expect(controller.getState().approvals).toHaveLength(0);
-		expect(controller.getState().lastCourseCheck).toBeUndefined();
-		expect(controller.getState().iterations).toEqual({});
-		// The fourth mutation crosses the next multiple.
-		await mutate("4");
-		await controller.automaticCourseChecksSettled();
-		expect(requests).toHaveLength(2);
-	});
-
-	test("with the switch absent no automatic consult happens at all (zero judge calls)", async () => {
-		const harness = makeFakePi();
-		let calls = 0;
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			courseCheckJudge: async () => {
-				calls++;
-				return { onTrack: {}, nextAction: "continue", reasons: [], confidence: 0.9, judged: true };
-			},
-			template: { gates: { mutation: false } },
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", {
-			type: "before_agent_start",
-			prompt: "work task: implement feature X",
-			systemPrompt: [],
-		});
-		for (const id of ["1", "2", "3", "4", "5"]) {
-			await harness.emit("tool_call", { type: "tool_call", toolCallId: id, toolName: "edit", input: {} });
-		}
-		await controller.automaticCourseChecksSettled();
-		expect(calls).toBe(0);
-		expect(controller.getState().lastAutoCourseCheck).toBeUndefined();
-	});
-
-	test("an automatic consult whose judge throws records uncertainty, blocks nothing, spends no rework", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			courseCheckJudge: async () => {
-				throw new Error("endpoint down");
-			},
-			template: { gates: { mutation: false }, courseCheck: { everyMutations: 1 } },
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", {
-			type: "before_agent_start",
-			prompt: "work task: implement feature X",
-			systemPrompt: [],
-		});
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
-		await harness.emit("tool_result", {
-			type: "tool_result",
-			toolCallId: "1",
-			toolName: "edit",
-			content: [{ type: "text", text: "applied edit 1" }],
-			isError: false,
-		});
-		await controller.automaticCourseChecksSettled();
-		expect(controller.getState().lastAutoCourseCheck?.judged).toBe(false);
-		expect(controller.getState().lastAutoCourseCheck?.reasons.join(" ")).toContain("judge unavailable");
-		expect(controller.getState().blockers).toEqual([]);
-		expect(controller.getState().iterations).toEqual({});
-	});
-
-	test("with a formalized list the automatic consult checks the formalized requirements", async () => {
-		const harness = makeFakePi();
-		const requests: CourseCheckRequest[] = [];
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			requirementsFormalizationJudge: fullFormalizationJudge,
-			courseCheckJudge: async req => {
-				requests.push(req);
-				return {
-					onTrack: Object.fromEntries(req.requirements.map(r => [r.id, true] as const)),
-					nextAction: "verify_before_proceeding",
-					reasons: ["more evidence needed"],
-					confidence: 0.9,
-					judged: true,
-				};
-			},
-			template: { gates: { mutation: false }, courseCheck: { everyMutations: 1 } },
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", {
-			type: "before_agent_start",
-			prompt: "work task: implement feature X",
-			systemPrompt: [],
-		});
-		await controller.submitDecision(formalizationInput());
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
-		await harness.emit("tool_result", {
-			type: "tool_result",
-			toolCallId: "1",
-			toolName: "edit",
-			content: [{ type: "text", text: "applied edit 1" }],
-			isError: false,
-		});
-		await controller.automaticCourseChecksSettled();
-		expect(requests[0]?.requirements).toEqual([
-			{ id: "req-1", quote: QUOTE_1 },
-			{ id: "req-2", quote: QUOTE_2 },
-		]);
-		// verify_before_proceeding is recorded and never unlocks the completion boundary.
-		expect(controller.getState().lastAutoCourseCheck?.selectedOption).toBe("verify_before_proceeding");
-		expect(controller.getState().lastCourseCheck).toBeUndefined();
-		expect(harness.sentMessages.some(m => JSON.stringify(m.payload).includes("verify_before_proceeding"))).toBe(true);
-	});
-
-	test("an engine answer outside the activity's declared outcome set fails closed", async () => {
-		const planning = ACTIVITY_REGISTRY["planning"]!;
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			claimCheckJudge: allClaimsSupported,
-			activities: {
-				...ACTIVITY_REGISTRY,
-				planning: { ...planning, outcomes: ["revise"], verdictActions: { revise: "return_to_activity" } },
-			},
-		});
-		const outcome = await controller.submitDecision({
-			stage: "claim_check",
-			task: "Decide how to wire the per-claim judge",
-			proposal: "the claims of the wiring decision, checked against the quoted measurement",
-			options: OPTIONS,
-			evidence: [evidence("execution", "parallel per-claim questions in ONE request: per-claim yes/no")],
-			claims: ["the marking path judges every claim in one request", "a second claim to be marked"],
-		});
-		expect(outcome.verdict).toBe("insufficient_evidence");
-		expect(outcome.judged).toBe(false);
-		expect(outcome.reasons.join(" ")).toContain("activity_outcome_undeclared");
-		expect(outcome.reasons.join(" ")).toContain("planning");
-		expect(controller.getState().approvals).toHaveLength(0);
-	});
-
-	test("the formalization and plan mapping records restore with the session", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			requirementsFormalizationJudge: fullFormalizationJudge,
-			claimCheckJudge: allClaimsSupported,
-		});
-		controller.register(harness.pi);
-		await controller.submitDecision(formalizationInput());
-		await controller.submitDecision(planMappingInput());
-		const entries = harness.appended.filter(e => e.customType === "jev.state");
-		expect(entries.length).toBeGreaterThan(0);
-		const restored = createJevController({ judge: async () => judgeResult({}) });
-		restored.onSessionStart([{ customType: "jev.state", data: entries[entries.length - 1]?.data }]);
-		expect(restored.getState().lastFormalization?.complete).toBe(true);
-		expect(restored.getState().lastFormalization?.requirements.map(r => r.id)).toEqual(["req-1", "req-2"]);
-		expect(restored.getState().lastPlanMapping?.complete).toBe(true);
-		// A malformed record is dropped, never trusted as a checklist.
-		restored.onSessionStart([
+		await pi.callTool(
+			"jev_consult",
 			{
-				customType: "jev.state",
-				data: {
-					lastFormalization: { requirements: [{ id: "req-1", text: "t", traceable: "yes" }], complete: true },
-					lastPlanMapping: { requirements: [{ id: "req-1", claim: "c" }], missing: [], complete: true },
-				},
+				mode: "choice",
+				question: "Which direction should the work take?",
+				context: "the last action left the registered task",
+				alternatives: [
+					{ label: "fix", meaning: "return to the registered task" },
+					{ label: "keep", meaning: "continue as it is" },
+				],
 			},
-		]);
-		expect(restored.getState().lastFormalization).toBeUndefined();
-		expect(restored.getState().lastPlanMapping).toBeUndefined();
+			ctx,
+		);
+
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toBeUndefined();
+	});
+
+	test("FR-12: completion-only mode makes no check before completion and one at completion", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": "# plan\n" }) });
+		const { pi, calls } = controllerFor(
+			{
+				needs_development: TRIAGE_DEEP,
+				plan: PLAN_SERVES,
+				direction: ON_COURSE,
+				follows_requirements: FOLLOWS,
+				acceptance: approvingAcceptance,
+			},
+			{ mode: "completion", interval: 1 },
+		);
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
+		const before = calls.length;
+
+		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 bytes"), ctx);
+		expect(calls.length).toBe(before);
+
+		await pi.callTool("jev_acceptance", { aspect: "business", claim: "c", evidence: [{ kind: "execution", quote: "12 pass" }] }, ctx);
+
+		// The acceptance check is an activity of its own; the completion check runs once, at the stop.
+		expect(calls[calls.length - 1]?.questions.map(question => question.name)).toEqual(["acceptance"]);
 	});
 });
 
-// ---------- FR-19/FR-20/FR-21: the accepted requirement list, its criteria and the judge's order ----------
+describe("T5 - acceptance and completion (FR-14, FR-15, FR-17)", () => {
+	test("FR-14, FR-17: developed work cannot settle while an acceptance aspect is missing", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": "# plan\n" }) });
+		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP, plan: PLAN_SERVES });
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
+		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 bytes"), ctx);
+
+		const reason = stopDecision(await pi.emit("session_stop", stopEvent(), ctx));
+
+		expect(reason).toContain("business");
+		expect(reason).toContain("architecture");
+	});
+
+	test("FR-17: a completion check that finds a deviation keeps the session from settling and is not re-asked", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": "# plan\n" }) });
+		const { pi, calls } = controllerFor({
+			needs_development: TRIAGE_DEEP,
+			plan: PLAN_SERVES,
+			follows_requirements: { label: "deviates", confidence: 0.9 },
+			acceptance: approvingAcceptance,
+		});
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
+		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 bytes"), ctx);
+		await pi.callTool("jev_acceptance", { aspect: "business", claim: "c", evidence: [{ kind: "execution", quote: "12 pass" }] }, ctx);
+		await pi.callTool("jev_acceptance", { aspect: "architecture", claim: "c", evidence: [{ kind: "code", quote: "class Report" }] }, ctx);
+
+		const reason = stopDecision(await pi.emit("session_stop", stopEvent(), ctx));
+		expect(reason).toContain("deviates");
+
+		const before = calls.length;
+		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toContain("deviates");
+		expect(calls.length).toBe(before);
+	});
+
+	test("FR-14, FR-17: with both aspects approved and the completion check passing the session settles, and a new change re-opens the gate", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": "# plan\n" }) });
+		const { pi } = controllerFor({
+			needs_development: TRIAGE_DEEP,
+			plan: PLAN_SERVES,
+			follows_requirements: FOLLOWS,
+			acceptance: approvingAcceptance,
+		});
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
+		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 bytes"), ctx);
+		await pi.callTool("jev_acceptance", { aspect: "business", claim: "c", evidence: [{ kind: "execution", quote: "12 pass" }] }, ctx);
+		await pi.callTool("jev_acceptance", { aspect: "architecture", claim: "c", evidence: [{ kind: "code", quote: "class Report" }] }, ctx);
+
+		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
+
+		await pi.emit("tool_result", toolResultEvent("edit", { path: "src/a.ts" }, "applied 1 hunk"), ctx);
+
+		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toContain("acceptance");
+	});
+
+	test("FR-14: repeated refusals for one unchanged reason are bounded and recorded as an open item", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": "# plan\n" }) });
+		const { pi, calls } = controllerFor({ needs_development: TRIAGE_DEEP, plan: PLAN_SERVES });
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
+		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 bytes"), ctx);
+		const before = calls.length;
+
+		for (let attempt = 0; attempt < POLICY.maxStopBlocks; attempt += 1) {
+			expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeDefined();
+		}
+		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
+
+		expect(pi.messages.some(message => message.customType === "jev.open_item")).toBe(true);
+		expect(calls.length).toBe(before);
+	});
+
+	test("a disabled completion gate lets the session settle", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": "# plan\n" }) });
+		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP, plan: PLAN_SERVES }, { mutation: false, completion: false });
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
+		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 bytes"), ctx);
+
+		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
+	});
+});
+
+const PLAN_CONTENT = "# plan\n";
 
 /**
- * These tests exist because they fail when the behaviour breaks: an item or criterion with no
- * reference is refused BEFORE the judge call, a criterion the judge does not accept is never
- * usable and is named at the completion boundary, the order is a function of the judge's own marks
- * and is recorded with each item's verbatim quote, a new accepted batch retires it by name and a
- * second judged call replaces it, and work started out of order is named.
+ * Triage and plan in one session, approve the proposal, then let the host clear the session (a new
+ * id and a new artifact root) and copy the artifacts over only after the switch — the order
+ * `#approvePlan` uses for the default approve-and-execute path.
  */
-describe("jev controller: acceptance criteria and priorities (FR-20, FR-21)", () => {
-	const Q1 = "the dashboard must show feature X after loading";
-	const Q2 = "a restart must not lose feature X";
-	const Q3 = "the export must keep working after the change";
-	const TEXTS = ["R1: the dashboard shows feature X", "R2: feature X survives a restart"] as const;
-	const EVIDENCE: Evidence[] = [evidence("user", Q1), evidence("spec", Q2)];
+async function approvedAcrossSwitch(
+	options: { reason?: "new" | "resume"; copied?: string } = {},
+): Promise<{ pi: FakePi; session: SwitchableHost }> {
+	const oldRoot = await fakeArtifacts({ "x-plan.md": PLAN_CONTENT });
+	const newRoot = await fakeArtifacts({});
+	const session = switchableCtx({ artifactsDir: oldRoot, sessionId: "session-old" });
+	const { pi } = controllerFor({ needs_development: TRIAGE_DEEP, plan: PLAN_SERVES, direction: ON_COURSE });
+	await triaged(pi, session.ctx);
+	await planned(pi, session.ctx);
+	expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "xd://propose", content: "x" }), session.ctx))).toBeUndefined();
 
-	const traceable = (marks: Record<string, boolean> = {}) =>
-		async (req: RequirementsFormalizationRequest) => ({
-			traceable: Object.fromEntries(req.requirements.map(r => [r.id, marks[r.id] ?? true])),
-			covered: Object.fromEntries(req.quotes.map(q => [q.id, true])),
-			reasons: [],
-			judged: true,
-		});
+	session.switchTo({ artifactsDir: newRoot, sessionId: "session-new" });
+	const reason = options.reason ?? "new";
+	await pi.emit("session_before_switch", { type: "session_before_switch", reason }, session.ctx);
+	await pi.emit("session_switch", { type: "session_switch", reason, previousSessionFile: "session.jsonl" }, session.ctx);
+	const copied = options.copied ?? PLAN_CONTENT;
+	if (copied.length > 0) await writeFile(join(newRoot, "local", "x-plan.md"), copied, "utf8");
+	return { pi, session };
+}
 
-	const formalize = (overrides: Record<string, unknown> = {}) => ({
-		stage: "requirements_formalization",
-		task: "Formalize the requirements of this task",
-		proposal: "the numbered list derived from the quoted user requirements",
-		options: OPTIONS,
-		evidence: EVIDENCE,
-		requirements: [
-			{ text: TEXTS[0], quoteId: "quote-1" },
-			{ text: TEXTS[1], quoteId: "quote-2" },
-		],
-		...overrides,
+describe("T3 - the plan approval across the host session switch (FR-07, FR-18)", () => {
+	test("FR-07: the approved plan is restored in the new execution session, so the next change passes", async () => {
+		const { pi, session } = await approvedAcrossSwitch();
+
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), session.ctx))).toBeUndefined();
 	});
 
-	const criteriaInput = (overrides: Record<string, unknown> = {}) => ({
-		stage: "acceptance_criteria",
-		task: "Formalize the acceptance criteria of the accepted requirements",
-		proposal: "the criteria derived from the accepted requirement list",
-		options: OPTIONS,
-		evidence: EVIDENCE,
-		criteria: [
-			{ requirementId: "req-1", text: "loading the dashboard renders feature X" },
-			{ requirementId: "req-2", text: "restarting the session keeps feature X" },
-		],
-		...overrides,
+	test("FR-18: an artifact whose bytes differ from the approved ones restores nothing", async () => {
+		const { pi, session } = await approvedAcrossSwitch({ copied: "# a different plan\n" });
+
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), session.ctx))).toContain("jev_triage");
+		// The handoff is spent: no later operation revives it.
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/b.ts", content: "x" }), session.ctx))).toContain("jev_triage");
 	});
 
-	const marks = (m: Record<string, boolean> = {}) =>
-		async (req: AcceptanceCriteriaRequest): Promise<AcceptanceCriteriaResult> => ({
-			marked: Object.fromEntries(req.criteria.map(c => [c.id, m[c.id] ?? true])),
-			reasons: [],
-			judged: true,
-		});
+	test("FR-18: a switch that is not the approved execution never inherits the development approval", async () => {
+		const { pi, session } = await approvedAcrossSwitch({ reason: "resume" });
 
-	const prioritiesInput = (overrides: Record<string, unknown> = {}) => ({
-		stage: "requirement_priorities",
-		task: "Let the judge set the build order over the accepted requirements",
-		proposal: "the accepted requirement list, to be ordered by the judge",
-		options: OPTIONS,
-		evidence: EVIDENCE,
-		...overrides,
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), session.ctx))).toContain("jev_triage");
 	});
 
-	const classes = (c: Record<string, PriorityClass> = {}) =>
-		async (req: PriorityRequest): Promise<PriorityResult> => ({
-			classes: Object.fromEntries(
-				req.requirements.map((r, i) => [r.id, c[r.id] ?? (i === 0 ? "must_be_first" : "later")]),
-			),
-			confidences: Object.fromEntries(req.requirements.map(r => [r.id, 0.9])),
-			reasons: [],
-			judged: true,
-		});
+	test("FR-18: an ordinary clear of a planned session restores nothing", async () => {
+		const oldRoot = await fakeArtifacts({ "x-plan.md": PLAN_CONTENT });
+		const newRoot = await fakeArtifacts({});
+		const session = switchableCtx({ artifactsDir: oldRoot, sessionId: "session-old" });
+		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP, plan: PLAN_SERVES });
+		await triaged(pi, session.ctx);
+		await planned(pi, session.ctx);
 
-	const allClaimsSupported = async (req: ClaimCheckRequest) => ({
-		supported: Object.fromEntries(req.claims.map(c => [c.id, true] as const)),
-		reasons: [],
-		judged: true,
-	});
+		session.switchTo({ artifactsDir: newRoot, sessionId: "session-new" });
+		await pi.emit("session_before_switch", { type: "session_before_switch", reason: "new" }, session.ctx);
+		await pi.emit("session_switch", { type: "session_switch", reason: "new", previousSessionFile: "session.jsonl" }, session.ctx);
+		await writeFile(join(newRoot, "local", "x-plan.md"), PLAN_CONTENT, "utf8");
 
-	const planInput = (overrides: Record<string, unknown> = {}) => ({
-		stage: "plan_mapping",
-		task: "Map the plan to the formalized requirements",
-		proposal: "the plan work that serves each formalized requirement",
-		options: OPTIONS,
-		evidence: EVIDENCE,
-		planClaims: [
-			{ requirementId: "req-1", claim: "the plan adds the dashboard view that renders feature X" },
-			{ requirementId: "req-2", claim: "the plan persists feature X so a restart keeps it" },
-		],
-		...overrides,
-	});
-
-	test("FR-19: an item naming no quote, or an unknown one, is refused before any judge call", async () => {
-		let calls = 0;
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			requirementsFormalizationJudge: async req => {
-				calls++;
-				return traceable()(req);
-			},
-		});
-		const unknown = await controller.submitDecision(
-			formalize({ requirements: [{ text: TEXTS[0], quoteId: "quote-9" }] }),
-		);
-		expect(calls).toBe(0);
-		expect(unknown.judged).toBe(false);
-		expect(unknown.reasons.join(" ")).toContain("unknown_quote_id");
-		expect(unknown.reasons.join(" ")).toContain("req-1→quote-9");
-		expect(unknown.reasons.join(" ")).toContain("quote-1, quote-2");
-
-		// A bare string item carries no reference at all: refused by the submission validator.
-		const bare = await controller.submitDecision(formalize({ requirements: [TEXTS[0]] }));
-		expect(bare.judged).toBe(false);
-		expect(bare.reasons.join(" ")).toContain("must be {text, quoteId}");
-		expect(calls).toBe(0);
-		expect(controller.getState().lastFormalization).toBeUndefined();
-	});
-
-	test("FR-20: a criterion referencing a requirement that was never accepted is refused before any judge call", async () => {
-		let calls = 0;
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			requirementsFormalizationJudge: traceable(),
-			acceptanceCriteriaJudge: async () => {
-				calls++;
-				return { marked: {}, reasons: [], judged: true };
-			},
-		});
-		await controller.submitDecision(formalize());
-		const outcome = await controller.submitDecision(
-			criteriaInput({ criteria: [{ requirementId: "req-7", text: "a criterion of nothing" }] }),
-		);
-		expect(calls).toBe(0);
-		expect(outcome.judged).toBe(false);
-		expect(outcome.reasons.join(" ")).toContain("unknown_requirement_id");
-		expect(outcome.reasons.join(" ")).toContain("req-1, req-2");
-
-		// Without an accepted list there is nothing a criterion could reference.
-		const fresh = createJevController({
-			judge: async () => judgeResult({}),
-			acceptanceCriteriaJudge: async () => {
-				calls++;
-				return { marked: {}, reasons: [], judged: true };
-			},
-		});
-		const nothingAccepted = await fresh.submitDecision(criteriaInput());
-		expect(calls).toBe(0);
-		expect(nothingAccepted.judged).toBe(false);
-		expect(nothingAccepted.reasons.join(" ")).toContain("ACCEPTED requirements list");
-	});
-
-	test("FR-20: the judge marks every criterion and the record carries each criterion with its requirement's quote", async () => {
-		const requests: AcceptanceCriteriaRequest[] = [];
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			requirementsFormalizationJudge: traceable(),
-			acceptanceCriteriaJudge: async req => {
-				requests.push(req);
-				return marks()(req);
-			},
-		});
-		await controller.submitDecision(formalize());
-		const outcome = await controller.submitDecision(criteriaInput());
-		expect(requests).toHaveLength(1);
-		expect(requests[0]?.criteria.map(c => [c.id, c.requirementId])).toEqual([
-			["crit-1", "req-1"],
-			["crit-2", "req-2"],
-		]);
-		// The judge read the accepted requirements themselves, quotes included.
-		expect(requests[0]?.requirements.map(r => [r.id, r.quote])).toEqual([
-			["req-1", Q1],
-			["req-2", Q2],
-		]);
-		expect(outcome.verdict).toBe("approve");
-		expect(outcome.selectedOption).toBe("criteria_accepted");
-		const record = controller.getState().lastAcceptanceCriteria;
-		expect(record?.complete).toBe(true);
-		expect(record?.criteria.map(c => [c.id, c.requirementId, c.requirementQuote, c.marked])).toEqual([
-			["crit-1", "req-1", Q1, true],
-			["crit-2", "req-2", Q2, true],
-		]);
-		// A criterion is never a gate grant of its own.
-		expect(controller.getState().approvals).toHaveLength(0);
-	});
-
-	test("FR-20: a criterion the judge does not accept is refused by name and keeps the completion boundary shut", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({
-			judge: gateJudge(),
-			requirementsFormalizationJudge: traceable(),
-			acceptanceCriteriaJudge: marks({ "crit-2": false }),
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", {
-			type: "before_agent_start",
-			prompt: "work task: implement feature X",
-			systemPrompt: [],
-		});
-		await approvePlan(controller);
-		await controller.submitDecision(formalize());
-		const outcome = await controller.submitDecision(criteriaInput());
-		expect(outcome.verdict).toBe("revise");
-		expect(outcome.selectedOption).toBe("criterion_without_requirement_basis");
-		expect(outcome.reasons.join(" ")).toContain("crit-2");
-		const record = controller.getState().lastAcceptanceCriteria;
-		expect(record?.complete).toBe(false);
-		expect(record?.unaccepted).toEqual(["crit-2"]);
-		// The unaccepted criterion is never usable, and the stop boundary names it.
-		const res = await runStop(harness);
-		expect(res?.decision).toBe("block");
-		expect(String(res?.reason)).toContain("acceptance criteria not accepted");
-		expect(String(res?.reason)).toContain("crit-2");
-	});
-
-	test("FR-20: a partial judge answer fails closed and no criteria record is written at all", async () => {
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			requirementsFormalizationJudge: traceable(),
-			acceptanceCriteriaJudge: async () => ({ marked: { "crit-1": true }, reasons: [], judged: true }),
-		});
-		await controller.submitDecision(formalize());
-		const outcome = await controller.submitDecision(criteriaInput());
-		expect(outcome.verdict).toBe("insufficient_evidence");
-		expect(outcome.judged).toBe(false);
-		expect(outcome.reasons.join(" ")).toContain("could not mark crit-2");
-		expect(controller.getState().lastAcceptanceCriteria).toBeUndefined();
-	});
-
-	test("FR-21: the judge sets the order and the record carries it with each item's verbatim quote", async () => {
-		const requests: PriorityRequest[] = [];
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			requirementsFormalizationJudge: traceable(),
-			priorityJudge: async req => {
-				requests.push(req);
-				return classes({ "req-1": "later", "req-2": "must_be_first" })(req);
-			},
-		});
-		await controller.submitDecision(formalize());
-		const outcome = await controller.submitDecision(prioritiesInput());
-		// The judge never invents an item: it ranks exactly the accepted list, quotes included.
-		expect(requests[0]?.requirements.map(r => [r.id, r.quote])).toEqual([
-			["req-1", Q1],
-			["req-2", Q2],
-		]);
-		expect(outcome.verdict).toBe("approve");
-		expect(outcome.selectedOption).toBe("ranked");
-		const order = controller.getState().lastPriorities;
-		expect(order?.stale).toBe(false);
-		expect(order?.items.map(i => [i.rank, i.requirementId, i.priorityClass, i.quote])).toEqual([
-			[1, "req-2", "must_be_first", Q2],
-			[2, "req-1", "later", Q1],
-		]);
-		// The order ranks the accepted batch and says which one.
-		expect(order?.batch.digest).toBe(controller.getState().lastFormalization?.batchDigest);
-		expect(order?.batch.taskFingerprint).toBe(controller.getState().taskFingerprint);
-		expect(outcome.summary).toContain("1. req-2");
-	});
-
-	test("FR-21: a partial ranking and an unaccepted-batch submission record no order", async () => {
-		let calls = 0;
-		const partial = createJevController({
-			judge: async () => judgeResult({}),
-			requirementsFormalizationJudge: traceable(),
-			priorityJudge: async () => {
-				calls++;
-				return { classes: { "req-1": "early" }, confidences: { "req-1": 0.9 }, reasons: [], judged: true };
-			},
-		});
-		await partial.submitDecision(formalize());
-		const refused = await partial.submitDecision(prioritiesInput());
-		expect(calls).toBe(1);
-		expect(refused.verdict).toBe("insufficient_evidence");
-		expect(refused.judged).toBe(false);
-		expect(refused.reasons.join(" ")).toContain("ranked no class for req-2");
-		expect(partial.getState().lastPriorities).toBeUndefined();
-
-		// Nothing accepted means nothing to rank, and the judge is never asked.
-		const fresh = createJevController({
-			judge: async () => judgeResult({}),
-			priorityJudge: async req => {
-				calls++;
-				return classes()(req);
-			},
-		});
-		const nothing = await fresh.submitDecision(prioritiesInput());
-		expect(nothing.judged).toBe(false);
-		expect(nothing.reasons.join(" ")).toContain("ACCEPTED requirements list");
-	});
-
-	test("FR-21: a new accepted batch retires the order by name and the second judged call replaces it", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({
-			judge: gateJudge(),
-			requirementsFormalizationJudge: traceable(),
-			priorityJudge: classes({ "req-1": "later", "req-2": "must_be_first" }),
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", {
-			type: "before_agent_start",
-			prompt: "work task: implement feature X",
-			systemPrompt: [],
-		});
-		await approvePlan(controller);
-		await controller.submitDecision(formalize());
-		await controller.submitDecision(prioritiesInput());
-		const first = controller.getState().lastPriorities;
-		expect(first?.stale).toBe(false);
-
-		// A NEW portion of requirements is accepted: the recorded order no longer ranks it.
-		await controller.submitDecision(
-			formalize({
-				requirements: [{ text: "R3: the export keeps working", quoteId: "quote-3" }],
-				evidence: [...EVIDENCE, evidence("user", Q3)],
-			}),
-		);
-		const retired = controller.getState().lastPriorities;
-		expect(retired?.stale).toBe(true);
-		expect(retired?.staleReason).toContain("re-rank");
-		const feedback = harness.sentMessages
-			.map(m => (isRecord(m.payload) && typeof m.payload["content"] === "string" ? m.payload["content"] : ""))
-			.join("\n");
-		expect(feedback).toContain("requirement_priorities");
-		expect(feedback).toContain("re-rank");
-		// Mutating work does not proceed on the retired order: the gate names the re-rank.
-		const blocked = blockResult(
-			await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} }),
-		);
-		expect(blocked.block).toBe(true);
-		expect(String(blocked.reason)).toContain("requirement_priorities");
-
-		// The second judged call replaces the record and names the batch it superseded.
-		const second = await controller.submitDecision(prioritiesInput());
-		expect(second.verdict).toBe("approve");
-		const replaced = controller.getState().lastPriorities;
-		expect(replaced?.stale).toBe(false);
-		expect(replaced?.supersedes?.digest).toBe(first?.batch.digest);
-		expect(replaced?.batch.digest).toBe(controller.getState().lastFormalization?.batchDigest);
-		expect(replaced?.batch.digest).not.toBe(first?.batch.digest);
-	});
-
-	test("FR-21: work started on an item the order ranks later is named and recorded", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({
-			// The plan-mapping question (single claim) answers with its approved option; the gates
-			// answer the happy path.
-			judge: async req =>
-				req.stage === "plan_mapping"
-					? judgeResult({ selectedOption: PLAN_MAPPING_APPROVED_OPTION, confidence: 0.93 })
-					: gateJudge()(req),
-			claimCheckJudge: allClaimsSupported,
-			requirementsFormalizationJudge: traceable(),
-			priorityJudge: classes({ "req-2": "must_be_first", "req-1": "later" }),
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", {
-			type: "before_agent_start",
-			prompt: "work task: implement feature X",
-			systemPrompt: [],
-		});
-		await approvePlan(controller);
-		await controller.submitDecision(formalize());
-		await controller.submitDecision(prioritiesInput());
-		// The plan starts at req-1, which the judge's order ranked second.
-		await controller.submitDecision(
-			planInput({ planClaims: [{ requirementId: "req-1", claim: "the plan adds the dashboard view" }] }),
-		);
-		const order = controller.getState().lastPriorities;
-		expect(order?.outOfOrder).toEqual({ started: "req-1", expectedFirst: "req-2" });
-		const feedback = harness.sentMessages
-			.map(m => (isRecord(m.payload) && typeof m.payload["content"] === "string" ? m.payload["content"] : ""))
-			.join("\n");
-		expect(feedback).toContain("work order starts at req-1");
-		expect(feedback).toContain("ranks req-2 first");
-	});
-
-	test("F3: a sub-floor automatic course check is recorded as uncertainty, never as not-judged", async () => {
-		const harness = makeFakePi();
-		const controller = createJevController({
-			judge: async () => judgeResult({}),
-			courseCheckJudge: async req => ({
-				onTrack: Object.fromEntries(req.requirements.map(r => [r.id, true] as const)),
-				nextAction: "verify_before_proceeding",
-				reasons: ["more evidence is needed before this continues"],
-				confidence: 0.3,
-				judged: true,
-			}),
-			template: { gates: { mutation: false }, courseCheck: { everyMutations: 1 } },
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", {
-			type: "before_agent_start",
-			prompt: "work task: implement feature X",
-			systemPrompt: [],
-		});
-		await harness.emit("tool_call", { type: "tool_call", toolCallId: "1", toolName: "edit", input: {} });
-		await harness.emit("tool_result", {
-			type: "tool_result",
-			toolCallId: "1",
-			toolName: "edit",
-			content: [{ type: "text", text: "applied edit 1" }],
-			isError: false,
-		});
-		await controller.automaticCourseChecksSettled();
-		const record = controller.getState().lastAutoCourseCheck;
-		expect(record?.judged).toBe(true);
-		expect(record?.belowFloor).toBe(true);
-		expect(record?.selectedOption).toBe("verify_before_proceeding");
-		expect(record?.confidence).toBe(0.3);
-		expect(record?.reasons.join(" ")).toContain("more evidence is needed");
-		const feedback = harness.sentMessages
-			.map(m => (isRecord(m.payload) && typeof m.payload["content"] === "string" ? m.payload["content"] : ""))
-			.join("\n");
-		expect(feedback).toContain("recorded uncertainty");
-		expect(feedback).toContain("below the floor");
-		expect(feedback).not.toContain("not judged");
-		// Advisory still: nothing blocked, no gate credit, no rework spent.
-		expect(controller.getState().blockers).toEqual([]);
-		expect(controller.getState().iterations).toEqual({});
-		expect(controller.getState().lastCourseCheck).toBeUndefined();
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), session.ctx))).toContain("jev_triage");
 	});
 });
 
-// ---------- review findings closed in this slice (see the slice report) ----------
+describe("T2, T3 - the first consequential change waits for triage (FR-01, FR-02, FR-10, FR-18)", () => {
+	test("FR-02, FR-10: a confirmed simple task proceeds, and a new prompt does not inherit it", async () => {
+		const ctx = fakeCtx();
+		const { pi, calls } = controllerFor({ needs_development: { probability: 0.04 } });
 
-describe("jev controller: findings from the independent review of HEAD 35b4d76", () => {
-	test("an approved attempt never consumes the rework bound and never spends its approach", async () => {
-		const harness = makeFakePi();
-		let calls = 0;
-		const controller = createJevController({
-			judge: async () => {
-				calls++;
-				return calls <= 3
-					? judgeResult({ selectedOption: "a", confidence: 0.95 })
-					: { verdict: "revise", reasons: ["the claim is not supported by the quoted source"], confidence: 0.9 };
-			},
-			maxReworkIterations: 3,
-		});
-		controller.register(harness.pi);
-		for (const approach of [
-			"verify after the first mutation",
-			"verify after the second mutation",
-			"verify after the third mutation",
-		]) {
-			const approved = await controller.submitDecision(validDecisionInput({ approach }));
-			expect(approved.verdict).toBe("approve");
-		}
-		// Three benign approvals must not close the stage: a real rejection is still judged.
-		const rejected = await controller.submitDecision(
-			validDecisionInput({ approach: "state the outcome plus the evidence that settles it" }),
-		);
-		expect(calls).toBe(4);
-		expect(rejected.verdict).toBe("revise");
-		expect(controller.getState().blockers.join(" ")).not.toContain("rework bound exhausted");
-		// An APPROVED approach is not a spent approach: naming it again later is a new consultation.
-		const again = await controller.submitDecision(
-			validDecisionInput({ approach: "verify after the first mutation", proposal: "the same move, later work" }),
-		);
-		expect(calls).toBe(5);
-		expect(again.verdict).toBe("revise");
-		expect(again.reasons.join(" ")).not.toContain("approach_already_spent");
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toContain("jev_triage");
+		// The judge routes and the read-only tools stay free while the gate is shut.
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "xd://jev_consult", content: "{}" }), ctx))).toBeUndefined();
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "local://x-plan.md", content: "# plan" }), ctx))).toBeUndefined();
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("read", { path: "src/a.ts" }), ctx))).toBeUndefined();
+
+		expect(toolFailed(await pi.callTool("jev_triage", { request: "Search the web for the release date" }, ctx))).toBe(false);
+		expect(calls).toHaveLength(1);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toBeUndefined();
+
+		await pi.emit("before_agent_start", { type: "before_agent_start", prompt: "Now rewrite the parser", systemPrompt: [] }, ctx);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/b.ts", content: "x" }), ctx))).toContain("jev_triage");
 	});
 
-	test("a consumed work order is not counted as in flight: the next spawn judges the live order", async () => {
-		const ORDER_1 = "Add module M implementing feature X and run the dashboard test suite.";
-		const ORDER_2 = "Add module N carrying the dashboard export and run the export test suite.";
-		const calls: DecisionRequest[] = [];
-		const harness = makeFakePi();
-		const controller = createJevController({
-			template: {
-				stages: { subagent_handoff: { instructions: "Judge the hand-off only from the quoted material." } },
-				// The acceptance side keeps a judged order in the session until the delivered result,
-				// which is exactly the state that used to make the next spawn look unattributable.
-				gates: { handoffAcceptance: true },
-			} as JevTemplateConfig,
-			judge: async req => {
-				calls.push(req);
-				return { verdict: "insufficient_evidence", reasons: ["insufficient_evidence"], confidence: 0.31 };
-			},
-		});
-		controller.register(harness.pi);
-		await harness.emit("before_agent_start", {
-			type: "before_agent_start",
-			prompt: "Implement feature X for the dashboard and keep the existing export working.",
-			systemPrompt: [],
-		});
-		// The host's real sequence: capture a work order, spawn, then capture the next one. A
-		// consumed order must not make the single live order look like "several in flight".
-		const spawn = async (spawnKey: string): Promise<void> => {
-			await harness.emit("before_subagent_spawn", {
-				type: "before_subagent_spawn",
-				agent: "task",
-				invocationKind: "task",
-				patterns: ["@task"],
-				spawnKey,
-			});
+	test("FR-01: a development triage replaces a simple verdict with the plan requirement", async () => {
+		const ctx = fakeCtx();
+		const judge: Judge = async (state, questions) => {
+			const deep = (state as Record<string, unknown>)["request"] === "Build the report";
+			return {
+				ok: true,
+				model: "fake",
+				answers: [
+					{
+						name: questions[0]?.name ?? "needs_development",
+						mode: "noul",
+						probability: deep ? 0.95 : 0.04,
+						confidence: deep ? 0.95 : 0.04,
+					},
+				],
+			};
 		};
-		await harness.emit("tool_call", {
-			type: "tool_call",
-			toolCallId: "t1",
-			toolName: "task",
-			input: { task: ORDER_1, agent: "task" },
+		const pi = fakePi();
+		createJevController({ judge, config: config(), zod: fakeZod() }).register(pi.api);
+		await pi.callTool("jev_triage", { request: "Search the web" }, ctx);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toBeUndefined();
+
+		await pi.emit("before_agent_start", { type: "before_agent_start", prompt: "Build the report", systemPrompt: [] }, ctx);
+		await pi.callTool("jev_triage", { request: "Build the report" }, ctx);
+
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toContain("jev_plan_review");
+	});
+});
+
+describe("T4 - the interval check holds changes while it is in flight (FR-11)", () => {
+	test("FR-11: a consequential change is blocked until the course check returns", async () => {
+		let entered = false;
+		let release = (): void => {};
+		const pending = new Promise<void>(resolve => {
+			release = resolve;
 		});
-		await spawn("t1:0");
-		expect(calls).toHaveLength(1);
-		await harness.emit("tool_call", {
-			type: "tool_call",
-			toolCallId: "t2",
-			toolName: "task",
-			input: { task: ORDER_2, agent: "task" },
-		});
-		await spawn("t2:0");
-		// The second spawn was judged against the SECOND work order, not discarded as "several in flight".
-		expect(calls).toHaveLength(2);
-		expect(calls[1]?.evidence.some(e => e.quote.includes(ORDER_2))).toBe(true);
-		expect(controller.getState().lastHandoff?.judged).toBe(true);
-		// A third spawn has no live order left, and the record says exactly that.
-		await spawn("t3:0");
-		expect(controller.getState().lastHandoff?.judged).toBe(false);
-		expect(controller.getState().lastHandoff?.reasons.join(" ")).toContain("already used");
+		const fake = answeringJudge({ needs_development: TRIAGE_DEEP, plan: PLAN_SERVES, direction: ON_COURSE });
+		const judge: Judge = async (state, questions) => {
+			if (questions.some(question => question.name === "direction")) {
+				entered = true;
+				await pending;
+			}
+			return fake.judge(state, questions);
+		};
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_CONTENT }) });
+		const pi = fakePi();
+		createJevController({ judge, config: config({ interval: 1 }), zod: fakeZod() }).register(pi.api);
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
+
+		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 bytes"), ctx);
+		expect(await until(() => entered)).toBe(true);
+
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/b.ts", content: "x" }), ctx))).toContain("course check");
+
+		release();
+		expect(await until(() => pi.messages.some(message => message.customType === "jev.course_check"))).toBe(true);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/b.ts", content: "x" }), ctx))).toBeUndefined();
 	});
 });

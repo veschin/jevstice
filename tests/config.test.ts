@@ -1,275 +1,88 @@
-/**
- * Template-override config tests: load precedence, merge, fail-closed invalid cases,
- * defaults unchanged when absent (R1-R6).
- */
 import { describe, expect, test } from "bun:test";
-import {
-	JevConfigError,
-	loadJevTemplateConfig,
-	mergeTemplateConfigs,
-	validateTemplateConfig,
-	type JevTemplateConfig,
-} from "../src/config.js";
+import { DEFAULT_CONFIG, configPaths, loadJevConfig } from "../src/config.js";
 
-function loader(files: Record<string, string>) {
-	return (p: string) => files[p];
+const USER_FILE = "/home/owner/.omp/agent/jev.config.json";
+const PROJECT_FILE = "/work/.omp/jev.config.json";
+
+/** A config reader over an in-memory file table. */
+function reader(files: Record<string, string>) {
+	return (path: string): string | null => files[path] ?? null;
 }
 
-const HOME = "/home/test";
-const CWD = "/work/project";
-const USER_FILE = `${HOME}/.omp/agent/jev.config.json`;
-const PROJECT_FILE = `${CWD}/.omp/jev.config.json`;
+describe("T4 - configuration of the gates and the course check", () => {
+	test("the fail-closed defaults apply when no file exists", () => {
+		const config = loadJevConfig({ cwd: "/work", home: "/home/owner", read: reader({}) });
 
-describe("jev template config", () => {
-	test("project overrides user per-key; missing user file fine", () => {
-		const cfg = loadJevTemplateConfig(
-			CWD,
-			HOME,
-			loader({
-				[USER_FILE]: JSON.stringify({
-					stages: { completion_review: { instructions: "user wording" } },
-					confidenceThreshold: 0.9,
-					capabilities: ["a"],
-				}),
+		expect(config).toEqual(DEFAULT_CONFIG);
+		expect(config.gates.mutation).toBe(true);
+		expect(config.gates.completion).toBe(true);
+		expect(config.courseCheck.mode).toBe("interval");
+	});
+
+	test("the project file overrides the user file and unknown keys are ignored", () => {
+		const config = loadJevConfig({
+			cwd: "/work",
+			home: "/home/owner",
+			read: reader({
+				[USER_FILE]: JSON.stringify({ gates: { mutation: true }, courseCheck: { mode: "completion", interval: 5 } }),
 				[PROJECT_FILE]: JSON.stringify({
-					stages: { completion_review: { instructions: "project wording" } },
+					gates: { completion: true },
+					courseCheck: { interval: 2 },
+					// A file written for the old shape must still load: its other keys are ignored.
+					routing: { skills: [{ id: "test-driven-development" }] },
 				}),
 			}),
-		);
-		expect(cfg.stages?.completion_review?.instructions).toBe("project wording");
-		expect(cfg.confidenceThreshold).toBe(0.9);
-		expect(cfg.capabilities).toEqual(["a"]);
-	});
-
-	test("R4 trust split: project cannot replace user confidenceThreshold", () => {
-		const cfg = loadJevTemplateConfig(
-			CWD,
-			HOME,
-			loader({
-				[USER_FILE]: JSON.stringify({ confidenceThreshold: 0.95 }),
-				[PROJECT_FILE]: JSON.stringify({ confidenceThreshold: 0.81 }),
-			}),
-		);
-		expect(cfg.confidenceThreshold).toBe(0.95);
-	});
-
-	test("fail-closed: invalid JSON names the file", () => {
-		try {
-			loadJevTemplateConfig(CWD, HOME, loader({ [PROJECT_FILE]: "{not json" }));
-			expect.unreachable();
-		} catch (err) {
-			expect(err).toBeInstanceOf(JevConfigError);
-			expect((err as JevConfigError).file).toBe(PROJECT_FILE);
-			expect((err as Error).message).toContain(PROJECT_FILE);
-			expect((err as Error).message).toContain("invalid JSON");
-		}
-	});
-
-	test("fail-closed: unknown stage key names file and key", () => {
-		expect(() =>
-			loadJevTemplateConfig(
-				CWD,
-				HOME,
-				loader({ [PROJECT_FILE]: JSON.stringify({ stages: { nonsense_stage: {} } }) }),
-			),
-		).toThrow(/nonsense_stage/);
-	});
-
-	test("fail-closed: confidenceThreshold outside 0..1", () => {
-		for (const bad of [-0.1, 1.5, "high"]) {
-			expect(() =>
-				validateTemplateConfig(PROJECT_FILE, { confidenceThreshold: bad }),
-			).toThrow(JevConfigError);
-		}
-	});
-
-	test("fail-closed: wrong types in stages", () => {
-		expect(() =>
-			validateTemplateConfig(PROJECT_FILE, { stages: { completion_review: { instructions: "" } } }),
-		).toThrow(/instructions/);
-		expect(() =>
-			validateTemplateConfig(PROJECT_FILE, { stages: { completion_review: { options: [{ id: "a" }] } } }),
-		).toThrow(/options/);
-	});
-
-	test("R3: options overrides need at least 2 unique-id options", () => {
-		expect(() =>
-			validateTemplateConfig(PROJECT_FILE, {
-				stages: { completion_review: { options: [{ id: "a", label: "A", meaning: "m" }] } },
-			}),
-		).toThrow(/at least 2/);
-		expect(() =>
-			validateTemplateConfig(PROJECT_FILE, {
-				stages: {
-					completion_review: {
-						options: [
-							{ id: "a", label: "A", meaning: "m" },
-							{ id: "a", label: "A2", meaning: "m2" },
-						],
-					},
-				},
-			}),
-		).toThrow(/unique/);
-	});
-
-	test("fail-closed: capabilities must be non-empty strings", () => {
-		expect(() => validateTemplateConfig(PROJECT_FILE, { capabilities: ["ok", ""] })).toThrow(/capabilities/);
-	});
-
-	test("controlPoints: on_demand accepted, gate triggers fail-closed naming file+key", () => {
-		const cfg = validateTemplateConfig(PROJECT_FILE, {
-			controlPoints: {
-				risk_assessment: { trigger: "on_demand", instructions: "weigh blast radius" },
-			},
 		});
-		expect(cfg.controlPoints?.risk_assessment?.trigger).toBe("on_demand");
-		try {
-			validateTemplateConfig(PROJECT_FILE, {
-				controlPoints: { cut_files: { trigger: "mutation_gate" } },
-			});
-			expect.unreachable();
-		} catch (err) {
-			expect(err).toBeInstanceOf(JevConfigError);
-			expect((err as Error).message).toContain(PROJECT_FILE);
-			expect((err as Error).message).toContain("cut_files");
-			expect((err as Error).message).toContain("on_demand");
-		}
+
+		expect(config.gates).toEqual({ mutation: true, completion: true });
+		expect(config.courseCheck).toEqual({ mode: "completion", interval: 2 });
+		expect(config.problems).toEqual([]);
 	});
 
-	test("D2: completion.confidenceFloor above the strict bar rejected as inert", () => {
-		try {
-			validateTemplateConfig(PROJECT_FILE, { completion: { confidenceFloor: 0.85 } });
-			expect.unreachable();
-		} catch (err) {
-			expect(err).toBeInstanceOf(JevConfigError);
-			expect((err as Error).message).toContain("confidenceFloor");
-			expect((err as Error).message).toContain("inert");
-		}
-	});
-
-	test("merge is per-key and keeps untouched keys", () => {
-		const user: JevTemplateConfig = {
-			stages: {
-				completion_review: { instructions: "u" },
-				important_decision: { instructions: "keep" },
-			},
-			capabilities: ["x"],
-		};
-		const project: JevTemplateConfig = {
-			stages: { completion_review: { options: [{ id: "a", label: "A", meaning: "m" }, { id: "b", label: "B", meaning: "n" }] } },
-		};
-		const merged = mergeTemplateConfigs(user, project);
-		expect(merged.stages?.completion_review?.options?.length).toBe(2);
-		expect(merged.stages?.completion_review?.instructions).toBeUndefined();
-		expect(merged.stages?.important_decision?.instructions).toBe("keep");
-		expect(merged.capabilities).toEqual(["x"]);
-	});
-});
-
-describe("jev template config: gates switch", () => {
-	test("trust split: the switch is user-owned, a project file cannot turn it back on", () => {
-		const merged = mergeTemplateConfigs({ gates: { mutation: false } }, { gates: { mutation: true } });
-		expect(merged.gates?.mutation).toBe(false);
-	});
-
-	test("fail-closed: gates.mutation must be a boolean and gates an object", () => {
-		expect(() => validateTemplateConfig(PROJECT_FILE, { gates: { mutation: "no" } })).toThrow(/gates\.mutation/);
-		expect(() => validateTemplateConfig(PROJECT_FILE, { gates: [] })).toThrow(/gates must be an object/);
-	});
-});
-
-describe("jev template config: completion switch", () => {
-	test("gates.completion=false is parsed and fails closed on a non-boolean", () => {
-		expect(validateTemplateConfig(USER_FILE, { gates: { completion: false } }).gates?.completion).toBe(false);
-		expect(() => validateTemplateConfig(PROJECT_FILE, { gates: { completion: 1 } })).toThrow(/gates\.completion/);
-	});
-});
-
-describe("jev template config: destructive-action gate", () => {
-	test("union: the user's destructive list survives and a project may add to it, never remove", () => {
-		const merged = mergeTemplateConfigs(
-			{ gates: { destructive: { patterns: ["rm -rf"] } } },
-			{ gates: { destructive: { patterns: ["anything", "rm -rf"] } } },
-		);
-		expect(merged.gates?.destructive?.patterns).toEqual(["rm -rf", "anything"]);
-	});
-
-	test("fail-closed: a malformed destructive block names the file and the problem", () => {
-		for (const bad of [
-			{ destructive: [] },
-			{ destructive: "rm -rf" },
-			{ destructive: {} },
-			{ destructive: { patterns: "rm -rf" } },
-			{ destructive: { patterns: ["rm -rf", ""] } },
-			{ destructive: { patterns: [1] } },
-		]) {
-			try {
-				validateTemplateConfig(PROJECT_FILE, { gates: bad });
-				expect.unreachable();
-			} catch (err) {
-				expect(err).toBeInstanceOf(JevConfigError);
-				expect((err as Error).message).toContain(PROJECT_FILE);
-				expect((err as Error).message).toContain("gates.destructive");
-			}
-		}
-	});
-});
-
-describe("jev template config: routing candidates", () => {
-	test("routing lists are parsed; empty or malformed lists fail closed", () => {
-		const parsed = validateTemplateConfig(USER_FILE, {
-			routing: {
-				skills: [{ id: "s1", label: "S1", meaning: "m" }],
-				models: [{ id: "m1", label: "M1", meaning: "m" }],
-				allowlist: ["m1"],
-			},
+	test("a gate can only be turned off explicitly", () => {
+		const config = loadJevConfig({
+			cwd: "/work",
+			home: "/home/owner",
+			read: reader({ [PROJECT_FILE]: JSON.stringify({ gates: { mutation: false, completion: false } }) }),
 		});
-		expect(parsed.routing?.skills?.length).toBe(1);
-		expect(parsed.routing?.allowlist).toEqual(["m1"]);
-		expect(() => validateTemplateConfig(PROJECT_FILE, { routing: { skills: [] } })).toThrow(/routing\.skills/);
-		expect(() => validateTemplateConfig(PROJECT_FILE, { routing: { models: [{ id: "m", label: "M" }] } })).toThrow(/meaning/);
-		expect(() => validateTemplateConfig(PROJECT_FILE, { routing: { allowlist: [] } })).toThrow(/allowlist/);
+
+		expect(config.gates).toEqual({ mutation: false, completion: false });
 	});
 
-	test("the candidate lists are user-owned in the merge", () => {
-		const merged = mergeTemplateConfigs(
-			{ routing: { skills: [{ id: "user", label: "U", meaning: "m" }] } },
-			{ routing: { skills: [{ id: "proj", label: "P", meaning: "m" }] } },
-		);
-		expect(merged.routing?.skills?.[0]?.id).toBe("user");
-	});
-});
-
-describe("jev template config: automatic course check", () => {
-	test("fail-closed: a malformed courseCheck block names the file and the problem", () => {
-		for (const bad of [
-			{ courseCheck: 2 },
-			{ courseCheck: [] },
-			{ courseCheck: {} },
-			{ courseCheck: { everyMutations: "2" } },
-			{ courseCheck: { everyMutations: -1 } },
-			{ courseCheck: { everyMutations: 1.5 } },
-			{ courseCheck: { everyMutations: null } },
-		]) {
-			try {
-				validateTemplateConfig(PROJECT_FILE, bad);
-				expect.unreachable();
-			} catch (err) {
-				expect(err).toBeInstanceOf(JevConfigError);
-				expect((err as Error).message).toContain(PROJECT_FILE);
-				expect((err as Error).message).toContain("courseCheck.everyMutations");
-			}
-		}
-	});
-
-	test("trust split: the period is user-owned, like the gates", () => {
-		const merged = mergeTemplateConfigs(
-			{ courseCheck: { everyMutations: 3 } },
-			{ courseCheck: { everyMutations: 1 } },
-		);
-		expect(merged.courseCheck).toEqual({ everyMutations: 3 });
-		expect(mergeTemplateConfigs({}, { courseCheck: { everyMutations: 4 } }).courseCheck).toEqual({
-			everyMutations: 4,
+	test("an invalid value keeps the fail-closed default and names the file and the key", () => {
+		const config = loadJevConfig({
+			cwd: "/work",
+			home: "/home/owner",
+			read: reader({
+				[PROJECT_FILE]: JSON.stringify({
+					gates: { mutation: "yes", completion: 1 },
+					courseCheck: { mode: "sometimes", interval: 0 },
+				}),
+			}),
 		});
+
+		expect(config.gates).toEqual({ mutation: true, completion: true });
+		expect(config.courseCheck).toEqual({ mode: "interval", interval: 3 });
+		expect(config.problems).toHaveLength(4);
+		expect(config.problems.join(" ")).toContain(PROJECT_FILE);
+		expect(config.problems.join(" ")).toContain("gates.mutation");
+		expect(config.problems.join(" ")).toContain("courseCheck.interval");
+	});
+
+	test("a file that is not JSON keeps every default in force", () => {
+		const config = loadJevConfig({
+			cwd: "/work",
+			home: "/home/owner",
+			read: reader({ [PROJECT_FILE]: "{oops", [USER_FILE]: "[]" }),
+		});
+
+		expect(config).toEqual({ ...DEFAULT_CONFIG, problems: config.problems });
+		expect(config.problems).toHaveLength(2);
+		expect(config.problems.join(" ")).toContain(USER_FILE);
+		expect(config.problems.join(" ")).toContain(PROJECT_FILE);
+	});
+
+	test("the user file is read before the project file", () => {
+		expect(configPaths({ cwd: "/work", home: "/home/owner" })).toEqual([USER_FILE, PROJECT_FILE]);
 	});
 });

@@ -4,14 +4,10 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "bun test",
-    "cli": "bun run src/cli.ts"
+    "test": "bun test"
   },
   "engines": {
     "bun": ">=1.1"
-  },
-  "omp": {
-    "extensions": ["src/index.ts"]
   },
   "devDependencies": {
     "@types/bun": "^1.1.0",
