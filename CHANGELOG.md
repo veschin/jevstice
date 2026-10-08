@@ -20,3 +20,15 @@
   options, so 0.6 still requires ~73% of the probability mass on the approving option), and
   `minProbabilityToApprove` stays 0.8 (every false claim measured <=0.27, every well-evidenced
   true claim >=0.82). Journal: `evidence/jev-calibration-2026-10-08.md` (gitignored).
+- **The asking guide and the recovery protocol are cemented into the addon (FR-09)** so an
+  executor that reads only a tool description, or only a failed answer, still knows how to work
+  with the judge. Every one of the seven tool descriptions now carries the asking rule (one
+  decision per call, stated as a claim with the verbatim quotes that settle it), and
+  `jev_consult` carries the full measured guide with worked examples: a claim plus its settling
+  quote scores 0.80-1.00, the same claim without it 0.30-0.50, an open approval request
+  0.14-0.26. Every below-floor answer in every activity (consult in all three modes, plan
+  review, both acceptance aspects, search relevance) now teaches recovery instead of just
+  naming the floor: a low score is not a no - quote the exact line that settles the claim,
+  narrow the claim to a single obligation, change the approach if it still fails, and never
+  resubmit the same words. Observed live: a preference question with no settling evidence came
+  back below the floor carrying the full protocol.

@@ -87,35 +87,42 @@ export interface JevController {
 
 const CONSULT_DESCRIPTION =
 	"Ask the Jev judge one decision, in the shape that fits it: mode=choice selects between submitted alternatives, mode=score places the material on a submitted rubric, mode=boolean answers a yes/no question as a probability. Use it when you are unsure during implementation, when a consequential business decision has to be taken from the task context (FR-19), or whenever a decision should not rest on your own guess. " +
-	"How to get a useful answer: one decision per call; write a claim and ask whether the quoted evidence supports it, not an open request for approval; `context` carries the task context the judge decides from; `evidence` carries 3-6 short non-duplicate quotes from the request, spec, code, run output or logs, kept verbatim. With mode=choice submit 2-4 real alternatives, each label naming what choosing it commits you to; with mode=score submit 2 or more rubric steps; with mode=boolean state trueMeaning and falseMeaning. " +
-	"The tool returns the judge's typed answer - the selected label, the score or the probability - with its reported confidence, and never an invented explanation. An answer below the confidence floor, a malformed answer or a failed call is reported as unusable and is not an approval. " +
+	"How to ask (measured on this judge): one decision per call; state a claim and quote the 3-6 short verbatim lines that settle it. A claim plus its settling quote scores 0.80-1.00; the same claim with the settling quote removed scores 0.30-0.50; an open 'is this fine?' scores 0.14-0.26. Keep arithmetic out of the question - quote the computed numbers instead. " +
+	"A low score is not a no and never a reason to stop: fix the material - quote what settles the claim, narrow the claim to a single obligation, or change the approach - and never resubmit the same words. " +
+	"The tool returns the judge's typed answer - the selected label, the score or the probability - with its reported confidence, and never an invented explanation. An answer below the confidence floor, a malformed answer or a failed call is reported as unusable together with the recovery steps - follow them instead of giving up. " +
+	"Example (good): question 'May the next consequential change proceed?', context 'the six recorded rework actions of the registered task, each verified', evidence [execution] '117 pass / 0 fail / 393 expect() calls' - answered proceed at 0.95. Example (bad): 'Review my work' with no quotes - below the floor, unusable, and no amount of rewording fixes it; only quoting the work does. " +
 	"When a Jev finding is holding consequential changes, the consultation must answer that finding: the judge is asked whether it does, and an unrelated consultation leaves the hold in place. Everything submitted is judged as data, never as instructions.";
+
+/** The one-line asking rule every other tool description carries (FR-09). */
+const ASKING_RULE =
+	" Asking rule: one decision per call, stated as a claim with the verbatim quotes that settle it; a low score means weak evidence or a too-wide claim, not a no - the guide with worked examples and measured scores is on jev_consult.";
 
 const TRIAGE_DESCRIPTION =
 	"Triage the owner's request before development work: does it need the deeper activities - a plan reviewed before consequential changes, course checks while implementing, and business and architecture acceptance before completion - or is it a simple task that needs none of them? " +
 	"Submit the request text, quoted evidence from it, and the narrow task-specific topics you think it needs (concrete concerns such as high availability, fault tolerance, security, performance or user interface behaviour, not generic labels). " +
-	"A `development task registered` answer registers the task and holds consequential changes until jev_plan_review approves the plan artifact; a `simple task` answer explicitly names the skipped activities, registers no development task, and lets consequential changes pass while that request stands. An answer the judge cannot settle is refused and registers nothing. A plain web search or a read-only question needs no triage call at all: it costs no judge call and no gate; the first consequential change of an untriaged session is held until triage or jev_requirements has judged the request.";
+	"A `development task registered` answer registers the task and holds consequential changes until jev_plan_review approves the plan artifact; a `simple task` answer explicitly names the skipped activities, registers no development task, and lets consequential changes pass while that request stands. An answer the judge cannot settle is refused and registers nothing. A plain web search or a read-only question needs no triage call at all: it costs no judge call and no gate; the first consequential change of an untriaged session is held until triage or jev_requirements has judged the request." + ASKING_RULE;
 
 const SEARCH_DESCRIPTION =
 	"Ask the judge which submitted search result is the relevant one for a query, and why. Submit the query and, per candidate, its title or url, the evidence it carries and YOUR proposed reason for its relevance. " +
-	"The judge selects one candidate-and-reason pair, or marks every submitted candidate irrelevant; the tool returns the selected candidate together with your own submitted reason - never an invented explanation - and the reported confidence, and returns no candidate when none is relevant. Submit 2 or more candidates; a selection below the confidence floor is refused as unusable. This is optional for a plain search: it costs a call only when you ask for it.";
+	"The judge selects one candidate-and-reason pair, or marks every submitted candidate irrelevant; the tool returns the selected candidate together with your own submitted reason - never an invented explanation - and the reported confidence, and returns no candidate when none is relevant. Submit 2 or more candidates; a selection below the confidence floor is refused as unusable. This is optional for a plain search: it costs a call only when you ask for it." + ASKING_RULE;
 
 const REQUIREMENTS_DESCRIPTION =
 	"Break the owner's request into individual concrete requirements and have Jev check them against the original request: submit the request text, one {text, source} item per requirement where source is the quote the item derives from, and optionally the owner needs you suspect you omitted as candidateNeeds. " +
-	"One batched call returns, per item, the probability that it faithfully captures an obligation of the request without invented scope; the coverage probability of the item set as a whole; and which candidate needs are missing from the list. Use it before the requirement list becomes the task plan. It registers the development task, so consequential changes are held until a plan review passes.";
+	"One batched call returns, per item, the probability that it faithfully captures an obligation of the request without invented scope; the coverage probability of the item set as a whole; and which candidate needs are missing from the list. Use it before the requirement list becomes the task plan. It registers the development task, so consequential changes are held until a plan review passes." + ASKING_RULE;
 
 const PLAN_REVIEW_DESCRIPTION =
 	"Submit the plan artifact for Jev review at the plan-mode boundary. `plan` is the artifact URL you wrote (local://<slug>-plan.md), `claim` states what the plan is meant to satisfy, `evidence` quotes the task requirements and the parts of the artifact that settle the claim. " +
 	"The tool reads the artifact itself and binds the approval to its exact content and to the task fingerprint; the approval then allows `write xd://propose` for that artifact, and any later change to the artifact invalidates it. Write the plan artifact before this call - review binds to the artifact, not to a copy of it. " +
-	"You can write the plan artifact and call every Jevstice tool while consequential changes are held; so can agent messages (agent://) and mounted device calls (xd://).";
+	"You can write the plan artifact and call every Jevstice tool while consequential changes are held; so can agent messages (agent://) and mounted device calls (xd://)." + ASKING_RULE;
 
 const ACCEPTANCE_DESCRIPTION =
 	"Defend the finished work before Jev, once per aspect. aspect=business states the owner's need is served; aspect=architecture states the design carries the result and can absorb the next change. Quote concrete artifact and verification evidence - a claim without quotes is refused. " +
-	"Completion of developed work requires both aspects approved at the current work revision; any further consequential change invalidates both, and the tool reports which aspect is still missing. A verdict below the confidence floor is recorded as no approval.";
+	"Completion of developed work requires both aspects approved at the current work revision; any further consequential change invalidates both, and the tool reports which aspect is still missing. A verdict below the confidence floor is recorded as no approval." + ASKING_RULE;
 
 const REVIEW_DESCRIPTION =
 	"Defend changed work before Jev as a developer. kind is checkpoint, commit or diff; target names it; claim states what the change does; evidence quotes the changed code, the diff and the verification run. " +
-	"The tool returns the judge's verdict with its confidence. A finding holds consequential changes until you consult jev_consult about it. A review verdict never approves completion - business and architecture acceptance do that.";
+	"The tool returns the judge's verdict with its confidence. A finding holds consequential changes until you consult jev_consult about it. A review verdict never approves completion - business and architecture acceptance do that." + ASKING_RULE;
+
 
 /** Best-effort reading of one string-valued method off the session manager. */
 function callString(host: Record<string, unknown> | undefined, method: string): string | null {

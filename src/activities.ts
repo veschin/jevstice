@@ -93,10 +93,17 @@ function refused(problem: string): ToolOutcome {
 	return { ok: false, text: `The submission was refused and nothing was approved: ${problem}` };
 }
 
+/**
+ * The recovery protocol every below-floor answer teaches (FR-09): a low score means the judge
+ * split its probability over the options, which is a defect of the submitted material, never a
+ * verdict to abandon. Measured on the live judge 2026-10-08 (evidence/jev-calibration-2026-10-08.md).
+ */
+const LOW_SCORE_RECOVERY =
+	" A low score is not a no: the judge split its probability because the claim or its evidence is weak, so the material - not the answer - is what to fix. Work, do not stop and do not resubmit the same words: (1) quote the exact line that settles the claim (a rule, a run output, an artifact fragment); (2) narrow the claim to a single obligation; (3) if it still fails, change the approach entirely. Measured on this judge: a claim plus its settling quote scores 0.80-1.00, the same claim with the settling quote removed scores 0.30-0.50, an open approval request scores 0.14-0.26.";
+
 function unusable(problem: string): ToolOutcome {
 	return { ok: false, text: `The judge answer is unusable and is not an approval: ${problem}` };
 }
-
 function text(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }
@@ -296,7 +303,7 @@ export async function consult(deps: ActivityDeps, state: JevState, params: unkno
 		const meaning = judgeQuestion.options?.[label] ?? "";
 		const usable = choseLabel(outcome, CONSULT_QUESTION, label);
 		if (usable && resolved) delete state.hold;
-		const summary = `consult (choice): ${label} - ${meaning} (confidence ${percent(answer.confidence)})${usable ? "" : `, below the ${POLICY.minConfidenceToApprove} floor - not usable as an answer`}${release}`;
+		const summary = `consult (choice): ${label} - ${meaning} (confidence ${percent(answer.confidence)})${usable ? "" : `, below the ${POLICY.minConfidenceToApprove} floor - not usable as an answer.${LOW_SCORE_RECOVERY}`}${release}`;
 		return usable
 			? { ok: true, text: summary, details: { mode, label, meaning, confidence: answer.confidence } }
 			: { ok: false, text: summary, details: { mode, label, meaning, confidence: answer.confidence } };
@@ -306,7 +313,7 @@ export async function consult(deps: ActivityDeps, state: JevState, params: unkno
 		const level = Math.max(0, Math.min(criteria.length - 1, Math.round(value)));
 		const usable = answer.confidence >= POLICY.minConfidenceToApprove;
 		if (usable && resolved) delete state.hold;
-		const summary = `consult (score): ${value.toFixed(2)} - nearest rubric step ${level}: ${criteria[level] ?? ""} (confidence ${percent(answer.confidence)})${usable ? "" : `, below the ${POLICY.minConfidenceToApprove} floor - not usable as an answer`}${release}`;
+		const summary = `consult (score): ${value.toFixed(2)} - nearest rubric step ${level}: ${criteria[level] ?? ""} (confidence ${percent(answer.confidence)})${usable ? "" : `, below the ${POLICY.minConfidenceToApprove} floor - not usable as an answer.${LOW_SCORE_RECOVERY}`}${release}`;
 		return usable
 			? { ok: true, text: summary, details: { mode, score: value, level, confidence: answer.confidence } }
 			: { ok: false, text: summary, details: { mode, score: value, level, confidence: answer.confidence } };
@@ -315,7 +322,7 @@ export async function consult(deps: ActivityDeps, state: JevState, params: unkno
 	const usable = yes >= POLICY.minProbabilityToApprove || 1 - yes >= POLICY.minProbabilityToApprove;
 	if (usable && resolved) delete state.hold;
 	const verdict = yes >= POLICY.minProbabilityToApprove ? "yes" : "no";
-	const summary = `consult (boolean): ${verdict} - probability of yes ${percent(yes)}${usable ? "" : `, neither outcome reaches the ${POLICY.minProbabilityToApprove} floor - not usable as an answer`}${release}`;
+	const summary = `consult (boolean): ${verdict} - probability of yes ${percent(yes)}${usable ? "" : `, neither outcome reaches the ${POLICY.minProbabilityToApprove} floor - not usable as an answer.${LOW_SCORE_RECOVERY}`}${release}`;
 	return usable
 		? { ok: true, text: summary, details: { mode, probability: yes, verdict, confidence: yes } }
 		: { ok: false, text: summary, details: { mode, probability: yes, verdict, confidence: yes } };
@@ -444,7 +451,7 @@ export async function searchRelevance(
 	if (answer.label === NONE_RELEVANT) {
 		if (answer.confidence < POLICY.minConfidenceToApprove) {
 			return unusable(
-				`the judge marked no candidate relevant with confidence ${percent(answer.confidence)}, below the ${POLICY.minConfidenceToApprove} floor; re-search and submit candidates that carry evidence for the query`,
+				`the judge marked no candidate relevant with confidence ${percent(answer.confidence)}, below the ${POLICY.minConfidenceToApprove} floor; re-search and submit candidates that carry evidence for the query.${LOW_SCORE_RECOVERY}`,
 			);
 		}
 		return {
@@ -458,7 +465,7 @@ export async function searchRelevance(
 	if (selected === undefined) return unusable("the judge selected a candidate that was not submitted");
 	if (answer.confidence < POLICY.minConfidenceToApprove) {
 		return unusable(
-			`the judge selected ${selected.title} with confidence ${percent(answer.confidence)}, below the ${POLICY.minConfidenceToApprove} floor; re-search and submit stronger evidence`,
+			`the judge selected ${selected.title} with confidence ${percent(answer.confidence)}, below the ${POLICY.minConfidenceToApprove} floor; re-search and submit stronger evidence.${LOW_SCORE_RECOVERY}`,
 		);
 	}
 	return {
@@ -655,7 +662,7 @@ export async function planReview(
 	delete state.plan;
 	if (label === PLAN_SERVES) {
 		return unusable(
-			`the judge approved with confidence ${percent(answer.confidence)}, below the ${POLICY.minConfidenceToApprove} floor; no plan approval is recorded`,
+			`the judge approved with confidence ${percent(answer.confidence)}, below the ${POLICY.minConfidenceToApprove} floor; no plan approval is recorded.${LOW_SCORE_RECOVERY}`,
 		);
 	}
 	return {
@@ -733,7 +740,7 @@ export async function acceptance(deps: ActivityDeps, state: JevState, params: un
 	}
 	if (label === approving) {
 		return unusable(
-			`the judge approved ${named} acceptance with confidence ${percent(answer.confidence)}, below the ${POLICY.minConfidenceToApprove} floor; no acceptance is recorded`,
+			`the judge approved ${named} acceptance with confidence ${percent(answer.confidence)}, below the ${POLICY.minConfidenceToApprove} floor; no acceptance is recorded.${LOW_SCORE_RECOVERY}`,
 		);
 	}
 	return {

@@ -532,3 +532,23 @@ describe("T4 - the interval check holds changes while it is in flight (FR-11)", 
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/b.ts", content: "x" }), ctx))).toBeUndefined();
 	});
 });
+
+describe("FR-09 - the tools teach how to ask (FR-09)", () => {
+	test("FR-09: every tool description carries the asking rule", () => {
+		const pi = fakePi();
+		createJevController({ judge: answeringJudge({}).judge, config: config(), zod: fakeZod() }).register(pi.api);
+		for (const tool of pi.tools.values()) {
+			expect(tool.description).toContain("one decision");
+		}
+	});
+
+	test("FR-09: the consult description carries worked examples with measured scores", () => {
+		const pi = fakePi();
+		createJevController({ judge: answeringJudge({}).judge, config: config(), zod: fakeZod() }).register(pi.api);
+
+		const description = pi.tools.get("jev_consult")?.description ?? "";
+		expect(description).toContain("Example (good)");
+		expect(description).toContain("Example (bad)");
+		expect(description).toContain("not a no");
+	});
+});

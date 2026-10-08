@@ -622,3 +622,54 @@ describe("T4 - the automatic checks (FR-11, FR-12, FR-17)", () => {
 		expect(outcome.text).toContain("not approved for completion");
 	});
 });
+
+describe("FR-09 - a below-floor answer teaches recovery instead of stopping", () => {
+	test("FR-09: a below-floor choice consult explains the split and the work to do", async () => {
+		const { deps } = depsFor({ consult: { label: "keep", confidence: 0.4 } });
+		const outcome = await consult(deps, freshState(), {
+			mode: "choice",
+			question: "Keep or replace the parser?",
+			context: "the parser is stable but slow",
+			alternatives: [
+				{ label: "keep", meaning: "keep the parser" },
+				{ label: "replace", meaning: "rewrite the parser" },
+			],
+		});
+
+		expect(outcome.ok).toBe(false);
+		expect(outcome.text).toContain("not a no");
+		expect(outcome.text).toContain("settles the claim");
+		expect(outcome.text).toContain("narrow the claim");
+	});
+
+	test("FR-09: a below-floor boolean consult carries the same recovery protocol", async () => {
+		const { deps } = depsFor({ consult: { probability: 0.5 } });
+		const outcome = await consult(deps, freshState(), {
+			mode: "boolean",
+			question: "Is the evidence enough to proceed?",
+			context: "one run passed",
+			trueMeaning: "proceed",
+			falseMeaning: "gather more evidence",
+		});
+
+		expect(outcome.ok).toBe(false);
+		expect(outcome.text).toContain("not a no");
+		expect(outcome.text).toContain("settles the claim");
+	});
+
+	test("FR-09: a below-floor acceptance approval names the recovery, not just the floor", async () => {
+		const state = freshState();
+		registerTask(state, "Report the coverage of the last run");
+		const { deps } = depsFor({ acceptance: { label: "serves_business_need", confidence: 0.3 } });
+
+		const outcome = await acceptance(deps, state, {
+			aspect: "business",
+			claim: "the report serves the owner's need",
+			evidence: [{ kind: "execution", quote: "the report was generated with every requested section" }],
+		});
+
+		expect(outcome.ok).toBe(false);
+		expect(outcome.text).toContain("not a no");
+		expect(outcome.text).toContain("settles the claim");
+	});
+});
