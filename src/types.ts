@@ -10,8 +10,15 @@
 export const POLICY = {
 	/** Judge failure, malformed payload and uncertainty can never approve. */
 	failureNeverApproves: true,
-	/** Choice and score confidence below this floor never approves. */
-	minConfidenceToApprove: 0.8,
+	/**
+	 * Choice and score confidence below this floor never approves. Confidence is the judge's
+	 * probability spread over the options ((3*p_max-1)/2 for three): 0.6 means roughly 73% of
+	 * the probability mass on the approving option. Calibrated 2026-10-08 on a ground-truth
+	 * domain (evidence/jev-calibration-2026-10-08.md): no false claim was ever approved at any
+	 * threshold, while well-evidenced true claims measured 0.66-1.00; 0.8 cut correct answers
+	 * that carry rule tension or one inference step.
+	 */
+	minConfidenceToApprove: 0.6,
 	/** Boolean (noul) probability of the approving outcome below this floor never approves. */
 	minProbabilityToApprove: 0.8,
 	/** Blocked stop continuations for one unchanged refusal before it is recorded as an open item. */
