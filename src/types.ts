@@ -21,8 +21,20 @@ export const POLICY = {
 	minConfidenceToApprove: 0.6,
 	/** Boolean (noul) probability of the approving outcome below this floor never approves. */
 	minProbabilityToApprove: 0.8,
+	/** Plan-review coverage floor: the topic set as a whole (the topics keep minProbabilityToApprove). */
+	minCoverageConfidence: 0.6,
 	/** Blocked stop continuations for one unchanged refusal before it is recorded as an open item. */
 	maxStopBlocks: 3,
+	/** Consecutive availability failures before the judge is declared unavailable for the session (FR-21). */
+	maxJudgeFailures: 3,
+	/** Refusals of one boundary before its hold is released as an open item (FR-22, FR-23). */
+	maxRefusalsPerStage: 3,
+	/** Consequential calls one standing boundary may refuse before the owner is told (FR-28). */
+	maxIgnoredBoundaryCalls: 3,
+	/** Fragments a submitted text is split into for the text review (FR-27). */
+	maxTextFragments: 12,
+	/** Judged submissions kept in the ledger a repeated framing is recognised against (FR-22). */
+	maxSubmissions: 24,
 	/** Judge model; never substituted by another provider. */
 	defaultModel: "jev-latest",
 	/** Env var carrying the TypeSafe API key; never persisted, logged or echoed. */
@@ -35,8 +47,8 @@ export const POLICY = {
 	maxArtifactChars: 16000,
 	/** Recent action results kept as evidence for the course and completion checks. */
 	maxActionRecords: 5,
-	/** Longest kept excerpt of one action result. */
-	maxActionExcerptChars: 200,
+	/** Longest kept excerpt of one action's change material or result. */
+	maxActionExcerptChars: 2000,
 	/** Longest single submitted quote. */
 	maxQuoteChars: 4000,
 } as const;
@@ -54,8 +66,40 @@ export interface Evidence {
 /** The two perspectives a finished task is defended from at acceptance. */
 export type Aspect = "business" | "architecture";
 
+/**
+ * The boundary names the gates read (FR-22, FR-23). A refusal is counted per boundary, and a
+ * boundary whose refusal bound is exhausted is released: `plan` is the hold on consequential changes,
+ * `hold` is a finding that has to be answered by a consultation.
+ */
+export const PLAN_BOUNDARY = "plan";
+export const HOLD_BOUNDARY = "hold";
+
 /** What a developer review looks at. */
 export type ReviewKind = "checkpoint" | "commit" | "diff";
+
+/**
+ * One topic of a plan, as the executor submits it with the plan review (FR-24). The review asks one
+ * question per topic, so a verdict names the topic it concerns; the paths are what the course check
+ * compares a recorded action target against (FR-25).
+ */
+export interface PlanTopic {
+	/** The id the verdict, the refusal and the course check name. */
+	id: string;
+	/** A verbatim section of the plan artifact that governs this topic. */
+	section: string;
+	/** The paths this topic changes. */
+	paths: readonly string[];
+	/** The requirement of the registered task this topic serves. */
+	requirement: string;
+}
+
+/** One register rule a reviewed text must satisfy; the rule text is the owner's own (FR-27). */
+export interface TextRule {
+	/** The class the rule belongs to, such as jargon, formal register or brevity. */
+	class: string;
+	/** The rule line the executor submitted; the tool returns it and writes none of its own. */
+	rule: string;
+}
 
 /** How often implementation is checked against the task direction. */
 export interface CourseCheckConfig {

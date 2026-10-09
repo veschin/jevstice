@@ -14,10 +14,12 @@ import {
 	completionCheck,
 	consult,
 	courseCheck,
+	reaim,
 	planReview,
 	requirements,
 	review,
 	searchRelevance,
+	textReview,
 	triage,
 	type ActivityDeps,
 } from "./activities.js";
@@ -27,11 +29,16 @@ import {
 	isConsequentialMutation,
 	isProposeCall,
 	mutationGate,
+	planArtifactChangedReason,
+	planArtifactUnreadableReason,
 	proposeGate,
+	targetOutsidePlan,
+	PROPOSE_BOUNDARY,
+	type GateVerdict,
 } from "./gates.js";
 import type { Judge } from "./judge.js";
-import { freshState, recordAction, recordStopBlock, sha256, type JevState, type PlanApproval, type TaskIdentity } from "./state.js";
-import { POLICY, asRecord, type JevConfig, type ToolOutcome } from "./types.js";
+import { freshState, markDeviation, recordAction, recordRefusedCall, recordStopBlock, sha256, type JevState, type PlanApproval, type TaskIdentity } from "./state.js";
+import { HOLD_BOUNDARY, POLICY, asRecord, type JevConfig, type ToolOutcome } from "./types.js";
 
 /** A schema node as this extension builds it; the host validates the built schema itself. */
 export interface SchemaLike {
@@ -102,6 +109,11 @@ const TRIAGE_DESCRIPTION =
 	"Submit the request text, quoted evidence from it, and the narrow task-specific topics you think it needs (concrete concerns such as high availability, fault tolerance, security, performance or user interface behaviour, not generic labels). " +
 	"A `development task registered` answer registers the task and holds consequential changes until jev_plan_review approves the plan artifact; a `simple task` answer explicitly names the skipped activities, registers no development task, and lets consequential changes pass while that request stands. An answer the judge cannot settle is refused and registers nothing. A plain web search or a read-only question needs no triage call at all: it costs no judge call and no gate; the first consequential change of an untriaged session is held until triage or jev_requirements has judged the request." + ASKING_RULE;
 
+
+const REAIM_DESCRIPTION =
+	"Register the owner's interjection as the course the work must follow (FR-29). Submit the owner's words verbatim as `interjection` and at least one `user` evidence item quoting them; the judge sees nothing else, and an interjection it cannot attribute to the owner changes nothing. " +
+	"On approval the task is re-aimed: the released boundaries stay released, the plan boundary is released by the owner's order, the old plan and acceptance records are dropped, the work revision restarts, and course checks judge against the owner's course - with no plan topics recorded, no course question runs. " +
+	"Use it when the owner interjects a new direction into a running session, instead of re-triage, which rebuilds every wall." + ASKING_RULE;
 const SEARCH_DESCRIPTION =
 	"Ask the judge which submitted search result is the relevant one for a query, and why. Submit the query and, per candidate, its title or url, the evidence it carries and YOUR proposed reason for its relevance. " +
 	"The judge selects one candidate-and-reason pair, or marks every submitted candidate irrelevant; the tool returns the selected candidate together with your own submitted reason - never an invented explanation - and the reported confidence, and returns no candidate when none is relevant. Submit 2 or more candidates; a selection below the confidence floor is refused as unusable. This is optional for a plain search: it costs a call only when you ask for it." + ASKING_RULE;
@@ -111,8 +123,9 @@ const REQUIREMENTS_DESCRIPTION =
 	"One batched call returns, per item, the probability that it faithfully captures an obligation of the request without invented scope; the coverage probability of the item set as a whole; and which candidate needs are missing from the list. Use it before the requirement list becomes the task plan. It registers the development task, so consequential changes are held until a plan review passes." + ASKING_RULE;
 
 const PLAN_REVIEW_DESCRIPTION =
-	"Submit the plan artifact for Jev review at the plan-mode boundary. `plan` is the artifact URL you wrote (local://<slug>-plan.md), `claim` states what the plan is meant to satisfy, `evidence` quotes the task requirements and the parts of the artifact that settle the claim. " +
-	"The tool reads the artifact itself and binds the approval to its exact content and to the task fingerprint; the approval then allows `write xd://propose` for that artifact, and any later change to the artifact invalidates it. Write the plan artifact before this call - review binds to the artifact, not to a copy of it. " +
+	"Submit the plan artifact for Jev review at the plan-mode boundary. `plan` is the artifact URL you wrote (local://<slug>-plan.md), `claim` states what the plan is meant to satisfy, `topics` lists the plan's topics - per topic its id, the artifact section that governs it quoted verbatim, the paths it changes and the requirement it serves - and `evidence` quotes the task requirements. " +
+	"The review reads the artifact itself and puts one question per topic to the judge, so a verdict names the topic it concerns; a topic whose quoted section is absent from the artifact is refused before any judge call, and the approval is recorded only when every topic passes. " +
+	"The approval is bound to the artifact's exact content and to the task fingerprint; it then allows `write xd://propose` for that artifact, and any later change to the artifact invalidates it. Write the plan artifact before this call - review binds to the artifact, not to a copy of it. " +
 	"You can write the plan artifact and call every Jevstice tool while consequential changes are held; so can agent messages (agent://) and mounted device calls (xd://)." + ASKING_RULE;
 
 const ACCEPTANCE_DESCRIPTION =
@@ -122,6 +135,11 @@ const ACCEPTANCE_DESCRIPTION =
 const REVIEW_DESCRIPTION =
 	"Defend changed work before Jev as a developer. kind is checkpoint, commit or diff; target names it; claim states what the change does; evidence quotes the changed code, the diff and the verification run. " +
 	"The tool returns the judge's verdict with its confidence. A finding holds consequential changes until you consult jev_consult about it. A review verdict never approves completion - business and architecture acceptance do that." + ASKING_RULE;
+
+const TEXT_REVIEW_DESCRIPTION =
+	"Have a text reviewed before you present it to the owner. Submit the text and the register rules it must satisfy as {class, rule}, quoted verbatim from the rules you were given - formal register, no jargon, one thought per sentence, the greatest brevity that keeps the meaning. " +
+	"The tool splits the text into fragments and puts every submitted rule to the judge once per fragment; the returned text quotes back the fragment and the rule line it violates, taken from the rules you submitted, and the tool adds no advice of its own. " +
+	"A text that violates none of the submitted rules is approved; a defect list is refused, so rewrite those fragments in the form the named rule lines require and submit again." + ASKING_RULE;
 
 
 /** Best-effort reading of one string-valued method off the session manager. */
@@ -197,6 +215,13 @@ function excerptOf(content: unknown): string {
 	return "";
 }
 
+/** The change material of a tool input - what the action wrote, edited or ran - bounded by policy. */
+function changeOf(input: unknown): string {
+	const text = JSON.stringify(input ?? null);
+	if (text === undefined || text.length <= POLICY.maxActionExcerptChars) return text ?? "";
+	return `${text.slice(0, POLICY.maxActionExcerptChars)}...`;
+}
+
 /** A plan approval granted in a session the host is about to replace with the execution session. */
 interface PlanHandoff {
 	/** The session the approval was granted in; the approval is never restored back into it. */
@@ -259,6 +284,64 @@ export function createJevController(deps: ControllerDeps): JevController {
 		state.plan = granted.plan;
 	};
 
+	/**
+	 * What the owner has to know and the executor cannot be told often enough (FR-21, FR-23): the judge
+	 * became unavailable, or a boundary was released after its refusal bound. Each is announced once.
+	 */
+	const announce = (pi: PiApi, ctx: unknown, state: JevState): void => {
+		const openItem = state.openItem;
+		const signature = openItem === undefined ? undefined : `${openItem.boundary}:${openItem.attempts}`;
+		if (openItem !== undefined && signature !== undefined && state.openItemNotified !== signature) {
+			state.openItemNotified = signature;
+			notify(
+				ctx,
+				`Jevstice released the ${openItem.boundary} boundary as an OPEN item after ${openItem.attempts} refusals; nothing refused there is approved.`,
+			);
+			sendMessage(
+				pi,
+				"jev.open_item",
+				`Jevstice released the ${openItem.boundary} boundary after ${openItem.attempts} refusals (digests ${openItem.digests
+					.map(entry => entry.slice(0, 8))
+					.join(", ")}). The refusal stays an OPEN item for you; nothing it refused is approved.`,
+				"nextTurn",
+			);
+		}
+		if (state.judgeUnavailable === true && state.judgeUnavailableNotified !== true) {
+			state.judgeUnavailableNotified = true;
+			notify(
+				ctx,
+				`Jevstice: the judge could not be reached for ${POLICY.maxJudgeFailures} calls in a row, so the boundaries now pass without a judge answer and nothing is recorded as approved.`,
+			);
+		}
+	};
+
+	/**
+	 * One refused consequential call (FR-20, FR-28): the reason already carries the copy-ready next
+	 * call, the same instruction is delivered once per boundary into the executor's context rather than
+	 * only into its tool error, and the count of refused calls tells the owner when the executor is not
+	 * following the boundary.
+	 */
+	const refuse = (
+		pi: PiApi,
+		ctx: unknown,
+		state: JevState,
+		toolName: string,
+		input: unknown,
+		verdict: GateVerdict,
+	): { block: true; reason: string } => {
+		const boundary = verdict.boundary ?? "gate";
+		const reason = verdict.reason ?? `Jevstice holds this change at the ${boundary} boundary.`;
+		const count = recordRefusedCall(state, boundary, `${toolName} ${targetOf(input)}`);
+		if (count === 1) sendMessage(pi, "jev.boundary", reason, "aside");
+		if (count === POLICY.maxIgnoredBoundaryCalls) {
+			notify(
+				ctx,
+				`Jevstice: ${count} consequential calls were refused while the ${boundary} boundary stands and the call that resolves it was not made. Attempted: ${state.refusedCalls.calls.join("; ")}`,
+			);
+		}
+		return { block: true, reason };
+	};
+
 	/** The automatic course check: fired without the executor asking, delivered as a message. */
 	const runCourseCheck = async (pi: PiApi, ctx: unknown, id: string): Promise<void> => {
 		try {
@@ -315,6 +398,17 @@ export function createJevController(deps: ControllerDeps): JevController {
 			});
 
 			pi.registerTool({
+				name: "jev_reaim",
+				label: "Jev re-aim",
+				description: REAIM_DESCRIPTION,
+				parameters: z.object({
+					interjection: z.string(),
+					evidence,
+				}),
+				execute: run(reaim),
+			});
+
+			pi.registerTool({
 				name: "jev_search_relevance",
 				label: "Jev search relevance",
 				description: SEARCH_DESCRIPTION,
@@ -345,6 +439,14 @@ export function createJevController(deps: ControllerDeps): JevController {
 				parameters: z.object({
 					plan: z.string(),
 					claim: z.string(),
+					topics: z.array(
+						z.object({
+							id: z.string(),
+							section: z.string(),
+							paths: z.array(z.string()),
+							requirement: z.string(),
+						}),
+					),
 					evidence,
 				}),
 				execute: run(planReview),
@@ -373,6 +475,17 @@ export function createJevController(deps: ControllerDeps): JevController {
 					evidence,
 				}),
 				execute: run(review),
+			});
+
+			pi.registerTool({
+				name: "jev_text_review",
+				label: "Jev text review",
+				description: TEXT_REVIEW_DESCRIPTION,
+				parameters: z.object({
+					text: z.string(),
+					rules: z.array(z.object({ class: z.string(), rule: z.string() })),
+				}),
+				execute: run(textReview),
 			});
 
 			pi.on("session_start", (_event, ctx) => {
@@ -409,30 +522,35 @@ export function createJevController(deps: ControllerDeps): JevController {
 				if (typeof toolName !== "string") return undefined;
 				const input = asRecord(event)?.["input"];
 				const state = stateFor(ctx);
+				announce(pi, ctx, state);
 				if (isProposeCall(toolName, input)) {
 					const verdict = proposeGate(state, deps.config, input);
 					if (!verdict.block && verdict.url !== undefined && state.plan !== undefined) {
 						const artifact = await activitiesFor(ctx).readArtifact?.(verdict.url);
 						if (artifact === null || artifact === undefined) {
-							return {
+							return refuse(pi, ctx, state, toolName, input, {
 								block: true,
-								reason: `Jevstice holds this plan proposal: the artifact ${verdict.url} could not be read, so the approval cannot be bound to what is being proposed. Write the plan there and review it again.`,
-							};
+								boundary: PROPOSE_BOUNDARY,
+								reason: planArtifactUnreadableReason(verdict.url),
+							});
 						}
 						if (sha256(artifact) !== state.plan.planDigest) {
-							return {
+							return refuse(pi, ctx, state, toolName, input, {
 								block: true,
-								reason: `Jevstice holds this plan proposal: ${verdict.url} changed after the plan review. Submit jev_plan_review for its current content, then propose again.`,
-							};
+								boundary: PROPOSE_BOUNDARY,
+								reason: planArtifactChangedReason(verdict.url),
+							});
 						}
 						if (state.task !== undefined) {
 							handoff = { fromSessionId: sessionIdOf(ctx), task: state.task, plan: state.plan };
 						}
 					}
-					return verdict.block ? { block: true, reason: verdict.reason } : undefined;
+					return verdict.block
+						? refuse(pi, ctx, state, toolName, input, { ...verdict, boundary: verdict.boundary ?? PROPOSE_BOUNDARY })
+						: undefined;
 				}
 				const verdict = mutationGate(state, deps.config, toolName, input);
-				return verdict.block ? { block: true, reason: verdict.reason } : undefined;
+				return verdict.block ? refuse(pi, ctx, state, toolName, input, verdict) : undefined;
 			});
 
 			pi.on("tool_result", async (event, ctx) => {
@@ -445,9 +563,18 @@ export function createJevController(deps: ControllerDeps): JevController {
 				const state = stateFor(ctx);
 				// Only the registered development task carries the interval, the evidence and the hold.
 				if (state.task === undefined) return undefined;
-				recordAction(state, { tool: toolName, target: targetOf(input), excerpt: excerptOf(record["content"]) });
+				const target = targetOf(input);
+				recordAction(state, { tool: toolName, target, excerpt: [changeOf(record["input"]), excerptOf(record["content"])].filter(part => part.length > 0).join("\n") }, toolName !== "bash");
+				// A change outside the approved plan is a trigger of its own (FR-25): the plan named the
+				// paths its topics change, so an action elsewhere is a possible change of course.
+				if (state.deviation === undefined && targetOutsidePlan(toolName, target, state.planTopics)) {
+					markDeviation(state, toolName, target);
+				}
+				// Completion-only checking defers every course check to completion (FR-12).
 				if (deps.config.courseCheck.mode !== "interval") return undefined;
-				if (state.actionsSinceCheck < deps.config.courseCheck.interval) return undefined;
+				// A hold this boundary can no longer enforce makes the check a judge call with no effect (FR-23).
+				if (state.released.includes(HOLD_BOUNDARY)) return undefined;
+				if (state.deviation === undefined && state.actionsSinceCheck < deps.config.courseCheck.interval) return undefined;
 				state.actionsSinceCheck = 0;
 				// The check is in flight: a change decided before its verdict returns would bypass it.
 				state.checkPending = true;
@@ -458,6 +585,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 			pi.on("session_stop", async (_event, ctx) => {
 				await restoreApprovedPlan(ctx);
 				const state = stateFor(ctx);
+				announce(pi, ctx, state);
 				const gate = completionGate(state, deps.config);
 				if (!gate.applies) return undefined;
 				let reason = gate.reason;

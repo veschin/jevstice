@@ -17,17 +17,33 @@ import {
 	saidTrue,
 	scoreOf,
 	type Judge,
+	type JudgeOutcome,
 	type JudgeQuestion,
 } from "./judge.js";
-import { acceptanceAt, recordAcceptance, registerSimple, registerTask, sha256, type JevState } from "./state.js";
 import {
+	acceptanceAt,
+	recordAcceptance,
+	recordRefusal,
+	registerSimple,
+	registerTask,
+	releaseBoundary,
+	reaimTask,
+	sha256,
+	submissionLedger,
+	type JevState,
+} from "./state.js";
+import {
+	HOLD_BOUNDARY,
+	PLAN_BOUNDARY,
 	POLICY,
 	asRecord,
 	type Aspect,
 	type Evidence,
 	type EvidenceKind,
 	type JevConfig,
+	type PlanTopic,
 	type ReviewKind,
+	type TextRule,
 	type ToolOutcome,
 } from "./types.js";
 
@@ -52,9 +68,8 @@ const EVIDENCE_KINDS: Record<string, true> = {
 
 const DEPTH_QUESTION = "needs_development";
 const COVERAGE_QUESTION = "coverage";
-const DIRECTION_QUESTION = "direction";
+const REAIM_QUESTION = "reaim";
 const FOLLOWS_QUESTION = "follows_requirements";
-const PLAN_QUESTION = "plan";
 const CONSULT_QUESTION = "consult";
 const RESOLVES_HOLD_QUESTION = "resolves_hold";
 
@@ -89,20 +104,44 @@ const CONSULT_MODES: Record<string, true> = { choice: true, score: true, boolean
 /** How many questions one batch may carry; larger submissions are split by the executor. */
 const MAX_QUESTIONS = 200;
 
+/** The boundary names the refusal ledger counts, one per judged activity (FR-22). */
+const TRIAGE_BOUNDARY = "triage";
+const SEARCH_BOUNDARY = "search";
+const REQUIREMENTS_BOUNDARY = "requirements";
+const REVIEW_BOUNDARY = "review";
+const CONSULT_BOUNDARY = "consult";
+const TEXT_BOUNDARY = "text";
+
+/**
+ * The class a refusal carries (FR-20). A verdict below the floor means the submitted material is
+ * what has to change; a call that did not reach the judge, or an answer that could not be read,
+ * means the judge is at fault and the same submission may be sent again.
+ */
+const MATERIAL_FAULT =
+	"Class: a defect of the submitted material - the submission, not the judge's answer, is what has to change.";
+const JUDGE_FAULT =
+	"Class: the judge could not answer - the submission is not at fault, so the same material may be submitted again.";
+
 function refused(problem: string): ToolOutcome {
-	return { ok: false, text: `The submission was refused and nothing was approved: ${problem}` };
+	return {
+		ok: false,
+		text: `The submission was refused and nothing was approved: ${problem} ${MATERIAL_FAULT} Next action: correct the submission as stated above and submit it again.`,
+	};
 }
 
 /**
- * The recovery protocol every below-floor answer teaches (FR-09): a low score means the judge
+ * The recovery protocol every below-floor answer teaches (FR-09, FR-20): a low score means the judge
  * split its probability over the options, which is a defect of the submitted material, never a
  * verdict to abandon. Measured on the live judge 2026-10-08 (evidence/jev-calibration-2026-10-08.md).
  */
 const LOW_SCORE_RECOVERY =
-	" A low score is not a no: the judge split its probability because the claim or its evidence is weak, so the material - not the answer - is what to fix. Work, do not stop and do not resubmit the same words: (1) quote the exact line that settles the claim (a rule, a run output, an artifact fragment); (2) narrow the claim to a single obligation; (3) if it still fails, change the approach entirely. Measured on this judge: a claim plus its settling quote scores 0.80-1.00, the same claim with the settling quote removed scores 0.30-0.50, an open approval request scores 0.14-0.26.";
+	` ${MATERIAL_FAULT} Next action: rework the material before submitting again - (1) quote the exact line that settles the claim (a rule, a run output, an artifact fragment); (2) narrow the claim to a single obligation; (3) if it still fails, change the approach entirely. Measured on this judge: a claim plus its settling quote scores 0.80-1.00, the same claim with the settling quote removed scores 0.30-0.50, an open approval request scores 0.14-0.26.`;
 
 function unusable(problem: string): ToolOutcome {
-	return { ok: false, text: `The judge answer is unusable and is not an approval: ${problem}` };
+	return {
+		ok: false,
+		text: `The judge answer is unusable and is not an approval: ${problem} ${JUDGE_FAULT} Next action: submit the same material again.`,
+	};
 }
 function text(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
@@ -192,6 +231,43 @@ function itemName(index: number): string {
 	return `item_${index}`;
 }
 
+/**
+ * Prepared plan topics (FR-24): each one an id, the artifact section it governs, the paths it
+ * changes and the requirement it serves. A topic without a section cannot be judged against the
+ * artifact, and one without a path cannot be compared with a recorded action (FR-25).
+ */
+function readTopics(
+	value: unknown,
+): { ok: true; topics: PlanTopic[] } | { ok: false; problem: string } {
+	if (!Array.isArray(value) || value.length === 0) {
+		return {
+			ok: false,
+			problem:
+				"topics must list the plan's topics as {id, section, paths, requirement}, one per topic: the review asks one question per topic (FR-24)",
+		};
+	}
+	const topics: PlanTopic[] = [];
+	const ids = new Set<string>();
+	for (const entry of value) {
+		const record = asRecord(entry);
+		const id = text(record?.["id"]);
+		const section = text(record?.["section"]);
+		const requirement = text(record?.["requirement"]);
+		const paths = readStrings(record?.["paths"]);
+		if (id === undefined || section === undefined || requirement === undefined || paths.length === 0) {
+			return {
+				ok: false,
+				problem:
+					"every topic needs a non-empty id, the artifact section it governs, the requirement it serves, and at least one path it changes",
+			};
+		}
+		if (ids.has(id)) return { ok: false, problem: `two topics share the id "${id}"` };
+		ids.add(id);
+		topics.push({ id, section, paths, requirement });
+	}
+	return { ok: true, topics };
+}
+
 function needName(index: number): string {
 	return `need_${index}`;
 }
@@ -217,6 +293,67 @@ function material(
 		...fields,
 		quotes: renderEvidence(evidence),
 	};
+}
+
+/**
+ * One judge call with its availability record folded in (FR-21): a usable answer clears the count
+ * and lifts a declared unavailability, a call that failed for availability counts towards the bound,
+ * and a malformed or below-floor answer does neither because it says nothing about the judge.
+ */
+async function askJudge(
+	deps: ActivityDeps,
+	state: JevState,
+	judged: unknown,
+	questions: readonly JudgeQuestion[],
+): Promise<JudgeOutcome> {
+	const outcome = await deps.judge(judged, questions);
+	if (outcome.ok) {
+		state.judgeFailures = 0;
+		delete state.judgeUnavailable;
+		delete state.judgeUnavailableNotified;
+		return outcome;
+	}
+	if (outcome.kind === "unavailable") {
+		state.judgeFailures += 1;
+		if (state.judgeFailures >= POLICY.maxJudgeFailures) state.judgeUnavailable = true;
+	}
+	return outcome;
+}
+
+/**
+ * One submission to the judge, with the ledger in front of it (FR-22, FR-23): the digest of the
+ * material about to be judged is looked up first, so a framing already refused at this boundary costs
+ * no judge call, and a boundary past its refusal bound is released as an open item instead of being
+ * asked again. The caller records the refusal it gets back, which is what the ledger counts.
+ */
+async function submitToJudge(
+	deps: ActivityDeps,
+	state: JevState,
+	boundary: string,
+	judged: unknown,
+	questions: readonly JudgeQuestion[],
+): Promise<{ ok: true; outcome: JudgeOutcome; digest: string } | { ok: false; text: string }> {
+	const digest = sha256(JSON.stringify(judged));
+	const ledger = submissionLedger(state, boundary, digest);
+	if (ledger.repeat) {
+		return {
+			ok: false,
+			text:
+				`The submission was refused and nothing was approved: this exact material was already judged and refused at ${boundary}, so it is not a new attempt (${ledger.attempts} refused so far). ${MATERIAL_FAULT} Next action: change the material itself - the line it quotes, the width of its claim, or the approach - and submit that.`,
+		};
+	}
+	if (ledger.exhausted) {
+		const openItem = releaseBoundary(state, boundary);
+		return {
+			ok: false,
+			text:
+				`The submission was refused and nothing was approved: ${boundary} reached its bound of ${POLICY.maxRefusalsPerStage} refusals, so it is released as an OPEN item (digests ${openItem.digests
+					.map(entry => entry.slice(0, 8))
+					.join(", ")}) and the owner is told. ` +
+				"Work on and report the wall: a boundary that refused this many times does not hold the work for good, and nothing here is an approval.",
+		};
+	}
+	return { ok: true, outcome: await askJudge(deps, state, judged, questions), digest };
 }
 
 function percent(value: number): string {
@@ -291,7 +428,13 @@ export async function consult(deps: ActivityDeps, state: JevState, params: unkno
 		});
 	}
 
-	const outcome = await deps.judge(material(state, { question, context, heldFinding: held ?? null }, withRequest(state.task?.request, evidence.evidence)), questions);
+	// A consultation while a finding holds the work is judged at the finding's boundary, so the same
+	// unrelated answer cannot be sent twice (FR-22); otherwise it is an ordinary consultation.
+	const boundary = held === undefined ? CONSULT_BOUNDARY : HOLD_BOUNDARY;
+	const judged = material(state, { question, context, heldFinding: held ?? null }, withRequest(state.task?.request, evidence.evidence));
+	const call = await submitToJudge(deps, state, boundary, judged, questions);
+	if (!call.ok) return { ok: false, text: call.text };
+	const outcome = call.outcome;
 	const answer = answerOf(outcome, CONSULT_QUESTION);
 	if (!outcome.ok || answer === undefined) {
 		return unusable(outcome.ok ? `the judge returned no answer for '${CONSULT_QUESTION}'` : outcome.problem);
@@ -303,6 +446,7 @@ export async function consult(deps: ActivityDeps, state: JevState, params: unkno
 		const meaning = judgeQuestion.options?.[label] ?? "";
 		const usable = choseLabel(outcome, CONSULT_QUESTION, label);
 		if (usable && resolved) delete state.hold;
+		if (!usable) recordRefusal(state, { boundary, digest: call.digest, verdict: "below_floor" });
 		const summary = `consult (choice): ${label} - ${meaning} (confidence ${percent(answer.confidence)})${usable ? "" : `, below the ${POLICY.minConfidenceToApprove} floor - not usable as an answer.${LOW_SCORE_RECOVERY}`}${release}`;
 		return usable
 			? { ok: true, text: summary, details: { mode, label, meaning, confidence: answer.confidence } }
@@ -313,6 +457,7 @@ export async function consult(deps: ActivityDeps, state: JevState, params: unkno
 		const level = Math.max(0, Math.min(criteria.length - 1, Math.round(value)));
 		const usable = answer.confidence >= POLICY.minConfidenceToApprove;
 		if (usable && resolved) delete state.hold;
+		if (!usable) recordRefusal(state, { boundary, digest: call.digest, verdict: "below_floor" });
 		const summary = `consult (score): ${value.toFixed(2)} - nearest rubric step ${level}: ${criteria[level] ?? ""} (confidence ${percent(answer.confidence)})${usable ? "" : `, below the ${POLICY.minConfidenceToApprove} floor - not usable as an answer.${LOW_SCORE_RECOVERY}`}${release}`;
 		return usable
 			? { ok: true, text: summary, details: { mode, score: value, level, confidence: answer.confidence } }
@@ -321,11 +466,57 @@ export async function consult(deps: ActivityDeps, state: JevState, params: unkno
 	const yes = probabilityOf(outcome, CONSULT_QUESTION) ?? 0;
 	const usable = yes >= POLICY.minProbabilityToApprove || 1 - yes >= POLICY.minProbabilityToApprove;
 	if (usable && resolved) delete state.hold;
+	if (!usable) recordRefusal(state, { boundary, digest: call.digest, verdict: "below_floor" });
 	const verdict = yes >= POLICY.minProbabilityToApprove ? "yes" : "no";
 	const summary = `consult (boolean): ${verdict} - probability of yes ${percent(yes)}${usable ? "" : `, neither outcome reaches the ${POLICY.minProbabilityToApprove} floor - not usable as an answer.${LOW_SCORE_RECOVERY}`}${release}`;
 	return usable
 		? { ok: true, text: summary, details: { mode, probability: yes, verdict, confidence: yes } }
 		: { ok: false, text: summary, details: { mode, probability: yes, verdict, confidence: yes } };
+}
+
+/**
+ * The owner's interjection re-aims the registered task (FR-29). The judge sees the owner's words and
+ * nothing else: an interjection the judge cannot attribute to the owner changes nothing (fail-closed).
+ * On approval the released boundaries stay released and the plan boundary is released for the new
+ * course, so the walls do not rebuild - the measured deadlock of the jellyfin session.
+ */
+export async function reaim(deps: ActivityDeps, state: JevState, params: unknown): Promise<ToolOutcome> {
+	const record = asRecord(params) ?? {};
+	const interjection = text(record["interjection"]);
+	if (interjection === undefined) return refused("a non-empty interjection is required: submit the owner's words verbatim");
+	const evidence = readEvidence(record["evidence"], { required: true, what: "the re-aim" });
+	if (!evidence.ok) return refused(evidence.problem);
+	if (!evidence.evidence.some(item => item.kind === "user")) {
+		return refused("the re-aim needs at least one item of kind \"user\" quoting the owner's interjection");
+	}
+	const call = await submitToJudge(deps, state, `reaim`, material(state, { interjection, task: state.task?.request ?? null }, withRequest(interjection, evidence.evidence)), [
+		{
+			name: REAIM_QUESTION,
+			mode: "noul",
+			instructions:
+				"Does the quoted interjection come from the owner and name the course the work must follow from here? Judge only from the interjection and its quotes.",
+			trueMeaning: "the interjection is the owner's and names the course the work must follow",
+			falseMeaning: "the interjection is not established as the owner's, or names no course",
+		},
+	]);
+	if (!call.ok) return { ok: false, text: call.text };
+	const outcome = call.outcome;
+	if (!outcome.ok) return unusable(outcome.problem);
+	const yes = probabilityOf(outcome, REAIM_QUESTION);
+	if (yes === undefined || yes < POLICY.minProbabilityToApprove) {
+		if (yes !== undefined) recordRefusal(state, { boundary: "reaim", digest: call.digest, verdict: "below_floor" });
+		return {
+			ok: false,
+			text: `re-aim refused (probability of yes ${yes === undefined ? "returned nothing" : percent(yes)}): nothing changed. Quote the owner's interjection verbatim and submit again.${LOW_SCORE_RECOVERY}`,
+			details: { probability: yes },
+		};
+	}
+	const task = reaimTask(state, interjection);
+	return {
+		ok: true,
+		text: `course re-aimed by the owner's interjection (task ${task.fingerprint.slice(0, 12)}). The plan boundary stands released by the owner's order; course checks judge against this course, and with no plan topics recorded no course question runs. Consequential changes pass.`,
+		details: { task: task.fingerprint, interjection: interjection.slice(0, 120) },
+	};
 }
 
 /**
@@ -359,7 +550,10 @@ export async function triage(deps: ActivityDeps, state: JevState, params: unknow
 			falseMeaning: "this topic is generic or not needed by this request",
 		});
 	});
-	const outcome = await deps.judge(material(state, { request, candidateTopics: topics }, withRequest(request, evidence.evidence)), questions);
+	const judged = material(state, { request, candidateTopics: topics }, withRequest(request, evidence.evidence));
+	const call = await submitToJudge(deps, state, TRIAGE_BOUNDARY, judged, questions);
+	if (!call.ok) return { ok: false, text: call.text };
+	const outcome = call.outcome;
 	const depth = probabilityOf(outcome, DEPTH_QUESTION);
 	if (!outcome.ok || depth === undefined) {
 		return unusable(outcome.ok ? `the judge returned no probability for '${DEPTH_QUESTION}'` : outcome.problem);
@@ -367,9 +561,11 @@ export async function triage(deps: ActivityDeps, state: JevState, params: unknow
 	const needsDevelopment = depth >= POLICY.minProbabilityToApprove;
 	const isSimple = 1 - depth >= POLICY.minProbabilityToApprove;
 	if (!needsDevelopment && !isSimple) {
-		return unusable(
-			`the judge did not settle whether deeper development activities apply (simple-task probability ${percent(1 - depth)}, floor ${POLICY.minProbabilityToApprove}); submit the request with quotes from it and try again`,
-		);
+		recordRefusal(state, { boundary: TRIAGE_BOUNDARY, digest: call.digest, verdict: "unsettled" });
+		return {
+			ok: false,
+			text: `The submission was refused and nothing was approved: the judge did not settle whether deeper development activities apply (simple-task probability ${percent(1 - depth)}, floor ${POLICY.minProbabilityToApprove}), so the request was too wide for it. ${MATERIAL_FAULT} Next action: narrow the request to the one outcome it asks for and quote the lines of it that say what is wanted, then submit the triage again.`,
+		};
 	}
 	const selected = topics.filter((_, index) => saidTrue(outcome, topicName(index + 1)));
 	if (isSimple) {
@@ -433,7 +629,8 @@ export async function searchRelevance(
 		return refused(`candidate ${incomplete + 1} needs both the evidence it carries and your own proposed reason`);
 	}
 	options[NONE_RELEVANT] = "none of the submitted candidates is relevant to the query";
-	const outcome = await deps.judge(material(state, { query, candidates }, []), [
+	const judged = material(state, { query, candidates }, []);
+	const call = await submitToJudge(deps, state, SEARCH_BOUNDARY, judged, [
 		{
 			name: "candidate",
 			mode: "choice",
@@ -444,15 +641,19 @@ export async function searchRelevance(
 			options,
 		},
 	]);
+	if (!call.ok) return { ok: false, text: call.text };
+	const outcome = call.outcome;
 	const answer = answerOf(outcome, "candidate");
 	if (!outcome.ok || answer === undefined) {
 		return unusable(outcome.ok ? "the judge returned no candidate selection" : outcome.problem);
 	}
 	if (answer.label === NONE_RELEVANT) {
 		if (answer.confidence < POLICY.minConfidenceToApprove) {
-			return unusable(
-				`the judge marked no candidate relevant with confidence ${percent(answer.confidence)}, below the ${POLICY.minConfidenceToApprove} floor; re-search and submit candidates that carry evidence for the query.${LOW_SCORE_RECOVERY}`,
-			);
+			recordRefusal(state, { boundary: SEARCH_BOUNDARY, digest: call.digest, verdict: NONE_RELEVANT });
+			return {
+				ok: false,
+				text: `the judge marked no candidate relevant with confidence ${percent(answer.confidence)}, below the ${POLICY.minConfidenceToApprove} floor; re-search and submit candidates that carry evidence for the query.${LOW_SCORE_RECOVERY}`,
+			};
 		}
 		return {
 			ok: true,
@@ -464,9 +665,11 @@ export async function searchRelevance(
 	const selected = Number.isInteger(index) ? candidates[index - 1] : undefined;
 	if (selected === undefined) return unusable("the judge selected a candidate that was not submitted");
 	if (answer.confidence < POLICY.minConfidenceToApprove) {
-		return unusable(
-			`the judge selected ${selected.title} with confidence ${percent(answer.confidence)}, below the ${POLICY.minConfidenceToApprove} floor; re-search and submit stronger evidence.${LOW_SCORE_RECOVERY}`,
-		);
+		recordRefusal(state, { boundary: SEARCH_BOUNDARY, digest: call.digest, verdict: "below_floor" });
+		return {
+			ok: false,
+			text: `the judge selected ${selected.title} with confidence ${percent(answer.confidence)}, below the ${POLICY.minConfidenceToApprove} floor; re-search and submit stronger evidence.${LOW_SCORE_RECOVERY}`,
+		};
 	}
 	return {
 		ok: true,
@@ -523,18 +726,18 @@ export async function requirements(
 			falseMeaning: "this owner need is already represented by an item",
 		});
 	});
-	const outcome = await deps.judge(
-		material(
-			state,
-			{
-				request,
-				items: items.items.map((item, index) => ({ id: itemName(index + 1), text: item.text, source: item.source })),
-				candidateNeeds: needs,
-			},
-			withRequest(request, evidence.evidence),
-		),
-		questions,
+	const judged = material(
+		state,
+		{
+			request,
+			items: items.items.map((item, index) => ({ id: itemName(index + 1), text: item.text, source: item.source })),
+			candidateNeeds: needs,
+		},
+		withRequest(request, evidence.evidence),
 	);
+	const call = await submitToJudge(deps, state, REQUIREMENTS_BOUNDARY, judged, questions);
+	if (!call.ok) return { ok: false, text: call.text };
+	const outcome = call.outcome;
 	if (!outcome.ok) return unusable(outcome.problem);
 	const task = registerTask(state, request);
 	const coverage = probabilityOf(outcome, COVERAGE_QUESTION);
@@ -580,9 +783,10 @@ export async function requirements(
 }
 
 /**
- * Plan review at the plan-mode boundary (FR-07): the extension reads the artifact itself and binds
- * the approval to its exact content, the task fingerprint and the artifact URL. Any later change to
- * the artifact changes the digest and the approval no longer allows the proposal.
+ * Plan review at the plan-mode boundary (FR-07, FR-24): the extension reads the artifact itself,
+ * checks every submitted topic's quoted section against those bytes, puts one question per topic to
+ * the judge, and binds the approval to the artifact's exact content and to the task fingerprint. No
+ * single question covers the whole artifact, so a verdict always names the topic it concerns.
  */
 export async function planReview(
 	deps: ActivityDeps,
@@ -599,6 +803,8 @@ export async function planReview(
 		return refused("plan must name a single file at the session artifact root (local://<slug>-plan.md)");
 	}
 	if (claim === undefined) return refused("claim is required: state what the plan is meant to satisfy");
+	const topics = readTopics(record["topics"]);
+	if (!topics.ok) return refused(topics.problem);
 	const evidence = readEvidence(record["evidence"], { required: true, what: "the plan review" });
 	if (!evidence.ok) return refused(evidence.problem);
 	if (state.task === undefined) {
@@ -620,59 +826,95 @@ export async function planReview(
 			`the plan artifact ${plan} is ${artifact.length} characters long and only ${POLICY.maxArtifactChars} are submitted to the judge, so the rest would be approved unseen. Cut the plan down to its decisions, then submit the review again.`,
 		);
 	}
-	const digest = sha256(artifact);
-	const outcome = await deps.judge(
-		material(
-			state,
-			{
-				planUrl: plan,
-				planArtifact: artifact,
-				claim,
-				task: state.task.request,
-			},
-			withRequest(state.task.request, evidence.evidence),
-		),
-		[
-			{
-				name: PLAN_QUESTION,
-				mode: "choice",
-				instructions:
-					"Does the plan artifact, as quoted in the material, serve the registered task and can it be executed as written? Judge only from the quoted artifact text and the quoted evidence; a plan that omits a requirement of the task or cannot be executed as written is a revise.",
-				options: {
-					[PLAN_SERVES]: "the quoted plan artifact covers the task's requirements and can be executed as written",
-					[PLAN_REVISE]: "the plan has a defect that must be fixed before execution",
-					[PLAN_UNSUPPORTED]: "the quoted material does not establish what the plan serves",
-				},
-			},
-		],
-	);
-	const answer = answerOf(outcome, PLAN_QUESTION);
-	if (!outcome.ok || answer === undefined) {
-		return unusable(outcome.ok ? "the judge returned no plan verdict" : outcome.problem);
-	}
-	const label = answer.label ?? "";
-	if (choseLabel(outcome, PLAN_QUESTION, PLAN_SERVES)) {
-		state.plan = { taskFingerprint: state.task.fingerprint, planUrl: plan, planDigest: digest, confidence: answer.confidence };
-		return {
-			ok: true,
-			text: `plan review: ${PLAN_SERVES} (confidence ${percent(answer.confidence)}). The approval is bound to ${plan} (digest ${digest.slice(0, 12)}) and to task ${state.task.fingerprint.slice(0, 12)}; proposing this plan is allowed while the artifact is unchanged.`,
-			details: { verdict: label, confidence: answer.confidence, planUrl: plan, planDigest: digest, task: state.task.fingerprint },
-		};
-	}
-	delete state.plan;
-	if (label === PLAN_SERVES) {
-		return unusable(
-			`the judge approved with confidence ${percent(answer.confidence)}, below the ${POLICY.minConfidenceToApprove} floor; no plan approval is recorded.${LOW_SCORE_RECOVERY}`,
+	// A topic quoting a section the artifact does not carry cannot be executed as written. The review
+	// holds the artifact bytes itself, so this is refused before any judge call (FR-24).
+	const absent = topics.topics.filter(topic => !artifact.includes(topic.section));
+	if (absent.length > 0) {
+		return refused(
+			`the plan artifact ${plan} does not contain the ${absent.length === 1 ? "section" : "sections"} quoted for ${absent
+				.map(topic => `'${topic.id}'`)
+				.join(", ")}. Quote each topic's section verbatim from the artifact, then submit the review again.`,
 		);
 	}
+	const digest = sha256(artifact);
+	const submitted = material(
+		state,
+		{
+			planUrl: plan,
+			planArtifact: artifact,
+			claim,
+			task: state.task.request,
+			topics: topics.topics,
+		},
+		withRequest(state.task.request, evidence.evidence),
+	);
+	const call = await submitToJudge(deps, state, PLAN_BOUNDARY, submitted, [
+			{
+				name: COVERAGE_QUESTION,
+				mode: "noul",
+				instructions:
+					"Do the submitted topics, taken together, cover the registered task's requirements - every obligation of the task owned by at least one topic, and no topic adding work the task does not ask for?",
+				trueMeaning: "the topics collectively cover the registered task's requirements",
+				falseMeaning: "the topics leave part of the task's requirements uncovered or add unrequested work",
+			},
+			...topics.topics.map((topic, index) => ({
+				name: topicName(index + 1),
+				mode: "noul" as const,
+				instructions: `Can the part of the plan governed by the topic '${topic.id}' be executed as written for the requirement it serves - "${topic.requirement}"? Judge only from that topic's section as quoted in the material and the quoted evidence; a topic whose section is incomplete, or conflicts with what its own section states, is not executable as written.`,
+				trueMeaning: "the quoted section is complete and executable as written for this requirement",
+				falseMeaning: "the quoted section is incomplete or conflicts with itself, so this part of the plan cannot be executed as written",
+			})),
+		],
+	);
+	if (!call.ok) return { ok: false, text: call.text };
+	const outcome = call.outcome;
+	if (!outcome.ok) return unusable(outcome.problem);
+	const coverage = probabilityOf(outcome, COVERAGE_QUESTION);
+	const uncovered = coverage === undefined || coverage < POLICY.minCoverageConfidence;
+	const judged = topics.topics.map((topic, index) => ({
+		topic,
+		probability: probabilityOf(outcome, topicName(index + 1)),
+	}));
+	const belowFloor = judged.filter(entry => (entry.probability ?? 0) < POLICY.minProbabilityToApprove);
+	if (uncovered || belowFloor.length > 0) {
+		recordRefusal(state, { boundary: PLAN_BOUNDARY, digest: call.digest, verdict: PLAN_REVISE });
+		delete state.plan;
+		state.planTopics = [];
+		const failedLines = belowFloor
+			.map(entry => `  - ${entry.topic.id} (probability ${percent(entry.probability ?? 0)}): ${entry.topic.requirement}`)
+			.join("\n");
+		return {
+			ok: true,
+			text:
+				`plan review: no approval recorded.${
+					uncovered
+						? ` The topics do not cover the registered task (probability ${coverage === undefined ? "returned nothing" : percent(coverage)}).`
+						: ""
+				}${belowFloor.length > 0 ? `\nTopics below the ${POLICY.minProbabilityToApprove} floor:\n${failedLines}` : ""}` +
+				`\nReword those topics' sections in ${plan} and submit the review again; the topics that passed are re-asked from the artifact as it then stands.`,
+			details: {
+				verdict: PLAN_REVISE,
+				coverage,
+				topics: judged.map(entry => ({ id: entry.topic.id, probability: entry.probability })),
+				planUrl: plan,
+			},
+		};
+	}
+	const confidence = coverage ?? 0;
+	const lowest = Math.min(...judged.map(entry => entry.probability ?? 0));
+	state.plan = { taskFingerprint: state.task.fingerprint, planUrl: plan, planDigest: digest, confidence };
+	state.planTopics = topics.topics;
 	return {
 		ok: true,
-		text: `plan review verdict: ${label} (confidence ${percent(answer.confidence)}). No plan approval is recorded, so the plan proposal stays held. ${
-			label === PLAN_REVISE
-				? "Change the plan artifact, then submit the review again."
-				: "Quote the parts of the artifact that settle the claim, then submit the review again."
-		}`,
-		details: { verdict: label, confidence: answer.confidence, planUrl: plan },
+		text: `plan review: every topic approved (coverage ${percent(confidence)}, lowest topic ${percent(lowest)}). The approval is bound to ${plan} (digest ${digest.slice(0, 12)}) and to task ${state.task.fingerprint.slice(0, 12)}; proposing this plan is allowed while the artifact is unchanged.`,
+		details: {
+			verdict: PLAN_SERVES,
+			coverage,
+			topics: judged.map(entry => ({ id: entry.topic.id, probability: entry.probability })),
+			planUrl: plan,
+			planDigest: digest,
+			task: state.task.fingerprint,
+		},
 	};
 }
 
@@ -691,6 +933,15 @@ export async function acceptance(deps: ActivityDeps, state: JevState, params: un
 	if (state.task === undefined) {
 		return refused("no development task is registered. Triage the request with jev_triage before acceptance.");
 	}
+	// What the code does is judged from evidence, never from the executor's claim about it (FR-26):
+	// an execution item (the command and its output) and a code item (a diagnostic, a diff or a size
+	// measurement) are both required, and the refusal costs no judge call.
+	const kinds = evidence.evidence.map(item => item.kind);
+	if (!kinds.includes("execution") || !kinds.includes("code")) {
+		return refused(
+			`the acceptance needs at least one execution item (the command and its output) and one code item (a diagnostic, a diff or a size measurement); the submission carries ${kinds.length === 0 ? "no evidence" : kinds.join(", ")}. A claim about the work is not evidence for it (FR-26).`,
+		);
+	}
 	const approving = ASPECT_APPROVING_LABEL[named];
 	const questions: JudgeQuestion[] = [
 		named === "business"
@@ -698,36 +949,54 @@ export async function acceptance(deps: ActivityDeps, state: JevState, params: un
 					name: "acceptance",
 					mode: "choice",
 					instructions:
-						"Does the finished work serve the owner's business need stated in the registered task, judged from the quoted artifacts and verification output alone?",
+						"Does the finished work serve the owner's business need stated in the registered task, judged from the quoted evidence alone?",
 					options: {
-						[approving]: "the quoted material shows the owner's need is served",
-						business_gap: "a business gap remains: the quoted material shows the need is not served",
-						[PLAN_UNSUPPORTED]: "the quoted material does not establish either",
+						[approving]: "the quoted evidence shows the owner's need is served",
+						business_gap: "a business gap remains: the quoted evidence shows the need is not served",
+						[PLAN_UNSUPPORTED]: "the quoted evidence does not establish either",
 					},
 				}
 			: {
 					name: "acceptance",
 					mode: "choice",
 					instructions:
-						"Does the finished work hold up architecturally, judged from the quoted artifacts and verification output alone: does the design carry the result and can it absorb the next change?",
+						"Does the finished work hold up architecturally, judged from the quoted evidence alone: does the design carry the result and can it absorb the next change?",
 					options: {
-						[approving]: "the quoted material shows the design carries the result and can absorb the next change",
-						architecture_defect: "an architectural defect remains: the quoted material shows the design will not carry the next change",
-						[PLAN_UNSUPPORTED]: "the quoted material does not establish either",
+						[approving]: "the quoted evidence shows the design carries the result and can absorb the next change",
+						architecture_defect: "an architectural defect remains: the quoted evidence shows the design will not carry the next change",
+						[PLAN_UNSUPPORTED]: "the quoted evidence does not establish either",
 					},
 				},
+		...state.planTopics.map((topic, index) => ({
+			name: topicName(index + 1),
+			mode: "noul" as const,
+			instructions: `Does the quoted evidence show the topic '${topic.id}' met for its requirement "${topic.requirement}"? Judge only from the quoted execution and code items; evidence that does not carry this requirement is a no.`,
+			trueMeaning: "the quoted evidence shows this topic met",
+			falseMeaning: "the quoted evidence does not show this topic met",
+		})),
 	];
-	const outcome = await deps.judge(
-		material(state, { aspect: named, claim, task: state.task.request }, withRequest(state.task.request, evidence.evidence)),
-		questions,
+	const boundary = `acceptance:${named}`;
+	const submitted = material(
+		state,
+		{ aspect: named, claim, task: state.task.request, planTopics: state.planTopics, changedPaths: state.actions.map(action => action.target) },
+		withRequest(state.task.request, evidence.evidence),
 	);
+	const call = await submitToJudge(deps, state, boundary, submitted, questions);
+	if (!call.ok) return { ok: false, text: call.text };
+	const outcome = call.outcome;
 	const answer = answerOf(outcome, "acceptance");
 	if (!outcome.ok || answer === undefined) {
 		return unusable(outcome.ok ? "the judge returned no acceptance verdict" : outcome.problem);
 	}
 	const label = answer.label ?? "";
-	const approved = choseLabel(outcome, "acceptance", approving);
+	const unmet = state.planTopics
+		.map((topic, index) => ({ topic, probability: probabilityOf(outcome, topicName(index + 1)) }))
+		.filter(entry => (entry.probability ?? 0) < POLICY.minProbabilityToApprove);
+	const approved = choseLabel(outcome, "acceptance", approving) && unmet.length === 0;
 	recordAcceptance(state, { aspect: named, revision: state.revision, label, approved, confidence: answer.confidence });
+	if (!approved) recordRefusal(state, { boundary, digest: call.digest, verdict: label });
+	const spent = state.submissions.filter(entry => entry.boundary === boundary).length;
+	const budget = approved ? "" : ` Refusal budget at this boundary: ${spent}/${POLICY.maxRefusalsPerStage}; at the bound the boundary releases and no further submission is judged for this task.`;
 	if (approved) {
 		const other = named === "business" ? "architecture" : "business";
 		const otherRecord = acceptanceAt(state, other as Aspect);
@@ -738,18 +1007,29 @@ export async function acceptance(deps: ActivityDeps, state: JevState, params: un
 			details: { aspect: named, verdict: label, approved, confidence: answer.confidence, revision: state.revision },
 		};
 	}
+	if (label === approving && unmet.length > 0) {
+		const unmetLines = unmet
+			.map(entry => `  - ${entry.topic.id} (probability ${percent(entry.probability ?? 0)}): ${entry.topic.requirement}`)
+			.join("\n");
+		return {
+			ok: false,
+			text: `${named} acceptance: the aspect verdict passed, but the quoted evidence does not show every plan topic met:\n${unmetLines}\n${MATERIAL_FAULT} Next action: quote the execution and code items that carry those topics, or finish the work they name, then submit again.${budget}`,
+			details: { aspect: named, verdict: label, approved: false, unmet: unmet.map(entry => entry.topic.id), revision: state.revision },
+		};
+	}
 	if (label === approving) {
-		return unusable(
-			`the judge approved ${named} acceptance with confidence ${percent(answer.confidence)}, below the ${POLICY.minConfidenceToApprove} floor; no acceptance is recorded.${LOW_SCORE_RECOVERY}`,
-		);
+		return {
+			ok: false,
+			text: `the judge approved ${named} acceptance with confidence ${percent(answer.confidence)}, below the ${POLICY.minConfidenceToApprove} floor; no acceptance is recorded.${LOW_SCORE_RECOVERY}${budget}`,
+		};
 	}
 	return {
 		ok: true,
 		text: `${named} acceptance: ${label} (confidence ${percent(answer.confidence)}), not recorded. ${
 			label === PLAN_UNSUPPORTED
-				? "Quote the artifacts and verification output that settle the claim, then submit again."
+				? "Quote the execution and code items that settle the claim, then submit again."
 				: "Fix the work and defend it again with the evidence of the fix."
-		}`,
+		}${budget}`,
 		details: { aspect: named, verdict: label, approved: false, confidence: answer.confidence, revision: state.revision },
 	};
 }
@@ -767,13 +1047,12 @@ export async function review(deps: ActivityDeps, state: JevState, params: unknow
 	if (claim === undefined) return refused("claim is required: state what the change does");
 	const evidence = readEvidence(record["evidence"], { required: true, what: "the developer review" });
 	if (!evidence.ok) return refused(evidence.problem);
-	const outcome = await deps.judge(
-		material(
-			state,
-			{ reviewKind: kind as ReviewKind, target, claim, task: state.task?.request ?? null },
-			withRequest(state.task?.request, evidence.evidence),
-		),
-		[
+	const submitted = material(
+		state,
+		{ reviewKind: kind as ReviewKind, target, claim, task: state.task?.request ?? null },
+		withRequest(state.task?.request, evidence.evidence),
+	);
+	const call = await submitToJudge(deps, state, REVIEW_BOUNDARY, submitted, [
 			{
 				name: "review",
 				mode: "choice",
@@ -787,6 +1066,8 @@ export async function review(deps: ActivityDeps, state: JevState, params: unknow
 			},
 		],
 	);
+	if (!call.ok) return { ok: false, text: call.text };
+	const outcome = call.outcome;
 	const answer = answerOf(outcome, "review");
 	if (!outcome.ok || answer === undefined) {
 		return unusable(outcome.ok ? "the judge returned no review verdict" : outcome.problem);
@@ -801,6 +1082,7 @@ export async function review(deps: ActivityDeps, state: JevState, params: unknow
 			details: { kind, target, verdict: label, confidence: answer.confidence },
 		};
 	}
+	recordRefusal(state, { boundary: REVIEW_BOUNDARY, digest: call.digest, verdict: label });
 	state.hold = { reason: `the developer review of ${kind} ${target} answered "${label}" (confidence ${percent(answer.confidence)})` };
 	return {
 		ok: true,
@@ -810,51 +1092,177 @@ export async function review(deps: ActivityDeps, state: JevState, params: unknow
 }
 
 /**
- * The interval course check (FR-11): one call over the registered direction and the recent action
- * results. It runs without the executor asking, so its verdict is delivered as a session message.
+ * The text review (FR-27): the submitted text is split into bounded fragments and every submitted
+ * register rule is put to the judge once per fragment, so a defect is named where it sits. The
+ * instruction to rewrite is the rule line the executor itself submitted, quoted back - the judge
+ * returns no prose, so nothing here writes advice.
+ */
+export async function textReview(deps: ActivityDeps, state: JevState, params: unknown): Promise<ToolOutcome> {
+	const record = asRecord(params) ?? {};
+	const body = text(record["text"]);
+	if (body === undefined) return refused("a non-empty text is required: submit the text you intend to present");
+	const rules = readRules(record["rules"]);
+	if (!rules.ok) return refused(rules.problem);
+	const fragments = body
+		.split(/\n\s*\n/)
+		.map(fragment => fragment.trim())
+		.filter(fragment => fragment.length > 0);
+	if (fragments.length === 0) return refused("the text carries no fragment to review");
+	if (fragments.length > POLICY.maxTextFragments) {
+		return refused(
+			`the text carries ${fragments.length} fragments and only ${POLICY.maxTextFragments} are reviewed; split it and submit each part (FR-27).`,
+		);
+	}
+	const questions: JudgeQuestion[] = [];
+	fragments.forEach((fragment, fragmentIndex) => {
+		rules.rules.forEach((rule, ruleIndex) => {
+			questions.push({
+				name: fragmentQuestionName(fragmentIndex, ruleIndex),
+				mode: "noul",
+				instructions: `Does fragment ${fragmentIndex + 1} violate this rule - "${rule.rule}" (class: ${rule.class})? Answer from the fragment as quoted in the material alone; a fragment that satisfies the rule does not violate it.`,
+				trueMeaning: "the fragment violates the rule",
+				falseMeaning: "the fragment satisfies the rule",
+			});
+		});
+	});
+	const call = await submitToJudge(
+		deps,
+		state,
+		TEXT_BOUNDARY,
+		material(state, { text: body, fragments, rules: rules.rules }, []),
+		questions,
+	);
+	if (!call.ok) return { ok: false, text: call.text };
+	if (!call.outcome.ok) return unusable(call.outcome.problem);
+	const defects = fragments.flatMap((fragment, fragmentIndex) =>
+		rules.rules.flatMap((rule, ruleIndex) => {
+			const probability = probabilityOf(call.outcome, fragmentQuestionName(fragmentIndex, ruleIndex)) ?? 0;
+			return probability >= POLICY.minProbabilityToApprove ? [{ fragment, rule, probability }] : [];
+		}),
+	);
+	if (defects.length === 0) {
+		return {
+			ok: true,
+			text: `text review: no fragment violates the ${rules.rules.length} submitted rule${rules.rules.length === 1 ? "" : "s"} at the ${POLICY.minProbabilityToApprove} floor.`,
+			details: { defects: [], rules: rules.rules.length, fragments: fragments.length },
+		};
+	}
+	const lines = defects
+		.map(
+			defect =>
+				`  "${readableFragment(defect.fragment)}"\n    violates [${defect.rule.class}] "${defect.rule.rule}" (probability ${percent(defect.probability)})`,
+		)
+		.join("\n");
+	return {
+		ok: false,
+		text: `text review: ${defects.length} defect${defects.length === 1 ? "" : "s"} in ${fragments.length} fragment${fragments.length === 1 ? "" : "s"}:\n${lines}\n${MATERIAL_FAULT} Next action: rewrite those fragments in the form the named rule lines require, then submit the text again.`,
+		details: { defects: defects.map(defect => ({ class: defect.rule.class, rule: defect.rule.rule, fragment: defect.fragment })) },
+	};
+}
+
+/** The question name of one fragment-and-rule pair, so every answer is attributed on its own. */
+function fragmentQuestionName(fragmentIndex: number, ruleIndex: number): string {
+	return `fragment_${fragmentIndex + 1}_${ruleIndex + 1}`;
+}
+
+/** One fragment as it is quoted back: long fragments are clipped, never silently dropped. */
+function readableFragment(fragment: string): string {
+	return fragment.length > POLICY.maxActionExcerptChars ? `${fragment.slice(0, POLICY.maxActionExcerptChars)}...` : fragment;
+}
+
+/** The register rules a text is reviewed against (FR-27); each one is the executor's own wording. */
+function readRules(value: unknown): { ok: true; rules: TextRule[] } | { ok: false; problem: string } {
+	if (!Array.isArray(value) || value.length === 0) {
+		return {
+			ok: false,
+			problem: "rules must list the register rules the text has to satisfy as {class, rule}, quoted from the rules the owner stated (FR-27)",
+		};
+	}
+	const rules: TextRule[] = [];
+	for (const entry of value) {
+		const record = asRecord(entry);
+		const ruleClass = text(record?.["class"]);
+		const rule = text(record?.["rule"]);
+		if (ruleClass === undefined || rule === undefined) {
+			return { ok: false, problem: "every rule needs a non-empty class and its own text, quoted verbatim" };
+		}
+		rules.push({ class: ruleClass, rule });
+	}
+	return { ok: true, rules };
+}
+
+/**
+ * The interval course check (FR-11, FR-25): one question per approved plan topic, so a verdict
+ * names the topic it concerns. It runs without the executor asking, so its verdict is delivered as
+ * a session message. Without plan topics there is no course question to ask, so no check runs.
  */
 export async function courseCheck(deps: ActivityDeps, state: JevState): Promise<ToolOutcome> {
-	const outcome = await deps.judge(material(state, { task: state.task?.request ?? null, recentActions: state.actions }, []), [
-		directionQuestion(),
-	]);
-	const answer = answerOf(outcome, DIRECTION_QUESTION);
-	if (!outcome.ok || answer === undefined) {
+	const questions = directionQuestions(state);
+	if (questions.length === 0) {
+		return {
+			ok: true,
+			text: `course check at revision ${state.revision}: no approved plan topics, no check ran`,
+			details: { approved: true, topics: [], revision: state.revision },
+		};
+	}
+	const outcome = await askJudge(
+		deps,
+		state,
+		material(
+			state,
+			{
+				task: state.task?.request ?? null,
+				planTopics: state.planTopics,
+				changedPaths: state.actions.map(action => action.target),
+				deviation: state.deviation ?? null,
+				recentActions: state.actions,
+			},
+			[],
+		),
+		questions,
+	);
+	const answers = questions.map(question => ({ question, answer: answerOf(outcome, question.name) }));
+	if (!outcome.ok || answers.some(entry => entry.answer === undefined)) {
 		const problem = outcome.ok ? "the judge returned no direction answer" : outcome.problem;
 		state.courseCheck = { revision: state.revision, label: "no_answer", approved: false, confidence: 0 };
 		state.hold = { reason: `the course check at revision ${state.revision} could not be answered (${problem})` };
 		return unusable(problem);
 	}
-	const label = answer.label ?? "no_answer";
-	const approved = choseLabel(outcome, DIRECTION_QUESTION, DIRECTION_ON_COURSE);
-	state.courseCheck = { revision: state.revision, label, approved, confidence: answer.confidence };
+	const summary = answers
+		.map(entry => `${entry.answer?.label ?? "no_answer"} for ${entry.question.name} (confidence ${percent(entry.answer?.confidence ?? 0)})`)
+		.join(", ");
+	const approved = answers.every(entry => choseLabel(outcome, entry.question.name, DIRECTION_ON_COURSE));
+	const lowest = Math.min(...answers.map(entry => entry.answer?.confidence ?? 0));
+	state.courseCheck = { revision: state.revision, label: summary, approved, confidence: lowest };
 	if (approved) {
 		delete state.hold;
+		delete state.deviation;
 		return {
 			ok: true,
-			text: `course check at revision ${state.revision}: ${label} (confidence ${percent(answer.confidence)}).`,
-			details: { label, approved, confidence: answer.confidence, revision: state.revision },
+			text: `course check at revision ${state.revision}: ${summary}.`,
+			details: { label: summary, approved: true, confidence: lowest, revision: state.revision },
 		};
 	}
-	state.hold = { reason: `the course check at revision ${state.revision} answered "${label}" (confidence ${percent(answer.confidence)})` };
+	state.hold = { reason: `the course check at revision ${state.revision} answered ${summary}` };
 	return {
 		ok: true,
-		text: `course check at revision ${state.revision}: ${label} (confidence ${percent(answer.confidence)}). Consequential changes are held until you consult jev_consult about the direction.`,
-		details: { label, approved: false, confidence: answer.confidence, revision: state.revision },
+		text: `course check at revision ${state.revision}: ${summary}. Consequential changes are held until you consult jev_consult about the direction.`,
+		details: { label: summary, approved: false, confidence: lowest, revision: state.revision },
 	};
 }
 
-function directionQuestion(): JudgeQuestion {
-	return {
-		name: DIRECTION_QUESTION,
+/** One course question per approved plan topic (FR-25): the verdict names the topic it concerns. */
+function directionQuestions(state: JevState): JudgeQuestion[] {
+	return state.planTopics.map(topic => ({
+		name: `direction:${topic.id}`,
 		mode: "choice",
-		instructions:
-			"Does the work continue the registered task's direction? Judge only from the registered task text and the recent action results in the material; an action unrelated to the task's requirements is a change of course.",
+		instructions: `Do the recent actions serve the plan topic "${topic.id}" (requirement: ${topic.requirement})? Judge only from the material: the topic's paths (${topic.paths.join(", ") || "none named"}), the changed paths and the recent action results. An action whose target lies outside the topic's paths counts against the topic unless its result shows it serves it.`,
 		options: {
-			[DIRECTION_ON_COURSE]: "the recent actions follow the registered task and no change of course is needed",
-			[DIRECTION_OFF_COURSE]: "the recent actions have left the registered task's direction and a change is needed",
+			[DIRECTION_ON_COURSE]: `the recent actions serve the topic "${topic.id}" and no change of course is needed`,
+			[DIRECTION_OFF_COURSE]: `the recent actions have left the topic "${topic.id}" behind and a change is needed`,
 			[DIRECTION_UNCLEAR]: "the submitted action results do not establish either",
 		},
-	};
+	}));
 }
 
 /**
@@ -880,12 +1288,14 @@ export async function completionCheck(
 			},
 		},
 	];
-	if (options.course) questions.push(directionQuestion());
-	const outcome = await deps.judge(
+	if (options.course) questions.push(...directionQuestions(state));
+	const outcome = await askJudge(deps, state, 
 		material(
 			state,
 			{
 				task: state.task?.request ?? null,
+				planTopics: state.planTopics,
+				deviation: state.deviation ?? null,
 				acceptance: state.acceptance,
 				recentActions: state.actions,
 			},
@@ -894,22 +1304,23 @@ export async function completionCheck(
 		questions,
 	);
 	const follows = answerOf(outcome, FOLLOWS_QUESTION);
-	const direction = options.course ? answerOf(outcome, DIRECTION_QUESTION) : undefined;
-	if (!outcome.ok || follows === undefined || (options.course && direction === undefined)) {
+	const directions = options.course ? directionQuestions(state) : [];
+	const directionAnswers = directions.map(question => answerOf(outcome, question.name));
+	if (!outcome.ok || follows === undefined || directionAnswers.some(answer => answer === undefined)) {
 		const problem = outcome.ok ? "the judge returned no completion answer" : outcome.problem;
 		state.completion = { revision: state.revision, label: "no_answer", approved: false, confidence: 0 };
 		return unusable(problem);
 	}
 	const followsOk = choseLabel(outcome, FOLLOWS_QUESTION, FOLLOWS);
-	const directionOk = direction === undefined || choseLabel(outcome, DIRECTION_QUESTION, DIRECTION_ON_COURSE);
-	const approved = followsOk && directionOk;
-	const label = direction === undefined ? (follows.label ?? "no_answer") : `${follows.label ?? "no_answer"}/${direction.label ?? "no_answer"}`;
+	const failedTopics = directions.filter(question => !choseLabel(outcome, question.name, DIRECTION_ON_COURSE));
+	const approved = followsOk && failedTopics.length === 0;
+	const label = directions.length === 0 ? (follows.label ?? "no_answer") : `${follows.label ?? "no_answer"}/${failedTopics.length === 0 ? DIRECTION_ON_COURSE : failedTopics.map(question => question.name).join(" ")}`;
 	state.completion = { revision: state.revision, label, approved, confidence: follows.confidence };
 	return {
 		ok: true,
 		text: `completion check at revision ${state.revision}: ${label} (confidence ${percent(follows.confidence)}).${
 			approved ? "" : " The finished work is not approved for completion."
 		}`,
-		details: { label, approved, confidence: follows.confidence, revision: state.revision, follows: follows.label, direction: direction?.label },
+		details: { label, approved, confidence: follows.confidence, revision: state.revision, follows: follows.label, directions: directionAnswers.map(answer => answer?.label) },
 	};
 }

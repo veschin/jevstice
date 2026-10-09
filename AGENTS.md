@@ -12,14 +12,15 @@ What the executor can consult:
 - `jev_triage` - does the request need the deeper activities at all, and which narrow task-specific topics does it need? A simple result names the skipped activities and registers nothing.
 - `jev_search_relevance` - which submitted search candidate is relevant, with the executor's own submitted reason returned (FR-03).
 - `jev_requirements` - per-item understanding of the requirement list against the owner's request, plus its coverage and the omitted owner needs, in one batched call (FR-04..FR-06).
-- `jev_plan_review` - the plan artifact defended before the judge; the approval binds the task fingerprint and the artifact's exact bytes (FR-07).
+- `jev_plan_review` - the plan artifact defended topic by topic before the judge: the executor submits each topic with the artifact section that governs it, the paths it changes and the requirement it serves, and one question per topic decides it; the approval binds the task fingerprint and the artifact's exact bytes (FR-07, FR-24).
 - `jev_acceptance` - the finished work defended separately as `business` and as `architecture` (FR-14, FR-15).
 - `jev_review` - a checkpoint, commit or diff defended as a developer (FR-16).
+- `jev_text_review` - a text split into fragments, with the register rule each failing fragment violates quoted back (FR-27).
 
 The boundaries it holds:
 - the plan-mode proposal `write xd://propose` needs a plan approval for the artifact being proposed, and the approval survives the approve-and-execute session switch only while the copied artifact still matches the approved digest;
 - the first consequential change of a session waits for a triage decision (`jev_triage` or `jev_requirements`): a confirmed simple task then passes without the deeper stages, and the verdict belongs to that one request (FR-18);
-- a consequential change is held while the registered development task has no approved plan, while a course check is in flight, or while a finding is outstanding;
+- a consequential change is held while the registered development task has no approved plan, while a course check is in flight, or while a finding is outstanding - unless the judge proved unavailable or that boundary was released after its refusal bound, in which case it passes and the refusal stays an OPEN item (FR-21, FR-23);
 - `session_stop` is held until both acceptance aspects passed at the current work revision and the completion check agrees (FR-17).
 
 Nothing classifies prompts and nothing calls the judge before a tool is invoked or a boundary is reached: a plain read-only question or web search costs zero judge calls and no gate (FR-10, S13).
@@ -34,9 +35,9 @@ Flat `src/`, no subdirectories, no build step. Dependencies point right:
 - `judge.ts` - the single judge adapter: `JudgeQuestion`/`JudgeAnswer`/`JudgeOutcome`, request validation before any call, fail-closed normalization of SDK answers, and the answer accessors (`choseLabel`, `saidTrue`, `probabilityOf`, `scoreOf`, `answerOf`). The SDK returns no free prose, so nothing here invents an explanation.
 - `apikey.ts` - key resolution: environment variable first, then a resolver command whose stdout is the key. The key reaches the client and nothing else; a failure resolves to `undefined`.
 - `config.ts` - project `<cwd>/.omp/jev.config.json` overrides user `~/.omp/agent/jev.config.json`; reads `gates.mutation`, `gates.completion`, `courseCheck.mode`, `courseCheck.interval`. Unknown keys are ignored (old files still load) and an invalid value keeps the fail-closed default, naming the file and the key.
-- `state.ts` - per-session gate state, fingerprints (`sha256`) and the mutation ledger: task registration, action records, revision, acceptance records, stop-block ledger.
-- `gates.ts` - the visible boundaries as pure decisions: what counts as a consequential change, the mutation gate reason, the `xd://propose` gate, the completion gate.
-- `activities.ts` - the seven activities plus the two automatic checks (`courseCheck`, `completionCheck`): request validation, question building, judge call, typed-answer interpretation, state update, human-readable text.
+- `state.ts` - per-session gate state, fingerprints (`sha256`) and the ledgers: task registration, action records, revision, acceptance records, the stop-block ledger, the refused-submission ledger and the open item a released boundary leaves (FR-22, FR-23).
+- `gates.ts` - the visible boundaries as pure decisions: what counts as a consequential change, the mutation gate reason (each refusal names its boundary and renders the copy-ready next call, FR-28), the `xd://propose` gate, the completion gate, and the target-against-plan comparison the course check hangs off (FR-25).
+- `activities.ts` - the eight activities plus the two automatic checks (`courseCheck`, `completionCheck`): request validation, question building, the guarded judge call, typed-answer interpretation, state update, human-readable text. The guard in front of the judge keeps the refusal ledger: a digest already refused at a boundary costs no call, and the boundary releases itself once the bound is reached (FR-22, FR-23).
 - `artifact.ts` - reading a `local://` artifact from disk, so the plan review binds an approval to the artifact's bytes rather than to the caller's copy.
 - `controller.ts` - the omp wiring: registers the tools, holds the `tool_call` / `tool_result` / `session_stop` handlers, keys state per session, runs the automatic checks.
 - `index.ts` - extension entry (the `omp.extensions` manifest field in package.json is currently absent on purpose, so ordinary sessions load no addon).

@@ -47,6 +47,25 @@ describe("T3 - task registration and work revision", () => {
 		expect(state.actions).toHaveLength(POLICY.maxActionRecords);
 		expect(state.actions[0]?.target).toBe("src/f2.ts");
 	});
+
+	test("a verification command records evidence without moving the revision", () => {
+		const state = freshState();
+		registerTask(state, "task");
+		state.completion = { revision: 0, label: "follows", approved: true, confidence: 0.9 };
+
+		recordAction(state, { tool: "bash", target: "bun test", excerpt: "141 pass" }, false);
+
+		expect(state.revision).toBe(0);
+		expect(state.actionsSinceCheck).toBe(0);
+		expect(state.completion).toBeDefined();
+		expect(state.actions).toHaveLength(1);
+
+		recordAction(state, { tool: "write", target: "src/a.ts", excerpt: "x" });
+
+		expect(state.revision).toBe(1);
+		expect(state.actionsSinceCheck).toBe(1);
+		expect(state.completion).toBeUndefined();
+	});
 });
 
 describe("T5 - acceptance is bound to the work revision", () => {

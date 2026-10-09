@@ -47,10 +47,18 @@ export interface JudgeAnswer {
 	confidence: number;
 }
 
-/** The adapter's result: typed answers, or the problem that prevented a usable one. */
+/**
+ * The adapter's result: typed answers, or the problem that prevented a usable one. `kind` separates
+ * the failures the executor must read differently (FR-20): `unavailable` is the judge failing to
+ * answer (transport, authentication, a missing key), `unusable` is an answer that could not be read.
+ * Neither counts as an approval; only `unavailable` counts towards the availability bound (FR-21).
+ */
 export type JudgeOutcome =
 	| { ok: true; model: string; answers: readonly JudgeAnswer[] }
-	| { ok: false; problem: string };
+	| { ok: false; problem: string; kind: JudgeFailureKind };
+
+/** Why a judge answer could not be used (FR-20, FR-21). */
+export type JudgeFailureKind = "unavailable" | "unusable";
 
 /** Pure decision call. Tests inject a fake; production uses the TypeSafe client. */
 export type Judge = (state: unknown, questions: readonly JudgeQuestion[]) => Promise<JudgeOutcome>;
@@ -132,35 +140,35 @@ export function normalizeAnswers(
 	const envelope = asRecord(raw);
 	const model = typeof envelope?.["model"] === "string" ? envelope["model"] : POLICY.defaultModel;
 	const answers = asRecord(envelope?.["answers"]);
-	if (answers === undefined) return { ok: false, problem: "the judge returned no answers" };
+	if (answers === undefined) return { ok: false, kind: "unusable", problem: "the judge returned no answers" };
 	const extra = Object.keys(answers).filter(name => !questions.some(question => question.name === name));
-	if (extra.length > 0) return { ok: false, problem: `the judge answered unknown questions: ${extra.join(", ")}` };
+	if (extra.length > 0) return { ok: false, kind: "unusable", problem: `the judge answered unknown questions: ${extra.join(", ")}` };
 
 	const normalized: JudgeAnswer[] = [];
 	for (const question of questions) {
 		const answer = asRecord(answers[question.name]);
-		if (answer === undefined) return { ok: false, problem: `the judge returned no answer for '${question.name}'` };
+		if (answer === undefined) return { ok: false, kind: "unusable", problem: `the judge returned no answer for '${question.name}'` };
 		if (question.mode === "noul") {
 			const yes = probability(answer["noul"]);
-			if (answer["type"] !== "noul" || yes === undefined) return { ok: false, problem: `answer '${question.name}' carries no probability` };
+			if (answer["type"] !== "noul" || yes === undefined) return { ok: false, kind: "unusable", problem: `answer '${question.name}' carries no probability` };
 			normalized.push({ name: question.name, mode: "noul", probability: yes, confidence: Math.max(yes, 1 - yes) });
 			continue;
 		}
 		const confidence = probability(answer["confidence"]);
 		if (confidence === undefined) {
-			return { ok: false, problem: `answer '${question.name}' reports no usable confidence` };
+			return { ok: false, kind: "unusable", problem: `answer '${question.name}' reports no usable confidence` };
 		}
 		if (question.mode === "choice") {
 			const label = answer["choice"];
 			if (typeof label !== "string" || !Object.hasOwn(question.options ?? {}, label)) {
-				return { ok: false, problem: `answer '${question.name}' selected a label that was not offered` };
+				return { ok: false, kind: "unusable", problem: `answer '${question.name}' selected a label that was not offered` };
 			}
 			normalized.push({ name: question.name, mode: "choice", label, confidence });
 			continue;
 		}
 		const value = answer["score"];
 		if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > (question.criteria?.length ?? 0) - 1) {
-			return { ok: false, problem: `answer '${question.name}' carries a score outside the submitted rubric` };
+			return { ok: false, kind: "unusable", problem: `answer '${question.name}' carries a score outside the submitted rubric` };
 		}
 		normalized.push({ name: question.name, mode: "score", score: value, confidence });
 	}
@@ -193,7 +201,7 @@ export function createTypeSafeJudge(deps: {
 	let clientKey: string | undefined;
 	return async (state, questions) => {
 		const malformed = questionProblem(questions);
-		if (malformed !== undefined) return { ok: false, problem: malformed };
+		if (malformed !== undefined) return { ok: false, kind: "unusable", problem: malformed };
 		let key: string | undefined;
 		try {
 			key = await deps.resolveKey();
@@ -203,6 +211,7 @@ export function createTypeSafeJudge(deps: {
 		if (key === undefined) {
 			return {
 				ok: false,
+				kind: "unavailable",
 				problem: `no TypeSafe API key (${POLICY.apiKeyEnv}, ${POLICY.altApiKeyEnvs.join(", ")} or a resolver in ${POLICY.apiKeyCommandEnv})`,
 			};
 		}
@@ -214,7 +223,7 @@ export function createTypeSafeJudge(deps: {
 			const raw = await client.systemOne({ state: state as EntryType, questions: buildQuestions(questions), model });
 			return normalizeAnswers(questions, raw);
 		} catch {
-			return { ok: false, problem: "the judge call failed (transport, authentication or service error)" };
+			return { ok: false, kind: "unavailable", problem: "the judge call failed (transport, authentication or service error)" };
 		}
 	};
 }

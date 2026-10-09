@@ -5,16 +5,18 @@ import {
 	consult,
 	courseCheck,
 	planReview,
+	reaim,
 	requirements,
 	review,
 	searchRelevance,
+	textReview,
 	triage,
 	type ActivityDeps,
 } from "../src/activities.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { mutationGate, proposeGate } from "../src/gates.js";
 import { acceptanceAt, freshState, recordAction, registerTask, sha256 } from "../src/state.js";
-import { POLICY } from "../src/types.js";
+import { POLICY, type PlanTopic } from "../src/types.js";
 import { answeringJudge, failingJudge, type FakeAnswer } from "./helpers.js";
 
 /** Activity dependencies over a fake judge table and an optional artifact reader. */
@@ -26,10 +28,236 @@ function depsFor(table: Record<string, FakeAnswer>, readArtifact?: ActivityDeps[
 
 const PLAN_URL = "local://coverage-report-plan.md";
 const PLAN_BODY = "# Coverage report\n\n1. Collect the numbers\n";
+/** One topic whose quoted section is present in PLAN_BODY, and the answers a passing review needs (FR-24). */
+const PLAN_TOPICS: PlanTopic[] = [
+	{
+		id: "collect",
+		section: "1. Collect the numbers",
+		paths: ["src/report.ts"],
+		requirement: "report the coverage of the last run",
+	},
+];
+const PLAN_APPROVED: Record<string, FakeAnswer> = { coverage: { probability: 0.93 }, topic_1: { probability: 0.9 } };
 
 function planReader(body: string | null): ActivityDeps["readArtifact"] {
 	return async url => (url === PLAN_URL ? body : null);
 }
+
+describe("FR-22, FR-23 - a refusal is counted, a repeat costs nothing and the bound releases the boundary", () => {
+	const REFUSED: Record<string, FakeAnswer> = { coverage: { probability: 0.2 }, topic_1: { probability: 0.9 } };
+	const submission = (attempt: number) => ({
+		plan: PLAN_URL,
+		claim: `the plan delivers the coverage report, attempt ${attempt}`,
+		topics: PLAN_TOPICS,
+		evidence: [{ kind: "user", quote: `report the coverage of the last run, attempt ${attempt}` }],
+	});
+
+	test("FR-22: material already refused at this boundary costs no second judge call", async () => {
+		const { deps, calls } = depsFor(REFUSED, planReader(PLAN_BODY));
+		const state = freshState();
+		registerTask(state, "Report the coverage of the last run");
+		const params = submission(1);
+
+		expect((await planReview(deps, state, params)).ok).toBe(true);
+		const repeat = await planReview(deps, state, params);
+
+		expect(repeat.ok).toBe(false);
+		expect(repeat.text).toContain("already judged and refused");
+		expect(calls).toHaveLength(1);
+		expect(state.submissions).toHaveLength(1);
+	});
+
+	test("FR-23: the refusal bound releases the plan boundary and records the open item", async () => {
+		const { deps, calls } = depsFor(REFUSED, planReader(PLAN_BODY));
+		const state = freshState();
+		registerTask(state, "Report the coverage of the last run");
+
+		for (let attempt = 1; attempt <= POLICY.maxRefusalsPerStage; attempt += 1) {
+			expect((await planReview(deps, state, submission(attempt))).ok).toBe(true);
+		}
+
+		expect(calls).toHaveLength(POLICY.maxRefusalsPerStage);
+		expect(state.openItem?.boundary).toBe("plan");
+		expect(state.openItem?.attempts).toBe(POLICY.maxRefusalsPerStage);
+		// The released boundary no longer holds consequential changes, and nothing was approved.
+		expect(mutationGate(state, DEFAULT_CONFIG, "write", { path: "src/a.ts" }).block).toBe(false);
+		expect(state.plan).toBeUndefined();
+	});
+
+	test("FR-23: a submission after the release is refused without a judge call", async () => {
+		const { deps, calls } = depsFor(REFUSED, planReader(PLAN_BODY));
+		const state = freshState();
+		registerTask(state, "Report the coverage of the last run");
+		for (let attempt = 1; attempt <= POLICY.maxRefusalsPerStage; attempt += 1) {
+			await planReview(deps, state, submission(attempt));
+		}
+
+		const after = await planReview(deps, state, submission(99));
+
+		expect(after.ok).toBe(false);
+		expect(after.text).toContain("released as an OPEN item");
+		expect(calls).toHaveLength(POLICY.maxRefusalsPerStage);
+	});
+});
+
+describe("FR-29 - the owner's interjection re-aims the registered task", () => {
+	test("FR-29: an approved re-aim replaces the course and keeps the walls down", async () => {
+		const state = freshState();
+		registerTask(state, "old course");
+		state.released = ["hold"];
+		const { deps, calls } = depsFor({ reaim: { probability: 0.9 } });
+
+		const outcome = await reaim(deps, state, { interjection: "новое направление", evidence: [{ kind: "user", quote: "новое направление" }] });
+
+		expect(outcome.ok).toBe(true);
+		expect(state.task?.request).toBe("новое направление");
+		expect(state.released).toContain("hold");
+		expect(state.released).toContain("plan");
+		expect(calls[0]?.questions[0]?.name).toBe("reaim");
+	});
+
+	test("FR-29: a refused re-aim changes nothing", async () => {
+		const state = freshState();
+		registerTask(state, "old course");
+		const { deps } = depsFor({ reaim: { probability: 0.3 } });
+
+		const outcome = await reaim(deps, state, { interjection: "новое направление", evidence: [{ kind: "user", quote: "новое направление" }] });
+
+		expect(outcome.ok).toBe(false);
+		expect(state.task?.request).toBe("old course");
+	});
+});
+
+describe("wave two - the measured deadlock fixes", () => {
+	test("FR-25: an on-course verdict clears a standing deviation, an off-course verdict keeps it", async () => {
+		const good = freshState();
+		registerTask(good, "Report the coverage of the last run");
+		good.planTopics = PLAN_TOPICS;
+		good.deviation = { tool: "write", target: "docs/notes.md", revision: 1 };
+		await courseCheck(depsFor({ "direction:collect": { label: "on_course", confidence: 0.9 } }).deps, good);
+
+		expect(good.deviation).toBeUndefined();
+
+		const bad = freshState();
+		registerTask(bad, "Report the coverage of the last run");
+		bad.planTopics = PLAN_TOPICS;
+		bad.deviation = { tool: "write", target: "docs/notes.md", revision: 1 };
+		await courseCheck(depsFor({ "direction:collect": { label: "off_course", confidence: 0.9 } }).deps, bad);
+
+		expect(bad.deviation).toBeDefined();
+	});
+
+	test("FR-22: a refused acceptance names its remaining refusal budget", async () => {
+		const state = freshState();
+		registerTask(state, "Report the coverage of the last run");
+		const { deps } = depsFor({ acceptance: { label: "business_gap", confidence: 0.9 } });
+
+		const outcome = await acceptance(deps, state, { aspect: "business", claim: "c", evidence: [{ kind: "execution", quote: "12 pass" }, { kind: "code", quote: "no diagnostics" }] });
+
+		expect(outcome.text).toContain("Refusal budget at this boundary: 1/3");
+	});
+
+	test("FR-24: coverage at the sanity floor approves when every topic passes, below it refuses", async () => {
+		const approving = { coverage: { probability: 0.65 }, topic_1: { probability: 0.9 } };
+		const state = freshState();
+		registerTask(state, "Report the coverage of the last run");
+		const passed = await planReview(depsFor(approving, planReader(PLAN_BODY)).deps, state, { plan: PLAN_URL, claim: "the plan delivers the report", topics: PLAN_TOPICS, evidence: [{ kind: "user", quote: "report the coverage of the last run" }] });
+
+		expect(passed.ok).toBe(true);
+		expect(state.plan).toBeDefined();
+
+		const refusing = { coverage: { probability: 0.5 }, topic_1: { probability: 0.9 } };
+		const second = freshState();
+		registerTask(second, "Report the coverage of the last run");
+		const refusedOutcome = await planReview(depsFor(refusing, planReader(PLAN_BODY)).deps, second, { plan: PLAN_URL, claim: "the plan delivers the report", topics: PLAN_TOPICS, evidence: [{ kind: "user", quote: "report the coverage of the last run" }] });
+
+		expect(refusedOutcome.text).toContain("do not cover");
+	});
+});
+
+describe("FR-27 - the text review names the fragment and the rule it violates", () => {
+	const JARGON_RULE = "Жаргон в прозе не употребляется.";
+	const BREVITY_RULE = "Минимум слов, сохраняющих смысл.";
+	const RULES = [
+		{ class: "jargon", rule: JARGON_RULE },
+		{ class: "brevity", rule: BREVITY_RULE },
+	];
+
+	test("FR-27: a violating fragment returns the submitted rule line byte-identical", async () => {
+		const { deps, calls } = depsFor({ fragment_1_1: { probability: 0.93 }, fragment_1_2: { probability: 0.1 } });
+
+		const outcome = await textReview(deps, freshState(), { text: "Мы осуществили оптимизацию пайплайна.", rules: RULES });
+
+		expect(outcome.ok).toBe(false);
+		expect(outcome.text).toContain(JARGON_RULE);
+		expect(outcome.text).not.toContain(BREVITY_RULE);
+		expect(outcome.text).toContain("осуществили оптимизацию");
+		expect(calls[0]?.questions.map(question => question.name)).toEqual(["fragment_1_1", "fragment_1_2"]);
+	});
+
+	test("FR-27: a text that violates none of the submitted rules is approved", async () => {
+		const { deps } = depsFor({ fragment_1_1: { probability: 0.1 }, fragment_1_2: { probability: 0.05 } });
+
+		const outcome = await textReview(deps, freshState(), { text: "Отчёт готов.", rules: RULES });
+
+		expect(outcome.ok).toBe(true);
+		expect(outcome.text).toContain("no fragment violates");
+	});
+
+	test("FR-27: a review without rules, or over too many fragments, is refused without a judge call", async () => {
+		const { deps, calls } = depsFor({});
+
+		expect((await textReview(deps, freshState(), { text: "Отчёт готов." })).ok).toBe(false);
+		const many = Array.from({ length: POLICY.maxTextFragments + 1 }, (_, index) => `Абзац номер ${index}.`).join("\n\n");
+		const outcome = await textReview(deps, freshState(), { text: many, rules: RULES });
+
+		expect(outcome.ok).toBe(false);
+		expect(outcome.text).toContain(String(POLICY.maxTextFragments));
+		expect(calls).toHaveLength(0);
+	});
+});
+
+describe("FR-26 - acceptance is judged from the submitted evidence", () => {
+	test("FR-26: a claim without execution and code evidence is refused before any judge call", async () => {
+		const state = freshState();
+		registerTask(state, "Report the coverage of the last run");
+		const { deps, calls } = depsFor({ acceptance: { label: "serves_business_need", confidence: 0.9 } });
+
+		const outcome = await acceptance(deps, state, {
+			aspect: "business",
+			claim: "the report serves the owner's need",
+			evidence: [{ kind: "user", quote: "the report is done" }],
+		});
+
+		expect(outcome.ok).toBe(false);
+		expect(outcome.text).toContain("execution item");
+		expect(calls).toHaveLength(0);
+	});
+
+	test("FR-26: the acceptance asks one question per plan topic and names the topic its evidence misses", async () => {
+		const state = freshState();
+		registerTask(state, "Report the coverage of the last run");
+		state.planTopics = PLAN_TOPICS;
+		const { deps, calls } = depsFor({
+			acceptance: { label: "serves_business_need", confidence: 0.9 },
+			topic_1: { probability: 0.2 },
+		});
+
+		const outcome = await acceptance(deps, state, {
+			aspect: "business",
+			claim: "the report serves the owner's need",
+			evidence: [
+				{ kind: "execution", quote: "bun test: 132 pass" },
+				{ kind: "code", quote: "0 diagnostics" },
+			],
+		});
+
+		expect(outcome.ok).toBe(false);
+		expect(outcome.text).toContain("collect");
+		expect(acceptanceAt(state, "business")?.approved).toBe(false);
+		expect(calls[0]?.questions.map(question => question.name)).toEqual(["acceptance", "topic_1"]);
+	});
+});
 
 describe("T2 - triage decides whether the deeper activities apply (FR-01, FR-02, FR-10)", () => {
 	test("FR-01: a development request registers the task and returns only the narrow topics the judge selected", async () => {
@@ -386,15 +614,16 @@ describe("T1 - the flexible consultation (FR-08, FR-09, FR-13)", () => {
 	});
 });
 
-describe("T3 - the plan review binds the approval to the artifact (FR-07)", () => {
-	test("FR-07: an approved artifact approves this task and this artifact only", async () => {
-		const { deps, calls } = depsFor({ plan: { label: "serves", confidence: 0.93 } }, planReader(PLAN_BODY));
+describe("T3 - the plan review asks per topic and binds the approval to the artifact (FR-07, FR-24)", () => {
+	test("FR-24: every topic at the floor approves this task and this artifact only", async () => {
+		const { deps, calls } = depsFor(PLAN_APPROVED, planReader(PLAN_BODY));
 		const state = freshState();
 		const task = registerTask(state, "Report the coverage of the last run");
 
 		const outcome = await planReview(deps, state, {
 			plan: PLAN_URL,
 			claim: "the plan delivers the coverage report requirement",
+			topics: PLAN_TOPICS,
 			evidence: [{ kind: "user", quote: "report the coverage of the last run" }],
 		});
 
@@ -402,20 +631,77 @@ describe("T3 - the plan review binds the approval to the artifact (FR-07)", () =
 		expect(state.plan?.planUrl).toBe(PLAN_URL);
 		expect(state.plan?.planDigest).toBe(sha256(PLAN_BODY));
 		expect(state.plan?.taskFingerprint).toBe(task.fingerprint);
+		expect(state.planTopics).toEqual(PLAN_TOPICS);
 		expect(proposeGate(state, DEFAULT_CONFIG, { path: "xd://propose", content: "coverage-report" }).block).toBe(false);
 		expect(proposeGate(state, DEFAULT_CONFIG, { path: "xd://propose", content: "another-plan" }).block).toBe(true);
 		// The artifact text reaches the judge as material, not as a caller-supplied summary.
 		expect(JSON.stringify(calls[0]?.state)).toContain("Collect the numbers");
 	});
 
+	test("FR-24: one topic below the floor refuses the review and names that topic", async () => {
+		const { deps } = depsFor({ coverage: { probability: 0.95 }, topic_1: { probability: 0.4 } }, planReader(PLAN_BODY));
+		const state = freshState();
+		registerTask(state, "Report the coverage of the last run");
+
+		const outcome = await planReview(deps, state, {
+			plan: PLAN_URL,
+			claim: "the plan delivers the coverage report requirement",
+			topics: PLAN_TOPICS,
+			evidence: [{ kind: "user", quote: "report the coverage of the last run" }],
+		});
+
+		expect(outcome.ok).toBe(true);
+		expect(outcome.text).toContain("no approval recorded");
+		expect(outcome.text).toContain("collect");
+		expect(outcome.details?.["verdict"]).toBe("revise");
+		expect(state.plan).toBeUndefined();
+		expect(proposeGate(state, DEFAULT_CONFIG, { path: "xd://propose", content: "coverage-report" }).block).toBe(true);
+	});
+
+	test("FR-24: a topic set that leaves the task uncovered refuses the review although every topic passed", async () => {
+		const { deps } = depsFor({ coverage: { probability: 0.3 }, topic_1: { probability: 0.95 } }, planReader(PLAN_BODY));
+		const state = freshState();
+		registerTask(state, "Report the coverage of the last run");
+
+		const outcome = await planReview(deps, state, {
+			plan: PLAN_URL,
+			claim: "the plan delivers the coverage report requirement",
+			topics: PLAN_TOPICS,
+			evidence: [{ kind: "user", quote: "report the coverage of the last run" }],
+		});
+
+		expect(outcome.ok).toBe(true);
+		expect(outcome.text).toContain("do not cover");
+		expect(state.plan).toBeUndefined();
+	});
+
+	test("FR-24: a topic whose section the artifact does not carry is refused before any judge call", async () => {
+		const { deps, calls } = depsFor(PLAN_APPROVED, planReader(PLAN_BODY));
+		const state = freshState();
+		registerTask(state, "Report the coverage of the last run");
+
+		const outcome = await planReview(deps, state, {
+			plan: PLAN_URL,
+			claim: "the plan delivers the coverage report requirement",
+			topics: [{ id: "quote", section: "a section this artifact does not carry", paths: ["src/report.ts"], requirement: "the report" }],
+			evidence: [{ kind: "user", quote: "report the coverage of the last run" }],
+		});
+
+		expect(outcome.ok).toBe(false);
+		expect(outcome.text).toContain("'quote'");
+		expect(calls).toHaveLength(0);
+		expect(state.plan).toBeUndefined();
+	});
+
 	test("FR-07: an artifact that cannot be read binds nothing", async () => {
-		const { deps, calls } = depsFor({ plan: { label: "serves", confidence: 0.93 } }, planReader(null));
+		const { deps, calls } = depsFor(PLAN_APPROVED, planReader(null));
 		const state = freshState();
 		registerTask(state, "Report the coverage of the last run");
 
 		const outcome = await planReview(deps, state, {
 			plan: PLAN_URL,
 			claim: "the plan delivers the requirement",
+			topics: PLAN_TOPICS,
 			evidence: [{ kind: "user", quote: "report the coverage" }],
 		});
 
@@ -425,32 +711,16 @@ describe("T3 - the plan review binds the approval to the artifact (FR-07)", () =
 		expect(calls).toHaveLength(0);
 	});
 
-	test("FR-07: a revise verdict records no approval and the proposal stays held", async () => {
-		const { deps } = depsFor({ plan: { label: "revise", confidence: 0.9 } }, planReader(PLAN_BODY));
-		const state = freshState();
-		registerTask(state, "Report the coverage of the last run");
-
-		const outcome = await planReview(deps, state, {
-			plan: PLAN_URL,
-			claim: "the plan delivers the requirement",
-			evidence: [{ kind: "user", quote: "report the coverage" }],
-		});
-
-		expect(outcome.ok).toBe(true);
-		expect(outcome.text).toContain("No plan approval is recorded");
-		expect(state.plan).toBeUndefined();
-		expect(proposeGate(state, DEFAULT_CONFIG, { path: "xd://propose", content: "coverage-report" }).block).toBe(true);
-	});
-
 	test("FR-07: a plan longer than the submitted limit is refused before the judge sees it", async () => {
 		const long = `# plan\n${"x".repeat(POLICY.maxArtifactChars)}`;
-		const { deps, calls } = depsFor({ plan: { label: "serves", confidence: 0.93 } }, async () => long);
+		const { deps, calls } = depsFor(PLAN_APPROVED, async () => long);
 		const state = freshState();
 		registerTask(state, "Report the coverage of the last run");
 
 		const outcome = await planReview(deps, state, {
 			plan: PLAN_URL,
 			claim: "the plan delivers the requirement",
+			topics: [{ id: "body", section: "# plan", paths: ["src/report.ts"], requirement: "the report" }],
 			evidence: [{ kind: "user", quote: "report the coverage" }],
 		});
 
@@ -460,15 +730,19 @@ describe("T3 - the plan review binds the approval to the artifact (FR-07)", () =
 		expect(state.plan).toBeUndefined();
 	});
 
-	test("FR-07: a plan review before the task is registered, or without quotes, is refused", async () => {
-		const { deps, calls } = depsFor({ plan: { label: "serves" } }, planReader(PLAN_BODY));
+	test("FR-24: a review without topics, before the task is registered, or without quotes, is refused", async () => {
+		const { deps, calls } = depsFor(PLAN_APPROVED, planReader(PLAN_BODY));
+		const quoted = [{ kind: "user", quote: "report the coverage of the last run" }];
 
-		expect((await planReview(deps, freshState(), { plan: PLAN_URL, claim: "c", evidence: [{ kind: "user", quote: "q" }] })).ok).toBe(false);
+		expect((await planReview(deps, freshState(), { plan: PLAN_URL, claim: "c", topics: PLAN_TOPICS, evidence: quoted })).ok).toBe(false);
+		expect(calls).toHaveLength(0);
 
 		const state = freshState();
 		registerTask(state, "task");
-		expect((await planReview(deps, state, { plan: PLAN_URL, claim: "c", evidence: [] })).ok).toBe(false);
-		expect((await planReview(deps, state, { plan: "src/plan.md", claim: "c", evidence: [{ kind: "user", quote: "q" }] })).ok).toBe(false);
+		expect((await planReview(deps, state, { plan: PLAN_URL, claim: "c", evidence: quoted })).ok).toBe(false);
+		expect((await planReview(deps, state, { plan: PLAN_URL, claim: "c", topics: [], evidence: quoted })).ok).toBe(false);
+		expect((await planReview(deps, state, { plan: PLAN_URL, claim: "c", topics: PLAN_TOPICS, evidence: [] })).ok).toBe(false);
+		expect((await planReview(deps, state, { plan: "src/plan.md", claim: "c", topics: PLAN_TOPICS, evidence: quoted })).ok).toBe(false);
 		expect(calls).toHaveLength(0);
 	});
 });
@@ -483,7 +757,10 @@ describe("T5 - acceptance and developer review (FR-14, FR-15, FR-16)", () => {
 		const outcome = await acceptance(deps, state, {
 			aspect: "business",
 			claim: "the owner can read the coverage of the last run",
-			evidence: [{ kind: "execution", source: "bun test", quote: "12 pass" }],
+			evidence: [
+				{ kind: "execution", source: "bun test", quote: "12 pass" },
+				{ kind: "code", source: "src/report.ts", quote: "0 diagnostics" },
+			],
 		});
 
 		expect(outcome.ok).toBe(true);
@@ -501,7 +778,10 @@ describe("T5 - acceptance and developer review (FR-14, FR-15, FR-16)", () => {
 		const outcome = await acceptance(deps, state, {
 			aspect: "architecture",
 			claim: "the report can absorb the next metric",
-			evidence: [{ kind: "code", quote: "class Report { ... }" }],
+			evidence: [
+				{ kind: "execution", quote: "bun test: 132 pass / 0 fail" },
+				{ kind: "code", quote: "class Report { ... }" },
+			],
 		});
 
 		expect(outcome.ok).toBe(true);
@@ -562,8 +842,42 @@ describe("T5 - acceptance and developer review (FR-14, FR-15, FR-16)", () => {
 });
 
 describe("T4 - the automatic checks (FR-11, FR-12, FR-17)", () => {
-	test("FR-11: the course check judges the registered direction from the recorded action results", async () => {
-		const { deps, calls } = depsFor({ direction: { label: "on_course", confidence: 0.9 } });
+	test("FR-11: the course check asks one question per plan topic and judges from the recorded action results", async () => {
+		const { deps, calls } = depsFor({ "direction:collect": { label: "on_course", confidence: 0.9 } });
+		const state = freshState();
+		registerTask(state, "Report the coverage of the last run");
+		state.planTopics = PLAN_TOPICS;
+		recordAction(state, { tool: "write", target: "src/report.ts", excerpt: "wrote the report" });
+
+		const outcome = await courseCheck(deps, state);
+
+		expect(outcome.ok).toBe(true);
+		expect(state.courseCheck?.approved).toBe(true);
+		expect(calls[0]?.questions.map(question => question.name)).toEqual(["direction:collect"]);
+		expect(JSON.stringify(calls[0]?.state)).toContain("wrote the report");
+	});
+
+	test("FR-25: a failed topic is named in the hold", async () => {
+		const { deps } = depsFor({
+			"direction:good": { label: "on_course", confidence: 0.9 },
+			"direction:bad": { label: "off_course", confidence: 0.9 },
+		});
+		const state = freshState();
+		registerTask(state, "Report the coverage of the last run");
+		state.planTopics = [
+			{ id: "good", section: "collect", paths: ["src/a.ts"], requirement: "report the coverage" },
+			{ id: "bad", section: "format", paths: ["src/b.ts"], requirement: "format the report" },
+		];
+		recordAction(state, { tool: "write", target: "src/b.ts", excerpt: "wrote something else" });
+
+		await courseCheck(deps, state);
+
+		expect(state.courseCheck?.approved).toBe(false);
+		expect(state.hold?.reason).toContain("off_course for direction:bad");
+	});
+
+	test("FR-25: without plan topics the course check asks nothing and holds nothing", async () => {
+		const { deps, calls } = depsFor({});
 		const state = freshState();
 		registerTask(state, "Report the coverage of the last run");
 		recordAction(state, { tool: "write", target: "src/report.ts", excerpt: "wrote the report" });
@@ -571,25 +885,14 @@ describe("T4 - the automatic checks (FR-11, FR-12, FR-17)", () => {
 		const outcome = await courseCheck(deps, state);
 
 		expect(outcome.ok).toBe(true);
-		expect(state.courseCheck?.approved).toBe(true);
-		expect(JSON.stringify(calls[0]?.state)).toContain("wrote the report");
+		expect(calls).toHaveLength(0);
+		expect(state.hold).toBeUndefined();
 	});
 
-	test("FR-11: an off-course verdict holds consequential changes until a consultation clears it", async () => {
-		const { deps } = depsFor({ direction: { label: "off_course", confidence: 0.9 } });
+	test("FR-12, FR-17: the completion check asks whether the work follows the requirements, and one direction question per topic only when configured for completion-only", async () => {
 		const state = freshState();
 		registerTask(state, "Report the coverage of the last run");
-		recordAction(state, { tool: "write", target: "src/other.ts", excerpt: "wrote something else" });
-
-		await courseCheck(deps, state);
-
-		expect(state.courseCheck?.approved).toBe(false);
-		expect(state.hold?.reason).toContain("off_course");
-	});
-
-	test("FR-12, FR-17: the completion check asks whether the work follows the requirements, and the direction only when configured for completion-only", async () => {
-		const state = freshState();
-		registerTask(state, "Report the coverage of the last run");
+		state.planTopics = PLAN_TOPICS;
 		recordAction(state, { tool: "write", target: "src/report.ts", excerpt: "wrote the report" });
 
 		const interval = depsFor({ follows_requirements: { label: "follows", confidence: 0.94 } });
@@ -601,11 +904,11 @@ describe("T4 - the automatic checks (FR-11, FR-12, FR-17)", () => {
 
 		const completionOnly = depsFor({
 			follows_requirements: { label: "follows", confidence: 0.94 },
-			direction: { label: "on_course", confidence: 0.9 },
+			"direction:collect": { label: "on_course", confidence: 0.9 },
 		});
 		await completionCheck(completionOnly.deps, state, { course: true });
 
-		expect(completionOnly.calls[0]?.questions.map(question => question.name)).toEqual(["follows_requirements", "direction"]);
+		expect(completionOnly.calls[0]?.questions.map(question => question.name)).toEqual(["follows_requirements", "direction:collect"]);
 		expect(state.completion?.approved).toBe(true);
 	});
 
@@ -637,7 +940,7 @@ describe("FR-09 - a below-floor answer teaches recovery instead of stopping", ()
 		});
 
 		expect(outcome.ok).toBe(false);
-		expect(outcome.text).toContain("not a no");
+		expect(outcome.text).toContain("Class: a defect of the submitted material");
 		expect(outcome.text).toContain("settles the claim");
 		expect(outcome.text).toContain("narrow the claim");
 	});
@@ -653,7 +956,7 @@ describe("FR-09 - a below-floor answer teaches recovery instead of stopping", ()
 		});
 
 		expect(outcome.ok).toBe(false);
-		expect(outcome.text).toContain("not a no");
+		expect(outcome.text).toContain("Class: a defect of the submitted material");
 		expect(outcome.text).toContain("settles the claim");
 	});
 
@@ -665,11 +968,14 @@ describe("FR-09 - a below-floor answer teaches recovery instead of stopping", ()
 		const outcome = await acceptance(deps, state, {
 			aspect: "business",
 			claim: "the report serves the owner's need",
-			evidence: [{ kind: "execution", quote: "the report was generated with every requested section" }],
+			evidence: [
+				{ kind: "execution", quote: "the report was generated with every requested section" },
+				{ kind: "code", quote: "0 diagnostics" },
+			],
 		});
 
 		expect(outcome.ok).toBe(false);
-		expect(outcome.text).toContain("not a no");
+		expect(outcome.text).toContain("Class: a defect of the submitted material");
 		expect(outcome.text).toContain("settles the claim");
 	});
 });

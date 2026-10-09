@@ -249,6 +249,19 @@ describe("T5 - the completion boundary", () => {
 		expect(completionGate(state, DEFAULT_CONFIG).reason).toBeUndefined();
 	});
 
+	test("FR-23, FR-17: a released acceptance boundary satisfies the completion requirement", () => {
+		const released = developed();
+		released.released = ["acceptance:business"];
+		recordAcceptance(released, { aspect: "architecture", revision: released.revision, label: "sound_for_next_change", approved: true, confidence: 0.9 });
+
+		expect(completionGate(released, DEFAULT_CONFIG).reason).toBeUndefined();
+
+		const held = developed();
+		recordAcceptance(held, { aspect: "architecture", revision: held.revision, label: "sound_for_next_change", approved: true, confidence: 0.9 });
+
+		expect(completionGate(held, DEFAULT_CONFIG).reason).toContain("business");
+	});
+
 	test("FR-14: a subsequent change invalidates a stale acceptance", () => {
 		const state = developed();
 		recordAcceptance(state, { aspect: "business", revision: state.revision, label: "serves_business_need", approved: true, confidence: 0.9 });
@@ -270,5 +283,42 @@ describe("T5 - the completion boundary", () => {
 
 	test("a disabled completion gate lets the session settle", () => {
 		expect(completionGate(developed(), config({ completion: false })).applies).toBe(false);
+	});
+});
+
+describe("FR-20, FR-28 - a refusal carries one copy-ready call", () => {
+	test("FR-28: the triage and plan refusals name the call with its arguments and the boundary", () => {
+		const state = freshState();
+		const triage = mutationGate(state, config(), "write", { path: "src/a.ts" });
+		const call = /Next call: jev_triage\((\{.*\})\)/.exec(triage.reason ?? "")?.[1];
+
+		expect(call).toBeDefined();
+		expect(JSON.parse(call ?? "")).toHaveProperty("request");
+		expect(triage.boundary).toBe("triage");
+
+		registerTask(state, "Report the coverage of the last run");
+		const plan = mutationGate(state, config(), "write", { path: "src/a.ts" });
+
+		expect(plan.reason).toContain("Next call: write local://<slug>-plan.md, then jev_plan_review(");
+		expect(plan.boundary).toBe("plan");
+	});
+
+	test("FR-21: an unavailable judge stops holding the boundaries", () => {
+		const state = freshState();
+		state.judgeUnavailable = true;
+		registerTask(state, "Report the coverage of the last run");
+
+		expect(mutationGate(state, config(), "write", { path: "src/a.ts" }).block).toBe(false);
+		expect(completionGate(state, DEFAULT_CONFIG).applies).toBe(false);
+	});
+
+	test("FR-23: a released boundary stops holding the changes it held", () => {
+		const state = freshState();
+		registerTask(state, "Report the coverage of the last run");
+		expect(mutationGate(state, config(), "write", { path: "src/a.ts" }).block).toBe(true);
+
+		state.released = ["plan"];
+
+		expect(mutationGate(state, config(), "write", { path: "src/a.ts" }).block).toBe(false);
 	});
 });

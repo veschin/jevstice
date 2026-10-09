@@ -5,7 +5,7 @@
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Judge, JudgeAnswer, JudgeQuestion } from "../src/judge.js";
+import type { Judge, JudgeAnswer, JudgeFailureKind, JudgeQuestion } from "../src/judge.js";
 import type { PiApi, PiToolDefinition, SchemaBuilder, SchemaLike } from "../src/controller.js";
 import { asRecord } from "../src/types.js";
 
@@ -39,12 +39,12 @@ export function answeringJudge(table: Record<string, FakeAnswerSource>): FakeJud
 		for (const question of questions) {
 			const source = table[question.name];
 			const spec = typeof source === "function" ? source(question) : source;
-			if (spec === undefined) return { ok: false, problem: `no fake answer for '${question.name}'` };
+			if (spec === undefined) return { ok: false, kind: "unusable", problem: `no fake answer for '${question.name}'` };
 			const confidence = spec.confidence ?? 0.95;
 			if (question.mode === "choice") {
 				const label = spec.label;
 				if (label === undefined || question.options?.[label] === undefined) {
-					return { ok: false, problem: `fake label '${label ?? "(none)"}' was not offered for '${question.name}'` };
+					return { ok: false, kind: "unusable", problem: `fake label '${label ?? "(none)"}' was not offered for '${question.name}'` };
 				}
 				answers.push({ name: question.name, mode: "choice", label, confidence });
 				continue;
@@ -61,8 +61,8 @@ export function answeringJudge(table: Record<string, FakeAnswerSource>): FakeJud
 }
 
 /** A judge that always fails, for the fail-closed paths. */
-export function failingJudge(problem: string): Judge {
-	return async () => ({ ok: false, problem });
+export function failingJudge(problem: string, kind: JudgeFailureKind = "unavailable"): Judge {
+	return async () => ({ ok: false, problem, kind });
 }
 
 /** The schema builder the host injects; it only has to build, never validate. */
