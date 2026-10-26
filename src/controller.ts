@@ -37,7 +37,7 @@ import {
 	type GateVerdict,
 } from "./gates.js";
 import type { Judge } from "./judge.js";
-import { freshState, markDeviation, recordAction, recordRefusedCall, recordStopBlock, sha256, type JevState, type PlanApproval, type TaskIdentity } from "./state.js";
+import { freshState, markDeviation, recordAction, recordRefusedCall, recordStopBlock, screenRequest, sha256, type JevState, type PlanApproval, type TaskIdentity } from "./state.js";
 import { HOLD_BOUNDARY, POLICY, asRecord, type JevConfig, type ToolOutcome } from "./types.js";
 
 /** A schema node as this extension builds it; the host validates the built schema itself. */
@@ -103,6 +103,15 @@ const CONSULT_DESCRIPTION =
 /** The one-line asking rule every other tool description carries (FR-09). */
 const ASKING_RULE =
 	" Asking rule: one decision per call, stated as a claim with the verbatim quotes that settle it; a low score means weak evidence or a too-wide claim, not a no - the guide with worked examples and measured scores is on jev_consult.";
+
+/**
+ * The note every tool description ends with: where the tool sits in the one workflow, so the executor
+ * reads what a request has to be before a call is required of it. There is no mode to announce - the
+ * request itself is read before any judge call (`screen.ts`, FR-30), and the judge, not the
+ * configuration, decides how deep an entered request goes.
+ */
+const WORKFLOW_NOTE =
+	" Jevstice decides per request before it judges anything: a request that only publishes, inspects or verifies existing work never enters the judged workflow and asks the judge nothing, while a request that changes the project - or one the reading does not recognise - waits for jev_triage before its first consequential change. A simple-task verdict then runs the request without plan review, course checks or acceptance; a development task runs all of them.";
 
 const TRIAGE_DESCRIPTION =
 	"Triage the owner's request before development work: does it need the deeper activities - a plan reviewed before consequential changes, course checks while implementing, and business and architecture acceptance before completion - or is it a simple task that needs none of them? " +
@@ -360,6 +369,8 @@ export function createJevController(deps: ControllerDeps): JevController {
 	return {
 		register(pi: PiApi): void {
 			const z = deps.zod;
+			/** One registered description: the tool's own text and the note every tool shares. */
+			const described = (body: string): string => `${body}${WORKFLOW_NOTE}`;
 			const evidence = z.array(z.object({ kind: z.string(), quote: z.string(), source: z.string().optional() }));
 			const run =
 				(runActivity: (activity: ActivityDeps, state: JevState, params: unknown) => Promise<ToolOutcome>) =>
@@ -371,7 +382,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 			pi.registerTool({
 				name: "jev_consult",
 				label: "Jev consult",
-				description: CONSULT_DESCRIPTION,
+				description: described(CONSULT_DESCRIPTION),
 				parameters: z.object({
 					mode: z.enum(["choice", "score", "boolean"]),
 					question: z.string(),
@@ -388,7 +399,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 			pi.registerTool({
 				name: "jev_triage",
 				label: "Jev triage",
-				description: TRIAGE_DESCRIPTION,
+				description: described(TRIAGE_DESCRIPTION),
 				parameters: z.object({
 					request: z.string(),
 					topics: z.array(z.string()).optional(),
@@ -400,7 +411,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 			pi.registerTool({
 				name: "jev_reaim",
 				label: "Jev re-aim",
-				description: REAIM_DESCRIPTION,
+				description: described(REAIM_DESCRIPTION),
 				parameters: z.object({
 					interjection: z.string(),
 					evidence,
@@ -411,7 +422,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 			pi.registerTool({
 				name: "jev_search_relevance",
 				label: "Jev search relevance",
-				description: SEARCH_DESCRIPTION,
+				description: described(SEARCH_DESCRIPTION),
 				parameters: z.object({
 					query: z.string(),
 					candidates: z.array(z.object({ title: z.string().optional(), url: z.string().optional(), evidence: z.string(), reason: z.string() })),
@@ -422,7 +433,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 			pi.registerTool({
 				name: "jev_requirements",
 				label: "Jev requirements",
-				description: REQUIREMENTS_DESCRIPTION,
+				description: described(REQUIREMENTS_DESCRIPTION),
 				parameters: z.object({
 					request: z.string(),
 					items: z.array(z.object({ text: z.string(), source: z.string() })),
@@ -435,7 +446,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 			pi.registerTool({
 				name: "jev_plan_review",
 				label: "Jev plan review",
-				description: PLAN_REVIEW_DESCRIPTION,
+				description: described(PLAN_REVIEW_DESCRIPTION),
 				parameters: z.object({
 					plan: z.string(),
 					claim: z.string(),
@@ -455,7 +466,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 			pi.registerTool({
 				name: "jev_acceptance",
 				label: "Jev acceptance",
-				description: ACCEPTANCE_DESCRIPTION,
+				description: described(ACCEPTANCE_DESCRIPTION),
 				parameters: z.object({
 					aspect: z.enum(["business", "architecture"]),
 					claim: z.string(),
@@ -467,7 +478,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 			pi.registerTool({
 				name: "jev_review",
 				label: "Jev developer review",
-				description: REVIEW_DESCRIPTION,
+				description: described(REVIEW_DESCRIPTION),
 				parameters: z.object({
 					kind: z.enum(["checkpoint", "commit", "diff"]),
 					target: z.string(),
@@ -480,7 +491,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 			pi.registerTool({
 				name: "jev_text_review",
 				label: "Jev text review",
-				description: TEXT_REVIEW_DESCRIPTION,
+				description: described(TEXT_REVIEW_DESCRIPTION),
 				parameters: z.object({
 					text: z.string(),
 					rules: z.array(z.object({ class: z.string(), rule: z.string() })),
@@ -498,9 +509,13 @@ export function createJevController(deps: ControllerDeps): JevController {
 				states.delete(sessionIdOf(ctx));
 			});
 
-			// A new prompt is a new request: the previous request's simple verdict does not carry over.
-			pi.on("before_agent_start", (_event, ctx) => {
-				delete stateFor(ctx).simple;
+			// A new prompt is a new request: the previous request's simple verdict does not carry over, and
+			// the request is read once here - for free - to decide whether it enters the workflow at all.
+			pi.on("before_agent_start", (event, ctx) => {
+				const state = stateFor(ctx);
+				delete state.simple;
+				const request = asRecord(event)?.["prompt"];
+				screenRequest(state, typeof request === "string" ? request : "");
 			});
 
 			// The approve-and-execute switch arms here; the approval is restored after the switch,

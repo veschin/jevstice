@@ -107,13 +107,18 @@ export interface CourseCheckConfig {
 	interval: number;
 }
 
-/** Which boundaries are held by the extension. */
+/** Which boundaries hold work. Both are on by default; turning one off stops that boundary. */
 export interface GateConfig {
 	mutation: boolean;
 	completion: boolean;
 }
 
-/** Effective extension configuration plus the problems found while reading it. */
+/**
+ * Effective extension configuration plus the problems found while reading it. `gates` and
+ * `courseCheck` tune one workflow and there is deliberately no mode: what a request is judged for is
+ * read from the request itself (`screen.ts`) and the judge - not the configuration - decides how
+ * deep it goes. Turning both gates off is how an owner asks for it to hold nothing.
+ */
 export interface JevConfig {
 	gates: GateConfig;
 	courseCheck: CourseCheckConfig;

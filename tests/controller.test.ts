@@ -18,6 +18,7 @@ import {
 	toolCallEvent,
 	toolFailed,
 	toolResultEvent,
+	toolText,
 	until,
 	type FakeAnswer,
 	type FakeAnswerSource,
@@ -36,7 +37,9 @@ function config(options: Options = {}): JevConfig {
 	return {
 		gates: { mutation: options.mutation ?? true, completion: options.completion ?? true },
 		courseCheck: {
-			mode: options.mode ?? DEFAULT_CONFIG.courseCheck.mode,
+			// The shipped default defers the course question to completion; these tests exercise the
+			// interval check itself, so they ask for interval mode explicitly.
+			mode: options.mode ?? "interval",
 			interval: options.interval ?? DEFAULT_CONFIG.courseCheck.interval,
 		},
 		problems: [],
@@ -110,7 +113,6 @@ describe("T1 - the registered surface", () => {
 		expect(pi.messages).toHaveLength(0);
 	});
 });
-
 describe("T2 - a read-only question costs nothing (FR-10, constraint on S2/S13/S14)", () => {
 	test("a plain web search and a read are neither gated nor consulted", async () => {
 		const { pi, calls } = controllerFor({});
@@ -556,7 +558,7 @@ describe("T3 - the plan approval across the host session switch (FR-07, FR-18)",
 	});
 });
 
-describe("T2, T3 - the first consequential change waits for triage (FR-01, FR-02, FR-10, FR-18)", () => {
+describe("T2, T3 - the first consequential change waits for triage (FR-02, FR-10, FR-18)", () => {
 	test("FR-02, FR-10: a confirmed simple task proceeds, and a new prompt does not inherit it", async () => {
 		const ctx = fakeCtx();
 		const { pi, calls } = controllerFor({ needs_development: { probability: 0.04 } });
@@ -575,7 +577,18 @@ describe("T2, T3 - the first consequential change waits for triage (FR-01, FR-02
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/b.ts", content: "x" }), ctx))).toContain("jev_triage");
 	});
 
-	test("FR-01: a development triage replaces a simple verdict with the plan requirement", async () => {
+	test("FR-02: a confirmed simple task proposes its plan without a plan review", async () => {
+		const ctx = fakeCtx();
+		const { pi, calls } = controllerFor({ needs_development: { probability: 0.04 } });
+
+		expect(toolFailed(await pi.callTool("jev_triage", { request: "Write the release note" }, ctx))).toBe(false);
+		expect(calls).toHaveLength(1);
+
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "xd://propose", content: "release note" }), ctx))).toBeUndefined();
+		expect(calls).toHaveLength(1);
+	});
+
+	test("FR-02: a development triage replaces a simple verdict with the plan requirement", async () => {
 		const ctx = fakeCtx();
 		const judge: Judge = async (state, questions) => {
 			const deep = (state as Record<string, unknown>)["request"] === "Build the report";
@@ -655,7 +668,6 @@ describe("FR-09 - the tools teach how to ask (FR-09)", () => {
 		expect(description).toContain("not a no");
 	});
 });
-
 describe("FR-25 - the course check runs on a deviation or on the configured count", () => {
 	const run = async (target: string) => {
 		const artifacts = await fakeArtifacts({ "x-plan.md": PLAN_BODY });
@@ -741,5 +753,110 @@ describe("FR-21, FR-28 - the extension tells the owner what the executor cannot 
 		expect(notices).toHaveLength(1);
 		expect(notices[0]).toContain(`${POLICY.maxIgnoredBoundaryCalls} consequential calls were refused`);
 		expect(notices[0]).toContain("src/a0.ts");
+	});
+});
+
+describe("FR-30 - the request screen decides what is judged", () => {
+	test("a request that only inspects, verifies or publishes is never held and buys no judge call", async () => {
+		const { pi, calls } = controllerFor({});
+		const ctx = fakeCtx();
+
+		await pi.emit("before_agent_start", { type: "before_agent_start", prompt: "закоммить и запушь текущее состояние" }, ctx);
+
+		for (const command of ["git status", "git add -A", "git commit -m x", "git push", "bun test"]) {
+			expect(blockReason(await pi.emit("tool_call", toolCallEvent("bash", { command }), ctx))).toBeUndefined();
+			await pi.emit("tool_result", toolResultEvent("bash", { command }, "ok"), ctx);
+		}
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("edit", { paths: ["src/a.ts", "src/b.ts"] }), ctx))).toBeUndefined();
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "xd://propose", content: "Some plan" }), ctx))).toBeUndefined();
+		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
+		expect(calls).toHaveLength(0);
+		expect(pi.messages).toHaveLength(0);
+	});
+
+	test("a request that changes the project waits for triage, while its commits do not", async () => {
+		const { pi, calls } = controllerFor({ needs_development: { probability: 0.04 } });
+		const ctx = fakeCtx();
+
+		await pi.emit("before_agent_start", { type: "before_agent_start", prompt: "добавь отчёт по покрытию" }, ctx);
+
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("bash", { command: "git add -A && git commit -m x" }), ctx))).toBeUndefined();
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/report.ts", content: "x" }), ctx))).toContain("jev_triage");
+		expect(calls).toHaveLength(0);
+
+		await triaged(pi, ctx, "добавь отчёт по покрытию");
+
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/report.ts", content: "x" }), ctx))).toBeUndefined();
+	});
+
+	test("once a task entered the workflow, a later quiet request does not tear it down", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
+		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED });
+		await pi.emit("before_agent_start", { type: "before_agent_start", prompt: "добавь отчёт по покрытию" }, ctx);
+		await triaged(pi, ctx, "добавь отчёт по покрытию");
+
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toContain("jev_plan_review");
+
+		await pi.emit("before_agent_start", { type: "before_agent_start", prompt: "закоммить и запушь" }, ctx);
+
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toContain("jev_plan_review");
+	});
+
+	test("the registered tools answer outside the workflow too, and a finding holds work until it is consulted", async () => {
+		const { pi } = controllerFor({
+			consult: { label: "keep", confidence: 0.92 },
+			review: { label: "defect", confidence: 0.92 },
+		});
+		const ctx = fakeCtx();
+
+		const consulted = await pi.callTool(
+			"jev_consult",
+			{
+				mode: "choice",
+				question: "Keep the current design?",
+				context: "the design is stable and the change is small",
+				evidence: [{ kind: "code", quote: "one call site" }],
+				alternatives: [
+					{ label: "keep", meaning: "keep the design as it is" },
+					{ label: "replace", meaning: "replace it" },
+				],
+			},
+			ctx,
+		);
+		expect(toolFailed(consulted)).toBe(false);
+		expect(toolText(consulted)).toContain("keep");
+
+		const reviewed = await pi.callTool(
+			"jev_review",
+			{ kind: "commit", target: "HEAD", claim: "it adds the guard", evidence: [{ kind: "code", quote: "+ if (!ready) return;" }] },
+			ctx,
+		);
+		expect(toolText(reviewed)).toContain("defect");
+		expect(toolText(reviewed)).toContain("held until you consult");
+
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toContain("defect");
+	});
+
+	test("a commit and a push stay free while a real change waits for triage", async () => {
+		const { pi } = controllerFor({});
+		const ctx = fakeCtx();
+		const published = await pi.emit("tool_call", toolCallEvent("bash", { command: "git commit -m x && git push origin master" }), ctx);
+		const changed = await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx);
+
+		expect(blockReason(published)).toBeUndefined();
+		expect(blockReason(changed)).toContain("triaged");
+	});
+
+	test("a session that only inspects and publishes spends no judge call at all", async () => {
+		const { pi, calls } = controllerFor({});
+		const ctx = fakeCtx();
+
+		for (const command of ["git status", "git diff HEAD", "git add -A", "git commit -m x", "git push"]) {
+			expect(blockReason(await pi.emit("tool_call", toolCallEvent("bash", { command }), ctx))).toBeUndefined();
+			await pi.emit("tool_result", toolResultEvent("bash", { command }, "ok"), ctx);
+		}
+
+		expect(blockReason(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
+		expect(calls).toHaveLength(0);
 	});
 });

@@ -64,13 +64,19 @@ Each entry that carried a `review required` mark was put to its own Jev review, 
 
 - **FR-29 - Owner re-aim.** WHEN the owner interjects a new direction into a running session, the extension SHALL offer registering that interjection as the course - one judged question over the owner's words alone - and on approval SHALL re-aim the registered task without rebuilding walls: the released boundaries stay released, the plan boundary is released by the owner's order, the records of the old course are dropped, and nothing the old course refused is approved. [S27]
 
+### Entry and what counts as consequential
+
+- **FR-30 - Request weight read for free.** WHEN a request arrives, the extension SHALL read its text once, locally and before any judge call, and SHALL let it enter the judged workflow only if it names a change to the project or the reading does not recognise it; a request that asks to publish, inspect or verify work that already exists SHALL NOT enter it, and the reading SHALL decide entry only - it SHALL NOT take down the walls of a development task already registered, and the judge, not the reading, SHALL decide how deep an entered request goes. [S28]
+- **FR-31 - The boundary covers working-tree changes.** WHEN the executor invokes a shell command, the extension SHALL treat the command as consequential only when it can reach the working tree: a command whose every operator-free segment only reports state, or stages and publishes commits, SHALL pass without a boundary and without moving the work revision, while a command the extension cannot read fully - a substitution, a redirection, a background operator, a write flag, an unknown program or an unknown `git` subcommand - SHALL stay consequential. [S29]
+
 ## Constraints
 
 - A simple web search must not incur automatic generic classification or the development acceptance gates; the executor may still invoke FR-03. [S2, S13, S14]
+- A request that only publishes, inspects or verifies existing work must not cost a judge call or a boundary; the reading that decides this is local and happens before any call. [S28]
 - No extension claim may imply that private model thoughts are observable; enforcement applies to visible actions and completion. [S13]
 - A required consultation that fails, abstains, or has no usable answer must not count as approval. This retains the repository's fail-closed policy. [S16]
 - Calls should occur at purposeful activity boundaries, not as repeated generic feedback. The owner has not prescribed a numeric call budget. [S14]
-- This MVP favors the smallest code and tool surface that implements FR-01 through FR-28. [S15]
+- This MVP favors the smallest code and tool surface that implements FR-01 through FR-31. [S15]
 
 ## Source register
 
@@ -102,6 +108,8 @@ Each entry that carried a `review required` mark was put to its own Jev review, 
 - **S26:** Owner, current conversation: "модель не слушается jev, как ты сейчас не понимаешь что тебе делать. исправь это тоже. это одно из требований, адаптация модели к джеву".
 
 - **S27:** Owner, current conversation: "разреши мне вмешаться явно в сесиию и выставлять курс".
+- **S28:** Owner, current conversation: "давай улучшим extensions/jevstice чтобы он на всякие мелочи типа «коммить и пуш» не триггерился вообще, также не тригерился на планирование и другие бесполезные штуки".
+- **S29:** Owner, the same request, whose instance names the class FR-31 covers: a commit or a push must not trigger the extension at all, and FR-30 alone would still hold one whenever the prompt carries a change word ("закоммить и запушь исправления") or the reading does not recognise it.
 - **J1:** Jev `requirements_formalization` preparation batch: nine items were not identified as untraceable; its tenth, planning understanding, was rejected and independently checked as J3.
 - **J2:** Jev `requirements_formalization` execution batch: 9/9 traceable, 6/6 sources covered.
 - **J3:** Jev `claim_check` of the two planning clauses against S4: 2/2 supported.

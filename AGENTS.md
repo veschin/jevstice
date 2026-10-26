@@ -17,13 +17,17 @@ What the executor can consult:
 - `jev_review` - a checkpoint, commit or diff defended as a developer (FR-16).
 - `jev_text_review` - a text split into fragments, with the register rule each failing fragment violates quoted back (FR-27).
 
+What reaches those boundaries:
+- a request is read once when its prompt arrives, locally and for free (`src/screen.ts`): one that only publishes, inspects or verifies existing work is `quiet`, costs no judge call and holds nothing, and everything else - including any text the reading does not recognise - enters the judged workflow, where the judge and not the reading decides the depth (FR-30). The reading decides entry only: a development task already registered keeps its walls;
+- a shell command is consequential only when it can reach the working tree: inspections and publication pass without a boundary or a revision bump, while a command the classifier cannot read fully is held (FR-31).
+
 The boundaries it holds:
 - the plan-mode proposal `write xd://propose` needs a plan approval for the artifact being proposed, and the approval survives the approve-and-execute session switch only while the copied artifact still matches the approved digest;
 - the first consequential change of a session waits for a triage decision (`jev_triage` or `jev_requirements`): a confirmed simple task then passes without the deeper stages, and the verdict belongs to that one request (FR-18);
 - a consequential change is held while the registered development task has no approved plan, while a course check is in flight, or while a finding is outstanding - unless the judge proved unavailable or that boundary was released after its refusal bound, in which case it passes and the refusal stays an OPEN item (FR-21, FR-23);
 - `session_stop` is held until both acceptance aspects passed at the current work revision and the completion check agrees (FR-17).
 
-Nothing classifies prompts and nothing calls the judge before a tool is invoked or a boundary is reached: a plain read-only question or web search costs zero judge calls and no gate (FR-10, S13).
+Nothing classifies prompts and nothing calls the judge before a tool is invoked or a boundary is reached: a plain read-only question or web search costs zero judge calls and no gate (FR-10, S13), and the one reading that does happen reads the request text only, never the project (FR-30).
 
 Fail-closed is the core invariant (see `POLICY` in `src/types.ts`): judge errors, malformed answers, missing answers and answers below the floor never approve. There are no meta-option escapes to map - any deviation from the submitted question set fails the whole outcome. Stop refusals are bounded (`POLICY.maxStopBlocks`): the same unchanged refusal is recorded as an OPEN item instead of looping. Any change must preserve this; tests pin it.
 
@@ -34,9 +38,10 @@ Flat `src/`, no subdirectories, no build step. Dependencies point right:
 - `types.ts` - shared vocabulary (`Evidence`, `Aspect`, `JevConfig`, `ToolOutcome`), the `asRecord` guard and `POLICY` (floors, evidence bounds, transport defaults).
 - `judge.ts` - the single judge adapter: `JudgeQuestion`/`JudgeAnswer`/`JudgeOutcome`, request validation before any call, fail-closed normalization of SDK answers, and the answer accessors (`choseLabel`, `saidTrue`, `probabilityOf`, `scoreOf`, `answerOf`). The SDK returns no free prose, so nothing here invents an explanation.
 - `apikey.ts` - key resolution: environment variable first, then a resolver command whose stdout is the key. The key reaches the client and nothing else; a failure resolves to `undefined`.
-- `config.ts` - project `<cwd>/.omp/jev.config.json` overrides user `~/.omp/agent/jev.config.json`; reads `gates.mutation`, `gates.completion`, `courseCheck.mode`, `courseCheck.interval`. Unknown keys are ignored (old files still load) and an invalid value keeps the fail-closed default, naming the file and the key.
-- `state.ts` - per-session gate state, fingerprints (`sha256`) and the ledgers: task registration, action records, revision, acceptance records, the stop-block ledger, the refused-submission ledger and the open item a released boundary leaves (FR-22, FR-23).
-- `gates.ts` - the visible boundaries as pure decisions: what counts as a consequential change, the mutation gate reason (each refusal names its boundary and renders the copy-ready next call, FR-28), the `xd://propose` gate, the completion gate, and the target-against-plan comparison the course check hangs off (FR-25).
+- `config.ts` - project `<cwd>/.omp/jev.config.json` overrides user `~/.omp/agent/jev.config.json`; reads `gates.mutation`, `gates.completion`, `courseCheck.mode`, `courseCheck.interval`. `courseCheck.mode` ships as `completion`; there is no mode to configure, because what a request is judged for comes from the request itself. Unknown keys are ignored (old files still load) and an invalid value keeps the shipped default, naming the file and the key.
+- `screen.ts` - the free reading of a request (`weightOf`): `quiet` for publish-inspect-verify phrasing, `judged` for everything else including unrecognised text (FR-30). Lexical and deterministic; it decides entry only.
+- `state.ts` - per-session gate state, fingerprints (`sha256`) and the ledgers: the screen's reading of the current request, task registration, action records, revision, acceptance records, the stop-block ledger, the refused-submission ledger and the open item a released boundary leaves (FR-22, FR-23).
+- `gates.ts` - the visible boundaries as pure decisions: what counts as a consequential change including the shell-command classifier (`isNonMutatingCommand`, FR-31), the mutation gate reason (each refusal names its boundary and renders the copy-ready next call, FR-28), the `xd://propose` gate, the completion gate, and the target-against-plan comparison the course check hangs off (FR-25).
 - `activities.ts` - the eight activities plus the two automatic checks (`courseCheck`, `completionCheck`): request validation, question building, the guarded judge call, typed-answer interpretation, state update, human-readable text. The guard in front of the judge keeps the refusal ledger: a digest already refused at a boundary costs no call, and the boundary releases itself once the bound is reached (FR-22, FR-23).
 - `artifact.ts` - reading a `local://` artifact from disk, so the plan review binds an approval to the artifact's bytes rather than to the caller's copy.
 - `controller.ts` - the omp wiring: registers the tools, holds the `tool_call` / `tool_result` / `session_stop` handlers, keys state per session, runs the automatic checks.
@@ -48,8 +53,8 @@ The automatic checks run at visible boundaries: an interval course check follows
 
 ## Key Directories
 
-- `src/` - all runtime code, flat, one concern per file (10 files).
-- `tests/` - flat `*.test.ts` mirroring src modules, plus `tests/helpers.ts` (fake judge, fake host, fake artifacts).
+- `src/` - all runtime code, flat, one concern per file (11 files).
+- `tests/` - flat `*.test.ts` mirroring src modules, plus `tests/helpers.ts` (fake judge, fake host, fake artifacts, `boundaryConfig`).
 - `docs/` - README banner only.
 - `PRD.md` is the owner-approved, tracked source of the new functional requirements. `TASKS.md` is an ignored working plan; older process files under the repository root and `evidence/` remain ignored. Do not remove `PRD.md` from the index.
 
@@ -85,6 +90,7 @@ There is no CLI, no build, no lint, no format tooling, no CI. Verification befor
 - `src/types.ts` - `POLICY` and the shared vocabulary.
 - `src/controller.ts` (~420 lines) - tool registration, the handlers, the artifact reader wiring; read `PiApi` (structural typing over the omp host) first.
 - `src/activities.ts` (~870 lines) - one function per activity; read the activity you are changing plus `material()` (the evaluated state) and the shared validators at the top.
+- `src/screen.ts` - short (~45 lines): the request reading that decides entry before any judge call.
 - `src/gates.ts` + `src/state.ts` - the boundary decisions and the state they read.
 - `tsconfig.json` - strict + `noUncheckedIndexedAccess`, `noEmit`, `types: ["bun"]`.
 
@@ -98,7 +104,7 @@ There is no CLI, no build, no lint, no format tooling, no CI. Verification befor
 
 - Framework: `bun:test` only. Run everything with `bun test`; single file: `bun test tests/gates.test.ts`.
 - Layout: flat `tests/*.test.ts`, one file per src module (`judge`, `apikey`, `config`, `state`, `gates`, `artifact`, `activities`, `controller`).
-- Style: `describe`/`test` + `expect`; behavioral test names that cite requirement IDs (e.g. `FR-01`, `FR-11`, `POLICY.failureNeverApproves`). Shared helpers in `tests/helpers.ts`: `answeringJudge` (answers a question table, or derives an answer from the question), `failingJudge`, `fakePi` (registers tools and handlers and lets a test emit `tool_call`/`tool_result`/`session_stop`), `fakeCtx`, `fakeArtifacts` (a temp session artifact root), `fakeZod`, `blockReason`, `stopDecision`, `until`.
+- Style: `describe`/`test` + `expect`; behavioral test names that cite requirement IDs (e.g. `FR-01`, `FR-11`, `POLICY.failureNeverApproves`). Shared helpers in `tests/helpers.ts`: `answeringJudge` (answers a question table, or derives an answer from the question), `failingJudge`, `fakePi` (registers tools and handlers and lets a test emit `tool_call`/`tool_result`/`session_stop`), `fakeCtx`, `fakeArtifacts` (a temp session artifact root), `fakeZod`, `blockReason`, `stopDecision`, `until`, `boundaryConfig` (the shipped configuration with one boundary turned off).
 - Canonical patterns to follow: the judge is always an injected fake (no network in any test); fail-closed cases (judge error, malformed answer, below-floor answer, missing key) assert *non-approval*; gate tests assert both the block and the accepted path; the plan-review tests read a real artifact from a temp root; the API key must never appear in a request body.
 - Static check: `python3 ~/.omp/agent/managed-skills/code-guard/scripts/guard.py --deep` runs `tsc --noEmit` over `src` and `tests` (the repo has no prettier/eslint config, so that channel reports "skipped").
 - No coverage thresholds, no CI. The repo's own bar: a claim is done only with observed tool output recorded, never an agent's assertion - apply that when reporting test results.

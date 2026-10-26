@@ -13,16 +13,15 @@ import {
 	triage,
 	type ActivityDeps,
 } from "../src/activities.js";
-import { DEFAULT_CONFIG } from "../src/config.js";
 import { mutationGate, proposeGate } from "../src/gates.js";
 import { acceptanceAt, freshState, recordAction, registerTask, sha256 } from "../src/state.js";
 import { POLICY, type PlanTopic } from "../src/types.js";
-import { answeringJudge, failingJudge, type FakeAnswer } from "./helpers.js";
+import { answeringJudge, boundaryConfig, failingJudge, type FakeAnswer } from "./helpers.js";
 
 /** Activity dependencies over a fake judge table and an optional artifact reader. */
 function depsFor(table: Record<string, FakeAnswer>, readArtifact?: ActivityDeps["readArtifact"]) {
 	const fake = answeringJudge(table);
-	const deps: ActivityDeps = { judge: fake.judge, config: DEFAULT_CONFIG, readArtifact };
+	const deps: ActivityDeps = { judge: fake.judge, config: boundaryConfig(), readArtifact };
 	return { deps, calls: fake.calls };
 }
 
@@ -80,7 +79,7 @@ describe("FR-22, FR-23 - a refusal is counted, a repeat costs nothing and the bo
 		expect(state.openItem?.boundary).toBe("plan");
 		expect(state.openItem?.attempts).toBe(POLICY.maxRefusalsPerStage);
 		// The released boundary no longer holds consequential changes, and nothing was approved.
-		expect(mutationGate(state, DEFAULT_CONFIG, "write", { path: "src/a.ts" }).block).toBe(false);
+		expect(mutationGate(state, boundaryConfig(), "write", { path: "src/a.ts" }).block).toBe(false);
 		expect(state.plan).toBeUndefined();
 	});
 
@@ -279,7 +278,7 @@ describe("T2 - triage decides whether the deeper activities apply (FR-01, FR-02,
 		expect(outcome.text).not.toContain("general");
 		expect(outcome.details?.["needsDevelopment"]).toBe(true);
 		expect(state.task?.request).toBe("Keep the report available while a node fails");
-		expect(mutationGate(state, DEFAULT_CONFIG, "write", { path: "src/a.ts" }).block).toBe(true);
+		expect(mutationGate(state, boundaryConfig(), "write", { path: "src/a.ts" }).block).toBe(true);
 	});
 
 	test("FR-02: a simple request names the skipped activities and registers no task", async () => {
@@ -294,7 +293,7 @@ describe("T2 - triage decides whether the deeper activities apply (FR-01, FR-02,
 		expect(outcome.text).toContain("course checks");
 		expect(outcome.text).toContain("architecture acceptance");
 		expect(state.task).toBeUndefined();
-		expect(mutationGate(state, DEFAULT_CONFIG, "write", { path: "src/a.ts" }).block).toBe(false);
+		expect(mutationGate(state, boundaryConfig(), "write", { path: "src/a.ts" }).block).toBe(false);
 	});
 
 	test("FR-02: an answer the judge cannot settle is refused and registers nothing", async () => {
@@ -310,7 +309,7 @@ describe("T2 - triage decides whether the deeper activities apply (FR-01, FR-02,
 
 	test("a failing judge registers no development task", async () => {
 		const state = freshState();
-		const deps: ActivityDeps = { judge: failingJudge("socket reset"), config: DEFAULT_CONFIG };
+		const deps: ActivityDeps = { judge: failingJudge("socket reset"), config: boundaryConfig() };
 
 		const outcome = await triage(deps, state, { request: "Build the thing" });
 
@@ -573,7 +572,7 @@ describe("T1 - the flexible consultation (FR-08, FR-09, FR-13)", () => {
 
 		expect(outcome.ok).toBe(true);
 		expect(state.hold).toBeDefined();
-		expect(mutationGate(state, DEFAULT_CONFIG, "write", { path: "src/a.ts" }).block).toBe(true);
+		expect(mutationGate(state, boundaryConfig(), "write", { path: "src/a.ts" }).block).toBe(true);
 	});
 
 	test("FR-13: a negative answer does not clear a finding either", async () => {
@@ -601,7 +600,7 @@ describe("T1 - the flexible consultation (FR-08, FR-09, FR-13)", () => {
 		expect((await consult(deps, freshState(), { mode: "choice", question: "q", context: "", alternatives: [{ label: "one", meaning: "m" }, { label: "two", meaning: "m" }] })).ok).toBe(false);
 		expect(calls).toHaveLength(0);
 
-		const failing: ActivityDeps = { judge: failingJudge("the judge call failed (socket reset)"), config: DEFAULT_CONFIG };
+		const failing: ActivityDeps = { judge: failingJudge("the judge call failed (socket reset)"), config: boundaryConfig() };
 		const outcome = await consult(failing, freshState(), {
 			mode: "boolean",
 			question: "q",
@@ -632,8 +631,8 @@ describe("T3 - the plan review asks per topic and binds the approval to the arti
 		expect(state.plan?.planDigest).toBe(sha256(PLAN_BODY));
 		expect(state.plan?.taskFingerprint).toBe(task.fingerprint);
 		expect(state.planTopics).toEqual(PLAN_TOPICS);
-		expect(proposeGate(state, DEFAULT_CONFIG, { path: "xd://propose", content: "coverage-report" }).block).toBe(false);
-		expect(proposeGate(state, DEFAULT_CONFIG, { path: "xd://propose", content: "another-plan" }).block).toBe(true);
+		expect(proposeGate(state, boundaryConfig(), { path: "xd://propose", content: "coverage-report" }).block).toBe(false);
+		expect(proposeGate(state, boundaryConfig(), { path: "xd://propose", content: "another-plan" }).block).toBe(true);
 		// The artifact text reaches the judge as material, not as a caller-supplied summary.
 		expect(JSON.stringify(calls[0]?.state)).toContain("Collect the numbers");
 	});
@@ -655,7 +654,7 @@ describe("T3 - the plan review asks per topic and binds the approval to the arti
 		expect(outcome.text).toContain("collect");
 		expect(outcome.details?.["verdict"]).toBe("revise");
 		expect(state.plan).toBeUndefined();
-		expect(proposeGate(state, DEFAULT_CONFIG, { path: "xd://propose", content: "coverage-report" }).block).toBe(true);
+		expect(proposeGate(state, boundaryConfig(), { path: "xd://propose", content: "coverage-report" }).block).toBe(true);
 	});
 
 	test("FR-24: a topic set that leaves the task uncovered refuses the review although every topic passed", async () => {
@@ -816,7 +815,7 @@ describe("T5 - acceptance and developer review (FR-14, FR-15, FR-16)", () => {
 
 		expect(outcome.ok).toBe(true);
 		expect(state.hold?.reason).toContain("defect");
-		expect(mutationGate(state, DEFAULT_CONFIG, "write", { path: "src/a.ts" }).block).toBe(true);
+		expect(mutationGate(state, boundaryConfig(), "write", { path: "src/a.ts" }).block).toBe(true);
 
 		const sound = depsFor({ review: { label: "sound", confidence: 0.92 } });
 		await review(sound.deps, state, {
@@ -827,7 +826,7 @@ describe("T5 - acceptance and developer review (FR-14, FR-15, FR-16)", () => {
 		});
 
 		expect(state.hold).toBeUndefined();
-		expect(mutationGate(state, DEFAULT_CONFIG, "write", { path: "src/a.ts" }).block).toBe(false);
+		expect(mutationGate(state, boundaryConfig(), "write", { path: "src/a.ts" }).block).toBe(false);
 	});
 
 	test("FR-16: a review without a target, a kind or quotes is refused", async () => {

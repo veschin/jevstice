@@ -6,6 +6,7 @@
  */
 import { createHash } from "node:crypto";
 import { POLICY, PLAN_BOUNDARY, type Aspect, type PlanTopic } from "./types.js";
+import { weightOf, type RequestWeight } from "./screen.js";
 /** The development task the gate belongs to. */
 export interface TaskIdentity {
 	/** SHA-256 of the request text; the approval ledger is keyed by it. */
@@ -95,6 +96,12 @@ export interface JevState {
 	task?: TaskIdentity;
 	/** The request triage confirmed simple: consequential changes pass without the complex stages. */
 	simple?: TaskIdentity;
+	/**
+	 * The screen's reading of the current request. It decides whether the request has to enter the
+	 * workflow at all, and it is set when the prompt arrives, so it is not work state and survives
+	 * the clearing a triage verdict performs.
+	 */
+	request?: { text: string; weight: RequestWeight };
 	plan?: PlanApproval;
 	/** The approved plan's topics: one judge question each, and the paths the course check compares (FR-24, FR-25). */
 	planTopics: PlanTopic[];
@@ -205,6 +212,16 @@ export function registerSimple(state: JevState, request: string): TaskIdentity {
 	clearWork(state);
 	state.simple = { fingerprint: sha256(request.trim()), request };
 	return state.simple;
+}
+
+/**
+ * Read the request once, for free, when the prompt arrives (`screen.ts`). The reading decides
+ * whether the request has to enter the judged workflow; it costs no call and it is deliberately the
+ * cheap half of the decision, with the judge answering the expensive half if the request enters.
+ */
+export function screenRequest(state: JevState, request: string): RequestWeight {
+	state.request = { text: request, weight: weightOf(request) };
+	return state.request.weight;
 }
 
 /** The acceptance verdict for one aspect at the current revision, if recorded. */

@@ -2,9 +2,9 @@
  * Effective configuration: the project file `<cwd>/.omp/jev.config.json` overrides the user file
  * `~/.omp/agent/jev.config.json`.
  *
- * Only the keys the MVP reads are validated and unknown keys are ignored, so a file written for an
- * older shape still loads. An invalid value never loosens a gate: the fail-closed default stays in
- * force and the problem is recorded with the file it came from.
+ * Only the keys the extension reads are validated and unknown keys are ignored, so a file written
+ * for an older shape still loads. An invalid value keeps the default in force and is reported with
+ * the file and the key it came from: a bad file never loosens a boundary the owner did ask for.
  */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -13,10 +13,16 @@ import { asRecord, type JevConfig } from "./types.js";
 
 const CONFIG_FILE_NAME = "jev.config.json";
 
-/** Fail-closed defaults: both gates on, an interval check every third consequential action. */
+/**
+ * The shipped defaults: both gates on - a request that reaches the working tree waits for triage,
+ * and developed work waits for acceptance - with the course question deferred to completion, so a
+ * developed task is judged once at the end instead of on every third consequential change. What
+ * actually reaches a gate is what the request screen and the command classifier let through, and
+ * a plain question, an inspection, a commit or a push is neither.
+ */
 export const DEFAULT_CONFIG: JevConfig = {
 	gates: { mutation: true, completion: true },
-	courseCheck: { mode: "interval", interval: 3 },
+	courseCheck: { mode: "completion", interval: 3 },
 	problems: [],
 };
 
@@ -55,7 +61,7 @@ function booleanValue(
 	return fallback;
 }
 
-function modeValue(
+function courseModeValue(
 	value: unknown,
 	fallback: "interval" | "completion",
 	file: string,
@@ -79,7 +85,7 @@ export function loadJevConfig(options: { cwd: string; home?: string; read?: Conf
 	const read = options.read ?? readFileOrNull;
 	let mutationGate = DEFAULT_CONFIG.gates.mutation;
 	let completionGate = DEFAULT_CONFIG.gates.completion;
-	let mode = DEFAULT_CONFIG.courseCheck.mode;
+	let courseMode = DEFAULT_CONFIG.courseCheck.mode;
 	let interval = DEFAULT_CONFIG.courseCheck.interval;
 	const problems: string[] = [];
 	for (const path of configPaths(options)) {
@@ -102,8 +108,12 @@ export function loadJevConfig(options: { cwd: string; home?: string; read?: Conf
 		mutationGate = booleanValue(gates?.["mutation"], mutationGate, path, "gates.mutation", problems);
 		completionGate = booleanValue(gates?.["completion"], completionGate, path, "gates.completion", problems);
 		const courseCheck = asRecord(root["courseCheck"]);
-		mode = modeValue(courseCheck?.["mode"], mode, path, problems);
+		courseMode = courseModeValue(courseCheck?.["mode"], courseMode, path, problems);
 		interval = intervalValue(courseCheck?.["interval"], interval, path, problems);
 	}
-	return { gates: { mutation: mutationGate, completion: completionGate }, courseCheck: { mode, interval }, problems };
+	return {
+		gates: { mutation: mutationGate, completion: completionGate },
+		courseCheck: { mode: courseMode, interval },
+		problems,
+	};
 }

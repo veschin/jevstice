@@ -3,7 +3,10 @@
  *
  * The executor's private reasoning is not observable, so the extension enforces only what it can
  * see: a call that would change the working tree, the omp plan-mode proposal `write xd://propose`,
- * and the stop boundary at which a developed task settles.
+ * and the stop boundary at which a developed task settles. Whether a request reaches any of them is
+ * decided per request and for free: the command classifier (`isNonMutatingCommand`) settles what a
+ * call does, and the request screen (`screen.ts`) settles whether the request entered the judged
+ * workflow at all. Everything here is a pure function of the session state.
  */
 import { HOLD_BOUNDARY, PLAN_BOUNDARY, asRecord, type JevConfig, type PlanTopic } from "./types.js";
 import { acceptanceAt, type JevState } from "./state.js";
@@ -11,11 +14,120 @@ import { acceptanceAt, type JevState } from "./state.js";
 /**
  * Tools that change the working tree when their target is a filesystem path.
  *
- * `bash` is held and recorded as a whole: a command cannot be classified as read-only or mutating
- * without parsing it, and a shell reaches the working tree through arbitrarily many paths.
- * ponytail: a command-level classifier (git status is read-only, rm is not) would narrow this.
+ * `bash` is classified by its command text (`isNonMutatingCommand`): a command that provably only
+ * reports state or publishes commits changes no working-tree file, so it is not held and does not
+ * move the work revision. A command this extension cannot read stays consequential (FR-31).
  */
 const MUTATING_TOOLS: Record<string, true> = { write: true, edit: true, ast_edit: true, bash: true };
+
+/**
+ * Shell programs whose plain invocation only reports state: they read the working tree, the
+ * environment or the clock and write no file. `git` is read by subcommand instead (below).
+ */
+const NON_MUTATING_PROGRAMS: Record<string, true> = {
+	ls: true,
+	pwd: true,
+	cd: true,
+	cat: true,
+	echo: true,
+	printf: true,
+	wc: true,
+	head: true,
+	tail: true,
+	cut: true,
+	sort: true,
+	uniq: true,
+	grep: true,
+	rg: true,
+	which: true,
+	type: true,
+	printenv: true,
+	whoami: true,
+	id: true,
+	date: true,
+	uname: true,
+	hostname: true,
+	df: true,
+	du: true,
+	file: true,
+	stat: true,
+	tree: true,
+	jq: true,
+	tr: true,
+	basename: true,
+	dirname: true,
+	realpath: true,
+	readlink: true,
+	diff: true,
+	cmp: true,
+	true: true,
+	false: true,
+	sleep: true,
+	nl: true,
+	comm: true,
+	join: true,
+	paste: true,
+	rev: true,
+	fold: true,
+	column: true,
+	seq: true,
+	expr: true,
+	xxd: true,
+	od: true,
+	shasum: true,
+	sha256sum: true,
+	md5sum: true,
+};
+
+/**
+ * Argument tokens that turn an otherwise reporting program into a writer, so a command carrying one
+ * is handled as a change even when its program reports state. The `--flag=value` form counts too.
+ */
+const WRITE_FLAGS: Record<string, true> = {
+	"-i": true,
+	"--in-place": true,
+	"-o": true,
+	"--output": true,
+	"-exec": true,
+	"-execdir": true,
+	"-delete": true,
+	"-fprint": true,
+	"-fls": true,
+	"-ok": true,
+};
+
+/** Whether one argument is a write flag, in either its bare or its `--flag=value` form. */
+function isWriteFlag(argument: string): boolean {
+	if (WRITE_FLAGS[argument] === true) return true;
+	const equals = argument.indexOf("=");
+	if (equals < 1) return false;
+	return WRITE_FLAGS[argument.slice(0, equals)] === true;
+}
+
+/**
+ * `git` subcommands that move no working-tree file: the inspection subcommands only read, and staging
+ * and publication (`add`, `commit`, `push`) write the index, the object store or a remote - the
+ * owner asked for those not to be held at all. Everything else reaches the working tree.
+ */
+const NON_MUTATING_GIT_SUBCOMMANDS: Record<string, true> = {
+	add: true,
+	commit: true,
+	push: true,
+	fetch: true,
+	status: true,
+	diff: true,
+	log: true,
+	show: true,
+	"rev-parse": true,
+	describe: true,
+	"ls-files": true,
+	"ls-remote": true,
+	blame: true,
+	shortlog: true,
+	whatchanged: true,
+	version: true,
+	help: true,
+};
 
 /** `xd://` devices that change the working tree or drive the desktop when dispatched. */
 const MUTATING_DEVICES: Record<string, true> = {
@@ -147,10 +259,77 @@ function pathOf(record: Record<string, unknown> | undefined): string | undefined
 	return typeof legacy === "string" && legacy.length > 0 ? legacy : undefined;
 }
 
+/**
+ * The command text with the given quote characters' spans dropped. An unterminated quote drops the
+ * rest of the text, which only ever makes the command harder to call reporting.
+ */
+function withoutQuotes(text: string, quotes: string): string {
+	let result = "";
+	let quote: string | undefined;
+	for (const char of text) {
+		if (quote === undefined) {
+			if (quotes.includes(char)) {
+				quote = char;
+				continue;
+			}
+			result += char;
+			continue;
+		}
+		if (char === quote) quote = undefined;
+	}
+	return result;
+}
+
+/**
+ * Whether one operator-free shell segment only reports state: a reporting program without a write
+ * flag, or a `git` subcommand that stages, publishes or inspects. A leading `VAR=value` assignment
+ * only sets the environment of this command. An unknown program or an unknown subcommand answers
+ * false, so an unrecognised command keeps the consequential handling.
+ */
+function isNonMutatingSegment(segment: string): boolean {
+	const tokens = segment.split(/\s+/).filter(token => token.length > 0);
+	let index = 0;
+	while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index] ?? "")) index += 1;
+	const program = tokens[index];
+	if (program === undefined) return true;
+	const name = program.slice(program.lastIndexOf("/") + 1);
+	const args = tokens.slice(index + 1);
+	if (args.some(isWriteFlag)) return false;
+	if (name !== "git") return NON_MUTATING_PROGRAMS[name] === true;
+	const subcommand = args[0];
+	return subcommand !== undefined && NON_MUTATING_GIT_SUBCOMMANDS[subcommand] === true;
+}
+
+/**
+ * Whether a shell command provably changes no working-tree file: it carries no substitution,
+ * redirection or background operator, and every segment joined by `;`, `|`, `&&` or a newline
+ * reports state - inspects, or stages and publishes, as `git status` and `git commit` do.
+ *
+ * A single-quoted span is inert, so it is dropped first; a substitution or a backtick still runs
+ * another command inside double quotes, so it is read before those are dropped; a redirection is
+ * not, so it is read on what remains, where a commit message's own punctuation is already data.
+ * Any shape this cannot read answers false: `rm`, `bun test`, an unknown program and an unparsed
+ * substitution all stay consequential, so the gate is no looser than it was for them (FR-31).
+ */
+export function isNonMutatingCommand(command: string): boolean {
+	const unquotedSingle = withoutQuotes(command, "'");
+	if (unquotedSingle.includes("`") || unquotedSingle.includes("$(") || unquotedSingle.includes("${")) return false;
+	const text = withoutQuotes(unquotedSingle, `"`).replace(/\|\||&&/g, "\n").trim();
+	if (text.length === 0) return true;
+	if (/[<>&]/.test(text)) return false;
+	return text.split(/[;|\n]/).every(isNonMutatingSegment);
+}
+
 /** True when the call changes the working tree: a mutating tool at a filesystem-like target. */
 export function isConsequentialMutation(toolName: string, input: unknown): boolean {
 	if (MUTATING_TOOLS[toolName] !== true) return false;
 	const record = asRecord(input);
+	// A shell command is judged by its own text: one that only reports state or publishes commits
+	// changes no working-tree file, so it costs no approval, no course check and no revision bump.
+	if (toolName === "bash") {
+		const command = record?.["command"];
+		return typeof command !== "string" ? true : !isNonMutatingCommand(command);
+	}
 	const targets: string[] = [];
 	const path = pathOf(record);
 	if (path !== undefined) targets.push(path);
@@ -220,9 +399,12 @@ export function mutationGate(
 		};
 	}
 	if (state.released.includes(PLAN_BOUNDARY)) return { block: false };
-	// Only a triaged request opens the gate: triage either confirms a simple task or registers the
-	// development task whose plan review the next change waits for.
+	// Only a request that entered the judged workflow opens the gate: triage either confirms a simple
+	// task or registers the development task whose plan review the next change waits for.
 	if (state.task === undefined) {
+		// The screen's reading decides entry, before any judge call: a request read as a publication,
+		// an inspection or a verification never asks the judge anything (FR-30).
+		if (state.request?.weight === "quiet") return { block: false };
 		if (state.simple !== undefined) return { block: false };
 		return { block: true, boundary: TRIAGE_BOUNDARY, reason: TRIAGE_REQUIRED_REASON };
 	}
@@ -264,6 +446,9 @@ function planSlugFromTitle(title: string): string | undefined {
  */
 export function proposeGate(state: JevState, config: JevConfig, input: unknown): ProposeVerdict {
 	if (!config.gates.mutation) return { block: false };
+	// A request triage confirmed simple needs no plan review, so its plan-mode proposal is not held
+	// either, and neither is a request the screen never let into the workflow (FR-02, FR-30).
+	if (state.simple !== undefined || state.request?.weight === "quiet") return { block: false };
 	const content = asRecord(input)?.["content"];
 	const slug = typeof content === "string" ? planSlugFromTitle(content) : undefined;
 	if (slug === undefined) {

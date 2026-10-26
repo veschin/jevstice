@@ -10,13 +10,13 @@ function reader(files: Record<string, string>) {
 }
 
 describe("T4 - configuration of the gates and the course check", () => {
-	test("the fail-closed defaults apply when no file exists", () => {
+	test("the shipped default holds work at both boundaries and defers the course question", () => {
 		const config = loadJevConfig({ cwd: "/work", home: "/home/owner", read: reader({}) });
 
 		expect(config).toEqual(DEFAULT_CONFIG);
 		expect(config.gates.mutation).toBe(true);
 		expect(config.gates.completion).toBe(true);
-		expect(config.courseCheck.mode).toBe("interval");
+		expect(config.courseCheck.mode).toBe("completion");
 	});
 
 	test("the project file overrides the user file and unknown keys are ignored", () => {
@@ -62,7 +62,7 @@ describe("T4 - configuration of the gates and the course check", () => {
 		});
 
 		expect(config.gates).toEqual({ mutation: true, completion: true });
-		expect(config.courseCheck).toEqual({ mode: "interval", interval: 3 });
+		expect(config.courseCheck).toEqual({ mode: "completion", interval: 3 });
 		expect(config.problems).toHaveLength(4);
 		expect(config.problems.join(" ")).toContain(PROJECT_FILE);
 		expect(config.problems.join(" ")).toContain("gates.mutation");

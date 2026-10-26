@@ -23,6 +23,11 @@ Jevstice is an [oh-my-pi](https://github.com/can1357/oh-my-pi) extension that le
 
 The agent should submit concrete alternatives and quotes from the owner's request, artifacts or observed results. The SDK returns typed decisions, scores and probabilities, not explanatory prose. A missing key, unusable answer or answer below the approval threshold does not approve an action. The first change to the working tree waits for a triage decision on the request; a triaged simple task proceeds without the deeper stages, and the verdict covers only that request. A registered development task then uses the required visible checks before consequential changes and before completion.
 
+A request is read twice, and the first reading is free. When a prompt arrives, the extension reads its text once, locally and before any judge call: a request that asks to publish, inspect or verify work that already exists - "commit and push", "run the tests", "where is the parser defined?" - does not enter the judged workflow at all, while a request that names a change to the project, and any request the screen does not recognise, does. The screen is one-sided on purpose: a wrong "judged" costs one triage call, after which the judge itself answers "simple task", while a wrong "quiet" would run real development unjudged and silently, so unknown text always pays. It decides entry only: once triage has registered a development task, a later "commit and push" does not take the walls down.
+
+A change is consequential when it can reach the working tree, and a shell command is read by its own text. Inspections (`git status`, `git diff`, `git log`, `ls`, `cat`, `rg`, `jq`, `wc`) and publication (`git add`, `git commit`, `git push`, `git fetch`) are neither held nor counted as a work revision, so a session of nothing but commits and pushes runs without a single judge call or message. A command the extension cannot read fully - a redirection, a substitution, a writer such as `tee` in a pipeline, `rm`, an unknown program - stays consequential, because holding something harmless is cheaper than passing something real.
+Programs that can invoke commands, including `awk`, `env`, and `bc`, remain consequential; a request such as "review and improve the parser" also enters the judged workflow.
+
 Every refusal carries the class of the failure - a defect of the submitted material, or the judge failing to answer - and exactly one next action, and a gate refusal renders the call that resolves it with its arguments; the same instruction is delivered once per boundary as a session message. A submission whose material was already refused at that boundary costs no judge call, and a boundary that reaches three refusals is released as an OPEN item and reported to the owner instead of holding the work forever. When the judge cannot be reached three times in a row the boundaries pass without an answer and nothing is recorded as approved. Acceptance is judged from an execution item and a static code item per plan topic, and the course check runs on a change outside the paths the approved plan names, or on the configured count.
 
 ## Try the disabled checkout explicitly
@@ -44,11 +49,11 @@ The project file `<project>/.omp/jev.config.json` overrides `~/.omp/agent/jev.co
 ```json
 {
   "gates": { "mutation": true, "completion": true },
-  "courseCheck": { "mode": "interval", "interval": 3 }
+  "courseCheck": { "mode": "completion", "interval": 3 }
 }
 ```
 
-`courseCheck.mode` accepts `interval` or `completion`; the interval counts successful consequential actions. Invalid values retain the fail-closed default and report the offending file. Old configuration keys are ignored. No generic topic catalog or standalone CLI is part of this MVP.
+`courseCheck.mode` accepts `interval` or `completion`, and the shipped default is `completion`: the course of a developed task is judged once, when the work ends, instead of on every third consequential change. `interval` stays an explicit owner choice for tasks where a late reversal costs more than a check, and it counts successful consequential actions. Invalid values retain the shipped default and report the offending file. Old configuration keys are ignored. Turning both gates off is how an owner asks the extension to hold nothing: it is the only way to do so, since the extension holds a request or it does not by reading the request itself. No generic topic catalog or standalone CLI is part of this MVP.
 
 ## Development
 

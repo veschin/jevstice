@@ -5,9 +5,19 @@
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DEFAULT_CONFIG } from "../src/config.js";
 import type { Judge, JudgeAnswer, JudgeFailureKind, JudgeQuestion } from "../src/judge.js";
 import type { PiApi, PiToolDefinition, SchemaBuilder, SchemaLike } from "../src/controller.js";
-import { asRecord } from "../src/types.js";
+import { asRecord, type JevConfig } from "../src/types.js";
+
+/**
+ * The shipped configuration holds work at both boundaries and has no mode to turn on, so a boundary
+ * test uses it directly; this stays a function so a test can turn one gate off without rebuilding
+ * the object.
+ */
+export function boundaryConfig(gates: { mutation?: boolean; completion?: boolean } = {}): JevConfig {
+	return { ...DEFAULT_CONFIG, gates: { ...DEFAULT_CONFIG.gates, ...gates } };
+}
 
 export interface JudgeCall {
 	state: unknown;

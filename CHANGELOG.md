@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.2.0 - 2026-10-14
+
+- **A request is read once, for free, before any judge call (FR-30).** `src/screen.ts` reads the
+  prompt text when it arrives and decides entry only: a request that asks to publish, inspect or
+  verify work that already exists - "commit and push", "run the tests", "where is the parser
+  defined?" - does not enter the judged workflow, while a request that names a change to the project,
+  and any request the reading does not recognise, does. The screen is one-sided on purpose: a wrong
+  `judged` costs one triage call and the judge itself then answers "simple task", while a wrong
+  `quiet` would run real development unjudged and silently, so unknown text always pays. It decides
+  entry only - a development task triage already registered keeps its walls when a later request says
+  "commit and push" - and it is lexical and deterministic, reading the request text and never the
+  project. The reading recognises the owner's English and Russian phrasing, because those are the
+  requests actually written.
+
+- **A shell command is consequential only when it can reach the working tree (FR-31).**
+  `isNonMutatingCommand` parses the command text, so inspections (`git status`, `git diff`, `git log`,
+  `ls`, `cat`, `rg`, `jq`, `wc`) and publication (`git add`, `git commit`, `git push`, `git fetch`)
+  are no longer held and no longer move the work revision: a session of nothing but commits and
+  pushes costs no judge call and shows no message. A command the extension cannot read fully - a
+  redirection, `$(...)` or a backtick, a writer such as `tee` in a pipeline, `sed -i` and other write
+  flags, `rm`, an unknown program or an unknown `git` subcommand - stays consequential, because
+  holding something harmless is cheaper than passing something real. A commit message's own `&`, `;`
+  and quotes are read as data rather than as shell syntax.
+- **Command interpreters remain consequential, and change intent overrides routine wording (FR-30, FR-31).** The safe reporting list excludes `awk`, `env`, and `bc`, which can invoke commands. The request screen treats `improve` as a change signal, so "review and improve parser" enters the judged workflow.
+
+- **A simple task's plan proposal is not held (FR-02).** `proposeGate` passes `write xd://propose`
+  once triage has confirmed the request simple: planning a simple task needs no plan review and costs
+  no judge call.
+
+- **The course question is deferred by default (FR-12).** `courseCheck.mode` ships as `completion`,
+  so the course of a developed task is judged once when the work ends instead of on every third
+  consequential change; `interval` remains an explicit owner choice for tasks where a late reversal
+  costs more than a check.
+
+- Tool descriptions carry one shared `WORKFLOW_NOTE` through `described(...)`, so the executor reads
+  what a request has to be before a call is required of it rather than wording repeated per
+  registration. `DEFAULT_CONFIG.courseCheck` is the only shipped default that changed; the gates, the
+  floors, the refusal ledger and the fail-closed policy are untouched.
+
+- Verification: `bun test` 172 pass / 0 fail / 626 expect() calls across 8 files; `bun run typecheck`
+  clean. Live `omp` 18.10.4 sessions with this checkout loaded explicitly and `TYPESAFE_API_KEY_COMMAND`
+  replaced by a probe that records every key resolution: "закоммить и запушь текущее состояние" made 0
+  resolutions, showed no Jevstice message and finished the git work itself, while "добавь файл
+  notes.md со словом привет" was held by the triage message and reached the judge (the probe credential
+  is unusable, so that session then recorded the unavailable-judge path of FR-21). No test reaches the
+  live judge.
+
 ## 1.1.0 - 2026-10-09
 
 - **The course check judges real evidence per topic (FR-11, FR-25).** Measured live (2026-10-09):
