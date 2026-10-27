@@ -104,12 +104,26 @@ export function loadJevConfig(options: { cwd: string; home?: string; read?: Conf
 			problems.push(`${path}: a JSON object is expected at the top level - the fail-closed defaults stay in force`);
 			continue;
 		}
-		const gates = asRecord(root["gates"]);
-		mutationGate = booleanValue(gates?.["mutation"], mutationGate, path, "gates.mutation", problems);
-		completionGate = booleanValue(gates?.["completion"], completionGate, path, "gates.completion", problems);
-		const courseCheck = asRecord(root["courseCheck"]);
-		courseMode = courseModeValue(courseCheck?.["mode"], courseMode, path, problems);
-		interval = intervalValue(courseCheck?.["interval"], interval, path, problems);
+		const gatesValue = root["gates"];
+		const gates = asRecord(gatesValue);
+		if (gatesValue !== undefined && gates === undefined) {
+			problems.push(
+				`${path}: gates must be a JSON object, got ${describeValue(gatesValue)} - the defaults for gates.mutation and gates.completion stay in force`,
+			);
+		} else {
+			mutationGate = booleanValue(gates?.["mutation"], mutationGate, path, "gates.mutation", problems);
+			completionGate = booleanValue(gates?.["completion"], completionGate, path, "gates.completion", problems);
+		}
+		const courseCheckValue = root["courseCheck"];
+		const courseCheck = asRecord(courseCheckValue);
+		if (courseCheckValue !== undefined && courseCheck === undefined) {
+			problems.push(
+				`${path}: courseCheck must be a JSON object, got ${describeValue(courseCheckValue)} - the defaults for courseCheck.mode and courseCheck.interval stay in force`,
+			);
+		} else {
+			courseMode = courseModeValue(courseCheck?.["mode"], courseMode, path, problems);
+			interval = intervalValue(courseCheck?.["interval"], interval, path, problems);
+		}
 	}
 	return {
 		gates: { mutation: mutationGate, completion: completionGate },

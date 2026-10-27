@@ -1,8 +1,8 @@
-# Jevstice MVP - Product Requirements
+# Jevstice - Product Requirements
 
 ## Purpose and scope
 
-Jev supports the omp executor's consequential decisions throughout a task, rather than merely preventing file writes. The extension can enforce consultations at visible tool and completion boundaries; it cannot observe private model reasoning. The MVP implements the distinct activities below with minimal code and no automatic generic catalog call on each user prompt. [S10, S11, S13, S14, S15]
+Jev guides an OMP executor from the owner's high-level objective through requirements, planning, execution and acceptance. The extension enforces decisions at visible tool boundaries rather than relying on voluntary consultation. It reuses the TypeSafe typed-decision API and cannot observe private reasoning or act as an OS sandbox. [S34-S36]
 
 The executor is the omp agent doing the work. Jev is the judge reached through the TypeSafe API. A simple task does not inherit development gates merely because it has a user prompt. [S2, S13]
 
@@ -11,6 +11,8 @@ The executor is the omp agent doing the work. Jev is the judge reached through t
 Each requirement specifies one independently observable behavior. The owner-request coverage was checked with Jev in separate preparation and execution batches; the planning-understanding clause was additionally checked as an independent claim. [J1, J2, J3]
 
 Each entry that carried a `review required` mark was put to its own Jev review, and the mark was removed only by a recorded verdict at or above the approval floor (`POLICY.minConfidenceToApprove` 0.6 for a choice, 0.8 for a probability). The verdicts are recorded below.
+
+The current autonomous-execution mandate [S34-S36] supersedes the former mandatory owner-confirmation and emergency-release behavior. Historical verdicts below describe the earlier requirements; they are not fresh validation of the revised policy.
 
 ### Review record
 
@@ -28,8 +30,8 @@ Each entry that carried a `review required` mark was put to its own Jev review, 
 - **FR-02 - Simple-task decision.** WHEN a task is simple, triage SHALL explicitly say that deeper development activities are unnecessary. [S2; J1:2]
 - **FR-03 - Search relevance.** WHEN the executor submits web-search candidates with evidence and a proposed reason for each, Jev SHALL select a relevant candidate-and-reason pair. [S2, S3; J1:3]
 - **FR-04 - Requirement decomposition.** DURING planning, the executor SHALL break the owner's request into individual concrete requirements. [S4; J1:4]
-- **FR-05 - Understanding check.** DURING planning, the executor SHALL submit each proposed requirement to Jev for a check against the original request. [S4; J3:2]
-- **FR-06 - Complete requirement set.** BEFORE a requirement list becomes the task PRD, the executor SHALL establish that its self-contained items collectively cover the owner's request. [S5; J1:6]
+- **FR-05 - Understanding check.** DURING planning, Jev SHALL check each proposed requirement against the original objective and actual owner corrections; necessary implementation choices MAY be inferred by the executor and judged without a second owner message. [S4, S34]
+- **FR-06 - Complete requirement set.** BEFORE planning, Jev SHALL establish that the proposed delivery covers the objective without contradictions or unrelated goals; suspected omissions SHALL be settled rather than silently treating uncertain answers as absence. [S5, S34]
 - **FR-07 - Native plan mode.** WHILE omp's plan mode is active, the extension SHALL connect plan review to the actual host plan-mode boundary. [S6; J1:7]
 - **FR-08 - Flexible consultation.** WHEN consulting Jev on its own question, the executor SHALL be able to choose Choice, Score, or Boolean. [S6; J1:8]
 - **FR-09 - Consultation guidance.** The extension SHALL teach the executor how to use the flexible Jev consultation to obtain useful decisions. [S6; J1:9]
@@ -44,30 +46,41 @@ Each entry that carried a `review required` mark was put to its own Jev review, 
 - **FR-15 - Architecture acceptance.** AT acceptance, the executor SHALL defend its work before Jev from the architecture perspective. [S8; J2:5]
 - **FR-16 - Developer review.** WHEN reviewing a checkpoint, commit, or diff, the executor SHALL defend the changed work before Jev as a developer. [S9; J2:6]
 - **FR-17 - Completion decision.** BEFORE a developed task is reported complete, Jev SHALL check whether the work follows the owner's requirements. [S10; J2:7]
-- **FR-18 - Important-decision boundary.** WHEN an important decision requires Jev and the executor reaches an enforceable visible boundary without submitting it, the extension SHALL block that boundary. [S11, S13; J2:8]
+- **FR-18 - Important-decision boundary.** WHEN an important decision requires Jev and the executor reaches an enforceable visible boundary without submitting it, the extension SHALL block that boundary; an unknown `xd://` device SHALL be treated as consequential unless explicitly listed as read-only or a Jev route. [S11, S13; J2:8]
 - **FR-19 - Business decision.** WHEN the executor faces a consequential business decision, it SHALL consult Jev with the task context. [S12; J2:9]
 
 ### Refusal handling and judge availability
 
-- **FR-20 - Refusal names the class and the next action.** WHEN a judge answer is unusable or below the approval floor, the extension SHALL return, with the verdict, the class of the refusal - a defect of the submitted material, or the judge failing to answer - and exactly one next action for the executor. [S17]
-- **FR-21 - Work without the judge.** WHEN judge calls fail for availability (a transport failure, an authentication failure, or a missing key) `POLICY.maxJudgeFailures` times in a row, the extension SHALL notify the owner once and SHALL pass the mutation and completion boundaries without a judge answer, recording no approval; a usable answer from any later call resets the count and restores the boundaries, and a malformed or below-floor answer counts as neither. [S18, S21]
-- **FR-22 - Reconsider instead of repeating.** WHILE a boundary holds, the extension SHALL record the digest of the material each refusal judged with its verdict; a resubmission whose digest was already refused at that boundary SHALL be refused without a judge call, naming the attempts so far and the next change of approach. [S19]
-- **FR-23 - Emergency release with an open item.** WHEN the refusal bound of FR-22 is exhausted at a boundary that holds consequential changes, the extension SHALL release that boundary for the current request, record the refusal as an OPEN item carrying the boundary, the attempt count and the refused digests, and notify the owner; the release approves nothing. [S20, S21]
+- **FR-20 - Truthful refusal.** A refusal SHALL distinguish invalid input, unavailable judgment, established defects and uncertainty. Recovery guidance SHALL preserve accepted decisions and SHALL NOT invent a defect from a low probability. [S17, S35]
+- **FR-21 - Judge availability.** Repeated availability failures SHALL notify the owner and keep required decisions unapproved. Unavailability SHALL NOT authorize execution or completion; a usable later answer MAY restore service. [S35]
+- **FR-22 - Reconsider instead of repeating.** Refused material and its question set SHALL be recorded per task and decision. An identical resubmission SHALL cost no judge call; unrelated later decisions SHALL NOT erase an earlier refusal budget. [S19, S35]
+- **FR-23 - Exhaustion remains blocked.** After three refused approaches to a decision, the extension SHALL record an OPEN item and stop judging that decision for the current task. Exhaustion SHALL NOT authorize work or acceptance. [S20, S35]
 
 ### Review rework
 
-- **FR-24 - Plan review by topics.** WHEN a plan is reviewed, the executor SHALL submit the plan's topics - per topic its id, the section of the artifact that governs it, the paths it changes and the requirement it serves; the review SHALL refuse a topic whose quoted section does not appear in the artifact bytes it read, SHALL put one question per topic in one batched call, and SHALL record an approval only when every topic reaches the floor; a refused topic SHALL be named with its own next action. [S22]
-- **FR-25 - Course check triggers.** The extension SHALL ask the judge about the course of the work when an observable trigger fires - a successful consequential action whose target lies outside every path the approved plan's topics name, or the configured number of actions since the last check, whichever comes first; the check SHALL submit the plan topics, the paths actually changed and the triggering action results, so that an off-course answer names the action that left the plan, and no check runs without an approved plan. [S23]
+- **FR-24 - Staged plan review.** Jev SHALL review a high-level outline, then one detail per call. Every call SHALL include the objective, approved requirements and relevant accepted context. A detail SHALL receive a typed readiness or defect-category decision. Finalization SHALL verify exact section presence locally and judge only cross-section consistency and additional scope, without rejudging accepted steps. Final approval SHALL bind the exact artifact bytes and task. [S22, S31-S36]
+- **FR-37 - Partial plan approvals.** Passing steps SHALL remain approved while rejected steps are revised. A changed detail loses its own approval; a changed outline invalidates its dependent details. Outline, detail and assembly refusal budgets SHALL remain separate, and exhaustion SHALL NOT open execution. [S32-S35]
+- **FR-25 - Course checks.** Configured post-execution checks SHALL judge each recent action against the whole approved task. Serving one requirement SHALL NOT require serving every topic. Failed consequential executions SHALL also advance the revision. A successful course check SHALL NOT clear an unrelated developer finding. [S23, S35]
 - **FR-26 - Acceptance judged from evidence.** WHEN code is accepted, the extension SHALL refuse the submission before any judge call unless its evidence carries at least one execution item (a command and its output) and at least one static code item (a diagnostic, a diff or a size measurement); the judge SHALL answer per plan topic whether that evidence shows the topic met, naming the evidence it rests on. [S24]
 - **FR-27 - Text review tool.** The extension SHALL offer a tool that takes a text and the register rules it must satisfy, splits the text into bounded fragments and puts every submitted rule to the judge once per fragment; for each fragment a rule fails on, the tool SHALL return that rule line as the executor submitted it, writing no prose of its own. [S25]
 - **FR-28 - The boundary teaches its own next step.** WHEN a boundary refuses a consequential change, the extension SHALL return the one next call as a copy-ready call with its arguments, SHALL deliver the same instruction once per boundary as a session message so it reaches the executor's context and not only its tool error, SHALL count the consequential calls it refuses while that boundary stands, and at `POLICY.maxIgnoredBoundaryCalls` SHALL notify the owner that the executor is not following the boundary, naming the calls it attempted. [S26]
 
-- **FR-29 - Owner re-aim.** WHEN the owner interjects a new direction into a running session, the extension SHALL offer registering that interjection as the course - one judged question over the owner's words alone - and on approval SHALL re-aim the registered task without rebuilding walls: the released boundaries stay released, the plan boundary is released by the owner's order, the records of the old course are dropped, and nothing the old course refused is approved. [S27]
+- **FR-29 - Owner re-aim.** A re-aim SHALL quote an actual current owner message, replace the task and invalidate its old requirements, plan and acceptances. It SHALL NOT reuse old exhaustion state or grant execution without a new approved plan. A new direction SHALL NOT silently inherit old permission. [S27, S34-S35]
 
 ### Entry and what counts as consequential
 
 - **FR-30 - Request weight read for free.** WHEN a request arrives, the extension SHALL read its text once, locally and before any judge call, and SHALL let it enter the judged workflow only if it names a change to the project or the reading does not recognise it; a request that asks to publish, inspect or verify work that already exists SHALL NOT enter it, and the reading SHALL decide entry only - it SHALL NOT take down the walls of a development task already registered, and the judge, not the reading, SHALL decide how deep an entered request goes. [S28]
-- **FR-31 - The boundary covers working-tree changes.** WHEN the executor invokes a shell command, the extension SHALL treat the command as consequential only when it can reach the working tree: a command whose every operator-free segment only reports state, or stages and publishes commits, SHALL pass without a boundary and without moving the work revision, while a command the extension cannot read fully - a substitution, a redirection, a background operator, a write flag, an unknown program or an unknown `git` subcommand - SHALL stay consequential. [S29]
+- **FR-31 - Capability boundary.** Fully recognized read-only commands MAY pass without a work revision. Unknown executables, quoted executable syntax, substitutions, redirections, write options, opaque code, delegation and mutating devices SHALL remain consequential. Direct tool and device routes SHALL receive equivalent enforcement. [S29, S35]
+
+- **FR-32 - Triage before project inspection.** WHEN a request enters the judged workflow, the executor SHALL call `jev_triage` before inspecting project files, searching the project, or drafting a plan; until triage settles the request, the extension SHALL hold project reads and searches, consequential shell calls, requirement submission and local plan-artifact writes, while allowing required skill reads and task tracking. [S30]
+
+- **FR-33 - Autonomous requirements.** The executor SHALL derive checkable obligations and necessary implementation choices from the owner's objective and submit them to Jev without requiring owner confirmation. [S34]
+- **FR-34 - Requirements gate.** Plan-artifact writes and plan review SHALL remain held until coverage reaches 0.6, every requirement reaches its support floor and candidate omissions are settled. Changes to requirements SHALL invalidate dependent approvals. [S31, S34-S35]
+- **FR-35 - No mandatory owner loop.** A later owner message SHALL NOT be a prerequisite for requirements or planning. Actual owner corrections SHALL retain authority through the re-aim boundary. [S34]
+- **FR-36 - Context continuity.** Requirements and staged/final plan approvals SHALL remain task-bound and survive a native plan handoff only when the artifact digest matches. Pending calls and stale judgment results SHALL NOT approve a different task or revision. [S33-S35]
+
+- **FR-38 - Mandatory invocation authorization.** Before a consequential invocation executes, the host SHALL submit its complete payload for automatic Jev authorization against the approved task, regardless of whether the executor consulted voluntarily. Oversized payloads SHALL be refused rather than truncated. Quiet/simple requests SHALL permit only their requested inspection, verification or publication, not unrelated implementation. [S34-S35]
+
 
 ## Constraints
 
@@ -76,7 +89,7 @@ Each entry that carried a `review required` mark was put to its own Jev review, 
 - No extension claim may imply that private model thoughts are observable; enforcement applies to visible actions and completion. [S13]
 - A required consultation that fails, abstains, or has no usable answer must not count as approval. This retains the repository's fail-closed policy. [S16]
 - Calls should occur at purposeful activity boundaries, not as repeated generic feedback. The owner has not prescribed a numeric call budget. [S14]
-- This MVP favors the smallest code and tool surface that implements FR-01 through FR-31. [S15]
+- This MVP favors the smallest code and tool surface that implements FR-01 through FR-36. [S15]
 
 ## Source register
 
@@ -110,6 +123,13 @@ Each entry that carried a `review required` mark was put to its own Jev review, 
 - **S27:** Owner, current conversation: "разреши мне вмешаться явно в сесиию и выставлять курс".
 - **S28:** Owner, current conversation: "давай улучшим extensions/jevstice чтобы он на всякие мелочи типа «коммить и пуш» не триггерился вообще, также не тригерился на планирование и другие бесполезные штуки".
 - **S29:** Owner, the same request, whose instance names the class FR-31 covers: a commit or a push must not trigger the extension at all, and FR-30 alone would still hold one whenever the prompt carries a change word ("закоммить и запушь исправления") or the reading does not recognise it.
+- **S30:** Owner, current conversation: "ожидается что модель со мной окнет все пункты сама в ходе триажа."
+- **S31:** Owner, current conversation: "давай порог по плану понизим до 0.6".
+- **S32:** Owner, current conversation: "разбей планирование на шаги с частичным аппрувом и все получится".
+- **S33:** Owner, current conversation: "ты же знаешь что jev не видит и не помнит ничего? нужно явно давать контекст ему причем выбирать что туда пойдет".
+- **S34:** Owner: "цель аддона даже самой глупой llm дать возможность делегировать решения в jev. и чтобы jev вел ее по задаче или задачам"; "я как пользователь даю крайне верхнеуровневое решение и больше ничего. а все остальное сделает llm и аддон".
+- **S35:** Owner: "ты предполагаешь что модель не будет игнорировать инструмент и будет советоваться но это крайне оптимистично"; "модель глупа она генерирует текст и старается обойти стены вместо решения".
+- **S36:** Owner: "не только плана а всего аддона"; "даю тебе добро на мажорные правки"; "не изобретай велосипед. посмотри то что есть и как это можно улучшить".
 - **J1:** Jev `requirements_formalization` preparation batch: nine items were not identified as untraceable; its tenth, planning understanding, was rejected and independently checked as J3.
 - **J2:** Jev `requirements_formalization` execution batch: 9/9 traceable, 6/6 sources covered.
 - **J3:** Jev `claim_check` of the two planning clauses against S4: 2/2 supported.

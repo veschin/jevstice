@@ -4,9 +4,9 @@
 
 # jevstice
 
-Jevstice is an [oh-my-pi](https://github.com/can1357/oh-my-pi) extension that lets an agent put consequential decisions to Jev (`jev-latest`) through the TypeSafe API. It checks visible actions and completion boundaries; it cannot read the agent's private reasoning. A plain question or web search does not trigger a generic classification call.
+Jevstice is an [oh-my-pi](https://github.com/can1357/oh-my-pi) extension that makes Jev (`jev-latest`, TypeSafe API) review an executor's decisions at enforceable tool boundaries. The owner supplies an objective; the executor derives requirements and implementation choices and defends them to Jev without a mandatory owner-confirmation round.
 
-**Status:** This checkout is a replacement MVP under verification. Its ordinary-session extension entry is deliberately disabled; do not treat it as an installed release. The previous implementation is preserved at commit `4c38d74`.
+The extension cannot observe private reasoning or control effects outside OMP's tool hooks. It does not trust voluntary consultation: before a consequential invocation executes, Jev receives its actual arguments and the approved scope.
 
 ## Activities
 
@@ -15,36 +15,39 @@ Jevstice is an [oh-my-pi](https://github.com/can1357/oh-my-pi) extension that le
 | Triage | `jev_triage` | Decide explicitly whether a task needs deeper development work, and name narrow topics only when it does. |
 | Search relevance | `jev_search_relevance` | Select among supplied search results and their *agent-proposed* reasons, or reject all candidates. Jev provides a choice, not a prose explanation. |
 | Requirements | `jev_requirements` | Check individual requirements against the owner's request and check the set's coverage in one call. |
-| Plan | `jev_plan_review` | Check the actual `local://...-plan.md` artifact topic by topic before submitting it to omp's `xd://propose` plan-mode boundary: every submitted topic is judged on its own, so a verdict names the topic it concerns. |
+| Plan | `jev_plan_review` | Approve an outline, review each detail once, then check the assembled artifact for contradictions and new scope. |
 | Consultation | `jev_consult` | Ask one evidence-backed Choice, Score or Boolean question when uncertain or facing a business decision. |
 | Acceptance | `jev_acceptance` | Defend the delivered work against business needs and architecture, separately, from submitted execution and code evidence. |
 | Developer review | `jev_review` | Defend a checkpoint, commit or diff as a developer. |
+| Re-aim | `jev_reaim` | Register an actual owner change of direction and invalidate the previous task's approvals. |
 | Text review | `jev_text_review` | Split a text and quote back the register rule each fragment violates, so a rewrite follows the rules the owner stated rather than advice from the judge. |
 
-The agent should submit concrete alternatives and quotes from the owner's request, artifacts or observed results. The SDK returns typed decisions, scores and probabilities, not explanatory prose. A missing key, unusable answer or answer below the approval threshold does not approve an action. The first change to the working tree waits for a triage decision on the request; a triaged simple task proceeds without the deeper stages, and the verdict covers only that request. A registered development task then uses the required visible checks before consequential changes and before completion.
+The SDK returns typed choices, scores and probabilities, not explanatory prose. Detail review returns a specific defect category only when Jev selects it confidently; uncertainty is not presented as a proven defect. Passing decisions remain valid while rejected steps are corrected. Final assembly does not rejudge the executability of accepted steps.
 
-A request is read twice, and the first reading is free. When a prompt arrives, the extension reads its text once, locally and before any judge call: a request that asks to publish, inspect or verify work that already exists - "commit and push", "run the tests", "where is the parser defined?" - does not enter the judged workflow at all, while a request that names a change to the project, and any request the screen does not recognise, does. The screen is one-sided on purpose: a wrong "judged" costs one triage call, after which the judge itself answers "simple task", while a wrong "quiet" would run real development unjudged and silently, so unknown text always pays. It decides entry only: once triage has registered a development task, a later "commit and push" does not take the walls down.
+Development proceeds through triage, requirements, outline, step details, final plan, implementation and separate business/architecture acceptances. The approved artifact is bound to exact bytes and rechecked before changes. Native `xd://propose` uses the same approval and preserves the requirement/plan context across its session handoff.
 
-A change is consequential when it can reach the working tree, and a shell command is read by its own text. Inspections (`git status`, `git diff`, `git log`, `ls`, `cat`, `rg`, `jq`, `wc`) and publication (`git add`, `git commit`, `git push`, `git fetch`) are neither held nor counted as a work revision, so a session of nothing but commits and pushes runs without a single judge call or message. A command the extension cannot read fully - a redirection, a substitution, a writer such as `tee` in a pipeline, `rm`, an unknown program - stays consequential, because holding something harmless is cheaper than passing something real.
-Programs that can invoke commands, including `awk`, `env`, and `bc`, remain consequential; a request such as "review and improve the parser" also enters the judged workflow.
+Read-only tools and conservatively recognized inspection commands need no action judgment. Unknown tools, executable code, delegation, mutating devices and shell syntax with uncertain effects are consequential. Quiet or simple requests skip development planning, but do not authorize arbitrary writes: consequential invocations still require Jev authorization against the owner's request.
 
-Every refusal carries the class of the failure - a defect of the submitted material, or the judge failing to answer - and exactly one next action, and a gate refusal renders the call that resolves it with its arguments; the same instruction is delivered once per boundary as a session message. A submission whose material was already refused at that boundary costs no judge call, and a boundary that reaches three refusals is released as an OPEN item and reported to the owner instead of holding the work forever. When the judge cannot be reached three times in a row the boundaries pass without an answer and nothing is recorded as approved. Acceptance is judged from an execution item and a static code item per plan topic, and the course check runs on a change outside the paths the approved plan names, or on the configured count.
+An action check inspects the complete invocation before execution; oversized payloads must be split, never silently truncated. Configured course checks inspect observed actions against the whole plan, not against every topic simultaneously. Failed executions also invalidate prior acceptance because a failing command can already have changed files.
 
-## Try the disabled checkout explicitly
+Repeated refused material costs no new judge call. Three distinct refusals exhaust the decision as an OPEN, blocked item; neither exhaustion nor judge unavailability grants execution or completion permission. A changed task resets its own decision history without inheriting prior approvals. An uncertain text review never counts as a clean review.
+
+This protects visible boundaries, not the truth of executor-supplied evidence. Acceptance requires execution and code evidence, but the extension is not an OS sandbox and cannot guarantee that a probabilistic judge detects every deceptive submission.
+
+## Load explicitly
 
 The extension requires Bun >= 1.1, `@typesafe-ai/sdk`, and a TypeSafe API key in `TYPESAFE_API_KEY` or `JEVI_API_KEY`, or a resolver command in `TYPESAFE_API_KEY_COMMAND`. Install dependencies with `bun install` in this checkout if needed. A missing key fails closed.
 
 ```sh
-# From a separate project, while testing only; explicit tools remain available.
-omp --no-extensions -e /home/veschin/ai/jev/src/index.ts \
-  --tools=read,write,jev_triage,jev_requirements,jev_plan_review,jev_consult,jev_search_relevance,jev_acceptance,jev_review
+# From a separate project:
+omp --no-extensions -e /path/to/jevstice/src/index.ts
 ```
 
-The path above is this checkout's local path; replace it with your own checkout location. The repository currently has no `omp.extensions` manifest entry, and its ordinary-session installation link remains disabled. This explicit command does not re-enable the addon for other sessions.
+The package declares `src/index.ts` as its OMP extension entry. Whether an ordinary session loads it depends on the owner's installation and launch options; the command above explicitly loads this checkout without changing those settings.
 
 ## Configuration
 
-The project file `<project>/.omp/jev.config.json` overrides `~/.omp/agent/jev.config.json`. Only these keys affect the MVP:
+The project file `<project>/.omp/jev.config.json` overrides `~/.omp/agent/jev.config.json`:
 
 ```json
 {
@@ -53,7 +56,7 @@ The project file `<project>/.omp/jev.config.json` overrides `~/.omp/agent/jev.co
 }
 ```
 
-`courseCheck.mode` accepts `interval` or `completion`, and the shipped default is `completion`: the course of a developed task is judged once, when the work ends, instead of on every third consequential change. `interval` stays an explicit owner choice for tasks where a late reversal costs more than a check, and it counts successful consequential actions. Invalid values retain the shipped default and report the offending file. Old configuration keys are ignored. Turning both gates off is how an owner asks the extension to hold nothing: it is the only way to do so, since the extension holds a request or it does not by reading the request itself. No generic topic catalog or standalone CLI is part of this MVP.
+`courseCheck.mode` accepts `interval` or `completion` (the default). This controls post-execution course checks, not mandatory pre-execution action authorization. Invalid section types or values retain defaults and report the file and key; unknown keys are ignored. The owner can explicitly disable mutation or completion gates; a model cannot disable them by exhausting refusals.
 
 ## Development
 
@@ -62,7 +65,7 @@ bun test
 bun run typecheck
 ```
 
-Tests use an injected judge and do not call the live API. The functional requirements and their owner quotations are in [PRD.md](PRD.md). The previous product, including its measurements and older documentation, remains available in git history.
+Tests use injected judges and never call the live API. [tools/README.md](tools/README.md) documents real-Jev and actual-OMP smoke commands and their evidence output. [PRD.md](PRD.md) records the current requirements and their sources. Historical releases remain in git history.
 
 ## License
 

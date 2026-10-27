@@ -55,8 +55,19 @@ function controllerFor(table: Record<string, FakeAnswerSource>, options: Options
 }
 
 const TRIAGE_DEEP: FakeAnswer = { probability: 0.95 };
-/** The answers a passing plan review needs: coverage, topic scope and executability (FR-24). */
-const PLAN_APPROVED: Record<string, FakeAnswer> = { coverage: { probability: 0.93 }, scope_1: { probability: 0.93 }, topic_1: { probability: 0.9 } };
+/** Answers that pass requirement coverage and each plan topic (FR-24, FR-34). */
+const PLAN_APPROVED: Record<string, FakeAnswer> = {
+	coverage: { probability: 0.93 },
+	item_1: { probability: 0.93 },
+	outline_requirement_1: { probability: 0.93 },
+	outline_step_1: { probability: 0.93 },
+	detail: { label: "ready", confidence: 0.9 },
+	finalize_consistency: { probability: 0.93 },
+	finalize_scope: { probability: 0.93 },
+	topic_1: { probability: 0.9 },
+	// The pre-execution action check (FR-31): the admitted payload serves the approved plan.
+	action: { label: "on_course", confidence: 0.9 },
+};
 const ON_COURSE: FakeAnswer = { label: "on_course", confidence: 0.9 };
 const FOLLOWS: FakeAnswer = { label: "follows", confidence: 0.94 };
 
@@ -77,21 +88,65 @@ function approvingAcceptance(question: JudgeQuestion): FakeAnswer {
 const PLAN_ARTIFACT = "local://x-plan.md";
 const PLAN_EVIDENCE = [{ kind: "user", quote: "report the coverage of the last run" }];
 const PLAN_BODY = "# plan\n\n1. Collect the numbers\n";
-const PLAN_TOPICS = [
-	{
-		id: "collect",
-		section: "1. Collect the numbers",
-		paths: ["src/a.ts"],
-		requirement: "report the coverage of the last run",
-	},
-];
 
 async function triaged(pi: FakePi, ctx: unknown, request = "Report the coverage of the last run"): Promise<void> {
 	await pi.callTool("jev_triage", { request }, ctx);
 }
 
-async function planned(pi: FakePi, ctx: unknown): Promise<void> {
-	await pi.callTool("jev_plan_review", { plan: PLAN_ARTIFACT, claim: "the plan delivers the report", topics: PLAN_TOPICS, evidence: PLAN_EVIDENCE }, ctx);
+/** The obligation list is derived from the owner's request; no owner confirmation is read. */
+async function requirementsReviewed(pi: FakePi, ctx: unknown, request = "Report the coverage of the last run"): Promise<void> {
+	const outcome = await pi.callTool(
+		"jev_requirements",
+		{
+			request,
+			items: [{ text: request, source: request }],
+			candidateNeeds: [],
+			evidence: PLAN_EVIDENCE,
+		},
+		ctx,
+	);
+	expect(toolFailed(outcome)).toBe(false);
+}
+
+async function planReviewed(
+	pi: FakePi,
+	ctx: unknown,
+	plan = PLAN_ARTIFACT,
+	requirement = "Report the coverage of the last run",
+): Promise<void> {
+	const outline = await pi.callTool(
+		"jev_plan_review",
+		{
+			phase: "outline",
+			steps: [{ id: "collect", summary: "Collect the numbers.", requirement }],
+			evidence: PLAN_EVIDENCE,
+		},
+		ctx,
+	);
+	if (toolFailed(outline)) throw new Error(toolText(outline));
+	const detail = await pi.callTool(
+		"jev_plan_review",
+		{
+			phase: "detail",
+			plan,
+			topic: { id: "collect", section: "1. Collect the numbers", paths: ["src/a.ts"], requirement },
+			evidence: PLAN_EVIDENCE,
+		},
+		ctx,
+	);
+	if (toolFailed(detail)) throw new Error(toolText(detail));
+	const finalized = await pi.callTool("jev_plan_review", { phase: "finalize", plan, evidence: PLAN_EVIDENCE }, ctx);
+	if (toolFailed(finalized)) throw new Error(toolText(finalized));
+}
+
+async function planned(pi: FakePi, ctx: unknown, request = "Report the coverage of the last run"): Promise<void> {
+	await requirementsReviewed(pi, ctx, request);
+	await planReviewed(pi, ctx, PLAN_ARTIFACT, request);
+}
+
+async function accepted(pi: FakePi, ctx: unknown): Promise<void> {
+	await pi.callTool("jev_acceptance", { aspect: "business", claim: "c", evidence: [{ kind: "execution", quote: "12 pass" }, { kind: "code", quote: "no diagnostics" }] }, ctx);
+	await pi.callTool("jev_acceptance", { aspect: "architecture", claim: "c", evidence: [{ kind: "execution", quote: "bun test: 132 pass" }, { kind: "code", quote: "class Report" }] }, ctx);
 }
 
 describe("T1 - the registered surface", () => {
@@ -130,7 +185,18 @@ describe("Jev prompt guidance", () => {
 			systemPromptAppend: expect.stringContaining("below-floor answer is not approval."),
 		});
 	});
+
+	test("the guidance describes an autonomous obligation list and no owner confirmation", () => {
+		const { pi } = controllerFor({});
+		const triage = pi.tools.get("jev_triage")?.description ?? "";
+		const requirements = pi.tools.get("jev_requirements")?.description ?? "";
+
+		expect(triage).toContain("No owner confirmation step exists");
+		expect(requirements).toContain("one checkable item per obligation you derived from it");
+		expect(requirements).not.toContain("After the owner confirms");
+	});
 });
+
 describe("T2 - a read-only question costs nothing (FR-10, constraint on S2/S13/S14)", () => {
 	test("a plain web search and a read are neither gated nor consulted", async () => {
 		const { pi, calls } = controllerFor({});
@@ -163,6 +229,7 @@ describe("T3 - the plan-mode boundary (FR-07, FR-18)", () => {
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/report.ts", content: "x" }), ctx))).toContain("jev_triage");
 
 		expect(toolFailed(await pi.callTool("jev_triage", { request: "Report the coverage of the last run" }, ctx))).toBe(false);
+		await requirementsReviewed(pi, ctx);
 
 		// A registered development task holds consequential changes.
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/report.ts", content: "x" }), ctx))).toContain("jev_plan_review");
@@ -173,11 +240,82 @@ describe("T3 - the plan-mode boundary (FR-07, FR-18)", () => {
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("jev_consult", {}), ctx))).toBeUndefined();
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "xd://jev_consult", content: "{}" }), ctx))).toBeUndefined();
 
-		expect(toolFailed(await pi.callTool("jev_plan_review", { plan: "local://coverage-report-plan.md", claim: "the plan delivers the report", topics: PLAN_TOPICS, evidence: PLAN_EVIDENCE }, ctx))).toBe(false);
+		await planReviewed(pi, ctx, "local://coverage-report-plan.md");
 
 		// The approved plan opens the working tree and the proposal of that artifact.
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/report.ts", content: "x" }), ctx))).toBeUndefined();
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "xd://propose", content: "coverage-report" }), ctx))).toBeUndefined();
+	});
+
+	test("FR-34: requirements pass from the owner's request alone, with no owner reply loop", async () => {
+		const ctx = fakeCtx();
+		const { pi, calls } = controllerFor({
+			needs_development: TRIAGE_DEEP,
+			coverage: { probability: 0.93 },
+			item_1: { probability: 0.93 },
+		});
+		await triaged(pi, ctx);
+
+		const submission = {
+			request: "Report the coverage of the last run",
+			items: [{ text: "report the coverage of the last run", source: "Report the coverage of the last run" }],
+			candidateNeeds: [],
+			evidence: PLAN_EVIDENCE,
+		};
+		// No prompt was recorded after triage, and none is required.
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("jev_requirements", submission), ctx))).toBeUndefined();
+		expect(toolFailed(await pi.callTool("jev_requirements", submission, ctx))).toBe(false);
+		expect(calls).toHaveLength(2);
+		const quotes = (calls[1]?.state as Record<string, unknown>)["quotes"];
+		expect(quotes).toContain("[user] Report the coverage of the last run");
+	});
+
+	test("FR-34: a development plan waits for requirements to pass Jev", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "coverage-report-plan.md": PLAN_BODY }) });
+		const { pi } = controllerFor({
+			needs_development: TRIAGE_DEEP,
+			coverage: { probability: 0.93 },
+			item_1: { probability: 0.93 },
+			...PLAN_APPROVED,
+		});
+		await triaged(pi, ctx);
+
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "local://plan.md", content: PLAN_BODY }), ctx))).toEqual(
+			expect.stringContaining("jev_requirements"),
+		);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: PLAN_ARTIFACT, content: PLAN_BODY }), ctx))).toEqual(expect.stringContaining("jev_requirements"));
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "xd://jev_plan_review", content: "{}" }), ctx))).toEqual(expect.stringContaining("jev_requirements"));
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("jev_plan_review", {}), ctx))).toEqual(expect.stringContaining("jev_requirements"));
+
+		await requirementsReviewed(pi, ctx);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: PLAN_ARTIFACT, content: PLAN_BODY }), ctx))).toBeUndefined();
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "xd://jev_plan_review", content: "{}" }), ctx))).toBeUndefined();
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("jev_plan_review", {}), ctx))).toBeUndefined();
+	});
+
+	test("FR-34: a rejected obligation keeps the plan boundary closed", async () => {
+		const ctx = fakeCtx();
+		const { pi } = controllerFor({
+			needs_development: TRIAGE_DEEP,
+			coverage: { probability: 0.93 },
+			item_1: { probability: 0.1 },
+		});
+		await triaged(pi, ctx);
+
+		const outcome = await pi.callTool(
+			"jev_requirements",
+			{
+				request: "Report the coverage of the last run",
+				items: [{ text: "report the coverage of the last run", source: "Report the coverage of the last run" }],
+				evidence: PLAN_EVIDENCE,
+			},
+			ctx,
+		);
+
+		expect(toolFailed(outcome)).toBe(false);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: PLAN_ARTIFACT, content: PLAN_BODY }), ctx))).toEqual(
+			expect.stringContaining("jev_requirements"),
+		);
 	});
 
 	test("FR-07: proposing a plan that was never reviewed is blocked", async () => {
@@ -196,19 +334,124 @@ describe("T3 - the plan-mode boundary (FR-07, FR-18)", () => {
 		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED });
 
 		await triaged(pi, ctx);
-		await pi.callTool("jev_plan_review", { plan: "local://coverage-report-plan.md", claim: "the plan delivers the report", topics: PLAN_TOPICS, evidence: PLAN_EVIDENCE }, ctx);
+		await requirementsReviewed(pi, ctx);
+		await planReviewed(pi, ctx, "local://coverage-report-plan.md");
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "xd://propose", content: "coverage-report" }), ctx))).toBeUndefined();
 
 		await writeFile(join(artifactsDir, "local", "coverage-report-plan.md"), "# A different plan\n", "utf8");
 
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "xd://propose", content: "coverage-report" }), ctx))).toContain("changed after the plan review");
 	});
+
+	test("FR-07: a plan artifact rewritten after the review no longer authorises a project change", async () => {
+		const artifactsDir = await fakeArtifacts({ "x-plan.md": PLAN_BODY });
+		const ctx = fakeCtx({ artifactsDir });
+		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED });
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
+
+		await writeFile(join(artifactsDir, "local", "x-plan.md"), "# replaced\n", "utf8");
+
+		const held = await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx);
+
+		expect(blockReason(held)).toContain("changed after the plan review");
+		expect(blockReason(held)).toContain("jev_plan_review");
+	});
+
+	test("FR-31: eval, delegation, an editing LSP action and an unknown MCP route are held before the plan and free after it", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
+		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED });
+
+		await pi.emit("before_agent_start", { prompt: "Build the report" }, ctx);
+		await triaged(pi, ctx, "Build the report");
+
+		for (const [tool, input] of [
+			["eval", { language: "py", code: "1" }],
+			["task", { context: "c", tasks: [{ task: "read only", solutionSpace: "one fix" }] }],
+			["lsp", { action: "rename", file: "src/a.ts", new_name: "y" }],
+			["mcp__google_sheets_update_cells", { spreadsheetId: "s", range: "A1", values: [] }],
+			["multi_tool_use.parallel", { tool_uses: [{ recipient_name: "write", parameters: { path: "src/a.ts" } }] }],
+		] as const) {
+			expect({ tool, reason: blockReason(await pi.emit("tool_call", toolCallEvent(tool, input), ctx)) }).toEqual({
+				tool,
+				reason: expect.stringContaining("jev_plan_review"),
+			});
+		}
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("lsp", { action: "diagnostics", file: "src/a.ts" }), ctx))).toBeUndefined();
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("mcp__google_sheets_get_sheet_data", { spreadsheetId: "s" }), ctx))).toBeUndefined();
+
+		await planned(pi, ctx, "Build the report");
+
+		for (const [tool, input] of [
+			["eval", { language: "py", code: "1" }],
+			["task", { context: "c", tasks: [{ task: "read only", solutionSpace: "one fix" }] }],
+			["lsp", { action: "rename", file: "src/a.ts", new_name: "y" }],
+			["mcp__google_sheets_update_cells", { spreadsheetId: "s", range: "A1", values: [] }],
+		] as const) {
+			expect({ tool, reason: blockReason(await pi.emit("tool_call", toolCallEvent(tool, input), ctx)) }).toEqual({ tool, reason: undefined });
+		}
+	});
+});
+
+describe("FR-31 - the admitted payload is judged before it runs", () => {
+	test("an off-course payload is blocked unexecuted and the whole payload reaches the judge", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
+		const { pi, calls } = controllerFor({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED, action: { label: "off_course", confidence: 0.9 } });
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
+
+		const payload = `const hidden = "${"B".repeat(POLICY.maxActionExcerptChars + 200)}";`;
+		const reason = blockReason(await pi.emit("tool_call", toolCallEvent("eval", { language: "js", code: payload }), ctx));
+
+		expect(reason).toBeDefined();
+		expect(reason).toContain("not executed");
+		const judged = calls.filter(call => call.questions.some(question => question.name === "action")).at(-1);
+		// The payload past the evidence cap is part of what the judge read, not truncated away.
+		expect(JSON.stringify(judged?.state)).toContain("B".repeat(POLICY.maxActionExcerptChars + 100));
+	});
+
+	test("a judge that returns no action answer leaves the call unexecuted", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
+		const table: Record<string, FakeAnswerSource> = { needs_development: TRIAGE_DEEP, ...PLAN_APPROVED };
+		delete table["action"];
+		const { pi } = controllerFor(table);
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
+
+		const reason = blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx));
+
+		expect(reason).toContain("not executed");
+	});
+
+	test("an approved plan whose artifact is rewritten during the judgment stops the execution", async () => {
+		const artifactsDir = await fakeArtifacts({ "x-plan.md": PLAN_BODY });
+		const ctx = fakeCtx({ artifactsDir });
+		const fake = answeringJudge({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED });
+		const judge: Judge = async (state, questions) => {
+			if (questions.some(question => question.name === "action")) {
+				await writeFile(join(artifactsDir, "local", "x-plan.md"), "# replaced mid-judgment\n", "utf8");
+			}
+			return fake.judge(state, questions);
+		};
+		const pi = fakePi();
+		createJevController({ judge, config: config(), zod: fakeZod() }).register(pi.api);
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
+
+		const reason = blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx));
+
+		expect(reason).toContain("changed after the plan review");
+		expect(reason).toContain("jev_plan_review");
+	});
 });
 
 describe("T4 - implementation course checks (FR-11, FR-12, FR-13)", () => {
 	test("FR-11: with an interval of two, one check runs after the second successful action and carries its result", async () => {
 		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
-		const { pi, calls } = controllerFor({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED, "direction:collect": ON_COURSE }, { interval: 2 });
+		const { pi, calls } = controllerFor(
+			{ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED, "direction:1": ON_COURSE, "direction:2": ON_COURSE },
+			{ interval: 2 },
+		);
 		await triaged(pi, ctx);
 		await planned(pi, ctx);
 		const before = calls.length;
@@ -220,14 +463,13 @@ describe("T4 - implementation course checks (FR-11, FR-12, FR-13)", () => {
 		expect(await until(() => calls.length > before)).toBe(true);
 
 		const check = calls[calls.length - 1];
-		expect(check?.questions.map(question => question.name)).toEqual(["direction:collect"]);
 		expect(JSON.stringify(check?.state)).toContain("applied 2 hunks");
 		expect(await until(() => pi.messages.some(message => message.customType === "jev.course_check"))).toBe(true);
 	});
 
 	test("FR-11: failed and read-only calls do not advance the interval", async () => {
 		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
-		const { pi, calls } = controllerFor({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED, "direction:collect": ON_COURSE }, { interval: 2 });
+		const { pi, calls } = controllerFor({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED, "direction:1": ON_COURSE }, { interval: 2 });
 		await triaged(pi, ctx);
 		await planned(pi, ctx);
 		const before = calls.length;
@@ -243,59 +485,112 @@ describe("T4 - implementation course checks (FR-11, FR-12, FR-13)", () => {
 		expect(calls.length).toBe(before);
 	});
 
-	test("FR-18, FR-11: a shell command is held like any other change but records evidence without advancing the interval", async () => {
+	test("FR-18, FR-11: a successful mutating shell command advances the revision and triggers a course check", async () => {
 		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
-		const { pi, calls } = controllerFor({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED, "direction:collect": ON_COURSE }, { interval: 1 });
+		const { pi, calls } = controllerFor({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED, "direction:1": ON_COURSE }, { interval: 1 });
 		await triaged(pi, ctx);
 
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("bash", { command: "rm -rf build" }), ctx))).toContain("jev_plan_review");
 
 		await planned(pi, ctx);
 		const before = calls.length;
-		await pi.emit("tool_result", toolResultEvent("bash", { command: "npm run build" }, "built in 2s"), ctx);
-		expect(calls.length).toBe(before);
-
-		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 bytes"), ctx);
-		expect(await until(() => calls.some(call => call.questions[0]?.name === "direction:collect"))).toBe(true);
-		expect(JSON.stringify(calls[calls.length - 1]?.state)).toContain("npm run build");
-		expect(JSON.stringify(calls[calls.length - 1]?.state)).toContain("built in 2s");
+		await pi.emit("tool_result", toolResultEvent("bash", { command: "rm -rf build" }, "removed build"), ctx);
+		expect(await until(() => calls.length > before)).toBe(true);
+		expect(JSON.stringify(calls[calls.length - 1]?.state)).toContain("rm -rf build");
+		expect(JSON.stringify(calls[calls.length - 1]?.state)).toContain("removed build");
 	});
 
+	test("FR-11: no interval check runs without an approved plan", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
+		const { pi, calls } = controllerFor({ needs_development: TRIAGE_DEEP }, { interval: 1 });
+		await triaged(pi, ctx);
+		const before = calls.length;
 
-	test("FR-29: an owner interjection re-aims the task and the walls stay down", async () => {
+		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 bytes"), ctx);
+
+		expect(calls.length).toBe(before);
+		// No marker is pending: the next change waits for the plan, not for a course check.
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/b.ts", content: "x" }), ctx))).toContain("jev_plan_review");
+		expect(pi.messages.some(message => message.customType === "jev.course_check")).toBe(false);
+	});
+
+	test("FR-29: an owner interjection clears the old approvals and the re-aimed task needs a fresh plan", async () => {
 		const ctx = fakeCtx();
 		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP, reaim: { probability: 0.9 } });
 		await triaged(pi, ctx);
 
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toContain("jev_plan_review");
 
-		await pi.callTool("jev_reaim", { interjection: "новой волной: закрой F-40", evidence: [{ kind: "user", quote: "новой волной: закрой F-40" }] }, ctx);
+		await pi.emit("before_agent_start", { prompt: "новой волной: закрой F-40" }, ctx);
+		const outcome = await pi.callTool("jev_reaim", { interjection: "новой волной: закрой F-40", evidence: [{ kind: "user", quote: "новой волной: закрой F-40" }] }, ctx);
+		expect(toolFailed(outcome)).toBe(false);
 
-		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toBeUndefined();
+		// Re-aiming approves nothing: the new course waits for its own requirements and plan review.
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toContain("jev_plan_review");
 	});
 
-	test("FR-18: a verification run keeps a recorded acceptance valid", async () => {
+	test("FR-29: an owner message during an approved task holds changes until a judged re-aim", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
+		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED, reaim: { probability: 0.9 } });
+		await pi.emit("before_agent_start", { prompt: "добавь отчёт по покрытию" }, ctx);
+		await triaged(pi, ctx, "добавь отчёт по покрытию");
+		await planned(pi, ctx, "добавь отчёт по покрытию");
+
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toBeUndefined();
+
+		await pi.emit("before_agent_start", { prompt: "теперь закрой F-40" }, ctx);
+		const held = await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx);
+
+		expect(blockReason(held)).toContain("jev_reaim");
+		expect(blockReason(held)).toContain("direction");
+
+		await pi.callTool("jev_reaim", { interjection: "теперь закрой F-40", evidence: [{ kind: "user", quote: "теперь закрой F-40" }] }, ctx);
+
+		// The re-aim approves no plan: the re-aimed task waits for its own requirements and plan review.
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toContain("jev_plan_review");
+	});
+
+	test("FR-18: a consequential shell command invalidates completed acceptance", async () => {
 		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
 		const { pi } = controllerFor({
 			needs_development: TRIAGE_DEEP,
 			...PLAN_APPROVED,
-			"direction:collect": ON_COURSE,
+			"direction:1": ON_COURSE,
 			follows_requirements: FOLLOWS,
 			acceptance: approvingAcceptance,
 		});
 		await triaged(pi, ctx);
 		await planned(pi, ctx);
 		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 bytes"), ctx);
-		await pi.callTool("jev_acceptance", { aspect: "business", claim: "c", evidence: [{ kind: "execution", quote: "12 pass" }, { kind: "code", quote: "no diagnostics" }] }, ctx);
-		await pi.callTool("jev_acceptance", { aspect: "architecture", claim: "c", evidence: [{ kind: "execution", quote: "bun test: 132 pass" }, { kind: "code", quote: "class Report" }] }, ctx);
+		await accepted(pi, ctx);
 
 		await pi.emit("tool_result", toolResultEvent("bash", { command: "bun test" }, "141 pass"), ctx);
 
-		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
+		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toContain("acceptance has not passed");
 	});
+
+	test("FR-31: a failed consequential call may have touched the tree, so it invalidates acceptance", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
+		const { pi } = controllerFor({
+			needs_development: TRIAGE_DEEP,
+			...PLAN_APPROVED,
+			acceptance: approvingAcceptance,
+			follows_requirements: FOLLOWS,
+		});
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
+		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 bytes"), ctx);
+		await accepted(pi, ctx);
+
+		// The command changed a file before failing: its non-zero exit is no reason to trust acceptance.
+		await pi.emit("tool_result", toolResultEvent("bash", { command: "touch marker; false" }, "exit code 1", true), ctx);
+
+		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toContain("acceptance has not passed");
+	});
+
 	test("FR-10, FR-11: a session that registered no task accrues no actions, no hold and no call", async () => {
 		const ctx = fakeCtx();
-		const { pi, calls } = controllerFor({ "direction:collect": { label: "off_course", confidence: 0.9 } }, { interval: 1 });
+		const { pi, calls } = controllerFor({ "direction:1": { label: "off_course", confidence: 0.9 } }, { interval: 1 });
 
 		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 bytes"), ctx);
 		await pi.emit("tool_result", toolResultEvent("bash", { command: "rm -rf build" }, ""), ctx);
@@ -312,7 +607,7 @@ describe("T4 - implementation course checks (FR-11, FR-12, FR-13)", () => {
 			{
 				needs_development: TRIAGE_DEEP,
 				...PLAN_APPROVED,
-				"direction:collect": { label: "off_course", confidence: 0.9 },
+				"direction:1": { label: "off_course", confidence: 0.9 },
 				consult: { label: "fix", confidence: 0.91 },
 				resolves_hold: { probability: 0.93 },
 			},
@@ -322,7 +617,7 @@ describe("T4 - implementation course checks (FR-11, FR-12, FR-13)", () => {
 		await planned(pi, ctx);
 
 		await pi.emit("tool_result", toolResultEvent("write", { path: "src/other.ts" }, "Successfully wrote 3 bytes"), ctx);
-		expect(await until(() => calls.some(call => call.questions[0]?.name === "direction:collect"))).toBe(true);
+		expect(await until(() => calls.some(call => call.questions[0]?.name === "direction:1"))).toBe(true);
 		expect(await until(() => pi.messages.some(message => message.customType === "jev.course_check" && message.content.includes("off_course")))).toBe(true);
 
 		const held = await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx);
@@ -345,13 +640,13 @@ describe("T4 - implementation course checks (FR-11, FR-12, FR-13)", () => {
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toBeUndefined();
 	});
 
-	test("FR-23, FR-11: after the hold boundary released, no further interval course check fires", async () => {
+	test("FR-23, FR-11: a spent hold budget keeps the work blocked and spends no further check", async () => {
 		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
 		const { pi, calls } = controllerFor(
 			{
 				needs_development: TRIAGE_DEEP,
 				...PLAN_APPROVED,
-				"direction:collect": { label: "off_course", confidence: 0.9 },
+				"direction:1": { label: "off_course", confidence: 0.9 },
 				consult: { probability: 0.4 },
 				resolves_hold: { probability: 0.5 },
 			},
@@ -361,9 +656,9 @@ describe("T4 - implementation course checks (FR-11, FR-12, FR-13)", () => {
 		await planned(pi, ctx);
 
 		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 bytes"), ctx);
-		expect(await until(() => calls.some(call => call.questions.some(question => question.name === "direction:collect")))).toBe(true);
+		expect(await until(() => calls.some(call => call.questions.some(question => question.name === "direction:1")))).toBe(true);
 
-		for (let attempt = 1; attempt <= 3; attempt += 1) {
+		for (let attempt = 1; attempt <= POLICY.maxRefusalsPerStage; attempt += 1) {
 			await pi.callTool(
 				"jev_consult",
 				{
@@ -377,23 +672,25 @@ describe("T4 - implementation course checks (FR-11, FR-12, FR-13)", () => {
 				ctx,
 			);
 		}
-		// The third refusal released the hold boundary (FR-23): holds on it can no longer hold.
+		// The spent budget stops automated retries; it never releases the hold (FR-23).
 
 		const before = calls.length;
+		const verdict = await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx);
+		expect(blockReason(verdict)).toContain("OPEN item");
+
 		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 more bytes"), ctx);
 		expect(calls.length).toBe(before);
-		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toBeUndefined();
 	});
 
 	test("FR-11: the judge material carries the change itself, bounded by the policy cap", async () => {
 		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
-		const { pi, calls } = controllerFor({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED, "direction:collect": ON_COURSE }, { interval: 1 });
+		const { pi, calls } = controllerFor({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED, "direction:1": ON_COURSE }, { interval: 1 });
 		await triaged(pi, ctx);
 		await planned(pi, ctx);
 		const long = "A".repeat(POLICY.maxActionExcerptChars + 500);
 
 		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts", content: long }, "Successfully wrote many bytes"), ctx);
-		expect(await until(() => calls.some(call => call.questions.some(question => question.name === "direction:collect")))).toBe(true);
+		expect(await until(() => calls.some(call => call.questions.some(question => question.name === "direction:1")))).toBe(true);
 
 		const state = JSON.stringify(calls[calls.length - 1]?.state);
 		expect(state).toContain("Successfully wrote many bytes");
@@ -407,7 +704,7 @@ describe("T4 - implementation course checks (FR-11, FR-12, FR-13)", () => {
 			{
 				needs_development: TRIAGE_DEEP,
 				...PLAN_APPROVED,
-				"direction:collect": ON_COURSE,
+				"direction:1": ON_COURSE,
 				follows_requirements: FOLLOWS,
 				acceptance: approvingAcceptance,
 			},
@@ -453,8 +750,7 @@ describe("T5 - acceptance and completion (FR-14, FR-15, FR-17)", () => {
 		await triaged(pi, ctx);
 		await planned(pi, ctx);
 		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 bytes"), ctx);
-		await pi.callTool("jev_acceptance", { aspect: "business", claim: "c", evidence: [{ kind: "execution", quote: "12 pass" }, { kind: "code", quote: "no diagnostics" }] }, ctx);
-		await pi.callTool("jev_acceptance", { aspect: "architecture", claim: "c", evidence: [{ kind: "execution", quote: "bun test: 132 pass" }, { kind: "code", quote: "class Report" }] }, ctx);
+		await accepted(pi, ctx);
 
 		const reason = stopDecision(await pi.emit("session_stop", stopEvent(), ctx));
 		expect(reason).toContain("deviates");
@@ -475,8 +771,7 @@ describe("T5 - acceptance and completion (FR-14, FR-15, FR-17)", () => {
 		await triaged(pi, ctx);
 		await planned(pi, ctx);
 		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 bytes"), ctx);
-		await pi.callTool("jev_acceptance", { aspect: "business", claim: "c", evidence: [{ kind: "execution", quote: "12 pass" }, { kind: "code", quote: "no diagnostics" }] }, ctx);
-		await pi.callTool("jev_acceptance", { aspect: "architecture", claim: "c", evidence: [{ kind: "execution", quote: "bun test: 132 pass" }, { kind: "code", quote: "class Report" }] }, ctx);
+		await accepted(pi, ctx);
 
 		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
 
@@ -485,7 +780,7 @@ describe("T5 - acceptance and completion (FR-14, FR-15, FR-17)", () => {
 		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toContain("acceptance");
 	});
 
-	test("FR-14: repeated refusals for one unchanged reason are bounded and recorded as an open item", async () => {
+	test("FR-14: repeated refusals for one unchanged reason never settle the session by themselves", async () => {
 		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
 		const { pi, calls } = controllerFor({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED });
 		await triaged(pi, ctx);
@@ -493,11 +788,12 @@ describe("T5 - acceptance and completion (FR-14, FR-15, FR-17)", () => {
 		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 bytes"), ctx);
 		const before = calls.length;
 
-		for (let attempt = 0; attempt < POLICY.maxStopBlocks; attempt += 1) {
+		for (let attempt = 0; attempt <= POLICY.maxStopBlocks; attempt += 1) {
 			expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeDefined();
 		}
-		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
-
+		// Past the bound the refusal is an OPEN item, and the stop keeps being blocked (FR-23).
+		const exhausted = stopDecision(await pi.emit("session_stop", stopEvent(), ctx));
+		expect(exhausted).toContain("OPEN item");
 		expect(pi.messages.some(message => message.customType === "jev.open_item")).toBe(true);
 		expect(calls.length).toBe(before);
 	});
@@ -539,10 +835,12 @@ async function approvedAcrossSwitch(
 }
 
 describe("T3 - the plan approval across the host session switch (FR-07, FR-18)", () => {
-	test("FR-07: the approved plan is restored in the new execution session, so the next change passes", async () => {
+	test("FR-07: the approved plan and its requirements are restored in the new execution session", async () => {
 		const { pi, session } = await approvedAcrossSwitch();
 
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), session.ctx))).toBeUndefined();
+		// The carried requirements keep the plan artifact writable instead of reopening that gate.
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "local://x-plan.md", content: PLAN_BODY }), session.ctx))).toBeUndefined();
 	});
 
 	test("FR-18: an artifact whose bytes differ from the approved ones restores nothing", async () => {
@@ -577,9 +875,31 @@ describe("T3 - the plan approval across the host session switch (FR-07, FR-18)",
 });
 
 describe("T2, T3 - the first consequential change waits for triage (FR-02, FR-10, FR-18)", () => {
-	test("FR-02, FR-10: a confirmed simple task proceeds, and a new prompt does not inherit it", async () => {
+	test("FR-32: a development request is triaged before project inspection or requirement review", async () => {
 		const ctx = fakeCtx();
-		const { pi, calls } = controllerFor({ needs_development: { probability: 0.04 } });
+		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP });
+
+		await pi.emit("before_agent_start", { type: "before_agent_start", prompt: "Build the report", systemPrompt: [] }, ctx);
+
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("read", { path: "skill://ready-first" }), ctx))).toBeUndefined();
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("read", { path: "src/index.ts" }), ctx))).toEqual(expect.stringContaining("jev_triage"));
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("find", { query: "project files" }), ctx))).toEqual(expect.stringContaining("jev_triage"));
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("bash", { command: "ls" }), ctx))).toBeUndefined();
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("bash", { command: "bun test" }), ctx))).toEqual(expect.stringContaining("jev_triage"));
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "local://draft-plan.md", content: "# plan" }), ctx))).toEqual(expect.stringContaining("jev_triage"));
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("task", { task: "inspect project" }), ctx))).toEqual(expect.stringContaining("jev_triage"));
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "xd://propose", content: "plan" }), ctx))).toEqual(expect.stringContaining("jev_triage"));
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("jev_requirements", {}), ctx))).toEqual(expect.stringContaining("jev_triage"));
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("jev_plan_review", {}), ctx))).toEqual(expect.stringContaining("jev_triage"));
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "xd://jev_plan_review", content: "{}" }), ctx))).toEqual(expect.stringContaining("jev_triage"));
+
+		await triaged(pi, ctx, "Build the report");
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("read", { path: "src/index.ts" }), ctx))).toBeUndefined();
+	});
+
+	test("FR-02, FR-10: a confirmed simple task admits a judged change, and a new prompt does not inherit it", async () => {
+		const ctx = fakeCtx();
+		const { pi, calls } = controllerFor({ needs_development: { probability: 0.04 }, action: ON_COURSE });
 
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toContain("jev_triage");
 		// The judge routes and the read-only tools stay free while the gate is shut.
@@ -589,7 +909,9 @@ describe("T2, T3 - the first consequential change waits for triage (FR-02, FR-10
 
 		expect(toolFailed(await pi.callTool("jev_triage", { request: "Search the web for the release date" }, ctx))).toBe(false);
 		expect(calls).toHaveLength(1);
+		// The simple verdict is no blanket pass: the exact change is judged before it runs.
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toBeUndefined();
+		expect(calls).toHaveLength(2);
 
 		await pi.emit("before_agent_start", { type: "before_agent_start", prompt: "Now rewrite the parser", systemPrompt: [] }, ctx);
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/b.ts", content: "x" }), ctx))).toContain("jev_triage");
@@ -613,14 +935,11 @@ describe("T2, T3 - the first consequential change waits for triage (FR-02, FR-10
 			return {
 				ok: true,
 				model: "fake",
-				answers: [
-					{
-						name: questions[0]?.name ?? "needs_development",
-						mode: "noul",
-						probability: deep ? 0.95 : 0.04,
-						confidence: deep ? 0.95 : 0.04,
-					},
-				],
+				answers: questions.map(question =>
+					question.mode === "choice"
+						? { name: question.name, mode: "choice" as const, label: "on_course", confidence: 0.95 }
+						: { name: question.name, mode: "noul" as const, probability: deep ? 0.95 : 0.04, confidence: deep ? 0.95 : 0.04 },
+				),
 			};
 		};
 		const pi = fakePi();
@@ -638,13 +957,10 @@ describe("T2, T3 - the first consequential change waits for triage (FR-02, FR-10
 describe("T4 - the interval check holds changes while it is in flight (FR-11)", () => {
 	test("FR-11: a consequential change is blocked until the course check returns", async () => {
 		let entered = false;
-		let release = (): void => {};
-		const pending = new Promise<void>(resolve => {
-			release = resolve;
-		});
-		const fake = answeringJudge({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED, "direction:collect": ON_COURSE });
+		const { promise: pending, resolve: release } = Promise.withResolvers<void>();
+		const fake = answeringJudge({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED, "direction:1": ON_COURSE });
 		const judge: Judge = async (state, questions) => {
-			if (questions.some(question => question.name === "direction:collect")) {
+			if (questions.some(question => question.name === "direction:1")) {
 				entered = true;
 				await pending;
 			}
@@ -660,10 +976,55 @@ describe("T4 - the interval check holds changes while it is in flight (FR-11)", 
 		expect(await until(() => entered)).toBe(true);
 
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/b.ts", content: "x" }), ctx))).toContain("course check");
+		// A stop also waits for the check in flight instead of settling work it has not seen.
+		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toContain("course check");
 
 		release();
 		expect(await until(() => pi.messages.some(message => message.customType === "jev.course_check"))).toBe(true);
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/b.ts", content: "x" }), ctx))).toBeUndefined();
+	});
+
+	test("FR-11: two judged calls of one session are serialised, never raced", async () => {
+		let inFlight = 0;
+		let peak = 0;
+		let entered = false;
+		const { promise: firstRun, resolve: startFirst } = Promise.withResolvers<void>();
+		const fake = answeringJudge({ consult: { label: "keep", confidence: 0.92 } });
+		const judge: Judge = async (state, questions) => {
+			inFlight += 1;
+			peak = Math.max(peak, inFlight);
+			try {
+				if (!entered) {
+					entered = true;
+					await firstRun;
+				}
+				return await fake.judge(state, questions);
+			} finally {
+				inFlight -= 1;
+			}
+		};
+		const pi = fakePi();
+		createJevController({ judge, config: config(), zod: fakeZod() }).register(pi.api);
+		const ctx = fakeCtx();
+		const consult = (question: string) => ({
+			mode: "choice" as const,
+			question,
+			context: "the design is stable",
+			evidence: [{ kind: "code", quote: "one call site" }],
+			alternatives: [
+				{ label: "keep", meaning: "keep the design" },
+				{ label: "replace", meaning: "replace it" },
+			],
+		});
+
+		const first = pi.callTool("jev_consult", consult("Keep one?"), ctx);
+		// The second call arrives while the first holds the session lock: it must queue, not race.
+		const second = pi.callTool("jev_consult", consult("Keep two?"), ctx);
+		startFirst();
+		await Promise.all([first, second]);
+
+		expect(fake.calls).toHaveLength(2);
+		expect(peak).toBe(1);
 	});
 });
 
@@ -674,7 +1035,7 @@ describe("FR-25 - the course check runs on a deviation or on the configured coun
 			ui: { notify: () => {} },
 			sessionManager: { getArtifactsDir: () => artifacts, getSessionId: () => `session-${target}` },
 		};
-		const { pi, calls } = controllerFor({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED, "direction:collect": ON_COURSE }, { interval: 3 });
+		const { pi, calls } = controllerFor({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED, "direction:1": ON_COURSE }, { interval: 3 });
 		await triaged(pi, ctx);
 		await planned(pi, ctx);
 		const before = calls.length;
@@ -685,13 +1046,12 @@ describe("FR-25 - the course check runs on a deviation or on the configured coun
 
 	test("FR-25: a change outside the plan's paths is checked, one inside them is not", async () => {
 		expect(await run("src/a.ts")).toEqual([]);
-		expect(await run("docs/notes.md")).toEqual([["direction:collect"]]);
+		expect(await run("docs/notes.md")).toEqual([["direction:1"]]);
 	});
 });
 
-
 describe("FR-21, FR-28 - the extension tells the owner what the executor cannot report", () => {
-	test("FR-21: repeated judge failures pass the boundaries, tell the owner once, and a usable answer restores them", async () => {
+	test("FR-21: an unreachable judge keeps the boundaries closed, tells the owner once, and a usable answer restores the gate", async () => {
 		let mode: "down" | "deep" = "down";
 		const judge: Judge = async (_state, questions) => {
 			if (mode === "down") {
@@ -719,7 +1079,8 @@ describe("FR-21, FR-28 - the extension tells the owner what the executor cannot 
 			expect(toolFailed(await pi.callTool("jev_triage", { request: "Report the coverage of the last run" }, ctx))).toBe(true);
 		}
 
-		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toBeUndefined();
+		// Nothing can be decided without the judge: the change waits and nothing is approved.
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toContain("judge could not be reached");
 		expect(notices).toHaveLength(1);
 		expect(notices[0]).toContain("could not be reached");
 
@@ -756,25 +1117,33 @@ describe("FR-21, FR-28 - the extension tells the owner what the executor cannot 
 });
 
 describe("FR-30 - the request screen decides what is judged", () => {
-	test("a request that only inspects, verifies or publishes is never held and buys no judge call", async () => {
-		const { pi, calls } = controllerFor({});
+	test("a request that only inspects or publishes costs no judge call, and a verification run costs one authorization", async () => {
+		const { pi, calls } = controllerFor({ action: ON_COURSE });
 		const ctx = fakeCtx();
 
 		await pi.emit("before_agent_start", { type: "before_agent_start", prompt: "закоммить и запушь текущее состояние" }, ctx);
 
-		for (const command of ["git status", "git add -A", "git commit -m x", "git push", "bun test"]) {
+		for (const command of ["git status", "git add -A", "git commit -m x", "git push"]) {
 			expect(blockReason(await pi.emit("tool_call", toolCallEvent("bash", { command }), ctx))).toBeUndefined();
 			await pi.emit("tool_result", toolResultEvent("bash", { command }, "ok"), ctx);
 		}
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("read", { path: "src/a.ts" }), ctx))).toBeUndefined();
+		expect(calls).toHaveLength(0);
+
+		// `bun test` runs arbitrary code: it is admitted by one judged authorization, not by the screen.
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("bash", { command: "bun test" }), ctx))).toBeUndefined();
+		await pi.emit("tool_result", toolResultEvent("bash", { command: "bun test" }, "ok"), ctx);
+		expect(calls).toHaveLength(1);
+
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("edit", { paths: ["src/a.ts", "src/b.ts"] }), ctx))).toBeUndefined();
+		expect(calls).toHaveLength(2);
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "xd://propose", content: "Some plan" }), ctx))).toBeUndefined();
 		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
-		expect(calls).toHaveLength(0);
 		expect(pi.messages).toHaveLength(0);
 	});
 
 	test("a request that changes the project waits for triage, while its commits do not", async () => {
-		const { pi, calls } = controllerFor({ needs_development: { probability: 0.04 } });
+		const { pi, calls } = controllerFor({ needs_development: { probability: 0.04 }, action: ON_COURSE });
 		const ctx = fakeCtx();
 
 		await pi.emit("before_agent_start", { type: "before_agent_start", prompt: "добавь отчёт по покрытию" }, ctx);
@@ -798,7 +1167,29 @@ describe("FR-30 - the request screen decides what is judged", () => {
 
 		await pi.emit("before_agent_start", { type: "before_agent_start", prompt: "закоммить и запушь" }, ctx);
 
+		// A routine follow-up keeps the task and its gate: nothing here opens a registered task's walls.
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toContain("jev_plan_review");
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "xd://propose", content: "coverage" }), ctx))).toContain("jev_plan_review");
+	});
+
+	test("a finished task is dropped for the next request, an unfinished one is not", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
+		const { pi } = controllerFor({
+			needs_development: TRIAGE_DEEP,
+			...PLAN_APPROVED,
+			follows_requirements: FOLLOWS,
+			acceptance: approvingAcceptance,
+		});
+		await pi.emit("before_agent_start", { prompt: "добавь отчёт по покрытию" }, ctx);
+		await triaged(pi, ctx, "добавь отчёт по покрытию");
+		await planned(pi, ctx, "добавь отчёт по покрытию");
+		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 bytes"), ctx);
+		await accepted(pi, ctx);
+		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
+
+		// The completed task no longer holds the next prompt: it is triaged on its own.
+		await pi.emit("before_agent_start", { prompt: "Now rewrite the parser" }, ctx);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/b.ts", content: "x" }), ctx))).toContain("jev_triage");
 	});
 
 	test("the registered tools answer outside the workflow too, and a finding holds work until it is consulted", async () => {

@@ -1,0 +1,10 @@
+{
+  "gates": {
+    "mutation": true,
+    "completion": true
+  },
+  "courseCheck": {
+    "mode": "interval",
+    "interval": 1
+  }
+}

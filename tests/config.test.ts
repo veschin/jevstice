@@ -69,6 +69,34 @@ describe("T4 - configuration of the gates and the course check", () => {
 		expect(config.problems.join(" ")).toContain("courseCheck.interval");
 	});
 
+	test("a gates or courseCheck value that is not an object names the file and the key", () => {
+		const config = loadJevConfig({
+			cwd: "/work",
+			home: "/home/owner",
+			read: reader({
+				[USER_FILE]: JSON.stringify({ gates: ["mutation"] }),
+				[PROJECT_FILE]: JSON.stringify({ courseCheck: "interval" }),
+			}),
+		});
+
+		expect(config.gates).toEqual({ mutation: true, completion: true });
+		expect(config.courseCheck).toEqual({ mode: "completion", interval: 3 });
+		expect(config.problems).toHaveLength(2);
+		expect(config.problems.join(" ")).toContain(`${USER_FILE}: gates must be a JSON object`);
+		expect(config.problems.join(" ")).toContain(`${PROJECT_FILE}: courseCheck must be a JSON object`);
+	});
+
+	test("an empty object for a section keeps the defaults and reports nothing", () => {
+		const config = loadJevConfig({
+			cwd: "/work",
+			home: "/home/owner",
+			read: reader({ [PROJECT_FILE]: JSON.stringify({ gates: {}, courseCheck: {} }) }),
+		});
+
+		expect(config).toEqual(DEFAULT_CONFIG);
+		expect(config.problems).toEqual([]);
+	});
+
 	test("a file that is not JSON keeps every default in force", () => {
 		const config = loadJevConfig({
 			cwd: "/work",

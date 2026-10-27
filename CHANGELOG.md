@@ -1,16 +1,30 @@
 # Changelog
 
-## Unreleased
+## 2.0.0 - 2026-10-27
+
+### Breaking changes
+
+- Jev authorization is mandatory before consequential invocations when mutation gating is enabled. Exhausted refusal budgets and judge outages no longer release execution or completion boundaries.
+- Requirements derive from the user objective without a separate owner-confirmation field. Plan submissions use outline, detail and finalize stages; approved details survive revisions to other steps.
+- Start a fresh OMP session after upgrading so the new tool schemas and controller load together. Existing gate configuration remains supported; this release does not change the owner's installation or launch settings.
+
+### Verification
+
+- 215 tests pass; TypeScript and code-guard deep checks are clean.
+- Real-Jev execution passed through requirements, staged planning, action authorization, behavior checks, both acceptance aspects and completion in OMP.
+- A separate seven-step Factorio plan passed in OMP at final confidence 0.91. This verifies planning, not a Factorio implementation.
 
 ### Fixed
 
-- Jev tool guidance now follows activity-specific inputs and distinguishes negative answers from insufficient confidence.
-- Each Jev tool now states its call inputs, outcome and next action in a concise description.
-- The addon now appends its bundled Jev protocol to each agent prompt through `before_agent_start`.
-- Plan and business acceptance refusals now identify uncovered requirements or unmet business obligations without directing changes to passing topics.
-- Plan review now separates missing requirement coverage from per-topic scope creep.
-- Below-floor recovery guidance reads the typed answer and no longer presents historical score ranges as universal.
-
+- Requirements now derive from the owner's objective without a mandatory owner-confirmation round. Necessary implementation choices are proposals for Jev, not missing owner permission.
+- Planning retains partial outline/detail approvals. Details use typed readiness/defect choices; finalization checks exact section presence, assembly consistency and new scope instead of rejudging every accepted step.
+- Consequential invocations receive automatic, full-payload Jev authorization before execution. Opaque executable/delegated/device routes are no longer exempt merely because their tool names differ.
+- Refusal exhaustion and judge unavailability keep required decisions blocked. Task replacement, re-aim and plan handoffs no longer inherit or manufacture execution permission.
+- Approved artifacts are digest-bound; stale asynchronous answers cannot accept later work. Failed executions invalidate earlier acceptance because failure does not prove absence of side effects.
+- Course checks judge each action against the whole plan. An uncertain text review cannot pass; unrelated developer reviews cannot clear a held finding.
+- Invalid configuration section types report their source and retain defaults.
+- Removed obsolete measurement/review scripts that imported deleted modules. `tools/live-smoke.ts` uses the existing controller/SDK and actual OMP host to record planning, execution and acceptance evidence.
+- Shell quoting and escaping now require invocation judgment instead of being stripped by the read-only classifier; quoted output flags and nested substitutions can no longer hide writes.
 
 ## 1.2.0 - 2026-10-14
 

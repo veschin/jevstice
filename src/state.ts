@@ -5,7 +5,7 @@
  * again, which is the safe direction (approvals are never restored from disk and never inferred).
  */
 import { createHash } from "node:crypto";
-import { POLICY, PLAN_BOUNDARY, type Aspect, type PlanTopic } from "./types.js";
+import { PLAN_BOUNDARY, POLICY, type Aspect, type PlanOutlineStep, type PlanTopic } from "./types.js";
 import { weightOf, type RequestWeight } from "./screen.js";
 /** The development task the gate belongs to. */
 export interface TaskIdentity {
@@ -20,6 +20,15 @@ export interface PlanApproval {
 	planUrl: string;
 	planDigest: string;
 	confidence: number;
+}
+
+/** The task-bound partial state retained between plan-review stages. */
+export interface PlanDraft {
+	taskFingerprint: string;
+	requirementsDigest: string;
+	steps: PlanOutlineStep[];
+	outlineApproved: boolean;
+	details: PlanTopic[];
 }
 
 /** One acceptance verdict for one aspect at one work revision. */
@@ -70,7 +79,7 @@ export interface SubmissionRecord {
 	verdict: string;
 }
 
-/** A boundary released because its refusal bound was exhausted (FR-23). */
+/** A boundary whose refusal budget is spent, kept as the OPEN item the owner has to settle (FR-23). */
 export interface OpenItemRecord {
 	boundary: string;
 	attempts: number;
@@ -91,10 +100,18 @@ export interface Deviation {
 	revision: number;
 }
 
+/** The course check in flight, and the task/revision whose verdict it is allowed to record. */
+export interface PendingCheck {
+	taskFingerprint?: string;
+	revision: number;
+}
+
 /** Everything the gates read and write for one session. */
 export interface JevState {
 	task?: TaskIdentity;
-	/** The request triage confirmed simple: consequential changes pass without the complex stages. */
+	/** The approved obligations of the registered task. */
+	requirementsApproval?: { taskFingerprint: string; items: string[] };
+	/** The request triage confirmed simple: read-only work needs no deeper workflow, nothing more. */
 	simple?: TaskIdentity;
 	/**
 	 * The screen's reading of the current request. It decides whether the request has to enter the
@@ -105,29 +122,39 @@ export interface JevState {
 	plan?: PlanApproval;
 	/** The approved plan's topics: one judge question each, and the paths the course check compares (FR-24, FR-25). */
 	planTopics: PlanTopic[];
+	/** Partial outline and detail approvals, bound to the task and approved requirements. */
+	planDraft?: PlanDraft;
 	/** Count of successful consequential changes; a change invalidates stale approvals. */
 	revision: number;
 	/** Consequential actions since the last course check. */
 	actionsSinceCheck: number;
-	/** A course check is in flight: consequential changes wait for its verdict. */
-	checkPending?: boolean;
+	/** A course check is in flight; consequential changes wait for its verdict. */
+	checkPending?: PendingCheck;
 	/** A finding that holds consequential changes until the executor consults. */
 	hold?: { reason: string };
+	/**
+	 * The owner's latest message arrived while the task was active. Its words may name a new course,
+	 * so the direction is undecided until a judged re-aim replaces the task; nothing else opens it.
+	 */
+	directionPending?: { text: string };
 	actions: ActionRecord[];
 	/** Consecutive judge calls that failed for availability, reset by any usable answer (FR-21). */
 	judgeFailures: number;
-	/** The judge is unavailable for this session: the boundaries pass without an answer (FR-21). */
+	/** The judge could not be reached: nothing can be decided, so every boundary stays closed (FR-21). */
 	judgeUnavailable?: true;
 	/** The owner has been told the judge is unavailable; cleared when a usable answer restores it. */
 	judgeUnavailableNotified?: true;
 	/** The open item signature the owner has already been told about (FR-23). */
 	openItemNotified?: string;
-	/** The material every refusal judged, so a repeated framing is recognised (FR-22). */
+	/** The material every refusal judged, so a repeated framing is recognised (FR-22). The counts are permanent for the task. */
 	submissions: SubmissionRecord[];
-	/** A boundary released after its refusal bound was exhausted (FR-23). */
+	/** The boundary whose refusal budget is spent (FR-23). */
 	openItem?: OpenItemRecord;
-	/** The boundaries released for the current request (FR-23). */
-	released: string[];
+	/**
+	 * The boundaries whose refusal budget is spent. An exhausted boundary stays blocked for the task:
+	 * the budget ends automated retries and never authorises a change (FR-23).
+	 */
+	exhausted: string[];
 	/** The consequential calls one standing boundary refused (FR-28). */
 	refusedCalls: RefusedCalls;
 	/** The first action whose target left the approved plan (FR-25). */
@@ -146,7 +173,7 @@ export function freshState(): JevState {
 		acceptance: [],
 		planTopics: [],
 		submissions: [],
-		released: [],
+		exhausted: [],
 		refusedCalls: { boundary: "", count: 0, calls: [] },
 		judgeFailures: 0,
 	};
@@ -157,14 +184,27 @@ export function sha256(text: string): string {
 	return createHash("sha256").update(text).digest("hex");
 }
 
-/** Drop every approval, verdict and record that belonged to the previous request. */
+/**
+ * The key an exhausted boundary is recorded under. Every plan-review stage closes the one plan
+ * boundary, so exhausting a stage blocks the whole plan for the task; every other boundary keeps its
+ * own key, so one spent budget never blocks an unrelated decision.
+ */
+export function boundaryKey(boundary: string): string {
+	return boundary.startsWith(`${PLAN_BOUNDARY}:`) ? PLAN_BOUNDARY : boundary;
+}
+
+/** Drop every approval, verdict, retry and exhaustion marker that belonged to the previous task. */
 function clearWork(state: JevState): void {
 	delete state.task;
 	delete state.simple;
+	delete state.requirementsApproval;
+	delete state.planDraft;
 	delete state.plan;
-	state.planTopics = [];
 	delete state.hold;
+	delete state.directionPending;
 	delete state.openItem;
+	delete state.openItemNotified;
+	delete state.checkPending;
 	delete state.deviation;
 	delete state.courseCheck;
 	delete state.completion;
@@ -172,7 +212,8 @@ function clearWork(state: JevState): void {
 	state.acceptance = [];
 	state.actions = [];
 	state.submissions = [];
-	state.released = [];
+	state.exhausted = [];
+	state.planTopics = [];
 	state.refusedCalls = { boundary: "", count: 0, calls: [] };
 	state.revision = 0;
 	state.actionsSinceCheck = 0;
@@ -180,7 +221,8 @@ function clearWork(state: JevState): void {
 
 /**
  * Register the development task under a fingerprint of its request. A different request starts
- * fresh work, so every approval and verdict of the previous task is dropped.
+ * fresh work, so every approval, refusal and exhaustion of the previous task is dropped - a new
+ * request never inherits an old approval or an old bypass.
  */
 export function registerTask(state: JevState, request: string): TaskIdentity {
 	const fingerprint = sha256(request.trim());
@@ -191,22 +233,33 @@ export function registerTask(state: JevState, request: string): TaskIdentity {
 }
 
 /**
- * The owner's interjection re-aims the registered task (FR-29): every approval and record of the
- * previous course is dropped, but the released boundaries stay released and the plan boundary is
- * released for the new course - the owner's order replaces the plan review for the re-aim itself,
- * and nothing here approves anything the old course refused.
+ * The owner's interjection re-aims the registered task (FR-29): every approval, refusal and
+ * exhaustion of the previous course is dropped, but nothing is approved - the re-aimed task needs a
+ * fresh plan, and the plan boundary is not marked exhausted on its behalf.
  */
 export function reaimTask(state: JevState, request: string): TaskIdentity {
-	const released = state.released.includes(PLAN_BOUNDARY) ? state.released : [...state.released, PLAN_BOUNDARY];
 	clearWork(state);
-	state.released = released;
 	state.task = { fingerprint: sha256(request.trim()), request };
 	return state.task;
 }
 
 /**
+ * Drop a finished task when its completion check approved the current revision: the next prompt is a
+ * new request and may be triaged on its own. An unfinished task is kept, so a later prompt cannot
+ * open its walls.
+ */
+export function clearFinishedTask(state: JevState): boolean {
+	if (state.task === undefined) return false;
+	if (state.hold !== undefined) return false;
+	if (state.completion?.approved !== true || state.completion.revision !== state.revision) return false;
+	clearWork(state);
+	return true;
+}
+
+/**
  * Record a request triage confirmed simple. The verdict belongs to that request and ends any
- * registered development task, so consequential changes pass without the complex stages.
+ * registered development task; read-only work then needs no further workflow, and every
+ * consequential call is still judged on its own payload before it runs.
  */
 export function registerSimple(state: JevState, request: string): TaskIdentity {
 	clearWork(state);
@@ -250,32 +303,44 @@ export function recordAction(state: JevState, action: ActionRecord, bumpsRevisio
 }
 
 /**
- * Count one blocked stop for an unchanged refusal. The count allows POLICY.maxStopBlocks blocks;
- * beyond that the refusal is recorded as an open item instead of looping on the same framing.
+ * Record a consequential call that failed. It may still have touched the working tree (`rm` followed
+ * by a failing command, a partial write), so it moves the revision and keeps its evidence - but it
+ * advances no check interval, because a failed call is not progress to judge.
  */
-export function recordStopBlock(state: JevState, signature: string): { block: boolean; blocks: number } {
-	const blocks = state.stop?.signature === signature ? state.stop.blocks + 1 : 1;
-	state.stop = { signature, blocks };
-	return { block: blocks <= POLICY.maxStopBlocks, blocks };
+export function recordFailedAction(state: JevState, action: ActionRecord): void {
+	state.actions = [...state.actions, action].slice(-POLICY.maxActionRecords);
+	state.revision += 1;
+	delete state.completion;
 }
 
 /**
- * Record one refusal at a boundary with the digest of the material it judged (FR-22), and release the
- * boundary as an open item as soon as the refusal bound is reached (FR-23), so a judge that will not
- * pass a submission never holds the work indefinitely. The release approves nothing.
+ * Count one blocked stop for an unchanged refusal. The count allows POLICY.maxStopBlocks continuing
+ * blocks before the refusal is delivered as an OPEN item; a blocked stop never settles the session.
+ */
+export function recordStopBlock(state: JevState, signature: string): { blocks: number; exhausted: boolean } {
+	const blocks = state.stop?.signature === signature ? state.stop.blocks + 1 : 1;
+	state.stop = { signature, blocks };
+	return { blocks, exhausted: blocks > POLICY.maxStopBlocks };
+}
+
+/**
+ * Record one refusal at a boundary with the digest of the material it judged (FR-22). The ledger is
+ * permanent for the task, so a refusal never falls out of the count. Once the budget is spent the
+ * boundary is recorded as an OPEN item (FR-23): it stays blocked and nothing is approved.
  */
 export function recordRefusal(state: JevState, record: SubmissionRecord): void {
-	state.submissions = [...state.submissions, record].slice(-POLICY.maxSubmissions);
+	state.submissions = [...state.submissions, record];
 	const refusals = state.submissions.filter(entry => entry.boundary === record.boundary);
-	if (refusals.length >= POLICY.maxRefusalsPerStage && !state.released.includes(record.boundary)) {
-		releaseBoundary(state, record.boundary);
+	if (refusals.length >= POLICY.maxRefusalsPerStage && !state.exhausted.includes(boundaryKey(record.boundary))) {
+		exhaustBoundary(state, record.boundary);
 	}
 }
 
 /**
  * What the ledger says about one material at one boundary, before any judge call (FR-22): whether
  * this exact framing was judged there already, how many submissions that boundary has taken, and
- * whether the bound is exhausted so the hold has to be released instead of repeated (FR-23).
+ * whether the budget is spent (FR-23). Exhaustion is read from its own record, so it survives any
+ * later change to the submission history.
  */
 export function submissionLedger(
 	state: JevState,
@@ -283,19 +348,19 @@ export function submissionLedger(
 	digest: string,
 ): { repeat: boolean; attempts: number; exhausted: boolean } {
 	const judged = state.submissions.filter(entry => entry.boundary === boundary);
+	const attempts = judged.length;
 	return {
 		repeat: judged.some(entry => entry.digest === digest),
-		attempts: judged.length,
-		exhausted: judged.length >= POLICY.maxRefusalsPerStage,
+		attempts,
+		exhausted: state.exhausted.includes(boundaryKey(boundary)) || attempts >= POLICY.maxRefusalsPerStage,
 	};
 }
 
 /**
- * Release a boundary after its refusal bound was exhausted: the request stops waiting for a decision
- * the executor cannot obtain, the refusal stays recorded as an open item with its numbers, and
- * nothing is approved (FR-23).
+ * Record a spent refusal budget as an OPEN item: the boundary stays blocked for the task, the
+ * refusals stay recorded with their digests, and nothing is approved (FR-23).
  */
-export function releaseBoundary(state: JevState, boundary: string): OpenItemRecord {
+export function exhaustBoundary(state: JevState, boundary: string): OpenItemRecord {
 	const refused = state.submissions.filter(entry => entry.boundary === boundary);
 	const openItem: OpenItemRecord = {
 		boundary,
@@ -303,8 +368,14 @@ export function releaseBoundary(state: JevState, boundary: string): OpenItemReco
 		digests: refused.map(entry => entry.digest),
 	};
 	state.openItem = openItem;
-	state.released = [...state.released, boundary];
+	const key = boundaryKey(boundary);
+	if (!state.exhausted.includes(key)) state.exhausted = [...state.exhausted, key];
 	return openItem;
+}
+
+/** Whether a boundary's refusal budget is spent, so the work it held stays blocked (FR-23). */
+export function boundaryExhausted(state: JevState, boundary: string): boolean {
+	return state.exhausted.includes(boundaryKey(boundary));
 }
 
 /** Count one consequential call a standing boundary refused, and keep the call it named (FR-28). */

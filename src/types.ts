@@ -1,5 +1,5 @@
 /**
- * Shared contracts for the Jevstice MVP.
+ * Shared contracts for Jevstice.
  *
  * `POLICY` carries the fail-closed floors: a judge error, a malformed answer and an
  * answer below the floor never approve (PRD constraint on S16). Every activity that
@@ -19,22 +19,24 @@ export const POLICY = {
 	 * that carry rule tension or one inference step.
 	 */
 	minConfidenceToApprove: 0.6,
-	/** Boolean (noul) probability of the approving outcome below this floor never approves. */
+	/** Boolean probability floor for activities other than plan-topic execution. */
 	minProbabilityToApprove: 0.8,
-	/** Plan-review coverage floor: the topic set as a whole (the topics keep minProbabilityToApprove). */
+	/** Requirement-list coverage floor; inferred implementation choices are reviewed against the objective. */
+	minRequirementsCoverageConfidence: 0.6,
+	/** Outline-step support floor; detail choices use minConfidenceToApprove. */
+	minPlanTopicConfidence: 0.6,
+	/** Plan-review coverage and scope floor. */
 	minCoverageConfidence: 0.6,
 	/** Blocked stop continuations for one unchanged refusal before it is recorded as an open item. */
 	maxStopBlocks: 3,
 	/** Consecutive availability failures before the judge is declared unavailable for the session (FR-21). */
 	maxJudgeFailures: 3,
-	/** Refusals of one boundary before its hold is released as an open item (FR-22, FR-23). */
+	/** Refusals of one decision before it remains blocked as an open item (FR-22, FR-23). */
 	maxRefusalsPerStage: 3,
 	/** Consequential calls one standing boundary may refuse before the owner is told (FR-28). */
 	maxIgnoredBoundaryCalls: 3,
 	/** Fragments a submitted text is split into for the text review (FR-27). */
 	maxTextFragments: 12,
-	/** Judged submissions kept in the ledger a repeated framing is recognised against (FR-22). */
-	maxSubmissions: 24,
 	/** Judge model; never substituted by another provider. */
 	defaultModel: "jev-latest",
 	/** Env var carrying the TypeSafe API key; never persisted, logged or echoed. */
@@ -68,7 +70,7 @@ export type Aspect = "business" | "architecture";
 
 /**
  * The boundary names the gates read (FR-22, FR-23). A refusal is counted per boundary, and a
- * boundary whose refusal bound is exhausted is released: `plan` is the hold on consequential changes,
+ * boundary whose refusal bound is exhausted stays blocked: `plan` holds consequential changes,
  * `hold` is a finding that has to be answered by a consultation.
  */
 export const PLAN_BOUNDARY = "plan";
@@ -90,6 +92,13 @@ export interface PlanTopic {
 	/** The paths this topic changes. */
 	paths: readonly string[];
 	/** The requirement of the registered task this topic serves. */
+	requirement: string;
+}
+
+/** One proposed high-level plan step, before its implementation details are reviewed. */
+export interface PlanOutlineStep {
+	id: string;
+	summary: string;
 	requirement: string;
 }
 

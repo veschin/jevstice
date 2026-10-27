@@ -1,7 +1,27 @@
 import { describe, expect, test } from "bun:test";
-import { completionGate, isConsequentialMutation, isNonMutatingCommand, isProposeCall, mutationGate, planArtifactUrl, proposeGate } from "../src/gates.js";
+import {
+	completionGate,
+	isConsequentialMutation,
+	isNonMutatingCommand,
+	isProposeCall,
+	mutationGate,
+	planArtifactUrl,
+	proposeGate,
+	requirementsBeforePlanGate,
+	triageBeforeInspectionGate,
+} from "../src/gates.js";
 import { weightOf } from "../src/screen.js";
-import { freshState, recordAcceptance, recordAction, registerSimple, registerTask, screenRequest, sha256, type JevState } from "../src/state.js";
+import {
+	freshState,
+	recordAcceptance,
+	recordAction,
+	recordRefusal,
+	registerSimple,
+	registerTask,
+	screenRequest,
+	sha256,
+	type JevState,
+} from "../src/state.js";
 import type { JevConfig } from "../src/types.js";
 import { boundaryConfig } from "./helpers.js";
 
@@ -17,6 +37,17 @@ function developed(): JevState {
 	return state;
 }
 
+/** A developed state whose plan approval belongs to the registered task. */
+function planned(): JevState {
+	const state = developed();
+	state.plan = { taskFingerprint: state.task?.fingerprint ?? "", planUrl: "local://x-plan.md", planDigest: "d", confidence: 0.9 };
+	return state;
+}
+
+function spendBoundary(state: JevState, boundary: string): void {
+	for (const digest of ["a", "b", "c"]) recordRefusal(state, { boundary, digest, verdict: "refused" });
+}
+
 describe("T3 - what counts as a consequential change", () => {
 	test("FR-18: working-tree changes are consequential, coordination and judge routes are not", () => {
 		expect(isConsequentialMutation("write", { path: "src/a.ts" })).toBe(true);
@@ -25,6 +56,8 @@ describe("T3 - what counts as a consequential change", () => {
 		expect(isConsequentialMutation("edit", { paths: ["src/a.ts", "src/b.ts"] })).toBe(true);
 		expect(isConsequentialMutation("ast_edit", { paths: ["src/a.ts"] })).toBe(true);
 		expect(isConsequentialMutation("write", {})).toBe(true);
+		// An opaque patch names no readable target, so it is a change.
+		expect(isConsequentialMutation("edit", { patch: "*** Begin Patch\n*** Update File: src/a.ts" })).toBe(true);
 	});
 
 	test("FR-18: the registered judge tools, agent messages and session artifacts pass", () => {
@@ -35,11 +68,42 @@ describe("T3 - what counts as a consequential change", () => {
 		expect(isConsequentialMutation("write", { path: "xd://read" })).toBe(false);
 		expect(isConsequentialMutation("read", { path: "src/a.ts" })).toBe(false);
 		expect(isConsequentialMutation("web_search", { query: "x" })).toBe(false);
+		expect(isConsequentialMutation("wait", {})).toBe(false);
 	});
 
-	test("FR-18: a mounted mutating device is consequential", () => {
-		expect(isConsequentialMutation("write", { path: "xd://ast_edit", content: "{}" })).toBe(true);
-		expect(isConsequentialMutation("write", { path: "xd://bash", content: "{}" })).toBe(true);
+	test("FR-31: opaque execution is consequential - eval, delegation and device dispatch", () => {
+		expect(isConsequentialMutation("eval", { language: "py", code: "print('read only')" })).toBe(true);
+		expect(isConsequentialMutation("task", { context: "c", tasks: [{ task: "only read", solutionSpace: "one fix" }] })).toBe(true);
+		expect(isConsequentialMutation("write", { path: "xd://eval", content: "{}" })).toBe(true);
+		expect(isConsequentialMutation("write", { path: "xd://debug", content: "{}" })).toBe(true);
+		expect(isConsequentialMutation("write", { path: "xd://mcp__google_sheets_update_cells", content: "{}" })).toBe(true);
+	});
+
+	test("FR-31: an LSP call that can apply an edit is consequential, a query is not", () => {
+		expect(isConsequentialMutation("lsp", { action: "diagnostics", file: "src/a.ts" })).toBe(false);
+		expect(isConsequentialMutation("lsp", { action: "references", file: "src/a.ts", line: 3, symbol: "x" })).toBe(false);
+		expect(isConsequentialMutation("lsp", { action: "rename", file: "src/a.ts", new_name: "y" })).toBe(true);
+		expect(isConsequentialMutation("lsp", { action: "code_actions", file: "src/a.ts", apply: true, query: "fix" })).toBe(true);
+		expect(isConsequentialMutation("lsp", { action: "request", query: "textDocument/rename" })).toBe(true);
+		expect(isConsequentialMutation("lsp", {})).toBe(true);
+		expect(isConsequentialMutation("write", { path: "xd://lsp", content: JSON.stringify({ action: "diagnostics", file: "src/a.ts" }) })).toBe(false);
+		expect(isConsequentialMutation("write", { path: "xd://lsp", content: JSON.stringify({ action: "rename", file: "src/a.ts", new_name: "y" }) })).toBe(true);
+	});
+
+	test("FR-31: an unknown tool and an unknown MCP route are consequential, known reads are not", () => {
+		expect(isConsequentialMutation("some_new_tool", { path: "src/a.ts" })).toBe(true);
+		expect(isConsequentialMutation("mcp__google_sheets_update_cells", { spreadsheetId: "s", range: "A1", values: [] })).toBe(true);
+		expect(isConsequentialMutation("mcp__some_mutating_server_tool", {})).toBe(true);
+		expect(isConsequentialMutation("mcp__google_sheets_get_sheet_data", { spreadsheetId: "s" })).toBe(false);
+	});
+
+	test("FR-31: the parallel wrapper is judged by the calls it carries", () => {
+		const write = { tool_uses: [{ recipient_name: "read", parameters: { path: "src/a.ts" } }, { recipient_name: "write", parameters: { path: "src/a.ts" } }] };
+		const reads = { tool_uses: [{ recipient_name: "read", parameters: { path: "src/a.ts" } }, { recipient_name: "grep", parameters: { pattern: "x" } }] };
+
+		expect(isConsequentialMutation("multi_tool_use.parallel", write)).toBe(true);
+		expect(isConsequentialMutation("multi_tool_use.parallel", reads)).toBe(false);
+		expect(isConsequentialMutation("multi_tool_use.parallel", {})).toBe(true);
 	});
 
 	test("FR-18: a mutating shell command and a target under the legacy alias are consequential too", () => {
@@ -72,7 +136,7 @@ describe("T3 - what counts as a consequential change", () => {
 	test("FR-31: staging and publishing cost no boundary either", () => {
 		for (const command of [
 			"git add -A",
-			"git add src/a.ts && git commit -m 'feat: add a'",
+			"git add src/a.ts && git commit -m update",
 			"git commit -am wip",
 			"git push",
 			"git push -u origin master",
@@ -82,10 +146,10 @@ describe("T3 - what counts as a consequential change", () => {
 		}
 	});
 
-	test("FR-31: a message's own punctuation and operators are data, not shell syntax", () => {
-		expect(isConsequentialMutation("bash", { command: `git commit -m "feat(core): add a && b"` })).toBe(false);
-		expect(isConsequentialMutation("bash", { command: `git commit -m 'fix: (v2) > 1'` })).toBe(false);
-		expect(isConsequentialMutation("bash", { command: `git commit -m "afk while I run the tests; back in 10"` })).toBe(false);
+	test("FR-31: quoted shell arguments require judgment instead of being stripped", () => {
+		expect(isConsequentialMutation("bash", { command: `git commit -m "feat(core): add a && b"` })).toBe(true);
+		expect(isConsequentialMutation("bash", { command: `git commit -m 'fix: (v2) > 1'` })).toBe(true);
+		expect(isConsequentialMutation("bash", { command: `sort "-o" out.txt in.txt` })).toBe(true);
 	});
 
 	test("FR-31: anything that reaches the working tree stays consequential", () => {
@@ -105,6 +169,23 @@ describe("T3 - what counts as a consequential change", () => {
 			"ls -o out.txt",
 			"git diff --output=patch.txt",
 			"sort --output=sorted.txt notes.txt",
+		]) {
+			expect({ command, consequential: isConsequentialMutation("bash", { command }) }).toEqual({ command, consequential: true });
+		}
+	});
+
+	test("FR-31: a quoted program, a path program and a positional output file stay consequential", () => {
+		for (const command of [
+			`"touch" true`,
+			`'ls' -la`,
+			`/tmp/ls -la`,
+			`bin/cat package.json`,
+			"xxd notes.bin notes.out",
+			"sort -oout.txt notes.txt",
+			`echo "'$(touch out.txt)'"`,
+			`sort "-o" out.txt in.txt`,
+			"uniq notes.txt notes.out",
+			`ls; "touch" marker`,
 		]) {
 			expect({ command, consequential: isConsequentialMutation("bash", { command }) }).toEqual({ command, consequential: true });
 		}
@@ -166,10 +247,19 @@ describe("T3 - the mutation gate", () => {
 		expect(verdict.reason).toContain("local://");
 	});
 
+	test("FR-31: eval, delegation and unknown tools are held by the same plan boundary", () => {
+		const state = freshState();
+		registerTask(state, "Add the coverage report");
+
+		expect(mutationGate(state, config(), "eval", { language: "py", code: "1" }).block).toBe(true);
+		expect(mutationGate(state, config(), "task", { context: "c", tasks: [] }).block).toBe(true);
+		expect(mutationGate(state, config(), "mcp__google_sheets_update_cells", {}).block).toBe(true);
+		expect(mutationGate(state, config(), "multi_tool_use.parallel", { tool_uses: [{ recipient_name: "write", parameters: { path: "src/a.ts" } }] }).block).toBe(true);
+	});
+
 	test("FR-11: a course check in flight holds consequential changes until its verdict returns", () => {
-		const state = developed();
-		state.plan = { taskFingerprint: state.task?.fingerprint ?? "", planUrl: "local://x-plan.md", planDigest: "d", confidence: 0.9 };
-		state.checkPending = true;
+		const state = planned();
+		state.checkPending = { revision: state.revision };
 
 		const verdict = mutationGate(state, config(), "write", { path: "src/a.ts" });
 
@@ -197,8 +287,7 @@ describe("T3 - the mutation gate", () => {
 	});
 
 	test("a finding holds consequential changes until it is consulted", () => {
-		const state = developed();
-		state.plan = { taskFingerprint: state.task?.fingerprint ?? "", planUrl: "local://x-plan.md", planDigest: "d", confidence: 0.9 };
+		const state = planned();
 		state.hold = { reason: 'the course check at revision 1 answered "off_course" (confidence 0.91)' };
 
 		const verdict = mutationGate(state, config(), "write", { path: "src/a.ts" });
@@ -213,6 +302,146 @@ describe("T3 - the mutation gate", () => {
 		registerTask(state, "Add the coverage report");
 
 		expect(mutationGate(state, config({ mutation: false }), "write", { path: "src/a.ts" }).block).toBe(false);
+	});
+});
+
+describe("FR-21, FR-23 - unavailable and spent boundaries stay blocked", () => {
+	test("FR-21: an unreachable judge closes the consequential boundary instead of opening it", () => {
+		const state = planned();
+		state.judgeUnavailable = true;
+
+		const verdict = mutationGate(state, config(), "write", { path: "src/a.ts" });
+
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("judge could not be reached");
+		expect(completionGate(state, boundaryConfig()).applies).toBe(true);
+		expect(completionGate(state, boundaryConfig()).reason).toContain("judge could not be reached");
+	});
+
+	test("FR-23: a spent plan budget keeps the plan boundary closed with one blocked next action", () => {
+		const state = freshState();
+		registerTask(state, "Report the coverage of the last run");
+		expect(mutationGate(state, config(), "write", { path: "src/a.ts" }).block).toBe(true);
+
+		spendBoundary(state, "plan:outline");
+
+		const verdict = mutationGate(state, config(), "write", { path: "src/a.ts" });
+
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("OPEN item");
+		expect(verdict.reason).toContain("jev_reaim");
+		expect(state.plan).toBeUndefined();
+	});
+
+	test("FR-23: a spent budget and a pending check do not leak into the next task", () => {
+		const state = freshState();
+		registerTask(state, "Report the coverage of the last run");
+		spendBoundary(state, "plan:outline");
+		state.checkPending = { revision: 0 };
+
+		registerTask(state, "Write the migration guide");
+
+		expect(state.exhausted).toEqual([]);
+		expect(state.checkPending).toBeUndefined();
+		const verdict = mutationGate(state, config(), "write", { path: "src/a.ts" });
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("jev_plan_review");
+		expect(verdict.reason).not.toContain("OPEN item");
+	});
+
+	test("FR-29: an unjudged owner message closes the plan, the proposal and the completion", () => {
+		const state = planned();
+		state.directionPending = { text: "теперь закрой F-40" };
+
+		const verdict = mutationGate(state, config(), "write", { path: "src/a.ts" });
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("jev_reaim");
+		expect(proposeGate(state, config(), { path: "xd://propose", content: "x" }).reason).toContain("jev_reaim");
+		expect(completionGate(state, boundaryConfig()).reason).toContain("jev_reaim");
+	});
+
+	test("FR-23: a spent hold budget keeps the change blocked instead of releasing it", () => {
+		const state = planned();
+		state.hold = { reason: "a defect" };
+		spendBoundary(state, "hold");
+
+		const verdict = mutationGate(state, config(), "write", { path: "src/a.ts" });
+
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("OPEN item");
+	});
+
+	test("FR-23: a spent triage budget keeps an untriaged session closed", () => {
+		const state = freshState();
+		spendBoundary(state, "triage");
+
+		const verdict = mutationGate(state, config(), "write", { path: "src/a.ts" });
+
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("OPEN item");
+	});
+
+	test("FR-23, FR-21: a spent or unreachable triage also holds the pre-triage inspection", () => {
+		const spent = freshState();
+		screenRequest(spent, "добавь отчёт по покрытию");
+		spendBoundary(spent, "triage");
+		expect(triageBeforeInspectionGate(spent, config(), "read", { path: "src/a.ts" }).block).toBe(true);
+
+		const down = freshState();
+		screenRequest(down, "добавь отчёт по покрытию");
+		down.judgeUnavailable = true;
+		expect(triageBeforeInspectionGate(down, config(), "read", { path: "src/a.ts" }).block).toBe(true);
+		expect(triageBeforeInspectionGate(down, config(), "read", { path: "skill://ready-first" }).block).toBe(false);
+	});
+
+	test("FR-28: the triage and plan refusals name the call with its arguments and the boundary", () => {
+		const state = freshState();
+		const triage = mutationGate(state, config(), "write", { path: "src/a.ts" });
+		const call = /Next call: jev_triage\((\{.*\})\)/.exec(triage.reason ?? "")?.[1];
+
+		expect(call).toBeDefined();
+		expect(JSON.parse(call ?? "")).toHaveProperty("request");
+		expect(triage.boundary).toBe("triage");
+
+		registerTask(state, "Report the coverage of the last run");
+		const plan = mutationGate(state, config(), "write", { path: "src/a.ts" });
+
+		expect(plan.reason).toContain("Next call: write local://<slug>-plan.md, then jev_plan_review(");
+		expect(plan.boundary).toBe("plan");
+	});
+});
+
+describe("FR-34 - requirements review before the plan", () => {
+	test("plan artifacts and reviews wait for approved requirements, project changes do not", () => {
+		const state = freshState();
+		const task = registerTask(state, "Add the coverage report");
+
+		expect(requirementsBeforePlanGate(state, config(), "write", { path: "local://x-plan.md" }).block).toBe(true);
+		expect(requirementsBeforePlanGate(state, config(), "jev_plan_review", {}).block).toBe(true);
+		expect(requirementsBeforePlanGate(state, config(), "write", { path: "src/a.ts" }).block).toBe(false);
+
+		state.requirementsApproval = { taskFingerprint: task.fingerprint, items: ["add the coverage report"] };
+
+		expect(requirementsBeforePlanGate(state, config(), "write", { path: "local://x-plan.md" }).block).toBe(false);
+		expect(requirementsBeforePlanGate(state, config(), "jev_plan_review", {}).block).toBe(false);
+	});
+
+	test("a spent requirements budget blocks the plan preparation as an OPEN item", () => {
+		const state = freshState();
+		registerTask(state, "Add the coverage report");
+		spendBoundary(state, "requirements");
+
+		const verdict = requirementsBeforePlanGate(state, config(), "write", { path: "local://x-plan.md" });
+
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("OPEN item");
+	});
+
+	test("no owner confirmation is read: triage alone does not block the requirements submission", () => {
+		const state = freshState();
+		registerTask(state, "Add the coverage report");
+
+		expect(requirementsBeforePlanGate(state, config(), "jev_requirements", {}).block).toBe(false);
 	});
 });
 
@@ -238,9 +467,19 @@ describe("T3 - the plan-mode proposal boundary", () => {
 		expect(proposeGate(state, config(), { path: "xd://propose", content: "release note" }).block).toBe(false);
 	});
 
-	test("a proposal with no slug is blocked", () => {
+	test("a quiet follow-up never opens the proposal of a registered task", () => {
 		const state = freshState();
-		const verdict = proposeGate(state, config(), { path: "xd://propose", content: "   " });
+		registerTask(state, "Add the coverage report");
+		screenRequest(state, "закоммить и запушь текущее состояние");
+
+		const verdict = proposeGate(state, config(), { path: "xd://propose", content: "coverage report" });
+
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("jev_plan_review");
+	});
+
+	test("a proposal with no slug is blocked", () => {
+		const verdict = proposeGate(freshState(), config(), { path: "xd://propose", content: "   " });
 
 		expect(verdict.block).toBe(true);
 		expect(verdict.reason).toContain("slug");
@@ -309,6 +548,17 @@ describe("T3 - the plan-mode proposal boundary", () => {
 		expect(verdict.block).toBe(true);
 		expect(verdict.reason).toContain("local://other-plan.md");
 	});
+
+	test("FR-23: a spent plan budget blocks the proposal as an OPEN item", () => {
+		const state = freshState();
+		registerTask(state, "Add the coverage report");
+		spendBoundary(state, "plan:finalize");
+
+		const verdict = proposeGate(state, config(), { path: "xd://propose", content: "coverage report" });
+
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("OPEN item");
+	});
 });
 
 describe("T5 - the completion boundary", () => {
@@ -337,17 +587,16 @@ describe("T5 - the completion boundary", () => {
 		expect(completionGate(state, boundaryConfig()).reason).toBeUndefined();
 	});
 
-	test("FR-23, FR-17: a released acceptance boundary satisfies the completion requirement", () => {
-		const released = developed();
-		released.released = ["acceptance:business"];
-		recordAcceptance(released, { aspect: "architecture", revision: released.revision, label: "sound_for_next_change", approved: true, confidence: 0.9 });
+	test("FR-23: a spent acceptance budget blocks completion instead of satisfying it", () => {
+		const state = developed();
+		recordAcceptance(state, { aspect: "architecture", revision: state.revision, label: "sound_for_next_change", approved: true, confidence: 0.9 });
+		spendBoundary(state, "acceptance:business");
 
-		expect(completionGate(released, boundaryConfig()).reason).toBeUndefined();
+		const gate = completionGate(state, boundaryConfig());
 
-		const held = developed();
-		recordAcceptance(held, { aspect: "architecture", revision: held.revision, label: "sound_for_next_change", approved: true, confidence: 0.9 });
-
-		expect(completionGate(held, boundaryConfig()).reason).toContain("business");
+		expect(gate.applies).toBe(true);
+		expect(gate.reason).toContain("OPEN item");
+		expect(gate.reason).toContain("business");
 	});
 
 	test("FR-14: a subsequent change invalidates a stale acceptance", () => {
@@ -359,8 +608,20 @@ describe("T5 - the completion boundary", () => {
 		expect(completionGate(state, boundaryConfig()).reason).toContain("business");
 	});
 
+	test("FR-11: a stop waits for the course check in flight", () => {
+		const state = planned();
+		recordAcceptance(state, { aspect: "business", revision: state.revision, label: "serves_business_need", approved: true, confidence: 0.9 });
+		recordAcceptance(state, { aspect: "architecture", revision: state.revision, label: "sound_for_next_change", approved: true, confidence: 0.9 });
+		state.checkPending = { revision: state.revision };
+
+		const gate = completionGate(state, boundaryConfig());
+
+		expect(gate.applies).toBe(true);
+		expect(gate.reason).toContain("course check");
+	});
+
 	test("a finding holds the completion boundary as well", () => {
-		const state = developed();
+		const state = planned();
 		state.hold = { reason: 'the developer review answered "defect"' };
 
 		const gate = completionGate(state, boundaryConfig());
@@ -371,44 +632,6 @@ describe("T5 - the completion boundary", () => {
 
 	test("a disabled completion gate lets the session settle", () => {
 		expect(completionGate(developed(), config({ completion: false })).applies).toBe(false);
-	});
-});
-
-describe("FR-21, FR-23 - unavailable or released boundaries stop holding changes", () => {
-	test("FR-28: the triage and plan refusals name the call with its arguments and the boundary", () => {
-		const state = freshState();
-		const triage = mutationGate(state, config(), "write", { path: "src/a.ts" });
-		const call = /Next call: jev_triage\((\{.*\})\)/.exec(triage.reason ?? "")?.[1];
-
-		expect(call).toBeDefined();
-		expect(JSON.parse(call ?? "")).toHaveProperty("request");
-		expect(triage.boundary).toBe("triage");
-
-		registerTask(state, "Report the coverage of the last run");
-		const plan = mutationGate(state, config(), "write", { path: "src/a.ts" });
-
-		expect(plan.reason).toContain("Next call: write local://<slug>-plan.md, then jev_plan_review(");
-		expect(plan.boundary).toBe("plan");
-	});
-
-
-	test("FR-21: an unavailable judge stops holding the boundaries", () => {
-		const state = freshState();
-		state.judgeUnavailable = true;
-		registerTask(state, "Report the coverage of the last run");
-
-		expect(mutationGate(state, config(), "write", { path: "src/a.ts" }).block).toBe(false);
-		expect(completionGate(state, boundaryConfig()).applies).toBe(false);
-	});
-
-	test("FR-23: a released boundary stops holding the changes it held", () => {
-		const state = freshState();
-		registerTask(state, "Report the coverage of the last run");
-		expect(mutationGate(state, config(), "write", { path: "src/a.ts" }).block).toBe(true);
-
-		state.released = ["plan"];
-
-		expect(mutationGate(state, config(), "write", { path: "src/a.ts" }).block).toBe(false);
 	});
 });
 
@@ -450,6 +673,7 @@ describe("FR-30 - the request screen decides whether a request enters the workfl
 		screenRequest(state, "закоммить и запушь");
 
 		expect(mutationGate(state, config(), "write", { path: "src/a.ts" }).block).toBe(true);
+		expect(proposeGate(state, config(), { path: "xd://propose", content: "coverage-report" }).block).toBe(true);
 	});
 
 	test("the judge's simple verdict opens the gate for a judged request", () => {
@@ -461,7 +685,7 @@ describe("FR-30 - the request screen decides whether a request enters the workfl
 	});
 
 	test("a commit, a push and an inspection stay free with nothing recorded at all", () => {
-		expect(mutationGate(freshState(), config(), "bash", { command: "git commit -am 'feat: x' && git push" }).block).toBe(false);
+		expect(mutationGate(freshState(), config(), "bash", { command: "git commit -am update && git push" }).block).toBe(false);
 		expect(mutationGate(freshState(), config(), "bash", { command: "git status" }).block).toBe(false);
 	});
 
