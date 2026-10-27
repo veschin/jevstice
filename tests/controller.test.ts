@@ -113,6 +113,24 @@ describe("T1 - the registered surface", () => {
 		expect(pi.messages).toHaveLength(0);
 	});
 });
+
+describe("Jev prompt guidance", () => {
+	test("FR-09: each prompt receives the addon-bundled decision protocol", async () => {
+		const { pi } = controllerFor({});
+		const results = await pi.emit(
+			"before_agent_start",
+			{ type: "before_agent_start", prompt: "Report the coverage of the last run" },
+			fakeCtx(),
+		);
+
+		expect(results).toContainEqual({
+			systemPromptAppend: expect.stringContaining("Use the matching Jev tool description as the authoritative call template."),
+		});
+		expect(results).toContainEqual({
+			systemPromptAppend: expect.stringContaining("below-floor answer is not approval."),
+		});
+	});
+});
 describe("T2 - a read-only question costs nothing (FR-10, constraint on S2/S13/S14)", () => {
 	test("a plain web search and a read are neither gated nor consulted", async () => {
 		const { pi, calls } = controllerFor({});

@@ -6,6 +6,7 @@
 
 - Jev tool guidance now follows activity-specific inputs and distinguishes negative answers from insufficient confidence.
 - Each Jev tool now states its call inputs, outcome and next action in a concise description.
+- The addon now appends its bundled Jev protocol to each agent prompt through `before_agent_start`.
 - Plan and business acceptance refusals now identify uncovered requirements or unmet business obligations without directing changes to passing topics.
 - Plan review now separates missing requirement coverage from per-topic scope creep.
 - Below-floor recovery guidance reads the typed answer and no longer presents historical score ranges as universal.

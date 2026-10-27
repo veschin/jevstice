@@ -9,6 +9,7 @@
  * Nothing here classifies prompts and nothing calls the judge before a tool is invoked or a
  * boundary is reached, so a plain read-only question costs no call and no gate.
  */
+import { readFileSync } from "node:fs";
 import {
 	acceptance,
 	completionCheck,
@@ -122,6 +123,8 @@ const REVIEW_DESCRIPTION =
 
 const TEXT_REVIEW_DESCRIPTION =
 	"Submit the text and exact rules as {class, rule}. Jev returns violating fragments and the submitted rules they break; revise only those fragments. No returned defects means the text meets the submitted rules.";
+
+const JEV_SKILL = readFileSync(new URL("./jev-skill.md", import.meta.url), "utf8").trim();
 
 
 /** Best-effort reading of one string-valued method off the session manager. */
@@ -489,6 +492,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 				delete state.simple;
 				const request = asRecord(event)?.["prompt"];
 				screenRequest(state, typeof request === "string" ? request : "");
+				return { systemPromptAppend: JEV_SKILL };
 			});
 
 			// The approve-and-execute switch arms here; the approval is restored after the switch,
