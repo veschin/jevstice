@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Jev tool guidance now follows activity-specific inputs and distinguishes negative answers from insufficient confidence.
+- Each Jev tool now states its call inputs, outcome and next action in a concise description.
+- Plan and business acceptance refusals now identify uncovered requirements or unmet business obligations without directing changes to passing topics.
+- Plan review now separates missing requirement coverage from per-topic scope creep.
+- Below-floor recovery guidance reads the typed answer and no longer presents historical score ranges as universal.
+
+
 ## 1.2.0 - 2026-10-14
 
 - **A request is read once, for free, before any judge call (FR-30).** `src/screen.ts` reads the

@@ -68,6 +68,7 @@ const EVIDENCE_KINDS: Record<string, true> = {
 
 const DEPTH_QUESTION = "needs_development";
 const COVERAGE_QUESTION = "coverage";
+const SCOPE_PREFIX = "scope";
 const REAIM_QUESTION = "reaim";
 const FOLLOWS_QUESTION = "follows_requirements";
 const CONSULT_QUESTION = "consult";
@@ -129,13 +130,9 @@ function refused(problem: string): ToolOutcome {
 	};
 }
 
-/**
- * The recovery protocol every below-floor answer teaches (FR-09, FR-20): a low score means the judge
- * split its probability over the options, which is a defect of the submitted material, never a
- * verdict to abandon. Measured on the live judge 2026-10-08 (evidence/jev-calibration-2026-10-08.md).
- */
+/** Recovery guidance for answers that do not clear their approval floor. */
 const LOW_SCORE_RECOVERY =
-	` ${MATERIAL_FAULT} Next action: rework the material before submitting again - (1) quote the exact line that settles the claim (a rule, a run output, an artifact fragment); (2) narrow the claim to a single obligation; (3) if it still fails, change the approach entirely. Measured on this judge: a claim plus its settling quote scores 0.80-1.00, the same claim with the settling quote removed scores 0.30-0.50, an open approval request scores 0.14-0.26.`;
+	` ${MATERIAL_FAULT} Next action: read the returned label, rubric score or yes probability. If it names a gap, address it; if the result is inconclusive, add only evidence relevant to the question or narrow the claim. Do not treat any score range as a guarantee or change topics that passed.`;
 
 function unusable(problem: string): ToolOutcome {
 	return {
@@ -274,6 +271,10 @@ function needName(index: number): string {
 
 function topicName(index: number): string {
 	return `topic_${index}`;
+}
+
+function scopeName(index: number): string {
+	return `${SCOPE_PREFIX}_${index}`;
 }
 
 function withRequest(request: string | undefined, evidence: readonly Evidence[]): Evidence[] {
@@ -852,11 +853,17 @@ export async function planReview(
 			{
 				name: COVERAGE_QUESTION,
 				mode: "noul",
-				instructions:
-					"Do the submitted topics, taken together, cover the registered task's requirements - every obligation of the task owned by at least one topic, and no topic adding work the task does not ask for?",
-				trueMeaning: "the topics collectively cover the registered task's requirements",
-				falseMeaning: "the topics leave part of the task's requirements uncovered or add unrequested work",
+				instructions: "Do the submitted topics collectively cover every obligation in the registered task?",
+				trueMeaning: "every obligation in the registered task is covered by at least one topic",
+				falseMeaning: "at least one obligation in the registered task is not covered by any topic",
 			},
+			...topics.topics.map((topic, index) => ({
+				name: scopeName(index + 1),
+				mode: "noul" as const,
+				instructions: `Does the requirement for topic '${topic.id}' stay within the registered task, without adding work the owner did not ask for? Compare the registered task with this requirement: "${topic.requirement}".`,
+				trueMeaning: "the topic's requirement stays within the registered task and adds no unrequested work",
+				falseMeaning: "the topic adds an obligation not requested in the registered task",
+			})),
 			...topics.topics.map((topic, index) => ({
 				name: topicName(index + 1),
 				mode: "noul" as const,
@@ -871,18 +878,42 @@ export async function planReview(
 	if (!outcome.ok) return unusable(outcome.problem);
 	const coverage = probabilityOf(outcome, COVERAGE_QUESTION);
 	const uncovered = coverage === undefined || coverage < POLICY.minCoverageConfidence;
+	const scope = topics.topics.map((topic, index) => ({
+		topic,
+		probability: probabilityOf(outcome, scopeName(index + 1)),
+	}));
+	const outOfScope = scope.filter(entry => (entry.probability ?? 0) < POLICY.minCoverageConfidence);
 	const judged = topics.topics.map((topic, index) => ({
 		topic,
 		probability: probabilityOf(outcome, topicName(index + 1)),
 	}));
 	const belowFloor = judged.filter(entry => (entry.probability ?? 0) < POLICY.minProbabilityToApprove);
-	if (uncovered || belowFloor.length > 0) {
+	if (uncovered || outOfScope.length > 0 || belowFloor.length > 0) {
 		recordRefusal(state, { boundary: PLAN_BOUNDARY, digest: call.digest, verdict: PLAN_REVISE });
 		delete state.plan;
 		state.planTopics = [];
+		const scopeLines = outOfScope
+			.map(
+				entry =>
+					`  - ${entry.topic.id} (probability ${entry.probability === undefined ? "returned nothing" : percent(entry.probability)}): ${entry.topic.requirement}`,
+			)
+			.join("\n");
 		const failedLines = belowFloor
 			.map(entry => `  - ${entry.topic.id} (probability ${percent(entry.probability ?? 0)}): ${entry.topic.requirement}`)
 			.join("\n");
+		const nextActions = [
+			uncovered
+				? "compare the registered task with the topic map and add or revise topics until every obligation is covered"
+				: undefined,
+			outOfScope.length > 0
+				? "remove or revise only the named topics that add work outside the registered task"
+				: undefined,
+			belowFloor.length > 0
+				? "revise only the named below-floor sections so their requirements are executable as written"
+				: undefined,
+		]
+			.filter(Boolean)
+			.join("; ");
 		return {
 			ok: true,
 			text:
@@ -890,8 +921,9 @@ export async function planReview(
 					uncovered
 						? ` The topics do not cover the registered task (probability ${coverage === undefined ? "returned nothing" : percent(coverage)}).`
 						: ""
-				}${belowFloor.length > 0 ? `\nTopics below the ${POLICY.minProbabilityToApprove} floor:\n${failedLines}` : ""}` +
-				`\nReword those topics' sections in ${plan} and submit the review again; the topics that passed are re-asked from the artifact as it then stands.`,
+				}${outOfScope.length > 0 ? `\nTopics adding unrequested work:\n${scopeLines}` : ""}${
+					belowFloor.length > 0 ? `\nTopics below the ${POLICY.minProbabilityToApprove} floor:\n${failedLines}` : ""
+				}` + `\nNext action: ${nextActions}. Leave passing sections unchanged.`,
 			details: {
 				verdict: PLAN_REVISE,
 				coverage,
@@ -1023,13 +1055,20 @@ export async function acceptance(deps: ActivityDeps, state: JevState, params: un
 			text: `the judge approved ${named} acceptance with confidence ${percent(answer.confidence)}, below the ${POLICY.minConfidenceToApprove} floor; no acceptance is recorded.${LOW_SCORE_RECOVERY}${budget}`,
 		};
 	}
+	const unmetTopics = unmet.map(entry => `${entry.topic.id}: ${entry.topic.requirement}`).join("; ");
+	const topicStatus =
+		state.planTopics.length === 0
+			? ""
+			: unmet.length === 0
+				? " All plan-topic evidence checks passed; they do not establish aspect acceptance."
+				: ` Plan-topic evidence also misses: ${unmetTopics}.`;
+	const gapRecovery =
+		named === "business"
+			? "Compare the registered task with the finished outcome, complete any unmet business obligation, then submit execution and code evidence of the fix."
+			: "Compare the required change with the design, correct any architectural defect, then submit execution and code evidence of the fix.";
 	return {
 		ok: true,
-		text: `${named} acceptance: ${label} (confidence ${percent(answer.confidence)}), not recorded. ${
-			label === PLAN_UNSUPPORTED
-				? "Quote the execution and code items that settle the claim, then submit again."
-				: "Fix the work and defend it again with the evidence of the fix."
-		}${budget}`,
+		text: `${named} acceptance: ${label} (confidence ${percent(answer.confidence)}), not recorded.${topicStatus} ${gapRecovery}${budget}`,
 		details: { aspect: named, verdict: label, approved: false, confidence: answer.confidence, revision: state.revision },
 	};
 }

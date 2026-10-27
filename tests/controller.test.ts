@@ -55,8 +55,8 @@ function controllerFor(table: Record<string, FakeAnswerSource>, options: Options
 }
 
 const TRIAGE_DEEP: FakeAnswer = { probability: 0.95 };
-/** The answers a passing per-topic plan review needs: one coverage answer and one per topic (FR-24). */
-const PLAN_APPROVED: Record<string, FakeAnswer> = { coverage: { probability: 0.93 }, topic_1: { probability: 0.9 } };
+/** The answers a passing plan review needs: coverage, topic scope and executability (FR-24). */
+const PLAN_APPROVED: Record<string, FakeAnswer> = { coverage: { probability: 0.93 }, scope_1: { probability: 0.93 }, topic_1: { probability: 0.9 } };
 const ON_COURSE: FakeAnswer = { label: "on_course", confidence: 0.9 };
 const FOLLOWS: FakeAnswer = { label: "follows", confidence: 0.94 };
 
@@ -649,25 +649,6 @@ describe("T4 - the interval check holds changes while it is in flight (FR-11)", 
 	});
 });
 
-describe("FR-09 - the tools teach how to ask (FR-09)", () => {
-	test("FR-09: every tool description carries the asking rule", () => {
-		const pi = fakePi();
-		createJevController({ judge: answeringJudge({}).judge, config: config(), zod: fakeZod() }).register(pi.api);
-		for (const tool of pi.tools.values()) {
-			expect(tool.description).toContain("one decision");
-		}
-	});
-
-	test("FR-09: the consult description carries worked examples with measured scores", () => {
-		const pi = fakePi();
-		createJevController({ judge: answeringJudge({}).judge, config: config(), zod: fakeZod() }).register(pi.api);
-
-		const description = pi.tools.get("jev_consult")?.description ?? "";
-		expect(description).toContain("Example (good)");
-		expect(description).toContain("Example (bad)");
-		expect(description).toContain("not a no");
-	});
-});
 describe("FR-25 - the course check runs on a deviation or on the configured count", () => {
 	const run = async (target: string) => {
 		const artifacts = await fakeArtifacts({ "x-plan.md": PLAN_BODY });

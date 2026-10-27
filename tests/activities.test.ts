@@ -36,14 +36,14 @@ const PLAN_TOPICS: PlanTopic[] = [
 		requirement: "report the coverage of the last run",
 	},
 ];
-const PLAN_APPROVED: Record<string, FakeAnswer> = { coverage: { probability: 0.93 }, topic_1: { probability: 0.9 } };
+const PLAN_APPROVED: Record<string, FakeAnswer> = { coverage: { probability: 0.93 }, scope_1: { probability: 0.93 }, topic_1: { probability: 0.9 } };
 
 function planReader(body: string | null): ActivityDeps["readArtifact"] {
 	return async url => (url === PLAN_URL ? body : null);
 }
 
 describe("FR-22, FR-23 - a refusal is counted, a repeat costs nothing and the bound releases the boundary", () => {
-	const REFUSED: Record<string, FakeAnswer> = { coverage: { probability: 0.2 }, topic_1: { probability: 0.9 } };
+	const REFUSED: Record<string, FakeAnswer> = { coverage: { probability: 0.2 }, scope_1: { probability: 0.93 }, topic_1: { probability: 0.9 } };
 	const submission = (attempt: number) => ({
 		plan: PLAN_URL,
 		claim: `the plan delivers the coverage report, attempt ${attempt}`,
@@ -157,7 +157,7 @@ describe("wave two - the measured deadlock fixes", () => {
 	});
 
 	test("FR-24: coverage at the sanity floor approves when every topic passes, below it refuses", async () => {
-		const approving = { coverage: { probability: 0.65 }, topic_1: { probability: 0.9 } };
+		const approving = { coverage: { probability: 0.65 }, scope_1: { probability: 0.93 }, topic_1: { probability: 0.9 } };
 		const state = freshState();
 		registerTask(state, "Report the coverage of the last run");
 		const passed = await planReview(depsFor(approving, planReader(PLAN_BODY)).deps, state, { plan: PLAN_URL, claim: "the plan delivers the report", topics: PLAN_TOPICS, evidence: [{ kind: "user", quote: "report the coverage of the last run" }] });
@@ -165,7 +165,7 @@ describe("wave two - the measured deadlock fixes", () => {
 		expect(passed.ok).toBe(true);
 		expect(state.plan).toBeDefined();
 
-		const refusing = { coverage: { probability: 0.5 }, topic_1: { probability: 0.9 } };
+		const refusing = { coverage: { probability: 0.5 }, scope_1: { probability: 0.93 }, topic_1: { probability: 0.9 } };
 		const second = freshState();
 		registerTask(second, "Report the coverage of the last run");
 		const refusedOutcome = await planReview(depsFor(refusing, planReader(PLAN_BODY)).deps, second, { plan: PLAN_URL, claim: "the plan delivers the report", topics: PLAN_TOPICS, evidence: [{ kind: "user", quote: "report the coverage of the last run" }] });
@@ -638,7 +638,7 @@ describe("T3 - the plan review asks per topic and binds the approval to the arti
 	});
 
 	test("FR-24: one topic below the floor refuses the review and names that topic", async () => {
-		const { deps } = depsFor({ coverage: { probability: 0.95 }, topic_1: { probability: 0.4 } }, planReader(PLAN_BODY));
+		const { deps } = depsFor({ coverage: { probability: 0.95 }, scope_1: { probability: 0.95 }, topic_1: { probability: 0.4 } }, planReader(PLAN_BODY));
 		const state = freshState();
 		registerTask(state, "Report the coverage of the last run");
 
@@ -658,7 +658,7 @@ describe("T3 - the plan review asks per topic and binds the approval to the arti
 	});
 
 	test("FR-24: a topic set that leaves the task uncovered refuses the review although every topic passed", async () => {
-		const { deps } = depsFor({ coverage: { probability: 0.3 }, topic_1: { probability: 0.95 } }, planReader(PLAN_BODY));
+		const { deps } = depsFor({ coverage: { probability: 0.3 }, scope_1: { probability: 0.95 }, topic_1: { probability: 0.95 } }, planReader(PLAN_BODY));
 		const state = freshState();
 		registerTask(state, "Report the coverage of the last run");
 
@@ -671,7 +671,63 @@ describe("T3 - the plan review asks per topic and binds the approval to the arti
 
 		expect(outcome.ok).toBe(true);
 		expect(outcome.text).toContain("do not cover");
+		expect(outcome.text).toContain("compare the registered task with the topic map");
+		expect(outcome.text).toContain("every obligation is covered");
+		expect(outcome.text).toContain("Leave passing sections unchanged.");
 		expect(state.plan).toBeUndefined();
+	});
+
+	test("FR-24: a plan with scope creep refuses even when coverage and every topic pass", async () => {
+		const { deps } = depsFor(
+			{
+				coverage: { probability: 0.95 },
+				scope_1: { probability: 0.3 },
+				topic_1: { probability: 0.95 },
+			},
+			planReader(PLAN_BODY),
+		);
+		const state = freshState();
+		registerTask(state, "Report the coverage of the last run");
+
+		const outcome = await planReview(deps, state, {
+			plan: PLAN_URL,
+			claim: "the plan delivers the coverage report requirement",
+			topics: PLAN_TOPICS,
+			evidence: [{ kind: "user", quote: "report the coverage of the last run" }],
+		});
+
+		expect(outcome.details?.["verdict"]).toBe("revise");
+		expect(outcome.text).toContain("Topics adding unrequested work");
+		expect(outcome.text).toContain("collect");
+		expect(outcome.text).toContain("remove or revise only the named topics");
+		expect(outcome.text).not.toContain("add or revise topics until every obligation is covered");
+		expect(state.plan).toBeUndefined();
+	});
+
+
+	test("FR-14: a business gap remains explicit when all plan topics pass", async () => {
+		const state = freshState();
+		registerTask(state, "Report the coverage of the last run");
+		state.planTopics = PLAN_TOPICS;
+		const { deps } = depsFor({
+			acceptance: { label: "business_gap", confidence: 0.9 },
+			topic_1: { probability: 0.95 },
+		});
+
+		const outcome = await acceptance(deps, state, {
+			aspect: "business",
+			claim: "the report serves the owner's need",
+			evidence: [
+				{ kind: "execution", quote: "bun test: 132 pass" },
+				{ kind: "code", quote: "0 diagnostics" },
+			],
+		});
+
+		expect(outcome.ok).toBe(true);
+		expect(outcome.text).toContain("business_gap");
+		expect(outcome.text).toContain("All plan-topic evidence checks passed");
+		expect(outcome.text).toContain("registered task");
+		expect(outcome.text).toContain("fix");
 	});
 
 	test("FR-24: a topic whose section the artifact does not carry is refused before any judge call", async () => {
@@ -926,7 +982,7 @@ describe("T4 - the automatic checks (FR-11, FR-12, FR-17)", () => {
 });
 
 describe("FR-09 - a below-floor answer teaches recovery instead of stopping", () => {
-	test("FR-09: a below-floor choice consult explains the split and the work to do", async () => {
+	test("FR-09: a below-floor choice consult remains non-approving", async () => {
 		const { deps } = depsFor({ consult: { label: "keep", confidence: 0.4 } });
 		const outcome = await consult(deps, freshState(), {
 			mode: "choice",
@@ -939,12 +995,9 @@ describe("FR-09 - a below-floor answer teaches recovery instead of stopping", ()
 		});
 
 		expect(outcome.ok).toBe(false);
-		expect(outcome.text).toContain("Class: a defect of the submitted material");
-		expect(outcome.text).toContain("settles the claim");
-		expect(outcome.text).toContain("narrow the claim");
 	});
 
-	test("FR-09: a below-floor boolean consult carries the same recovery protocol", async () => {
+	test("FR-09: a below-floor boolean consult remains non-approving", async () => {
 		const { deps } = depsFor({ consult: { probability: 0.5 } });
 		const outcome = await consult(deps, freshState(), {
 			mode: "boolean",
@@ -955,11 +1008,9 @@ describe("FR-09 - a below-floor answer teaches recovery instead of stopping", ()
 		});
 
 		expect(outcome.ok).toBe(false);
-		expect(outcome.text).toContain("Class: a defect of the submitted material");
-		expect(outcome.text).toContain("settles the claim");
 	});
 
-	test("FR-09: a below-floor acceptance approval names the recovery, not just the floor", async () => {
+	test("FR-14: an acceptance below its confidence floor remains unapproved", async () => {
 		const state = freshState();
 		registerTask(state, "Report the coverage of the last run");
 		const { deps } = depsFor({ acceptance: { label: "serves_business_need", confidence: 0.3 } });
@@ -974,7 +1025,5 @@ describe("FR-09 - a below-floor answer teaches recovery instead of stopping", ()
 		});
 
 		expect(outcome.ok).toBe(false);
-		expect(outcome.text).toContain("Class: a defect of the submitted material");
-		expect(outcome.text).toContain("settles the claim");
 	});
 });
