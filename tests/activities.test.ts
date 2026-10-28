@@ -668,7 +668,7 @@ describe("autonomous safety", () => {
 });
 
 describe("FR-23 - staged plan refusal remains an open item", () => {
-	test("repeated material costs no call and exhaustion never grants execution", async () => {
+	test("repeated material costs no call and exhaustion permits execution without approval", async () => {
 		const state = planState("Report coverage", ["Collect run data"]);
 		const { deps, calls } = depsFor({
 			outline_requirement_1: { probability: 0.3 },
@@ -691,7 +691,7 @@ describe("FR-23 - staged plan refusal remains an open item", () => {
 		expect(state.openItem?.boundary).toBe("plan:outline");
 		expect(state.exhausted).toContain("plan");
 		expect(state.plan).toBeUndefined();
-		expect(mutationGate(state, boundaryConfig(), "write", { path: "src/report.ts" }).block).toBe(true);
+		expect(mutationGate(state, boundaryConfig(), "write", { path: "src/report.ts" }).block).toBe(false);
 		expect((await planReview(deps, state, submission(99))).ok).toBe(false);
 		expect(calls).toHaveLength(POLICY.maxRefusalsPerStage);
 	});

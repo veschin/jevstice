@@ -45,6 +45,9 @@ import {
 import type { Judge } from "./judge.js";
 import {
 	clearFinishedTask,
+	allowContinuation,
+	continuationAllowed,
+	exhaustBoundary,
 	freshState,
 	markDeviation,
 	recordAction,
@@ -96,6 +99,7 @@ export interface PiToolDefinition {
 export interface PiApi {
 	on(event: string, handler: (event: unknown, ctx: unknown) => unknown): void;
 	registerTool(tool: PiToolDefinition): void;
+	registerCommand?(name: string, options: { description: string; handler: (args: string, ctx: unknown) => void }): void;
 	sendMessage?(
 		payload: unknown,
 		options?: { deliverAs?: "steer" | "followUp" | "nextTurn" | "aside"; triggerTurn?: boolean },
@@ -118,7 +122,7 @@ const CONSULT_DESCRIPTION =
 
 
 const WORKFLOW_NOTE =
-	" Read-only work needs no triage. If triage registers development, approve requirements and the plan before project changes; each admitted change is judged on its own payload before it runs, and both acceptance approvals are needed before stopping. A spent refusal budget keeps its boundary blocked as an OPEN item - it never authorises work.";
+	" Read-only work needs no triage. Development normally requires requirements, a plan and both acceptance aspects. The owner can permit continuation with /jev-continue or an explicit approval message. After the attempt limit, continue with unresolved findings marked OPEN; permission to proceed is not Jev approval.";
 
 const TRIAGE_DESCRIPTION =
 	"Before a consequential change, submit the owner's request and concrete task topics. A development result requires requirements review and plan review: derive one checkable obligation per part of the request yourself and submit it with jev_requirements, then plan. No owner confirmation step exists - do not ask the owner to confirm the obligation list. A simple result names skipped stages; an unsettled result registers nothing.";
@@ -351,22 +355,20 @@ export function createJevController(deps: ControllerDeps): JevController {
 			state.openItemNotified = signature;
 			notify(
 				ctx,
-				`Jevstice recorded the ${openItem.boundary} boundary as an OPEN item after ${openItem.attempts} refusals; it stays blocked and nothing refused there is approved.`,
+				`Jevstice recorded ${openItem.boundary} as OPEN after the attempt limit. Continuing this request is permitted; no refused decision is approved.`,
 			);
 			sendMessage(
 				pi,
 				"jev.open_item",
-				`Jevstice stopped retrying the ${openItem.boundary} boundary after ${openItem.attempts} refusals (digests ${openItem.digests
-					.map(entry => entry.slice(0, 8))
-					.join(", ")}). The boundary stays blocked as an OPEN item for you: settle the finding or change direction; nothing it refused is approved.`,
-				"nextTurn",
+				`Jevstice stopped retrying ${openItem.boundary}. Continue the current request with this finding OPEN, not approved. Prior refused material remains recorded.`,
+				"aside",
 			);
 		}
 		if (state.judgeUnavailable === true && state.judgeUnavailableNotified !== true) {
 			state.judgeUnavailableNotified = true;
 			notify(
 				ctx,
-				`Jevstice: the judge could not be reached for ${POLICY.maxJudgeFailures} calls in a row, so every boundary stays closed and nothing is recorded as approved. Retry the pending jev_ call with the same material.`,
+				`Jevstice: the judge could not be reached for ${POLICY.maxJudgeFailures} calls. Continue this request with unjudged decisions OPEN; no Jev approval is recorded.`,
 			);
 		}
 	};
@@ -390,12 +392,11 @@ export function createJevController(deps: ControllerDeps): JevController {
 		const count = recordRefusedCall(state, boundary, `${toolName} ${targetOf(input)}`);
 		if (count === 1) sendMessage(pi, "jev.boundary", reason, "aside");
 		if (count === POLICY.maxIgnoredBoundaryCalls) {
-			notify(
-				ctx,
-				`Jevstice: ${count} consequential calls were refused while the ${boundary} boundary stands and the call that resolves it was not made. Attempted: ${state.refusedCalls.calls.join("; ")}`,
-			);
+			exhaustBoundary(state, boundary);
+			notify(ctx, `Jevstice: ${count} refused calls reached the attempt limit. Continuation is permitted; the ${boundary} finding remains OPEN.`);
+			sendMessage(pi, "jev.open_item", `The ${boundary} gate reached ${count} refused calls. Retry the operation: continuation of this request is now permitted with the finding OPEN, not approved.`, "aside");
 		}
-		return { block: true, reason };
+		return { block: true, reason: continuationAllowed(state) ? `${reason} Attempt limit reached: retry the operation; continuation is permitted with the finding OPEN.` : `${reason} The owner may permit continuation with /jev-continue or an explicit approval message.` };
 	};
 
 	/**
@@ -420,6 +421,22 @@ export function createJevController(deps: ControllerDeps): JevController {
 
 	return {
 		register(pi: PiApi): void {
+			const approvedInputs = new Map<string, string>();
+			const approve = (ctx: unknown): void => {
+				const state = stateFor(ctx);
+				allowContinuation(state, "explicit owner approval; unresolved findings remain OPEN");
+				notify(ctx, "Jevstice: owner authorized continuation of this request. Unresolved findings remain OPEN; no Jev approval is recorded.");
+				sendMessage(pi, "jev.owner_approval", "The owner permits continuation of the current request despite Jev holds. Proceed; disclose unresolved findings as OPEN rather than claiming Jev approved them.", "aside");
+			};
+			pi.registerCommand?.("jev-continue", { description: "Continue the current request with unresolved Jev findings OPEN", handler: (_args, ctx) => approve(ctx) });
+			pi.on("input", (event, ctx) => {
+				const input = asRecord(event);
+				if (input?.["source"] !== "interactive" && input?.["source"] !== "rpc") return;
+				const text = input["text"];
+				if (typeof text !== "string" || !/^(?:аппрув|даю (?:полный )?аппрув|одобряю(?: продолжение)?|разрешаю продолжать|продолжай несмотря на (?:отказ|блокировку) jev|approve(?: continuation)?|continue despite jev)[.!]?$/iu.test(text.trim())) return;
+				approve(ctx);
+				approvedInputs.set(sessionIdOf(ctx), text);
+			});
 			const z = deps.zod;
 			/** One registered description: the tool's own text and the note every tool shares. */
 			const described = (body: string): string => `${body}${WORKFLOW_NOTE}`;
@@ -570,6 +587,11 @@ export function createJevController(deps: ControllerDeps): JevController {
 			// task keeps its walls - no prompt text opens them. The request is read once here, for free.
 			pi.on("before_agent_start", (event, ctx) => {
 				const state = stateFor(ctx);
+				const approval = approvedInputs.get(sessionIdOf(ctx));
+				approvedInputs.delete(sessionIdOf(ctx));
+				const incoming = asRecord(event)?.["prompt"];
+				if (approval !== undefined && incoming === approval) return { systemPromptAppend: JEV_SKILL };
+				if (continuationAllowed(state) && typeof incoming === "string" && /^(?:continue|proceed|продолжай|дальше)[.!]?$/iu.test(incoming.trim())) return { systemPromptAppend: JEV_SKILL };
 				delete state.simple;
 				clearFinishedTask(state);
 				const prompt = asRecord(event)?.["prompt"];
@@ -603,6 +625,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 				const input = asRecord(event)?.["input"];
 				const state = stateFor(ctx);
 				announce(pi, ctx, state);
+				if (continuationAllowed(state)) return undefined;
 				const triageVerdict = triageBeforeInspectionGate(state, deps.config, toolName, input);
 				if (triageVerdict.block) {
 					return refuse(pi, ctx, state, toolName, input, triageVerdict);
@@ -731,6 +754,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 					markDeviation(state, toolName, target);
 				}
 				// Completion-only checking defers every course check to completion (FR-12).
+				if (continuationAllowed(state)) return undefined;
 				if (deps.config.courseCheck.mode !== "interval") return undefined;
 				// A check needs an approved plan to judge against, and a standing finding cannot be
 				// changed by a course verdict: neither is a reason to spend a judge call.
@@ -773,19 +797,12 @@ export function createJevController(deps: ControllerDeps): JevController {
 						reason = `${outcome.text} The finished work is held at the completion boundary.`;
 					}
 				}
-				// A blocked stop never settles the session by itself: after the bound the refusal is
-				// delivered as an OPEN item, and the next stop blocks again for the same reason.
+				// Bound the stop itself too: exhausting acceptance or stop attempts never invents approval.
 				const { blocks, exhausted } = recordStopBlock(state, sha256(reason));
-				if (!exhausted) return { decision: "block", reason };
-				if (blocks === POLICY.maxStopBlocks + 1) {
-					sendMessage(
-						pi,
-						"jev.open_item",
-						`Jevstice keeps blocking this stop after ${blocks} refusals for one unchanged reason; the refusal is an OPEN item: ${reason}`,
-						"nextTurn",
-					);
-				}
-				return { decision: "block", reason: `${reason} This refusal is an OPEN item after ${blocks} blocked stops: the session stays open until the missing decision is obtained, and nothing here is approved.` };
+				if (!exhausted) return { decision: "block", reason: `${reason} The owner may permit continuation with /jev-continue.` };
+				exhaustBoundary(state, "completion");
+				sendMessage(pi, "jev.open_item", `Completion remains OPEN after ${blocks} blocked stops: ${reason}. Stopping is permitted without claiming Jev acceptance.`, "aside");
+				return undefined;
 			});
 		},
 	};

@@ -52,18 +52,18 @@ The current autonomous-execution mandate [S34-S36] supersedes the former mandato
 ### Refusal handling and judge availability
 
 - **FR-20 - Truthful refusal.** A refusal SHALL distinguish invalid input, unavailable judgment, established defects and uncertainty. Recovery guidance SHALL preserve accepted decisions and SHALL NOT invent a defect from a low probability. [S17, S35]
-- **FR-21 - Judge availability.** Repeated availability failures SHALL notify the owner and keep required decisions unapproved. Unavailability SHALL NOT authorize execution or completion; a usable later answer MAY restore service. [S35]
+- **FR-21 - Judge availability.** After three consecutive availability failures, the extension SHALL notify the owner and permit continuation of the current request. Unavailable judgments SHALL remain unapproved and disclosed as OPEN.
 - **FR-22 - Reconsider instead of repeating.** Refused material and its question set SHALL be recorded per task and decision. An identical resubmission SHALL cost no judge call; unrelated later decisions SHALL NOT erase an earlier refusal budget. [S19, S35]
-- **FR-23 - Exhaustion remains blocked.** After three refused approaches to a decision, the extension SHALL record an OPEN item and stop judging that decision for the current task. Exhaustion SHALL NOT authorize work or acceptance. [S20, S35]
+- **FR-23 - Bounded enforcement.** After three refused submissions or three blocked calls at a boundary, the extension SHALL retain the unresolved decision as OPEN and permit continuation of the current request across inspection, plan, mutation, invocation and completion boundaries. Three blocked stops SHALL permit the following stop. Permission SHALL NOT manufacture Jev approval.
 
 ### Review rework
 
 - **FR-24 - Staged plan review.** Jev SHALL review a high-level outline, then one detail per call. Every call SHALL include the objective, approved requirements and relevant accepted context. A detail SHALL receive a typed readiness or defect-category decision. Finalization SHALL verify exact section presence locally and judge only cross-section consistency and additional scope, without rejudging accepted steps. Final approval SHALL bind the exact artifact bytes and task. [S22, S31-S36]
-- **FR-37 - Partial plan approvals.** Passing steps SHALL remain approved while rejected steps are revised. A changed detail loses its own approval; a changed outline invalidates its dependent details. Outline, detail and assembly refusal budgets SHALL remain separate, and exhaustion SHALL NOT open execution. [S32-S35]
+- **FR-37 - Partial plan approvals.** Passing steps SHALL remain approved while rejected steps are revised. A changed detail loses its own approval; a changed outline invalidates its dependent details. Outline, detail and assembly refusal budgets SHALL remain separate; exhausted enforcement SHALL follow FR-23.
 - **FR-25 - Course checks.** Configured post-execution checks SHALL judge each recent action against the whole approved task. Serving one requirement SHALL NOT require serving every topic. Failed consequential executions SHALL also advance the revision. A successful course check SHALL NOT clear an unrelated developer finding. [S23, S35]
 - **FR-26 - Acceptance judged from evidence.** WHEN code is accepted, the extension SHALL refuse the submission before any judge call unless its evidence carries at least one execution item (a command and its output) and at least one static code item (a diagnostic, a diff or a size measurement); the judge SHALL answer per plan topic whether that evidence shows the topic met, naming the evidence it rests on. [S24]
 - **FR-27 - Text review tool.** The extension SHALL offer a tool that takes a text and the register rules it must satisfy, splits the text into bounded fragments and puts every submitted rule to the judge once per fragment; for each fragment a rule fails on, the tool SHALL return that rule line as the executor submitted it, writing no prose of its own. [S25]
-- **FR-28 - The boundary teaches its own next step.** WHEN a boundary refuses a consequential change, the extension SHALL return the one next call as a copy-ready call with its arguments, SHALL deliver the same instruction once per boundary as a session message so it reaches the executor's context and not only its tool error, SHALL count the consequential calls it refuses while that boundary stands, and at `POLICY.maxIgnoredBoundaryCalls` SHALL notify the owner that the executor is not following the boundary, naming the calls it attempted. [S26]
+- **FR-28 - The boundary teaches its own next step.** A refused call SHALL name the missing decision and the owner continuation command. The controller SHALL count blocked calls, notify the owner at the limit, and permit continuation with the finding OPEN rather than indefinitely repeating the gate.
 
 - **FR-29 - Owner re-aim.** A re-aim SHALL quote an actual current owner message, replace the task and invalidate its old requirements, plan and acceptances. It SHALL NOT reuse old exhaustion state or grant execution without a new approved plan. A new direction SHALL NOT silently inherit old permission. [S27, S34-S35]
 
@@ -79,8 +79,20 @@ The current autonomous-execution mandate [S34-S36] supersedes the former mandato
 - **FR-35 - No mandatory owner loop.** A later owner message SHALL NOT be a prerequisite for requirements or planning. Actual owner corrections SHALL retain authority through the re-aim boundary. [S34]
 - **FR-36 - Context continuity.** Requirements and staged/final plan approvals SHALL remain task-bound and survive a native plan handoff only when the artifact digest matches. Pending calls and stale judgment results SHALL NOT approve a different task or revision. [S33-S35]
 
-- **FR-38 - Mandatory invocation authorization.** Before a consequential invocation executes, the host SHALL submit its complete payload for automatic Jev authorization against the approved task, regardless of whether the executor consulted voluntarily. Oversized payloads SHALL be refused rather than truncated. Quiet/simple requests SHALL permit only their requested inspection, verification or publication, not unrelated implementation. [S34-S35]
+- **FR-38 - Invocation authorization.** Before a consequential invocation executes, the host SHALL submit its complete payload for Jev authorization unless current-request continuation permission applies under FR-23 or FR-44. Oversized payloads SHALL be refused rather than truncated. Without that permission, quiet/simple requests SHALL authorize only the requested inspection, verification or publication.
 
+- **FR-44 - Owner continuation.** An explicit owner approval through `/jev-continue` or a recognized standalone owner approval message SHALL immediately permit continuation of the current request across all addon gates. Tool arguments, quoted text and extension-originated input SHALL NOT count as owner approval. Changed requests and re-aims SHALL NOT inherit permission. Unresolved findings and refused verdicts SHALL remain recorded without claiming Jev acceptance. Owner source: "всегда должна быть возможность после моего аппрува как юзера, или после превышения всех попыток продолжать работу".
+
+
+### Session UX improvements (owner-approved, 2026-10-27)
+
+- [ ] **FR-39 - Automatic acceptance.** At completion, the controller SHALL collect observed code and execution evidence, submit missing business and architecture acceptance automatically, and return the unmet obligations without requiring manual acceptance calls.
+- [ ] **FR-40 - Owner interruption.** A question or stop instruction from the owner SHALL permit a conversational response without accepting or discarding unfinished work. Consequential actions SHALL remain blocked until the owner resumes or changes direction.
+- [ ] **FR-41 - Durable continuation.** Resuming an OMP session SHALL restore its task and accepted decisions from the native session journal. Changed files or plan sections SHALL invalidate only affected plan details; prior completion and execution acceptance SHALL require fresh verification after restart.
+- [ ] **FR-42 - Local requirement changes.** A judged owner correction SHALL retain unaffected requirements, outline steps and plan details. Dependent decisions SHALL be reviewed again, and execution SHALL wait for a newly bound complete plan.
+- [ ] **FR-43 - Evidence-first recovery.** Missing or unsuitable evidence SHALL return the unmet requirement and its approved verification section, directing the executor to observe that behavior before changing implementation. Only an established defect SHALL direct implementation repair.
+
+These requirements supplement FR-14/15/26 and supersede the full-discard behavior in FR-29/36/37 where an unaffected decision is explicitly retained. Initial status: all five are not implemented; completion requires observed behavioral checks.
 
 ## Constraints
 

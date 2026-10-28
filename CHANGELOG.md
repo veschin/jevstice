@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Restored bounded enforcement: exhausted judgment, tool-boundary, availability and stop attempts permit continuation with unresolved decisions OPEN, never falsely approved.
+- Added `/jev-continue` and explicit owner approval messages to release all addon gates for the current request. Quoted text and extension-originated input do not grant permission; new requests do not inherit it.
+- Updated the injected workflow to remove the obsolete owner-confirmation loop and permanent-block instructions.
+
 ## 2.0.0 - 2026-10-27
 
 ### Breaking changes

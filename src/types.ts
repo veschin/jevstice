@@ -31,9 +31,9 @@ export const POLICY = {
 	maxStopBlocks: 3,
 	/** Consecutive availability failures before the judge is declared unavailable for the session (FR-21). */
 	maxJudgeFailures: 3,
-	/** Refusals of one decision before it remains blocked as an open item (FR-22, FR-23). */
+	/** Refusals of one decision before continuation is permitted with that decision OPEN (FR-22, FR-23). */
 	maxRefusalsPerStage: 3,
-	/** Consequential calls one standing boundary may refuse before the owner is told (FR-28). */
+	/** Calls one standing boundary may refuse before notifying the owner and permitting continuation (FR-28). */
 	maxIgnoredBoundaryCalls: 3,
 	/** Fragments a submitted text is split into for the text review (FR-27). */
 	maxTextFragments: 12,
@@ -69,9 +69,8 @@ export interface Evidence {
 export type Aspect = "business" | "architecture";
 
 /**
- * The boundary names the gates read (FR-22, FR-23). A refusal is counted per boundary, and a
- * boundary whose refusal bound is exhausted stays blocked: `plan` holds consequential changes,
- * `hold` is a finding that has to be answered by a consultation.
+ * Boundary names used by gates and refusal ledgers (FR-22, FR-23). Exhaustion permits continuation
+ * of the current request while preserving the unapproved plan or unresolved finding.
  */
 export const PLAN_BOUNDARY = "plan";
 export const HOLD_BOUNDARY = "hold";

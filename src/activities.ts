@@ -22,6 +22,7 @@ import {
 } from "./judge.js";
 import {
 	acceptanceAt,
+	allowContinuation,
 	recordAcceptance,
 	recordRefusal,
 	registerSimple,
@@ -345,7 +346,10 @@ async function askJudge(
 	}
 	if (outcome.kind === "unavailable") {
 		state.judgeFailures += 1;
-		if (state.judgeFailures >= POLICY.maxJudgeFailures) state.judgeUnavailable = true;
+		if (state.judgeFailures >= POLICY.maxJudgeFailures) {
+			state.judgeUnavailable = true;
+			allowContinuation(state, "judge availability attempts exhausted; decisions remain OPEN");
+		}
 	}
 	return outcome;
 }
@@ -353,7 +357,7 @@ async function askJudge(
 /**
  * One submission to the judge, with the ledger in front of it (FR-22, FR-23): the digest of the
  * material about to be judged is looked up first, so a framing already refused at this boundary costs
- * no judge call. Exhaustion records a blocked open item, never execution permission.
+ * no judge call. Exhaustion retains the OPEN finding and permits continuation without approval.
  * The caller records the refusal it gets back, which is what the ledger counts.
  */
 async function submitToJudge(
@@ -377,7 +381,7 @@ async function submitToJudge(
 		exhaustBoundary(state, boundary);
 		return {
 			ok: false,
-			text: `The ${boundary} decision exhausted ${POLICY.maxRefusalsPerStage} attempts and remains OPEN and blocked. Nothing was approved. Next action: report the unresolved decision; do not retry or bypass it.`,
+			text: `The ${boundary} decision exhausted ${POLICY.maxRefusalsPerStage} attempts and remains OPEN. Continuing the current request is permitted without Jev approval; disclose the unresolved decision instead of retrying it.`,
 		};
 	}
 	return { ok: true, outcome: await askJudge(deps, state, judged, questions), digest };
@@ -835,7 +839,7 @@ export async function requirements(
 		text:
 			`requirement planning for task ${registeredTask.fingerprint.slice(0, 12)}:\n${coverageLine}\nitems:\n${lines.join("\n")}\n` +
 			`uncovered owner needs:\n${missingLines.length > 0 ? missingLines : "  (none marked missing)"}${advice}\n` +
-			(approved ? "Requirements approved. Next call: jev_plan_review with phase outline." : "Plan review remains blocked; refusal limits do not approve work."),
+			(approved ? "Requirements approved. Next call: jev_plan_review with phase outline." : "Requirements remain unapproved. Owner permission or the attempt limit permits continuation with this finding OPEN."),
 		details: { task: registeredTask.fingerprint, coverage, covered, approved, uncovered, uncoveredNeeds: missing, unresolvedNeeds, unsettledItems: unsettled, rejectedItems: rejected },
 	};
 }
@@ -1197,7 +1201,7 @@ export async function planReview(deps: ActivityDeps, state: JevState, params: un
 	const phase = text(record["phase"]);
 	if (phase !== "outline" && phase !== "detail" && phase !== "finalize") return refused('phase must be "outline", "detail" or "finalize"');
 	if (state.task === undefined) return refused("triage must register a development task before plan review");
-	if (state.exhausted.includes(PLAN_BOUNDARY)) return refused("the plan decision is exhausted and remains OPEN and blocked; do not retry or bypass it");
+	if (state.exhausted.includes(PLAN_BOUNDARY)) return { ok: false, text: "The plan decision remains OPEN after its attempt limit. Do not resubmit it. Continue the current request without claiming plan approval." };
 	const context = planContext(state);
 	if (context === undefined) return refused("complete Jev requirements approval before starting the plan");
 	if (
@@ -1300,7 +1304,7 @@ export async function acceptance(deps: ActivityDeps, state: JevState, params: un
 	recordAcceptance(state, { aspect: named, revision: state.revision, label, approved, confidence: answer.confidence });
 	if (!approved) recordRefusal(state, { boundary, digest: call.digest, verdict: label });
 	const spent = state.submissions.filter(entry => entry.boundary === boundary).length;
-	const budget = approved ? "" : ` Refusal budget: ${spent}/${POLICY.maxRefusalsPerStage}; exhausted decisions stay OPEN and blocked, never approved.`;
+	const budget = approved ? "" : ` Refusal budget: ${spent}/${POLICY.maxRefusalsPerStage}; at the limit, continuation is permitted with this decision OPEN, not approved.`;
 	if (approved) {
 		const other = named === "business" ? "architecture" : "business";
 		const otherRecord = acceptanceAt(state, other as Aspect);

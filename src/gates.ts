@@ -13,7 +13,7 @@
  * an unknown MCP route - reaches the working tree without naming a file.
  */
 import { HOLD_BOUNDARY, PLAN_BOUNDARY, asRecord, type JevConfig, type PlanTopic } from "./types.js";
-import { acceptanceAt, boundaryExhausted, boundaryKey, type JevState } from "./state.js";
+import { acceptanceAt, boundaryExhausted, boundaryKey, continuationAllowed, type JevState } from "./state.js";
 
 /**
  * Tools that change the working tree. `write`, `edit` and `ast_edit` are classified by their target;
@@ -294,26 +294,24 @@ function directionReason(state: JevState): string {
 }
 
 /**
- * The refusal of an unreachable judge (FR-21): no decision can be obtained, so every boundary stays
- * closed and nothing is recorded as approved. The one way forward is a judge call that answers.
+ * Refusal while availability has not granted current-request continuation (FR-21).
  */
 const JUDGE_UNAVAILABLE_REASON = refusal(
 	"Jevstice holds this change: the judge could not be reached, so no decision on it can be obtained and nothing is approved.",
 	"retry the pending jev_ call (jev_triage, jev_requirements or jev_plan_review) with the same material",
-	"A usable judge answer restores the boundaries; an unreachable judge never opens them.",
+	"Owner permission or the availability attempt limit permits continuation without judge approval.",
 );
 
 /**
- * The refusal of a boundary whose refusal budget is spent (FR-23): one clear blocked next action, and
- * the explicit statement that the OPEN item authorises nothing.
+ * A prior exhausted decision does not authorize a changed request. Its finding remains OPEN.
  */
 function openItemReason(state: JevState, boundary: string, what: string): string {
 	const item = state.openItem;
 	const attempts = item !== undefined && boundaryKey(item.boundary) === boundaryKey(boundary) ? item.attempts : 0;
 	return refusal(
 		`Jevstice holds ${what}: the ${boundary} boundary is an OPEN item after ${attempts} refused submissions, and nothing was approved.`,
-		`report the OPEN item to the owner; only an explicit owner redirect (jev_reaim) or a new request starts a fresh attempt`,
-		"A spent refusal budget ends automated retries: do not resubmit the same framing and do not treat the OPEN item as permission.",
+		"obtain current-request owner permission with /jev-continue, or register the owner's changed direction with jev_reaim",
+		"The prior request's continuation permission does not carry over to a changed request.",
 	);
 }
 
@@ -333,6 +331,7 @@ export function requirementsBeforePlanGate(
 	toolName: string,
 	input: unknown,
 ): GateVerdict {
+	if (continuationAllowed(state)) return { block: false };
 	if (!config.gates.mutation || state.task === undefined) return { block: false };
 	const path = pathOf(asRecord(input));
 	const isPlanArtifact = toolName === "write" && path?.startsWith("local://") === true;
@@ -468,6 +467,7 @@ export function triageBeforeInspectionGate(
 	toolName: string,
 	input: unknown,
 ): GateVerdict {
+	if (continuationAllowed(state)) return { block: false };
 	if (!config.gates.mutation || state.request?.weight !== "judged" || state.task !== undefined || state.simple !== undefined) {
 		return { block: false };
 	}
@@ -602,8 +602,9 @@ export function mutationGate(
 	input: unknown,
 ): GateVerdict {
 	if (!config.gates.mutation) return { block: false };
+	if (continuationAllowed(state)) return { block: false };
 	if (!isConsequentialMutation(toolName, input)) return { block: false };
-	// Nothing can be decided without the judge: every boundary stays closed (FR-21).
+	// No current-request continuation grant applies; unavailable judgment cannot approve a call.
 	if (state.judgeUnavailable === true) {
 		return { block: true, boundary: "judge", reason: JUDGE_UNAVAILABLE_REASON };
 	}
@@ -691,6 +692,7 @@ function planSlugFromTitle(title: string): string | undefined {
  */
 export function proposeGate(state: JevState, config: JevConfig, input: unknown): ProposeVerdict {
 	if (!config.gates.mutation) return { block: false };
+	if (continuationAllowed(state)) return { block: false };
 	// A request triage confirmed simple needs no plan review, so its plan-mode proposal is not held
 	// either - but only while no development task is registered, and a quiet follow-up never opens a
 	// registered task's proposal (FR-02, FR-30).
@@ -758,8 +760,9 @@ export interface CompletionGate {
  */
 export function completionGate(state: JevState, config: JevConfig): CompletionGate {
 	if (!config.gates.completion) return { applies: false };
+	if (continuationAllowed(state)) return { applies: false };
 	if (state.task === undefined || state.revision === 0) return { applies: false };
-	// A stop cannot settle work that no judge can judge: the session stays open, nothing is approved.
+	// Permission is checked above; without it, unavailable judgment cannot approve completion.
 	if (state.judgeUnavailable === true) return { applies: true, reason: JUDGE_UNAVAILABLE_REASON };
 	// The course check in flight owns the revision it started on: wait for its verdict first.
 	if (state.checkPending !== undefined) {

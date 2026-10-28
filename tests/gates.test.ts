@@ -305,7 +305,7 @@ describe("T3 - the mutation gate", () => {
 	});
 });
 
-describe("FR-21, FR-23 - unavailable and spent boundaries stay blocked", () => {
+describe("FR-21, FR-23 - boundaries are bounded without manufacturing approval", () => {
 	test("FR-21: an unreachable judge closes the consequential boundary instead of opening it", () => {
 		const state = planned();
 		state.judgeUnavailable = true;
@@ -318,7 +318,7 @@ describe("FR-21, FR-23 - unavailable and spent boundaries stay blocked", () => {
 		expect(completionGate(state, boundaryConfig()).reason).toContain("judge could not be reached");
 	});
 
-	test("FR-23: a spent plan budget keeps the plan boundary closed with one blocked next action", () => {
+	test("FR-23: a spent plan budget permits work while the plan remains unapproved", () => {
 		const state = freshState();
 		registerTask(state, "Report the coverage of the last run");
 		expect(mutationGate(state, config(), "write", { path: "src/a.ts" }).block).toBe(true);
@@ -327,9 +327,8 @@ describe("FR-21, FR-23 - unavailable and spent boundaries stay blocked", () => {
 
 		const verdict = mutationGate(state, config(), "write", { path: "src/a.ts" });
 
-		expect(verdict.block).toBe(true);
-		expect(verdict.reason).toContain("OPEN item");
-		expect(verdict.reason).toContain("jev_reaim");
+		expect(verdict.block).toBe(false);
+		expect(state.openItem?.boundary).toBe("plan:outline");
 		expect(state.plan).toBeUndefined();
 	});
 
@@ -360,32 +359,32 @@ describe("FR-21, FR-23 - unavailable and spent boundaries stay blocked", () => {
 		expect(completionGate(state, boundaryConfig()).reason).toContain("jev_reaim");
 	});
 
-	test("FR-23: a spent hold budget keeps the change blocked instead of releasing it", () => {
+	test("FR-23: a spent hold permits changes while retaining the finding", () => {
 		const state = planned();
 		state.hold = { reason: "a defect" };
 		spendBoundary(state, "hold");
 
 		const verdict = mutationGate(state, config(), "write", { path: "src/a.ts" });
 
-		expect(verdict.block).toBe(true);
-		expect(verdict.reason).toContain("OPEN item");
+		expect(verdict.block).toBe(false);
+		expect(state.hold?.reason).toBe("a defect");
 	});
 
-	test("FR-23: a spent triage budget keeps an untriaged session closed", () => {
+	test("FR-23: a spent triage budget permits continuation without registering a task", () => {
 		const state = freshState();
 		spendBoundary(state, "triage");
 
 		const verdict = mutationGate(state, config(), "write", { path: "src/a.ts" });
 
-		expect(verdict.block).toBe(true);
-		expect(verdict.reason).toContain("OPEN item");
+		expect(verdict.block).toBe(false);
+		expect(state.task).toBeUndefined();
 	});
 
-	test("FR-23, FR-21: a spent or unreachable triage also holds the pre-triage inspection", () => {
+	test("FR-23, FR-21: spent triage permits inspection; an unexhausted outage still holds it", () => {
 		const spent = freshState();
 		screenRequest(spent, "добавь отчёт по покрытию");
 		spendBoundary(spent, "triage");
-		expect(triageBeforeInspectionGate(spent, config(), "read", { path: "src/a.ts" }).block).toBe(true);
+		expect(triageBeforeInspectionGate(spent, config(), "read", { path: "src/a.ts" }).block).toBe(false);
 
 		const down = freshState();
 		screenRequest(down, "добавь отчёт по покрытию");
@@ -426,15 +425,15 @@ describe("FR-34 - requirements review before the plan", () => {
 		expect(requirementsBeforePlanGate(state, config(), "jev_plan_review", {}).block).toBe(false);
 	});
 
-	test("a spent requirements budget blocks the plan preparation as an OPEN item", () => {
+	test("a spent requirements budget permits plan preparation with an OPEN item", () => {
 		const state = freshState();
 		registerTask(state, "Add the coverage report");
 		spendBoundary(state, "requirements");
 
 		const verdict = requirementsBeforePlanGate(state, config(), "write", { path: "local://x-plan.md" });
 
-		expect(verdict.block).toBe(true);
-		expect(verdict.reason).toContain("OPEN item");
+		expect(verdict.block).toBe(false);
+		expect(state.requirementsApproval).toBeUndefined();
 	});
 
 	test("no owner confirmation is read: triage alone does not block the requirements submission", () => {
@@ -549,15 +548,15 @@ describe("T3 - the plan-mode proposal boundary", () => {
 		expect(verdict.reason).toContain("local://other-plan.md");
 	});
 
-	test("FR-23: a spent plan budget blocks the proposal as an OPEN item", () => {
+	test("FR-23: a spent plan budget permits the proposal without plan approval", () => {
 		const state = freshState();
 		registerTask(state, "Add the coverage report");
 		spendBoundary(state, "plan:finalize");
 
 		const verdict = proposeGate(state, config(), { path: "xd://propose", content: "coverage report" });
 
-		expect(verdict.block).toBe(true);
-		expect(verdict.reason).toContain("OPEN item");
+		expect(verdict.block).toBe(false);
+		expect(state.plan).toBeUndefined();
 	});
 });
 
@@ -587,16 +586,15 @@ describe("T5 - the completion boundary", () => {
 		expect(completionGate(state, boundaryConfig()).reason).toBeUndefined();
 	});
 
-	test("FR-23: a spent acceptance budget blocks completion instead of satisfying it", () => {
+	test("FR-23: a spent acceptance budget permits completion without satisfying acceptance", () => {
 		const state = developed();
 		recordAcceptance(state, { aspect: "architecture", revision: state.revision, label: "sound_for_next_change", approved: true, confidence: 0.9 });
 		spendBoundary(state, "acceptance:business");
 
 		const gate = completionGate(state, boundaryConfig());
 
-		expect(gate.applies).toBe(true);
-		expect(gate.reason).toContain("OPEN item");
-		expect(gate.reason).toContain("business");
+		expect(gate.applies).toBe(false);
+		expect(state.acceptance.some(record => record.aspect === "business" && record.approved)).toBe(false);
 	});
 
 	test("FR-14: a subsequent change invalidates a stale acceptance", () => {

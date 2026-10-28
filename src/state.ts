@@ -140,7 +140,7 @@ export interface JevState {
 	actions: ActionRecord[];
 	/** Consecutive judge calls that failed for availability, reset by any usable answer (FR-21). */
 	judgeFailures: number;
-	/** The judge could not be reached: nothing can be decided, so every boundary stays closed (FR-21). */
+	/** Availability attempts are exhausted; continuation is permitted without a judge approval (FR-21). */
 	judgeUnavailable?: true;
 	/** The owner has been told the judge is unavailable; cleared when a usable answer restores it. */
 	judgeUnavailableNotified?: true;
@@ -151,8 +151,8 @@ export interface JevState {
 	/** The boundary whose refusal budget is spent (FR-23). */
 	openItem?: OpenItemRecord;
 	/**
-	 * The boundaries whose refusal budget is spent. An exhausted boundary stays blocked for the task:
-	 * the budget ends automated retries and never authorises a change (FR-23).
+	 * Boundaries whose refusal budget is spent. The finding remains OPEN while the controller
+	 * permits continuation of the current request without manufacturing approval (FR-23).
 	 */
 	exhausted: string[];
 	/** The consequential calls one standing boundary refused (FR-28). */
@@ -163,6 +163,8 @@ export interface JevState {
 	completion?: CompletionRecord;
 	acceptance: AcceptanceRecord[];
 	stop?: StopRecord;
+	/** Permission to continue this request with unresolved findings; never a Jev approval. */
+	continuation?: { taskFingerprint?: string; request: string; reason: string };
 }
 
 export function freshState(): JevState {
@@ -177,6 +179,16 @@ export function freshState(): JevState {
 		refusedCalls: { boundary: "", count: 0, calls: [] },
 		judgeFailures: 0,
 	};
+}
+
+export function allowContinuation(state: JevState, reason: string): void {
+	state.continuation = { taskFingerprint: state.task?.fingerprint, request: state.request?.text ?? "", reason };
+}
+
+export function continuationAllowed(state: JevState): boolean {
+	return state.continuation !== undefined &&
+		state.continuation.taskFingerprint === state.task?.fingerprint &&
+		state.continuation.request === (state.request?.text ?? "");
 }
 
 /** SHA-256 in hex; the fingerprint and the artifact binding are both built from it. */
@@ -209,6 +221,7 @@ function clearWork(state: JevState): void {
 	delete state.courseCheck;
 	delete state.completion;
 	delete state.stop;
+	delete state.continuation;
 	state.acceptance = [];
 	state.actions = [];
 	state.submissions = [];
@@ -326,7 +339,7 @@ export function recordStopBlock(state: JevState, signature: string): { blocks: n
 /**
  * Record one refusal at a boundary with the digest of the material it judged (FR-22). The ledger is
  * permanent for the task, so a refusal never falls out of the count. Once the budget is spent the
- * boundary is recorded as an OPEN item (FR-23): it stays blocked and nothing is approved.
+ * boundary is recorded as OPEN and continuation is permitted without approval (FR-23).
  */
 export function recordRefusal(state: JevState, record: SubmissionRecord): void {
 	state.submissions = [...state.submissions, record];
@@ -357,8 +370,8 @@ export function submissionLedger(
 }
 
 /**
- * Record a spent refusal budget as an OPEN item: the boundary stays blocked for the task, the
- * refusals stay recorded with their digests, and nothing is approved (FR-23).
+ * Record a spent refusal budget as OPEN and permit continuation of this request.
+ * Refusals stay recorded with their digests; no plan or acceptance is approved (FR-23).
  */
 export function exhaustBoundary(state: JevState, boundary: string): OpenItemRecord {
 	const refused = state.submissions.filter(entry => entry.boundary === boundary);
@@ -370,10 +383,11 @@ export function exhaustBoundary(state: JevState, boundary: string): OpenItemReco
 	state.openItem = openItem;
 	const key = boundaryKey(boundary);
 	if (!state.exhausted.includes(key)) state.exhausted = [...state.exhausted, key];
+	allowContinuation(state, `attempt limit at ${boundary}; the decision remains OPEN`);
 	return openItem;
 }
 
-/** Whether a boundary's refusal budget is spent, so the work it held stays blocked (FR-23). */
+/** Whether a boundary's refusal budget is spent (FR-23). */
 export function boundaryExhausted(state: JevState, boundary: string): boolean {
 	return state.exhausted.includes(boundaryKey(boundary));
 }

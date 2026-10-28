@@ -6,7 +6,7 @@
 
 Jevstice is an [oh-my-pi](https://github.com/can1357/oh-my-pi) extension that makes Jev (`jev-latest`, TypeSafe API) review an executor's decisions at enforceable tool boundaries. The owner supplies an objective; the executor derives requirements and implementation choices and defends them to Jev without a mandatory owner-confirmation round.
 
-The extension cannot observe private reasoning or control effects outside OMP's tool hooks. It does not trust voluntary consultation: before a consequential invocation executes, Jev receives its actual arguments and the approved scope.
+The extension cannot observe private reasoning or control effects outside OMP's tool hooks. Normally, before a consequential invocation executes, Jev receives its actual arguments and approved scope. Explicit owner permission or exhausted attempts permit continuation without claiming judge approval.
 
 ## Activities
 
@@ -30,7 +30,7 @@ Read-only tools and conservatively recognized inspection commands need no action
 
 An action check inspects the complete invocation before execution; oversized payloads must be split, never silently truncated. Configured course checks inspect observed actions against the whole plan, not against every topic simultaneously. Failed executions also invalidate prior acceptance because a failing command can already have changed files.
 
-Repeated refused material costs no new judge call. Three distinct refusals exhaust the decision as an OPEN, blocked item; neither exhaustion nor judge unavailability grants execution or completion permission. A changed task resets its own decision history without inheriting prior approvals. An uncertain text review never counts as a clean review.
+Repeated refused material costs no new judge call. Three refused submissions, three blocked calls at one boundary, or three availability failures permit continuation of the current request with findings OPEN. Three blocked stops permit the following stop. The owner can release the current request immediately with `/jev-continue` or a standalone message such as `аппрув`, `одобряю продолжение`, or `approve continuation`. This covers inspection, file changes, plan proposals, automatic action checks and completion together, so a second gate cannot immediately trap the same request. A changed request or re-aim does not inherit permission; no plan or acceptance verdict is manufactured.
 
 This protects visible boundaries, not the truth of executor-supplied evidence. Acceptance requires execution and code evidence, but the extension is not an OS sandbox and cannot guarantee that a probabilistic judge detects every deceptive submission.
 
@@ -56,7 +56,7 @@ The project file `<project>/.omp/jev.config.json` overrides `~/.omp/agent/jev.co
 }
 ```
 
-`courseCheck.mode` accepts `interval` or `completion` (the default). This controls post-execution course checks, not mandatory pre-execution action authorization. Invalid section types or values retain defaults and report the file and key; unknown keys are ignored. The owner can explicitly disable mutation or completion gates; a model cannot disable them by exhausting refusals.
+`courseCheck.mode` accepts `interval` or `completion` (the default). This controls post-execution course checks. Invalid section types or values retain defaults and report the file and key; unknown keys are ignored. The owner can disable gates globally, or permit continuation only for the current request without changing configuration.
 
 ## Development
 
