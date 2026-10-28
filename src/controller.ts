@@ -49,6 +49,7 @@ import {
 	continuationAllowed,
 	exhaustBoundary,
 	freshState,
+	invalidatePlan,
 	markDeviation,
 	recordAction,
 	recordFailedAction,
@@ -303,11 +304,11 @@ export function createJevController(deps: ControllerDeps): JevController {
 		const digest = state.plan.planDigest;
 		const artifact = await activitiesFor(ctx).readArtifact?.(url);
 		if (artifact === null || artifact === undefined) {
-			delete state.plan;
+			invalidatePlan(state);
 			return { block: true, boundary: PLAN_BOUNDARY, reason: planArtifactUnreadableReason(url) };
 		}
 		if (sha256(artifact) !== digest) {
-			delete state.plan;
+			invalidatePlan(state);
 			return { block: true, boundary: PLAN_BOUNDARY, reason: planArtifactChangedReason(url) };
 		}
 		return undefined;

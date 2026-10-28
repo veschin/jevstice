@@ -22,7 +22,7 @@ The extension cannot observe private reasoning or control effects outside OMP's 
 | Re-aim | `jev_reaim` | Register an actual owner change of direction and invalidate the previous task's approvals. |
 | Text review | `jev_text_review` | Split a text and quote back the register rule each fragment violates, so a rewrite follows the rules the owner stated rather than advice from the judge. |
 
-The SDK returns typed choices, scores and probabilities, not explanatory prose. Detail review returns a specific defect category only when Jev selects it confidently; uncertainty is not presented as a proven defect. Passing decisions remain valid while rejected steps are corrected. Final assembly does not rejudge the executability of accepted steps.
+Detail review binds each approval to one complete, uniquely identified Markdown section read from the artifact itself - a heading or the exact full text; substrings, ambiguous headings and fenced examples never count as a section. Final assembly judges only the material outside those approved sections, and any plan change invalidates acceptance and completion recorded against the previous plan.
 
 Development proceeds through triage, requirements, outline, step details, final plan, implementation and separate business/architecture acceptances. The approved artifact is bound to exact bytes and rechecked before changes. Native `xd://propose` uses the same approval and preserves the requirement/plan context across its session handoff.
 

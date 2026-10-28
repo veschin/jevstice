@@ -196,6 +196,14 @@ export function sha256(text: string): string {
 	return createHash("sha256").update(text).digest("hex");
 }
 
+/** A changed plan invalidates every verdict that evaluated the previous plan, not owner permission. */
+export function invalidatePlan(state: JevState): void {
+	delete state.plan;
+	state.planTopics = [];
+	state.acceptance = [];
+	delete state.completion;
+}
+
 /**
  * The key an exhausted boundary is recorded under. Every plan-review stage closes the one plan
  * boundary, so exhausting a stage blocks the whole plan for the task; every other boundary keeps its

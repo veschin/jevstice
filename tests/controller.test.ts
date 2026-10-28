@@ -107,12 +107,12 @@ async function requirementsReviewed(pi: FakePi, ctx: unknown, request = "Report 
 	);
 	expect(toolFailed(outcome)).toBe(false);
 }
-
 async function planReviewed(
 	pi: FakePi,
 	ctx: unknown,
 	plan = PLAN_ARTIFACT,
 	requirement = "Report the coverage of the last run",
+	section = PLAN_BODY.trimEnd(),
 ): Promise<void> {
 	const outline = await pi.callTool(
 		"jev_plan_review",
@@ -129,7 +129,7 @@ async function planReviewed(
 		{
 			phase: "detail",
 			plan,
-			topic: { id: "collect", section: "1. Collect the numbers", paths: ["src/a.ts"], requirement },
+			topic: { id: "collect", section, paths: ["src/a.ts"], requirement },
 			evidence: PLAN_EVIDENCE,
 		},
 		ctx,
@@ -225,7 +225,7 @@ describe("T3 - the plan-mode boundary (FR-07, FR-18)", () => {
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("jev_consult", {}), ctx))).toBeUndefined();
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "xd://jev_consult", content: "{}" }), ctx))).toBeUndefined();
 
-		await planReviewed(pi, ctx, "local://coverage-report-plan.md");
+		await planReviewed(pi, ctx, "local://coverage-report-plan.md", undefined, "# Coverage report\n\n1. Collect the numbers");
 
 		// The approved plan opens the working tree and the proposal of that artifact.
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/report.ts", content: "x" }), ctx))).toBeUndefined();
@@ -318,7 +318,7 @@ describe("T3 - the plan-mode boundary (FR-07, FR-18)", () => {
 
 		await triaged(pi, ctx);
 		await requirementsReviewed(pi, ctx);
-		await planReviewed(pi, ctx, "local://coverage-report-plan.md");
+		await planReviewed(pi, ctx, "local://coverage-report-plan.md", undefined, "# Coverage report\n\n1. Collect the numbers");
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "xd://propose", content: "coverage-report" }), ctx))).toBeUndefined();
 
 		await writeFile(join(artifactsDir, "local", "coverage-report-plan.md"), "# A different plan\n", "utf8");

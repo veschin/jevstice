@@ -272,8 +272,7 @@ export function saidTrue(
 export function renderEvidence(evidence: readonly Evidence[]): string[] {
 	const rendered: string[] = [];
 	for (const item of evidence) {
-		const trimmed = item.quote.trim();
-		const quote = trimmed.length > POLICY.maxQuoteChars ? trimmed.slice(0, POLICY.maxQuoteChars) : trimmed;
+		const quote = item.quote.trim();
 		if (quote.length === 0) continue;
 		rendered.push(item.source === undefined || item.source.length === 0 ? `[${item.kind}] ${quote}` : `[${item.kind} ${item.source}] ${quote}`);
 	}

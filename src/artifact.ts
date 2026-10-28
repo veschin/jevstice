@@ -35,3 +35,45 @@ export async function readLocalArtifact(host: ArtifactHost, name: string): Promi
 		return null;
 	}
 }
+
+/** A complete ATX-heading section, including nested headings but excluding its next peer. */
+export interface PlanSection {
+	title: string;
+	heading: string;
+	section: string;
+	start: number;
+	end: number;
+}
+
+/** Read section boundaries from the artifact, never from the caller's quote. Fenced examples are data. */
+export function planSections(artifact: string): PlanSection[] {
+	const headings: { title: string; heading: string; start: number; body: number; level: number }[] = [];
+	const fence = { marker: "", size: 0 };
+	for (const line of artifact.matchAll(/[^\n]*(?:\n|$)/g)) {
+		const value = line[0].replace(/\r?\n$/, "");
+		const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(value);
+		if (fence.marker !== "") {
+			if (marker?.[1]?.[0] === fence.marker && marker[1].length >= fence.size && marker[2]?.trim() === "") fence.marker = "";
+			continue;
+		}
+		if (marker?.[1] !== undefined) {
+			fence.marker = marker[1][0]!;
+			fence.size = marker[1].length;
+			continue;
+		}
+		const heading = /^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*$/.exec(value);
+		if (heading?.[1] === undefined || heading[2] === undefined) continue;
+		headings.push({
+			title: heading[2].replace(/[ \t]+#+[ \t]*$/, ""),
+			heading: value.trim(),
+			start: line.index,
+			body: line.index + line[0].length,
+			level: heading[1].length,
+		});
+	}
+	return headings.flatMap((heading, index) => {
+		const end = headings.find((next, nextIndex) => nextIndex > index && next.level <= heading.level)?.start ?? artifact.length;
+		if (artifact.slice(heading.body, end).trim().length === 0) return [];
+		return [{ title: heading.title, heading: heading.heading, section: artifact.slice(heading.start, end).trimEnd(), start: heading.start, end }];
+	});
+}

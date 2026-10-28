@@ -9,6 +9,7 @@
  * `ok: true` means a well-formed judge answer was obtained - the verdict itself may be a refusal.
  * `ok: false` means the submission was refused or the answer was unusable: never an approval.
  */
+import { planSections, type PlanSection } from "./artifact.js";
 import {
 	answerOf,
 	choseLabel,
@@ -23,6 +24,7 @@ import {
 import {
 	acceptanceAt,
 	allowContinuation,
+	invalidatePlan,
 	recordAcceptance,
 	recordRefusal,
 	registerSimple,
@@ -171,6 +173,7 @@ function readEvidence(
 		}
 		const quote = text(record["quote"]);
 		if (quote === undefined) return { ok: false, problem: "every evidence item needs a non-empty quote" };
+		if (quote.length > POLICY.maxQuoteChars) return { ok: false, problem: `an evidence quote exceeds ${POLICY.maxQuoteChars} characters; split it into complete quoted items instead of submitting an unseen suffix` };
 		const source = text(record["source"]);
 		evidence.push(source === undefined ? { kind: kind as EvidenceKind, quote } : { kind: kind as EvidenceKind, quote, source });
 	}
@@ -330,13 +333,15 @@ async function askJudge(
 ): Promise<JudgeOutcome> {
 	const task = state.task;
 	const revision = state.revision;
+	const context = () => JSON.stringify([state.request?.text, state.simple, state.requirementsApproval, state.planDraft, state.plan, state.planTopics, state.hold]);
+	const submittedContext = context();
 	const outcome: JudgeOutcome = await Promise.resolve().then(() => deps.judge(judged, questions)).catch(() => ({
 		ok: false as const,
 		kind: "unavailable" as const,
 		problem: "the judge call failed",
 	}));
-	if (state.task !== task || state.revision !== revision) {
-		return { ok: false, kind: "unusable", problem: "the task or work changed during judgment; the stale answer was discarded" };
+	if (state.task !== task || state.revision !== revision || context() !== submittedContext) {
+		return { ok: false, kind: "unusable", problem: "the request, approvals or work changed during judgment; the stale answer was discarded" };
 	}
 	if (outcome.ok) {
 		state.judgeFailures = 0;
@@ -810,10 +815,7 @@ export async function requirements(
 	const approved = covered && unsettled.length === 0 && rejected.length === 0 && missing.length === 0 && unresolvedNeeds.length === 0;
 	if (!approved || JSON.stringify(state.requirementsApproval?.items) !== JSON.stringify(items.items.map(item => item.text))) {
 		delete state.planDraft;
-		delete state.plan;
-		state.planTopics = [];
-		delete state.completion;
-		state.acceptance = [];
+		invalidatePlan(state);
 	}
 	if (approved) {
 		state.requirementsApproval = { taskFingerprint: registeredTask.fingerprint, items: items.items.map(item => item.text) };
@@ -861,6 +863,18 @@ function planContext(state: JevState): PlanReviewContext | undefined {
 	};
 }
 
+/** Retain only complete, unique sections that still match the content Jev actually accepted. */
+function stalePlanDetails(state: JevState, sections: PlanSection[]): PlanTopic[] {
+	const draft = state.planDraft;
+	if (draft === undefined) return [];
+	const stale = draft.details.filter(detail => sections.filter(section => section.section === detail.section).length !== 1);
+	if (stale.length > 0) {
+		draft.details = draft.details.filter(detail => !stale.includes(detail));
+		invalidatePlan(state);
+	}
+	return stale;
+}
+
 
 function sameOutlineStep(left: PlanOutlineStep, right: PlanOutlineStep): boolean {
 	return left.id === right.id && left.summary === right.summary && left.requirement === right.requirement;
@@ -897,8 +911,7 @@ async function reviewPlanOutline(
 	if (state.planDraft?.outlineApproved && (changed || parsed.steps.some(step => !priorById.has(step.id)))) {
 		state.planDraft.details = [];
 		state.planDraft.outlineApproved = false;
-		delete state.plan;
-		state.planTopics = [];
+		invalidatePlan(state);
 	}
 	const submittedIds = new Set(parsed.steps.map(step => step.id));
 	const candidateOutline = old.map(step => parsed.steps.find(candidate => candidate.id === step.id) ?? step);
@@ -978,8 +991,7 @@ async function reviewPlanOutline(
 		outlineApproved,
 		details: state.planDraft?.details ?? [],
 	};
-	delete state.plan;
-	state.planTopics = [];
+	invalidatePlan(state);
 	if (!outlineApproved) {
 		recordRefusal(state, { boundary: `${PLAN_BOUNDARY}:outline`, digest: call.digest, verdict: PLAN_REVISE });
 		const rejectedLines = rejected
@@ -1026,8 +1038,9 @@ async function reviewPlanDetail(
 	if (plan === undefined) return refused("plan must name a single local:// session artifact");
 	const parsed = readTopics([record["topic"]]);
 	if (!parsed.ok) return refused(parsed.problem);
-	const topic = parsed.topics[0];
-	if (topic === undefined) return refused("topic is required");
+	const supplied = parsed.topics[0];
+	if (supplied === undefined) return refused("topic is required");
+	const topic = { ...supplied };
 	const step = draft.steps.find(entry => entry.id === topic.id);
 	if (step === undefined || step.requirement !== topic.requirement) {
 		return refused("detail must name an approved outline step and repeat its exact requirement");
@@ -1036,8 +1049,15 @@ async function reviewPlanDetail(
 	const artifact = await deps.readArtifact(plan);
 	if (artifact === null) return refused(`the plan artifact ${plan} could not be read`);
 	if (artifact.length > POLICY.maxArtifactChars) return refused(`the plan artifact exceeds ${POLICY.maxArtifactChars} characters`);
-	if (!artifact.includes(topic.section)) return refused(`the artifact does not contain the complete section quoted for '${topic.id}'`);
-	if (/^#{1,6}[ \t]+\S[^\r\n]*$/u.test(topic.section.trim())) return refused(`the section for '${topic.id}' contains only a heading and no implementation detail`);
+	const sections = planSections(artifact);
+	stalePlanDetails(state, sections);
+	const matches = sections.filter(section => section.title === topic.section || section.heading === topic.section || section.section === topic.section);
+	const selected = matches.length === 1 ? matches[0] : undefined;
+	if (selected === undefined) return refused(`section for '${topic.id}' must identify one complete, non-empty Markdown section by its unique heading or exact full text; substrings and ambiguous headings are not sections`);
+	if (draft.details.some(detail => detail.id !== topic.id && sections.some(section => section.section === detail.section && selected.start < section.end && section.start < selected.end))) {
+		return refused(`section for '${topic.id}' overlaps another approved step; use disjoint sections`);
+	}
+	topic.section = selected.section;
 	const prior = draft.details.find(entry => entry.id === topic.id);
 	if (
 		prior !== undefined &&
@@ -1054,8 +1074,7 @@ async function reviewPlanDetail(
 		};
 	}
 	draft.details = draft.details.filter(entry => entry.id !== topic.id);
-	delete state.plan;
-	state.planTopics = [];
+	invalidatePlan(state);
 	const submitted = material(
 		state,
 		{
@@ -1089,6 +1108,7 @@ async function reviewPlanDetail(
 	], { context, outline: draft.steps, acceptedDetails: draft.details, topic, artifact, evidence });
 	if (!call.ok) return { ok: false, text: call.text };
 	if (!call.outcome.ok) return unusable(call.outcome.problem);
+	if (await deps.readArtifact(plan) !== artifact) return refused("the plan artifact changed during detail judgment; submit its current section");
 	const answer = answerOf(call.outcome, DETAIL_QUESTION);
 	const confidence = answer?.confidence ?? 0;
 	const verdict = answer?.label ?? "unclear";
@@ -1114,7 +1134,7 @@ async function finalizePlan(
 	state: JevState,
 	record: Record<string, unknown>,
 	evidence: Evidence[],
-	context: NonNullable<ReturnType<typeof planContext>>,
+	context: PlanReviewContext,
 ): Promise<ToolOutcome> {
 	const draft = state.planDraft;
 	if (draft?.outlineApproved !== true || draft.steps.some(step => !draft.details.some(detail => detail.id === step.id))) {
@@ -1126,11 +1146,16 @@ async function finalizePlan(
 	const artifact = await deps.readArtifact(plan);
 	if (artifact === null) return refused(`the plan artifact ${plan} could not be read`);
 	if (artifact.length > POLICY.maxArtifactChars) return refused(`the plan artifact exceeds ${POLICY.maxArtifactChars} characters`);
-	const missing = draft.details.filter(topic => !artifact.includes(topic.section));
-	if (missing.length > 0) return refused(`the artifact no longer contains approved sections for ${missing.map(topic => `'${topic.id}'`).join(", ")}; restore or re-review those sections`);
+	const sections = planSections(artifact);
+	const missing = stalePlanDetails(state, sections);
+	if (missing.length > 0) return refused(`the artifact no longer contains the complete approved sections for ${missing.map(topic => `'${topic.id}'`).join(", ")}; re-review only those sections`);
 	if (state.plan?.taskFingerprint === context.taskFingerprint && state.plan.planDigest === sha256(artifact) && state.plan.planUrl === plan) {
 		return { ok: true, text: "The unchanged final plan is already approved.", details: { verdict: PLAN_SERVES, ...state.plan, reusedApproval: true } };
 	}
+	if (state.plan !== undefined) invalidatePlan(state);
+	const accepted = sections.filter(section => draft.details.some(detail => detail.section === section.section)).sort((left, right) => left.start - right.start);
+	if (accepted.some((section, index) => index > 0 && section.start < accepted[index - 1]!.end)) return refused("approved sections overlap; review disjoint sections before assembly");
+	const additionalMaterial = accepted.map((section, index) => artifact.slice(index === 0 ? 0 : accepted[index - 1]!.end, section.start)).join("") + artifact.slice(accepted.at(-1)?.end ?? 0);
 	const submitted = material(
 		state,
 		{
@@ -1141,7 +1166,7 @@ async function finalizePlan(
 			approvedDetails: draft.details,
 			planUrl: plan,
 			planArtifact: artifact,
-			additionalMaterial: draft.details.reduce((remaining, detail) => remaining.replace(detail.section, ""), artifact).trim(),
+			additionalMaterial: additionalMaterial.trim(),
 		},
 		withRequest(state.task?.request, evidence),
 	);
@@ -1209,8 +1234,7 @@ export async function planReview(deps: ActivityDeps, state: JevState, params: un
 		state.planDraft?.requirementsDigest !== context.requirementsDigest
 	) {
 		delete state.planDraft;
-		delete state.plan;
-		state.planTopics = [];
+		invalidatePlan(state);
 	}
 	state.planDraft ??= {
 		taskFingerprint: context.taskFingerprint,

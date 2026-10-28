@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Plan detail approvals bind to complete artifact sections resolved from the artifact itself (unique heading or exact full text), not to caller-supplied substrings: the finalize stage no longer treats 99% of an approved plan as unjudged "additional material", which repeatedly failed assembly after every part had passed. Overlapping sections, sections changed during judgment, and headings inside fenced code are refused.
+- Oversized evidence quotes are refused before any judge call instead of being silently truncated to a prefix, and the request itself is never clipped; a judge answer that arrives while the request, approvals or hold changed is discarded as stale.
+- Re-finalizing or revising a plan (outline, detail or digest change) now invalidates acceptance and completion verdicts recorded against the previous plan.
 - Restored bounded enforcement: exhausted judgment, tool-boundary, availability and stop attempts permit continuation with unresolved decisions OPEN, never falsely approved.
 - Added `/jev-continue` and explicit owner approval messages to release all addon gates for the current request. Quoted text and extension-originated input do not grant permission; new requests do not inherit it.
 - Updated the injected workflow to remove the obsolete owner-confirmation loop and permanent-block instructions.

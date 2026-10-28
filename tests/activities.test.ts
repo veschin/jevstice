@@ -15,8 +15,8 @@ import {
 	type ActivityDeps,
 } from "../src/activities.js";
 import { mutationGate, proposeGate } from "../src/gates.js";
-import { acceptanceAt, freshState, recordAction, registerTask, sha256 } from "../src/state.js";
-import { POLICY, type PlanTopic } from "../src/types.js";
+import { acceptanceAt, freshState, recordAction, registerTask, sha256, type JevState } from "../src/state.js";
+import { asRecord, POLICY, type PlanTopic } from "../src/types.js";
 import { answeringJudge, boundaryConfig, failingJudge, type FakeAnswerSource } from "./helpers.js";
 
 /** Activity dependencies over a fake judge table and an optional artifact reader. */
@@ -858,6 +858,128 @@ describe("FR-37 - planning approvals accumulate across outline, detail and final
 		expect(revised.text).toContain("detail approved");
 		expect(state.planDraft?.outlineApproved).toBe(true);
 		expect(state.planDraft?.details[0]?.section).toBe("## Collect\nRead the run data and calculate its coverage.");
+	});
+});
+
+describe("approval content binding", () => {
+	const evidence = [{ kind: "user", quote: "Report coverage" }];
+	const requirement = "Collect run data";
+	const section = "## Collect\nRead the run data and verify the count.";
+	const topic = { id: "collect", section, paths: ["src/report.ts"], requirement };
+	const answers = {
+		outline_requirement_1: { probability: 0.95 },
+		outline_step_1: { probability: 0.95 },
+		detail: { label: "ready", confidence: 0.95 },
+		finalize_consistency: { probability: 0.95 },
+		finalize_scope: { probability: 0.95 },
+	};
+	const prepared = async (body = `# Plan\n\n${section}\n`) => {
+		const document = { body };
+		const state = planState("Report coverage", [requirement]);
+		const fixture = depsFor(answers, async () => document.body);
+		await planReview(fixture.deps, state, {
+			phase: "outline", steps: [{ id: topic.id, summary: "Collect and verify the run data.", requirement }], evidence,
+		});
+		return { ...fixture, state, document };
+	};
+
+	test("a heading selector binds the full section and removes it from additional material", async () => {
+		const { deps, state, calls } = await prepared();
+		await planReview(deps, state, { phase: "detail", plan: PLAN_URL, topic: { ...topic, section: "Collect" }, evidence });
+		await planReview(deps, state, { phase: "finalize", plan: PLAN_URL, evidence });
+		expect(state.planTopics[0]?.section).toBe(section);
+		expect(asRecord(calls.at(-1)?.state)?.["additionalMaterial"]).toBe("# Plan");
+		expect(state.plan?.planDigest).toBe(sha256(`# Plan\n\n${section}\n`));
+	});
+
+	test("a substring or incomplete quote cannot stand for a complete section", async () => {
+		for (const selector of ["Read", "## Collect\nRead the run data"]) {
+			const { deps, state, calls } = await prepared();
+			const outcome = await planReview(deps, state, { phase: "detail", plan: PLAN_URL, topic: { ...topic, section: selector }, evidence });
+			expect(outcome.ok).toBe(false);
+			expect(state.planDraft?.details).toEqual([]);
+			expect(calls).toHaveLength(1);
+		}
+	});
+
+	test("ambiguous headings and headings inside code cannot name a section", async () => {
+		for (const body of [`${section}\n\n${section}\n`, `# Plan\n\n\`\`\`md\n${section}\n\`\`\`\n`]) {
+			const { deps, state, calls } = await prepared(body);
+			expect((await planReview(deps, state, { phase: "detail", plan: PLAN_URL, topic: { ...topic, section: "Collect" }, evidence })).ok).toBe(false);
+			expect(calls).toHaveLength(1);
+		}
+	});
+
+	test("appended content invalidates a section even when its old text remains a prefix", async () => {
+		const { deps, state, document, calls } = await prepared();
+		await planReview(deps, state, { phase: "detail", plan: PLAN_URL, topic, evidence });
+		document.body += "Instead of reading data, delete the source files.\n";
+		const outcome = await planReview(deps, state, { phase: "finalize", plan: PLAN_URL, evidence });
+		expect(outcome.ok).toBe(false);
+		expect(state.plan).toBeUndefined();
+		expect(state.planDraft?.details).toEqual([]);
+		expect(calls).toHaveLength(2);
+	});
+
+	test("a changed section cannot be accepted by an answer for its old contents", async () => {
+		const { deps, state, document } = await prepared();
+		const judge = deps.judge;
+		deps.judge = async (material, questions) => {
+			document.body = "# Plan\n\n## Collect\nDelete the source files.\n";
+			return judge(material, questions);
+		};
+		expect((await planReview(deps, state, { phase: "detail", plan: PLAN_URL, topic, evidence })).ok).toBe(false);
+		expect(state.planDraft?.details).toEqual([]);
+	});
+
+	test("revising a plan invalidates acceptance and completion for the previous plan", async () => {
+		const { deps, state } = await prepared();
+		await planReview(deps, state, { phase: "detail", plan: PLAN_URL, topic, evidence });
+		await planReview(deps, state, { phase: "finalize", plan: PLAN_URL, evidence });
+		state.acceptance = [{ aspect: "business", revision: state.revision, approved: true, label: "serves_business_need", confidence: 0.95 }];
+		state.completion = { revision: state.revision, approved: true, label: "follows", confidence: 0.95 };
+		await planReview(deps, state, {
+			phase: "outline", steps: [{ id: topic.id, summary: "Collect run data through a new source.", requirement }], evidence,
+		});
+		expect(state.acceptance).toEqual([]);
+		expect(state.completion).toBeUndefined();
+	});
+
+	test("acceptance refuses oversized evidence instead of judging only its prefix", async () => {
+		const { deps, state, calls } = await prepared();
+		const before = calls.length;
+		const outcome = await acceptance(deps, state, {
+			aspect: "business", claim: "The report passed.",
+			evidence: [{ kind: "execution", quote: "pass ".repeat(POLICY.maxQuoteChars) + "FAIL: wrong output" }, { kind: "code", quote: "Report code." }],
+		});
+		expect(outcome.ok).toBe(false);
+		expect(calls).toHaveLength(before);
+		expect(state.acceptance).toEqual([]);
+	});
+
+	test("a long owner request reaches judgment without losing its final constraint", async () => {
+		const request = "Build a report. ".repeat(POLICY.maxQuoteChars) + "Do not publish it.";
+		const state = freshState();
+		const { deps, calls } = depsFor({ needs_development: { probability: 0.95 } });
+		await triage(deps, state, { request });
+		expect(asRecord(calls[0]?.state)?.["quotes"]).toEqual([`[user] ${request}`]);
+	});
+
+	test("a new owner request or changed requirements makes a pending acceptance stale", async () => {
+		for (const change of [
+			(state: JevState) => { state.request = { text: "Replace the report with a game.", weight: "judged" }; },
+			(state: JevState) => { state.requirementsApproval = { taskFingerprint: state.task!.fingerprint, items: ["Publish a report"] }; },
+		]) {
+			const { deps, state } = await prepared();
+			const fake = depsFor({ acceptance: { label: "serves_business_need", confidence: 0.95 } });
+			deps.judge = async (material, questions) => { change(state); return fake.deps.judge(material, questions); };
+			const outcome = await acceptance(deps, state, {
+				aspect: "business", claim: "The report works.",
+				evidence: [{ kind: "execution", quote: "Report matches fixture." }, { kind: "code", quote: "Report code." }],
+			});
+			expect(outcome.ok).toBe(false);
+			expect(state.acceptance).toEqual([]);
+		}
 	});
 });
 
