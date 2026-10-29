@@ -16,6 +16,7 @@ import {
 	stopEvent,
 	switchableCtx,
 	toolCallEvent,
+	toolDetails,
 	toolFailed,
 	toolResultEvent,
 	toolText,
@@ -42,6 +43,7 @@ function config(options: Options = {}): JevConfig {
 			mode: options.mode ?? "interval",
 			interval: options.interval ?? DEFAULT_CONFIG.courseCheck.interval,
 		},
+		antiSlop: { mode: "advisory" },
 		problems: [],
 	};
 }
@@ -153,8 +155,11 @@ describe("T1 - the registered surface", () => {
 	test("T1, T2, T3, T5: the judge tools are registered and nothing is consulted at registration", () => {
 		const { pi, calls } = controllerFor({});
 
+		expect(pi.commands.has("jev-continue")).toBe(true);
+		expect(pi.commands.has("jev-waive")).toBe(true);
 		expect([...pi.tools.keys()].sort()).toEqual([
 			"jev_acceptance",
+			"jev_anti_slop",
 			"jev_consult",
 			"jev_plan_review",
 			"jev_reaim",
@@ -1283,5 +1288,86 @@ describe("owner-authorized continuation", () => {
 		await pi.emit("tool_result", toolResultEvent("write", { path: "src/report.ts" }, "written"), ctx);
 		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
 		expect(fake.calls).toHaveLength(1);
+	});
+});
+
+describe("FR-55 - advisory anti-slop discloses a gap without holding it", () => {
+	test("a missing review is disclosed and completion still proceeds to its other boundaries", async () => {
+		const { pi } = controllerFor({
+			needs_development: TRIAGE_DEEP,
+			external_deliverable: { probability: 0.95 },
+		});
+		const ctx = fakeCtx();
+		await pi.emit("before_agent_start", { prompt: "Write the legal memo" }, ctx);
+		await triaged(pi, ctx, "Write the legal memo");
+		await pi.emit("tool_result", toolResultEvent("write", { path: "memo.md" }, "written"), ctx);
+
+		const decision = stopDecision(await pi.emit("session_stop", stopEvent(), ctx));
+		expect(decision).toBeDefined();
+		expect(pi.messages.some(message => message.content.includes("anti-slop review"))).toBe(true);
+	});
+});
+
+describe("FR-54 - the owner waives one anti-slop finding", () => {
+	test("the waiver command names the finding and records the owner's decision", async () => {
+		const { pi } = controllerFor({
+			needs_development: TRIAGE_DEEP,
+			external_deliverable: { probability: 0.95 },
+			claim_1: { label: "refuted", confidence: 0.95 },
+			language_1: { probability: 0.05 },
+			meta_1: { probability: 0.05 },
+			relevance_1: { label: "serves", confidence: 0.95 },
+			rule_1_1: { probability: 0.05 },
+		});
+		const ctx = fakeCtx();
+		await pi.emit("before_agent_start", { prompt: "Write the legal memo" }, ctx);
+		await triaged(pi, ctx, "Write the legal memo");
+		const review = await pi.callTool(
+			"jev_anti_slop",
+			{
+				artifact: "The agreement takes effect on 1 January 2027.",
+				language: "en",
+				register: "formal legal English",
+				purpose: "legal memo",
+				audience: "external",
+				rules: [{ class: "register", rule: "Use formal legal English." }],
+				claims: [
+					{
+						id: "claim-1",
+						text: "The agreement takes effect on 1 January 2027.",
+						kind: "fact",
+						evidence: [
+							{
+								kind: "documentation",
+								quote: "Commencement: 1 January 2027.",
+								source: "contract",
+								sourceClass: "official",
+							},
+						],
+					},
+				],
+				inferences: [],
+			},
+			ctx,
+		);
+		const finding = (toolDetails(review)["findings"] as Array<Record<string, unknown>>).find(
+			entry => entry["severity"] === "blocker",
+		);
+		const findingId = String(finding?.["id"]);
+
+		pi.callCommand("jev-waive", `${findingId} owner accepted`, ctx);
+
+		expect(
+			pi.messages.some(
+				message => message.content.includes("waived") && message.content.includes(findingId),
+			),
+		).toBe(true);
+
+		await pi.emit("input", { text: `одобряю ${findingId}`, source: "interactive" }, ctx);
+		await pi.emit("before_agent_start", { prompt: `одобряю ${findingId}` }, ctx);
+		const reason = blockReason(
+			await pi.emit("tool_call", toolCallEvent("write", { path: "memo.md" }), ctx),
+		);
+		expect(reason ?? "").not.toContain("owner sent a message");
 	});
 });

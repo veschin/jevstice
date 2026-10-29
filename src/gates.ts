@@ -13,7 +13,17 @@
  * an unknown MCP route - reaches the working tree without naming a file.
  */
 import { HOLD_BOUNDARY, PLAN_BOUNDARY, asRecord, type JevConfig, type PlanTopic } from "./types.js";
-import { acceptanceAt, boundaryExhausted, boundaryKey, continuationAllowed, type JevState } from "./state.js";
+import {
+	acceptanceAt,
+	antiSlopScope,
+	antiSlopStatus,
+	boundaryExhausted,
+	boundaryKey,
+	continuationAllowed,
+	type AntiSlopScope,
+	type AntiSlopStatus,
+	type JevState,
+} from "./state.js";
 
 /**
  * Tools that change the working tree. `write`, `edit` and `ast_edit` are classified by their target;
@@ -43,6 +53,7 @@ const READ_ONLY_TOOLS: Record<string, true> = {
 	wait: true,
 	ast_grep: true,
 	jev_acceptance: true,
+	jev_anti_slop: true,
 	jev_consult: true,
 	jev_plan_review: true,
 	jev_reaim: true,
@@ -262,6 +273,41 @@ const HOLD_CALL =
 /** The call that defends finished work before completion (FR-14, FR-15, FR-26, FR-28). */
 const ACCEPTANCE_CALL = (aspect: string): string =>
 	`jev_acceptance({"aspect": "${aspect}", "claim": "<what the finished work achieves>", "evidence": [{"kind": "execution", "quote": "<the command and its output>"}, {"kind": "code", "quote": "<a diagnostic, a diff or a size measurement>"}]})`;
+
+/** The call that reviews the external deliverable (FR-46, FR-56). */
+const ANTI_SLOP_CALL =
+	`jev_anti_slop({"artifact": "<exact external artifact text>", "language": "<declared language>", "register": "<declared register>", "purpose": "<declared purpose>", "audience": "external", "rules": [{"class": "<rule class>", "rule": "<owner rule>"}], "claims": [{"id": "claim-1", "text": "<verbatim artifact sentence>", "kind": "fact", "evidence": [{"kind": "documentation", "quote": "<source quote>", "source": "<source locator>", "sourceClass": "official"}]}], "inferences": []})`;
+
+/** Why an external deliverable cannot settle yet (FR-55). */
+function antiSlopReason(state: JevState, scope: AntiSlopScope, status: AntiSlopStatus): string {
+	if (status.reviews.length === 0) {
+		return refusal(
+			`Jevstice holds this completion: the external deliverable has no anti-slop review at the current work revision (${state.revision}).`,
+			ANTI_SLOP_CALL,
+			"The review binds to the exact artifact and the current revision; a later change needs a fresh review.",
+		);
+	}
+	if (status.missing.length > 0) {
+		return refusal(
+			`Jevstice holds this completion: the anti-slop review covers part(s) ${status.reviews.map(review => review.part.index).join(", ")} but not part(s) ${status.missing.join(", ")}.`,
+			ANTI_SLOP_CALL,
+			"Every part of the deliverable must be reviewed at the current revision.",
+		);
+	}
+	if (status.inconsistent) {
+		return refusal(
+			"Jevstice holds this completion: the anti-slop parts were reviewed under different languages, registers or rule sets.",
+			ANTI_SLOP_CALL,
+			"Review every part with one declared language, register and rule set.",
+		);
+	}
+	const blockers = status.blockers.map(finding => `${finding.id} (${finding.kind})`).join(", ");
+	return refusal(
+		`Jevstice holds this completion: the anti-slop review has unwaived blocker(s): ${blockers}.`,
+		`owner: /jev-waive <finding-id> <reason>; executor: jev_anti_slop with a revised artifact`,
+		"A waiver records the owner's acceptance of that finding; it is not Jev approval. A revised artifact needs a fresh review.",
+	);
+}
 
 export const PLAN_REQUIRED_REASON = refusal(
 	"Jevstice holds this change: the registered development task has no approved plan.",
@@ -761,7 +807,17 @@ export interface CompletionGate {
 export function completionGate(state: JevState, config: JevConfig): CompletionGate {
 	if (!config.gates.completion) return { applies: false };
 	if (continuationAllowed(state)) return { applies: false };
-	if (state.task === undefined || state.revision === 0) return { applies: false };
+	if (state.task === undefined) {
+		if (state.simple?.external === true && config.antiSlop.mode === "enforce") {
+			const scope = antiSlopScope(state);
+			if (scope !== undefined) {
+				const status = antiSlopStatus(state, scope);
+				if (!status.complete) return { applies: true, reason: antiSlopReason(state, scope, status) };
+			}
+		}
+		return { applies: false };
+	}
+	if (state.revision === 0) return { applies: false };
 	// Permission is checked above; without it, unavailable judgment cannot approve completion.
 	if (state.judgeUnavailable === true) return { applies: true, reason: JUDGE_UNAVAILABLE_REASON };
 	// The course check in flight owns the revision it started on: wait for its verdict first.
@@ -789,6 +845,13 @@ export function completionGate(state: JevState, config: JevConfig): CompletionGa
 	}
 	// The owner's latest message is unjudged: completion would report on a direction no longer known.
 	if (state.directionPending !== undefined) return { applies: true, reason: directionReason(state) };
+	if (config.antiSlop.mode === "enforce") {
+		const scope = antiSlopScope(state);
+		if (scope !== undefined && !scope.quiet) {
+			const status = antiSlopStatus(state, scope);
+			if (!status.complete) return { applies: true, reason: antiSlopReason(state, scope, status) };
+		}
+	}
 	const missing = (["business", "architecture"] as const).filter(aspect => acceptanceAt(state, aspect)?.approved !== true);
 	const spent = missing.find(aspect => boundaryExhausted(state, `acceptance:${aspect}`));
 	if (spent !== undefined) {

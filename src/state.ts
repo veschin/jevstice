@@ -5,13 +5,24 @@
  * again, which is the safe direction (approvals are never restored from disk and never inferred).
  */
 import { createHash } from "node:crypto";
-import { PLAN_BOUNDARY, POLICY, type Aspect, type PlanOutlineStep, type PlanTopic } from "./types.js";
-import { weightOf, type RequestWeight } from "./screen.js";
+import {
+	PLAN_BOUNDARY,
+	POLICY,
+	type AntiSlopFinding,
+	type AntiSlopReviewRecord,
+	type AntiSlopWaiver,
+	type Aspect,
+	type PlanOutlineStep,
+	type PlanTopic,
+} from "./types.js";
+import { namesExternalDeliverable, weightOf, type RequestWeight } from "./screen.js";
 /** The development task the gate belongs to. */
 export interface TaskIdentity {
 	/** SHA-256 of the request text; the approval ledger is keyed by it. */
 	fingerprint: string;
 	request: string;
+	/** The deliverable is intended for an audience outside the project (FR-45). */
+	external?: boolean;
 }
 
 /** A plan approval, bound to one task and one exact artifact content. */
@@ -165,6 +176,12 @@ export interface JevState {
 	stop?: StopRecord;
 	/** Permission to continue this request with unresolved findings; never a Jev approval. */
 	continuation?: { taskFingerprint?: string; request: string; reason: string };
+	/** Recorded external-artifact review parts, newest last (FR-45..FR-56). */
+	antiSlopReviews: AntiSlopReviewRecord[];
+	/** Owner waivers for individual anti-slop findings (FR-54). */
+	antiSlopWaivers: AntiSlopWaiver[];
+	/** The advisory anti-slop disclosure already sent for this revision and finding set. */
+	antiSlopNotice?: string;
 }
 
 export function freshState(): JevState {
@@ -178,6 +195,8 @@ export function freshState(): JevState {
 		exhausted: [],
 		refusedCalls: { boundary: "", count: 0, calls: [] },
 		judgeFailures: 0,
+		antiSlopReviews: [],
+		antiSlopWaivers: [],
 	};
 }
 
@@ -236,6 +255,9 @@ function clearWork(state: JevState): void {
 	state.exhausted = [];
 	state.planTopics = [];
 	state.refusedCalls = { boundary: "", count: 0, calls: [] };
+	state.antiSlopReviews = [];
+	state.antiSlopWaivers = [];
+	delete state.antiSlopNotice;
 	state.revision = 0;
 	state.actionsSinceCheck = 0;
 }
@@ -245,11 +267,11 @@ function clearWork(state: JevState): void {
  * fresh work, so every approval, refusal and exhaustion of the previous task is dropped - a new
  * request never inherits an old approval or an old bypass.
  */
-export function registerTask(state: JevState, request: string): TaskIdentity {
+export function registerTask(state: JevState, request: string, external = false): TaskIdentity {
 	const fingerprint = sha256(request.trim());
 	if (state.simple === undefined && state.task?.fingerprint === fingerprint) return state.task;
 	clearWork(state);
-	state.task = { fingerprint, request };
+	state.task = { fingerprint, request, external };
 	return state.task;
 }
 
@@ -258,9 +280,9 @@ export function registerTask(state: JevState, request: string): TaskIdentity {
  * exhaustion of the previous course is dropped, but nothing is approved - the re-aimed task needs a
  * fresh plan, and the plan boundary is not marked exhausted on its behalf.
  */
-export function reaimTask(state: JevState, request: string): TaskIdentity {
+export function reaimTask(state: JevState, request: string, external = false): TaskIdentity {
 	clearWork(state);
-	state.task = { fingerprint: sha256(request.trim()), request };
+	state.task = { fingerprint: sha256(request.trim()), request, external };
 	return state.task;
 }
 
@@ -282,9 +304,9 @@ export function clearFinishedTask(state: JevState): boolean {
  * registered development task; read-only work then needs no further workflow, and every
  * consequential call is still judged on its own payload before it runs.
  */
-export function registerSimple(state: JevState, request: string): TaskIdentity {
+export function registerSimple(state: JevState, request: string, external = false): TaskIdentity {
 	clearWork(state);
-	state.simple = { fingerprint: sha256(request.trim()), request };
+	state.simple = { fingerprint: sha256(request.trim()), request, external };
 	return state.simple;
 }
 
@@ -412,4 +434,120 @@ export function recordRefusedCall(state: JevState, boundary: string, call: strin
 /** Remember the first action whose target left the approved plan's topics (FR-25). */
 export function markDeviation(state: JevState, tool: string, target: string): void {
 	if (state.deviation === undefined) state.deviation = { tool, target, revision: state.revision };
+}
+
+/** The external deliverable the anti-slop review belongs to (FR-45, FR-46). */
+export interface AntiSlopScope {
+	taskFingerprint?: string;
+	request: string;
+	revision: number;
+	quiet: boolean;
+}
+
+/** How far the recorded review parts cover one external deliverable (FR-53, FR-56). */
+export interface AntiSlopStatus {
+	reviews: AntiSlopReviewRecord[];
+	missing: number[];
+	blockers: AntiSlopFinding[];
+	/** Parts disagree on the declared language, register or rule set. */
+	inconsistent: boolean;
+	complete: boolean;
+}
+
+/** The deliverable the current session may review, or undefined for an internal task. */
+export function antiSlopScope(state: JevState): AntiSlopScope | undefined {
+	if (state.task?.external === true) {
+		return { taskFingerprint: state.task.fingerprint, request: state.task.request, revision: state.revision, quiet: false };
+	}
+	if (state.simple?.external === true) {
+		return { taskFingerprint: state.simple.fingerprint, request: state.simple.request, revision: state.revision, quiet: false };
+	}
+	if (
+		state.task === undefined &&
+		state.simple === undefined &&
+		state.request?.weight === "quiet" &&
+		namesExternalDeliverable(state.request.text)
+	) {
+		return { request: state.request.text, revision: state.revision, quiet: true };
+	}
+	return undefined;
+}
+
+/** Whether the owner waived one finding id (FR-54). */
+export function antiSlopWaived(state: JevState, findingId: string): boolean {
+	return state.antiSlopWaivers.some(waiver => waiver.findingId === findingId);
+}
+
+/** Record one review part, replacing an earlier version of the same part. */
+export function recordAntiSlopReview(state: JevState, review: AntiSlopReviewRecord): void {
+	const samePart = (existing: AntiSlopReviewRecord): boolean =>
+		existing.taskFingerprint === review.taskFingerprint &&
+		existing.request === review.request &&
+		existing.part.index === review.part.index;
+	state.antiSlopReviews = [...state.antiSlopReviews.filter(existing => !samePart(existing)), review].slice(
+		-POLICY.maxAntiSlopReviews,
+	);
+	delete state.antiSlopNotice;
+}
+
+/** Record an owner waiver; a repeated waiver is one record. */
+export function recordAntiSlopWaiver(state: JevState, waiver: AntiSlopWaiver): void {
+	if (antiSlopWaived(state, waiver.findingId)) return;
+	state.antiSlopWaivers = [...state.antiSlopWaivers, waiver];
+}
+
+/** Find one recorded finding and the review part that carries it. */
+export function findAntiSlopFinding(
+	state: JevState,
+	findingId: string,
+): { review: AntiSlopReviewRecord; finding: AntiSlopFinding } | undefined {
+	for (let index = state.antiSlopReviews.length - 1; index >= 0; index -= 1) {
+		const review = state.antiSlopReviews[index];
+		const finding = review?.findings.find(entry => entry.id === findingId);
+		if (review !== undefined && finding !== undefined) return { review, finding };
+	}
+	return undefined;
+}
+
+/**
+ * What the current review covers for one deliverable. The latest submitted part total owns the
+ * group; a part missing from that group keeps the review incomplete, and an unwaived blocker keeps
+ * it blocked. A review recorded for an older revision does not count (FR-53).
+ */
+export function antiSlopStatus(state: JevState, scope: AntiSlopScope): AntiSlopStatus {
+	const reviews = state.antiSlopReviews.filter(review => {
+		if (review.revision !== scope.revision) return false;
+		if (scope.taskFingerprint !== undefined) return review.taskFingerprint === scope.taskFingerprint;
+		return review.taskFingerprint === undefined && review.request === scope.request;
+	});
+	if (reviews.length === 0) {
+		return { reviews: [], missing: [], blockers: [], inconsistent: false, complete: false };
+	}
+	const latest = reviews[reviews.length - 1];
+	const total = latest?.part.total ?? 1;
+	const byIndex = new Map<number, AntiSlopReviewRecord>();
+	for (const review of reviews) {
+		if (review.part.total === total) byIndex.set(review.part.index, review);
+	}
+	const missing: number[] = [];
+	for (let index = 1; index <= total; index += 1) {
+		if (!byIndex.has(index)) missing.push(index);
+	}
+	const ordered = [...byIndex.values()].sort((left, right) => left.part.index - right.part.index);
+	const blockers = ordered.flatMap(review =>
+		review.findings.filter(finding => finding.severity === "blocker" && !antiSlopWaived(state, finding.id)),
+	);
+	const inconsistent = ordered.some(
+		review =>
+			review.language !== latest?.language ||
+			review.register !== latest?.register ||
+			review.rulesDigest !== latest?.rulesDigest,
+	);
+	return {
+		reviews: ordered,
+		missing,
+		blockers,
+		inconsistent,
+		complete: missing.length === 0 && blockers.length === 0 && !inconsistent,
+	};
 }

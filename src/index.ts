@@ -2,8 +2,8 @@
  * Jevstice entry point.
  *
  * Load manifest (integrator-owned package.json): `{ "omp": { "extensions": ["src/index.ts"] } }`.
- * The manifest field is deliberately absent at the moment, so ordinary sessions load no addon and
- * the extension is exercised only when a session loads it explicitly.
+ * An installed checkout loads in ordinary sessions; `omp --no-extensions -e <path>` loads this
+ * checkout explicitly without changing the installation.
  *
  * With no key configured the extension still loads; every submission then fails closed (an unusable
  * answer is never an approval). The key is resolved lazily and only ever handed to the judge client.

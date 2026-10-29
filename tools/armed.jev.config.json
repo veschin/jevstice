@@ -6,5 +6,8 @@
   "courseCheck": {
     "mode": "interval",
     "interval": 1
+  },
+  "antiSlop": {
+    "mode": "advisory"
   }
 }

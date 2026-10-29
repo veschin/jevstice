@@ -9,7 +9,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { asRecord, type JevConfig } from "./types.js";
+import { asRecord, type AntiSlopMode, type JevConfig } from "./types.js";
 
 const CONFIG_FILE_NAME = "jev.config.json";
 
@@ -23,6 +23,7 @@ const CONFIG_FILE_NAME = "jev.config.json";
 export const DEFAULT_CONFIG: JevConfig = {
 	gates: { mutation: true, completion: true },
 	courseCheck: { mode: "completion", interval: 3 },
+	antiSlop: { mode: "advisory" },
 	problems: [],
 };
 
@@ -80,6 +81,18 @@ function intervalValue(value: unknown, fallback: number, file: string, problems:
 	return fallback;
 }
 
+function antiSlopModeValue(
+	value: unknown,
+	fallback: AntiSlopMode,
+	file: string,
+	problems: string[],
+): AntiSlopMode {
+	if (value === undefined) return fallback;
+	if (value === "off" || value === "advisory" || value === "enforce") return value;
+	problems.push(`${file}: antiSlop.mode must be "off", "advisory" or "enforce", got ${describeValue(value)} - the default "${fallback}" stays in force`);
+	return fallback;
+}
+
 /** Read both configuration files and return the effective configuration with any problems found. */
 export function loadJevConfig(options: { cwd: string; home?: string; read?: ConfigReader }): JevConfig {
 	const read = options.read ?? readFileOrNull;
@@ -87,6 +100,7 @@ export function loadJevConfig(options: { cwd: string; home?: string; read?: Conf
 	let completionGate = DEFAULT_CONFIG.gates.completion;
 	let courseMode = DEFAULT_CONFIG.courseCheck.mode;
 	let interval = DEFAULT_CONFIG.courseCheck.interval;
+	let antiSlopMode = DEFAULT_CONFIG.antiSlop.mode;
 	const problems: string[] = [];
 	for (const path of configPaths(options)) {
 		const text = read(path);
@@ -124,10 +138,20 @@ export function loadJevConfig(options: { cwd: string; home?: string; read?: Conf
 			courseMode = courseModeValue(courseCheck?.["mode"], courseMode, path, problems);
 			interval = intervalValue(courseCheck?.["interval"], interval, path, problems);
 		}
+		const antiSlopValue = root["antiSlop"];
+		const antiSlop = asRecord(antiSlopValue);
+		if (antiSlopValue !== undefined && antiSlop === undefined) {
+			problems.push(
+				`${path}: antiSlop must be a JSON object, got ${describeValue(antiSlopValue)} - the default for antiSlop.mode stays in force`,
+			);
+		} else {
+			antiSlopMode = antiSlopModeValue(antiSlop?.["mode"], antiSlopMode, path, problems);
+		}
 	}
 	return {
 		gates: { mutation: mutationGate, completion: completionGate },
 		courseCheck: { mode: courseMode, interval },
+		antiSlop: { mode: antiSlopMode },
 		problems,
 	};
 }

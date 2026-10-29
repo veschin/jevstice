@@ -37,6 +37,15 @@ export const POLICY = {
 	maxIgnoredBoundaryCalls: 3,
 	/** Fragments a submitted text is split into for the text review (FR-27). */
 	maxTextFragments: 12,
+	/** Anti-slop claim, inference and part bounds (FR-46, FR-56). */
+	maxAntiSlopClaims: 40,
+	maxAntiSlopInferences: 20,
+	maxAntiSlopRules: 50,
+	maxAntiSlopParts: 20,
+	/** Review parts kept per session; older revisions remain readable until this bound. */
+	maxAntiSlopReviews: 80,
+	/** A decisive anti-slop verdict; below it the item stays unverified (FR-47). */
+	antiSlopFloor: 0.8,
 	/** Judge model; never substituted by another provider. */
 	defaultModel: "jev-latest",
 	/** Env var carrying the TypeSafe API key; never persisted, logged or echoed. */
@@ -109,6 +118,125 @@ export interface TextRule {
 	rule: string;
 }
 
+/** How the external-artifact review is enforced (FR-55). */
+export type AntiSlopMode = "off" | "advisory" | "enforce";
+
+/** The source-strength ladder a claim's evidence is marked with (FR-48). */
+export type AntiSlopSourceClass =
+	| "primary"
+	| "official"
+	| "peer_reviewed"
+	| "reputable_secondary"
+	| "anonymous"
+	| "none";
+
+/** One quoted source item for a factual claim or hypothesis. */
+export interface AntiSlopEvidence {
+	kind: EvidenceKind;
+	quote: string;
+	source?: string;
+	sourceClass: AntiSlopSourceClass;
+}
+
+/** One factual claim or hypothesis submitted to the anti-slop review. */
+export interface AntiSlopClaim {
+	id: string;
+	/** The claim as it occurs verbatim in the artifact. */
+	text: string;
+	kind: "fact" | "hypothesis";
+	evidence: readonly AntiSlopEvidence[];
+	/** An observable condition that would refute a hypothesis (FR-50). */
+	falsifier?: string;
+}
+
+/** One conclusion and the premises and warrant it rests on (FR-49). */
+export interface AntiSlopInference {
+	id: string;
+	premises: readonly string[];
+	warrant: string;
+	conclusion: string;
+}
+
+/** A reviewed artifact part; a large artifact is submitted in consecutive parts (FR-56). */
+export interface AntiSlopPart {
+	index: number;
+	total: number;
+}
+
+/** The review's trust mark for one claim or inference (FR-48). */
+export type AntiSlopTrust = "trusted" | "low_trust" | "distrusted" | "unverified";
+
+/** What one anti-slop finding says (FR-53). */
+export type AntiSlopFindingKind =
+	| "contradicted_claim"
+	| "unsupported_claim"
+	| "invalid_inference"
+	| "unfalsifiable_hypothesis"
+	| "language_mismatch"
+	| "meta_text"
+	| "low_trust_source"
+	| "register_violation"
+	| "redundant_material"
+	| "unverified_claim";
+
+/** One finding; the id is stable for the same task, part and material. */
+export interface AntiSlopFinding {
+	id: string;
+	kind: AntiSlopFindingKind;
+	severity: "blocker" | "warning";
+	target: string;
+	verdict: string;
+	confidence: number;
+	rule?: string;
+}
+
+/** One claim verdict returned by the review. */
+export interface AntiSlopClaimResult {
+	id: string;
+	trust: AntiSlopTrust;
+	verdict: string;
+	confidence: number;
+}
+
+/** One inference verdict returned by the review. */
+export interface AntiSlopInferenceResult {
+	id: string;
+	trust: AntiSlopTrust;
+	verdict: string;
+	confidence: number;
+}
+
+/** One recorded review part, bound to the task or quiet request, revision and artifact bytes. */
+export interface AntiSlopReviewRecord {
+	taskFingerprint?: string;
+	request: string;
+	revision: number;
+	part: AntiSlopPart;
+	partDigest: string;
+	language: string;
+	register: string;
+	rulesDigest: string;
+	mode: AntiSlopMode;
+	claims: AntiSlopClaimResult[];
+	inferences: AntiSlopInferenceResult[];
+	findings: AntiSlopFinding[];
+}
+
+/** An owner waiver for one finding id (FR-54). */
+export interface AntiSlopWaiver {
+	findingId: string;
+	reason: string;
+	/** The review part and task or request the waived finding belongs to. */
+	reviewPartDigest?: string;
+	taskFingerprint?: string;
+	request?: string;
+}
+
+/** The anti-slop configuration (FR-55). */
+export interface AntiSlopConfig {
+	mode: AntiSlopMode;
+}
+
 /** How often implementation is checked against the task direction. */
 export interface CourseCheckConfig {
 	mode: "interval" | "completion";
@@ -130,6 +258,7 @@ export interface GateConfig {
 export interface JevConfig {
 	gates: GateConfig;
 	courseCheck: CourseCheckConfig;
+	antiSlop: AntiSlopConfig;
 	problems: readonly string[];
 }
 

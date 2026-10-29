@@ -113,4 +113,46 @@ describe("T4 - configuration of the gates and the course check", () => {
 	test("the user file is read before the project file", () => {
 		expect(configPaths({ cwd: "/work", home: "/home/owner" })).toEqual([USER_FILE, PROJECT_FILE]);
 	});
+
+	test("anti-slop ships advisory and the project file can enforce it", () => {
+		const shipped = loadJevConfig({ cwd: "/work", home: "/home/owner", read: reader({}) });
+		expect(shipped.antiSlop).toEqual({ mode: "advisory" });
+
+		const enforced = loadJevConfig({
+			cwd: "/work",
+			home: "/home/owner",
+			read: reader({
+				[USER_FILE]: JSON.stringify({ antiSlop: { mode: "advisory" } }),
+				[PROJECT_FILE]: JSON.stringify({ antiSlop: { mode: "enforce" } }),
+			}),
+		});
+		expect(enforced.antiSlop).toEqual({ mode: "enforce" });
+		expect(enforced.problems).toEqual([]);
+	});
+
+	test("an invalid anti-slop mode keeps the default and names the file and key", () => {
+		const config = loadJevConfig({
+			cwd: "/work",
+			home: "/home/owner",
+			read: reader({
+				[PROJECT_FILE]: JSON.stringify({ antiSlop: { mode: "sometimes" } }),
+			}),
+		});
+
+		expect(config.antiSlop).toEqual({ mode: "advisory" });
+		expect(config.problems).toHaveLength(1);
+		expect(config.problems.join(" ")).toContain(`${PROJECT_FILE}: antiSlop.mode`);
+	});
+
+	test("an anti-slop section that is not an object keeps the default", () => {
+		const config = loadJevConfig({
+			cwd: "/work",
+			home: "/home/owner",
+			read: reader({ [PROJECT_FILE]: JSON.stringify({ antiSlop: "enforce" }) }),
+		});
+
+		expect(config.antiSlop).toEqual({ mode: "advisory" });
+		expect(config.problems).toHaveLength(1);
+		expect(config.problems.join(" ")).toContain(`${PROJECT_FILE}: antiSlop must be a JSON object`);
+	});
 });

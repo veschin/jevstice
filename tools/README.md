@@ -101,10 +101,12 @@ every consequential action. Copy it to the project being exercised:
 mkdir -p .omp && cp tools/armed.jev.config.json .omp/jev.config.json
 ```
 
-The shipped defaults in `src/config.ts` are `completion` mode with interval 3; the fixture is for a
-live run where every action is checked. Old keys (`routing`, `handoffAcceptance`, `everyMutations`)
-are ignored if present in an older file; only `gates.mutation`, `gates.completion`,
-`courseCheck.mode` and `courseCheck.interval` are read.
+The shipped defaults in `src/config.ts` are `completion` mode with interval 3 and `antiSlop.mode`
+`advisory`; the fixture is for a live run where every action is checked. Old keys (`routing`,
+`handoffAcceptance`, `everyMutations`) are ignored if present in an older file; only
+`gates.mutation`, `gates.completion`, `courseCheck.mode`, `courseCheck.interval` and
+`antiSlop.mode` are read. `antiSlop.mode` accepts `off`, `advisory` and `enforce`. The live smoke
+does not yet exercise the anti-slop review; `tests/anti-slop.test.ts` covers it.
 
 ## Removed harnesses
 

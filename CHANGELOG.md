@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+- `jev_anti_slop` reviews an external document, research output or legal communication: claim-evidence verdicts (`supported`, `refuted`, `not_enough_info`), Toulmin inference checks, hypothesis falsifiers, per-fragment language/register/meta-text/relevance findings, explicit trust marks, numbered parts and owner waivers. Triage records whether the deliverable is external. `antiSlop.mode` ships as `advisory`; `enforce` holds completion and external delivery while the current review is missing or an unwaived blocker remains. `/jev-waive <id>` records the owner's decision, not Jev approval.
+- Verification: `bun test` 249 pass / 0 fail / 954 `expect()` calls / 10 files; `bun run typecheck` clean. The live smoke does not yet exercise the anti-slop scenario.
+
+### Documentation
+
+- PRD records the external-artifact anti-slop requirements FR-45 through FR-56, their scientific basis and limits, and a code-derived inventory of the current implementation.
+- README, AGENTS.md and ACCEPTANCE.md now describe the current request screen, triage-before-inspection boundary, full-payload action preflight, plan review, refusal ledgers, owner continuation, anti-slop review, configuration, test baseline and live-smoke entry points.
+
 ### Fixed
 
 - Plan detail approvals bind to complete artifact sections resolved from the artifact itself (unique heading or exact full text), not to caller-supplied substrings: the finalize stage no longer treats 99% of an approved plan as unjudged "additional material", which repeatedly failed assembly after every part had passed. Overlapping sections, sections changed during judgment, and headings inside fenced code are refused.

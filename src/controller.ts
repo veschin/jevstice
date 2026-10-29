@@ -14,6 +14,7 @@ import { readFileSync } from "node:fs";
 import {
 	acceptance,
 	actionCheck,
+	antiSlop,
 	completionCheck,
 	consult,
 	courseCheck,
@@ -46,12 +47,16 @@ import type { Judge } from "./judge.js";
 import {
 	clearFinishedTask,
 	allowContinuation,
+	antiSlopScope,
+	antiSlopStatus,
 	continuationAllowed,
 	exhaustBoundary,
+	findAntiSlopFinding,
 	freshState,
 	invalidatePlan,
 	markDeviation,
 	recordAction,
+	recordAntiSlopWaiver,
 	recordFailedAction,
 	recordRefusedCall,
 	recordStopBlock,
@@ -126,7 +131,7 @@ const WORKFLOW_NOTE =
 	" Read-only work needs no triage. Development normally requires requirements, a plan and both acceptance aspects. The owner can permit continuation with /jev-continue or an explicit approval message. After the attempt limit, continue with unresolved findings marked OPEN; permission to proceed is not Jev approval.";
 
 const TRIAGE_DESCRIPTION =
-	"Before a consequential change, submit the owner's request and concrete task topics. A development result requires requirements review and plan review: derive one checkable obligation per part of the request yourself and submit it with jev_requirements, then plan. No owner confirmation step exists - do not ask the owner to confirm the obligation list. A simple result names skipped stages; an unsettled result registers nothing.";
+	"Before a consequential change, submit the owner's request and concrete task topics. A development result requires requirements review and plan review: derive one checkable obligation per part of the request yourself and submit it with jev_requirements, then plan. No owner confirmation step exists - do not ask the owner to confirm the obligation list. The same call records whether the deliverable is external-facing; the anti-slop review applies only then. A simple result names skipped stages; an unsettled result registers nothing.";
 
 const REAIM_DESCRIPTION =
 	"Use only when the owner changes direction mid-task. Copy the interjection verbatim and quote it as user evidence. Approval re-aims the task, drops the old approvals and requires a fresh requirements and plan review; do not re-triage.";
@@ -147,6 +152,9 @@ const REVIEW_DESCRIPTION =
 
 const TEXT_REVIEW_DESCRIPTION =
 	"Submit the text and exact rules as {class, rule}. Jev returns violating fragments and the submitted rules they break; revise only those fragments. No returned defects means the text meets the submitted rules.";
+
+const ANTI_SLOP_DESCRIPTION =
+	"Use for an external document, research output or legal communication. Submit the exact artifact, declared language/register/purpose/audience, owner rules, factual claims with quoted evidence and sourceClass, hypotheses with falsifiers, and inferences with premises, warrant and conclusion. Jev marks each claim and inference trusted, low_trust, distrusted or unverified and returns findings; advisory by default. A large artifact is split into numbered parts. No meta-text in the artifact or the result.";
 
 const JEV_SKILL = readFileSync(new URL("./jev-skill.md", import.meta.url), "utf8").trim();
 
@@ -423,20 +431,68 @@ export function createJevController(deps: ControllerDeps): JevController {
 	return {
 		register(pi: PiApi): void {
 			const approvedInputs = new Map<string, string>();
+			const deliveryCalls = new Set<string>();
 			const approve = (ctx: unknown): void => {
 				const state = stateFor(ctx);
 				allowContinuation(state, "explicit owner approval; unresolved findings remain OPEN");
 				notify(ctx, "Jevstice: owner authorized continuation of this request. Unresolved findings remain OPEN; no Jev approval is recorded.");
 				sendMessage(pi, "jev.owner_approval", "The owner permits continuation of the current request despite Jev holds. Proceed; disclose unresolved findings as OPEN rather than claiming Jev approved them.", "aside");
 			};
+			const waive = (ctx: unknown, findingId: string, reason: string): void => {
+				const state = stateFor(ctx);
+				const found = findAntiSlopFinding(state, findingId);
+				if (found === undefined) {
+					notify(ctx, `Jevstice: no anti-slop finding ${findingId} is recorded in this session.`);
+					return;
+				}
+				recordAntiSlopWaiver(state, {
+					findingId,
+					reason,
+					reviewPartDigest: found.review.partDigest,
+					...(found.review.taskFingerprint === undefined
+						? {}
+						: { taskFingerprint: found.review.taskFingerprint }),
+					request: found.review.request,
+				});
+				notify(
+					ctx,
+					`Jevstice: owner waived ${findingId} (${found.finding.kind}). The finding remains recorded; no Jev approval is claimed.`,
+				);
+				sendMessage(
+					pi,
+					"jev.anti_slop_waiver",
+					`The owner waived anti-slop finding ${findingId}. It remains recorded as waived by the owner, not approved by Jev.`,
+					"aside",
+				);
+			};
 			pi.registerCommand?.("jev-continue", { description: "Continue the current request with unresolved Jev findings OPEN", handler: (_args, ctx) => approve(ctx) });
+			pi.registerCommand?.("jev-waive", {
+				description: "Waive one anti-slop finding by its id",
+				handler: (args: string, ctx: unknown) => {
+					const [findingId, ...rest] = args.trim().split(/\s+/);
+					if (findingId === undefined || findingId.length === 0) {
+						notify(ctx, "Jevstice: /jev-waive needs a finding id.");
+						return;
+					}
+					waive(ctx, findingId, rest.join(" "));
+				},
+			});
 			pi.on("input", (event, ctx) => {
 				const input = asRecord(event);
 				if (input?.["source"] !== "interactive" && input?.["source"] !== "rpc") return;
 				const text = input["text"];
-				if (typeof text !== "string" || !/^(?:аппрув|даю (?:полный )?аппрув|одобряю(?: продолжение)?|разрешаю продолжать|продолжай несмотря на (?:отказ|блокировку) jev|approve(?: continuation)?|continue despite jev)[.!]?$/iu.test(text.trim())) return;
-				approve(ctx);
-				approvedInputs.set(sessionIdOf(ctx), text);
+				if (typeof text !== "string") return;
+				const trimmed = text.trim();
+				if (/^(?:аппрув|даю (?:полный )?аппрув|одобряю(?: продолжение)?|разрешаю продолжать|продолжай несмотря на (?:отказ|блокировку) jev|approve(?: continuation)?|continue despite jev)[.!]?$/iu.test(trimmed)) {
+					approve(ctx);
+					approvedInputs.set(sessionIdOf(ctx), text);
+					return;
+				}
+				const waiver = /^(?:waive|одобряю|принимаю)\s+(finding-[a-f0-9]{12})(?:\s+(.+))?$/iu.exec(trimmed);
+				if (waiver?.[1] !== undefined) {
+					waive(ctx, waiver[1], waiver[2] ?? "");
+					approvedInputs.set(sessionIdOf(ctx), text);
+				}
 			});
 			const z = deps.zod;
 			/** One registered description: the tool's own text and the note every tool shares. */
@@ -573,6 +629,61 @@ export function createJevController(deps: ControllerDeps): JevController {
 				execute: run(textReview),
 			});
 
+			pi.registerTool({
+				name: "jev_anti_slop",
+				label: "Jev anti-slop",
+				description: described(ANTI_SLOP_DESCRIPTION),
+				parameters: z.object({
+					artifact: z.string(),
+					language: z.string(),
+					register: z.string(),
+					purpose: z.string(),
+					audience: z.string(),
+					rules: z.array(
+						z.object({
+							class: z.string(),
+							rule: z.string(),
+							severity: z.enum(["blocker", "warning"]).optional(),
+						}),
+					),
+					claims: z.array(
+						z.object({
+							id: z.string(),
+							text: z.string(),
+							kind: z.enum(["fact", "hypothesis"]),
+							evidence: z.array(
+								z.object({
+									kind: z.string(),
+									quote: z.string(),
+									source: z.string().optional(),
+									sourceClass: z.enum([
+										"primary",
+										"official",
+										"peer_reviewed",
+										"reputable_secondary",
+										"anonymous",
+										"none",
+									]),
+								}),
+							),
+							falsifier: z.string().optional(),
+						}),
+					),
+					inferences: z
+						.array(
+							z.object({
+								id: z.string(),
+								premises: z.array(z.string()),
+								warrant: z.string(),
+								conclusion: z.string(),
+							}),
+						)
+						.optional(),
+					part: z.object({ index: z.number(), total: z.number() }).optional(),
+				}),
+				execute: run(antiSlop),
+			});
+
 			pi.on("session_start", (_event, ctx) => {
 				states.delete(sessionIdOf(ctx));
 				const problems = deps.config.problems;
@@ -623,6 +734,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 				await restoreApprovedPlan(ctx);
 				const toolName = asRecord(event)?.["toolName"];
 				if (typeof toolName !== "string") return undefined;
+				const toolCallId = asRecord(event)?.["toolCallId"];
 				const input = asRecord(event)?.["input"];
 				const state = stateFor(ctx);
 				announce(pi, ctx, state);
@@ -723,7 +835,11 @@ export function createJevController(deps: ControllerDeps): JevController {
 				const rechecked = await planBindingVerdict(ctx, state);
 				if (rechecked !== undefined) return refuse(pi, ctx, state, toolName, input, rechecked);
 				const finalVerdict = mutationGate(state, deps.config, toolName, input);
-				return finalVerdict.block ? refuse(pi, ctx, state, toolName, input, finalVerdict) : undefined;
+				if (finalVerdict.block) return refuse(pi, ctx, state, toolName, input, finalVerdict);
+				if (outcome.details["antiSlopDelivery"] === true && typeof toolCallId === "string") {
+					deliveryCalls.add(toolCallId);
+				}
+				return undefined;
 			});
 
 			pi.on("tool_result", async (event, ctx) => {
@@ -733,6 +849,8 @@ export function createJevController(deps: ControllerDeps): JevController {
 				const toolName = record["toolName"];
 				const input = record["input"];
 				if (typeof toolName !== "string" || !isConsequentialMutation(toolName, input)) return undefined;
+				const callId = record["toolCallId"];
+				const delivery = typeof callId === "string" && deliveryCalls.delete(callId);
 				const state = stateFor(ctx);
 				// Only the registered development task carries the interval, the evidence and the hold.
 				if (state.task === undefined) return undefined;
@@ -748,7 +866,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 					recordFailedAction(state, action);
 					return undefined;
 				}
-				recordAction(state, action);
+				recordAction(state, action, !delivery);
 				// A change outside the approved plan is a trigger of its own (FR-25): the plan named the
 				// paths its topics change, so an action elsewhere is a possible change of course.
 				if (state.deviation === undefined && targetOutsidePlan(toolName, target, state.planTopics)) {
@@ -775,6 +893,28 @@ export function createJevController(deps: ControllerDeps): JevController {
 				await restoreApprovedPlan(ctx);
 				const state = stateFor(ctx);
 				announce(pi, ctx, state);
+				if (deps.config.antiSlop.mode === "advisory") {
+					const scope = antiSlopScope(state);
+					if (scope !== undefined && !scope.quiet) {
+						const status = antiSlopStatus(state, scope);
+						if (!status.complete) {
+							const signature = `advisory:${scope.revision}:${status.missing.join(",")}:${status.blockers.map(finding => finding.id).join(",")}:${status.inconsistent}`;
+							if (state.antiSlopNotice !== signature) {
+								state.antiSlopNotice = signature;
+								notify(
+									ctx,
+									"Jevstice: the advisory anti-slop review is missing or has unwaived blockers; completion is not held in advisory mode.",
+								);
+								sendMessage(
+									pi,
+									"jev.anti_slop_advisory",
+									"The external deliverable has no complete anti-slop review at this revision. Completion is not held in advisory mode; the gap is disclosed, not approved.",
+									"aside",
+								);
+							}
+						}
+					}
+				}
 				const gate = completionGate(state, deps.config);
 				if (!gate.applies) return undefined;
 				let reason = gate.reason;

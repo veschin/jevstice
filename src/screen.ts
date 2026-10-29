@@ -29,6 +29,15 @@ const ROUTINE =
 const CHANGE =
 	/\b(?:implement|add|bug|improv|creat|delet|extract|featur|fix|generat|implement|integrat|migrat|move|rename|refactor|remov|rewrit|split|support|updat|upgrad|writ)\w*\b|(?:добав|реализ|почин|исправ|поправ|правк|фикс|созда|напиш|перепиш|передела|доработ|улучш|обнов|удал|перенес|перенест|перемест|вынес|раздели|поддерж|внедр|миграц|рефактор|докрут|додел|фич)/iu;
 
+/** A quiet request that names an external artifact or its publication (FR-45). */
+const EXTERNAL_DELIVERABLE =
+	/\b(?:publish|send|email|post|deliver|submit|file|serve|document|memo|memorandum|report|article|paper|brief|contract|agreement|letter|filing|submission|manuscript|research|analysis|policy|essay|thesis|dissertation|abstract|proposal|presentation|law|statute|regulation)\w*\b|(?:опублик|отправ|переда|подай|сдай|разошли|размести|документ|меморандум|отч[её]т|стать[яеиюё]|договор|соглашен|письм|заявлен|заключен|исследован|справк|доклад|юридическ|контракт|публикац|эссе|реферат|тезис|диссертац|презентац|предложен|закон|устав|регламент)/iu;
+
+/** Whether a quiet request names an external deliverable rather than an internal inspection. */
+export function namesExternalDeliverable(request: string): boolean {
+	return EXTERNAL_DELIVERABLE.test(request);
+}
+
 /**
  * The screen's verdict for one request. An empty or unrecognised request is `judged`: the judge is
  * the one that decides depth, and this file only decides whether asking is worth anything.

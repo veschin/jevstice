@@ -48,7 +48,11 @@ export function answeringJudge(table: Record<string, FakeAnswerSource>): FakeJud
 		const answers: JudgeAnswer[] = [];
 		for (const question of questions) {
 			const source = table[question.name];
-			const spec = typeof source === "function" ? source(question) : source;
+			// The external-deliverable classifier is new; old tables stay internal unless a test
+			// supplies it explicitly.
+			const spec =
+				(typeof source === "function" ? source(question) : source) ??
+				(question.name === "external_deliverable" ? { probability: 0 } : undefined);
 			if (spec === undefined) return { ok: false, kind: "unusable", problem: `no fake answer for '${question.name}'` };
 			const confidence = spec.confidence ?? 0.95;
 			if (question.mode === "choice") {
@@ -97,15 +101,19 @@ export interface EmittedMessage {
 export interface FakePi {
 	api: PiApi;
 	tools: Map<string, PiToolDefinition>;
+	commands: Map<string, (args: string, ctx: unknown) => void>;
 	messages: EmittedMessage[];
 	/** Run every handler registered for an event and collect the returned results. */
 	emit(event: string, payload: unknown, ctx: unknown): Promise<unknown[]>;
 	/** Run one registered tool the way the host does, with an injected context. */
 	callTool(name: string, params: unknown, ctx: unknown): Promise<unknown>;
+	/** Run one registered owner command. */
+	callCommand(name: string, args: string, ctx: unknown): void;
 }
 
 export function fakePi(): FakePi {
 	const tools = new Map<string, PiToolDefinition>();
+	const commands = new Map<string, (args: string, ctx: unknown) => void>();
 	const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
 	const messages: EmittedMessage[] = [];
 	const api: PiApi = {
@@ -114,6 +122,9 @@ export function fakePi(): FakePi {
 		},
 		registerTool(tool) {
 			tools.set(tool.name, tool);
+		},
+		registerCommand(name, options) {
+			commands.set(name, options.handler);
 		},
 		sendMessage(payload, options) {
 			const record = asRecord(payload) ?? {};
@@ -128,6 +139,7 @@ export function fakePi(): FakePi {
 	return {
 		api,
 		tools,
+		commands,
 		messages,
 		async emit(event, payload, ctx) {
 			const results: unknown[] = [];
@@ -138,6 +150,11 @@ export function fakePi(): FakePi {
 			const tool = tools.get(name);
 			if (tool === undefined) throw new Error(`tool '${name}' is not registered`);
 			return tool.execute("call-1", params, undefined, undefined, ctx);
+		},
+		callCommand(name, args, ctx) {
+			const handler = commands.get(name);
+			if (handler === undefined) throw new Error(`command '${name}' is not registered`);
+			handler(args, ctx);
 		},
 	};
 }
