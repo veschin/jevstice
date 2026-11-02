@@ -6,7 +6,7 @@
  * decision certainty is derived.
  * The SDK returns no free prose, so nothing here invents an explanation.
  *
- * Fail-closed normalization (POLICY.failureNeverApproves): a malformed request is refused
+ * Fail-closed normalization: a malformed request is refused
  * before any call, and a missing key, a transport error, a missing answer, an unknown
  * choice label or a confidence outside [0, 1] produce `{ ok: false }`. Callers must treat
  * that as "no answer", never as approval.
@@ -15,7 +15,7 @@ import { choice, noul, score, TypeSafeClient, type ChoiceCriteria, type EntryTyp
 import { POLICY, asRecord, type Evidence } from "./types.js";
 
 /** The three question shapes the executor may choose from. */
-export type JudgeMode = "choice" | "score" | "noul";
+type JudgeMode = "choice" | "score" | "noul";
 
 /** One question as the activity authors it. */
 export interface JudgeQuestion {
@@ -54,7 +54,7 @@ export interface JudgeAnswer {
  * Neither counts as an approval; only `unavailable` counts towards the availability bound (FR-21).
  */
 export type JudgeOutcome =
-	| { ok: true; model: string; answers: readonly JudgeAnswer[] }
+	| { ok: true; answers: readonly JudgeAnswer[]; usage?: { inputTokens: number; outputTokens: number } }
 	| { ok: false; problem: string; kind: JudgeFailureKind };
 
 /** Why a judge answer could not be used (FR-20, FR-21). */
@@ -138,8 +138,19 @@ export function normalizeAnswers(
 	raw: unknown,
 ): JudgeOutcome {
 	const envelope = asRecord(raw);
-	const model = typeof envelope?.["model"] === "string" ? envelope["model"] : POLICY.defaultModel;
 	const answers = asRecord(envelope?.["answers"]);
+	const usageRecord = asRecord(envelope?.["usage"]);
+	const inputTokens = usageRecord?.["input_tokens"];
+	const outputTokens = usageRecord?.["output_tokens"];
+	const usage =
+		typeof inputTokens === "number" &&
+		Number.isFinite(inputTokens) &&
+		inputTokens >= 0 &&
+		typeof outputTokens === "number" &&
+		Number.isFinite(outputTokens) &&
+		outputTokens >= 0
+			? { inputTokens, outputTokens }
+			: undefined;
 	if (answers === undefined) return { ok: false, kind: "unusable", problem: "the judge returned no answers" };
 	const extra = Object.keys(answers).filter(name => !questions.some(question => question.name === name));
 	if (extra.length > 0) return { ok: false, kind: "unusable", problem: `the judge answered unknown questions: ${extra.join(", ")}` };
@@ -159,6 +170,7 @@ export function normalizeAnswers(
 			return { ok: false, kind: "unusable", problem: `answer '${question.name}' reports no usable confidence` };
 		}
 		if (question.mode === "choice") {
+			if (answer["type"] !== "choice") return { ok: false, kind: "unusable", problem: `answer '${question.name}' is not typed as a choice` };
 			const label = answer["choice"];
 			if (typeof label !== "string" || !Object.hasOwn(question.options ?? {}, label)) {
 				return { ok: false, kind: "unusable", problem: `answer '${question.name}' selected a label that was not offered` };
@@ -167,12 +179,13 @@ export function normalizeAnswers(
 			continue;
 		}
 		const value = answer["score"];
+		if (answer["type"] !== "score") return { ok: false, kind: "unusable", problem: `answer '${question.name}' is not typed as a score` };
 		if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > (question.criteria?.length ?? 0) - 1) {
 			return { ok: false, kind: "unusable", problem: `answer '${question.name}' carries a score outside the submitted rubric` };
 		}
 		normalized.push({ name: question.name, mode: "score", score: value, confidence });
 	}
-	return { ok: true, model, answers: normalized };
+	return { ok: true, answers: normalized, ...(usage === undefined ? {} : { usage }) };
 }
 
 /** The production transport: one TypeSafe client per resolved key, no body logging. */

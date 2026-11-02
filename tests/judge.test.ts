@@ -58,6 +58,7 @@ describe("T1 - the judge adapter returns typed answers", () => {
 				effort: { type: "score", score: 1.6, confidence: 0.88, probabilities: { "0": 0.05, "1": 0.3, "2": 0.65 }, legend: {} },
 				worth: { type: "noul", noul: 0.93 },
 			},
+			usage: { input_tokens: 120, output_tokens: 12 },
 		});
 		const judge = createTypeSafeJudge({ resolveKey: async () => "key", createClient: () => client });
 
@@ -71,6 +72,7 @@ describe("T1 - the judge adapter returns typed answers", () => {
 		expect(probabilityOf(outcome, "worth")).toBeCloseTo(0.93);
 		expect(saidTrue(outcome, "worth")).toBe(true);
 		expect(answerOf(outcome, "decision")?.confidence).toBeCloseTo(0.91);
+		expect(outcome.ok ? outcome.usage : undefined).toEqual({ inputTokens: 120, outputTokens: 12 });
 	});
 
 	test("FR-08: the submitted criteria reach the wire and no answer invents prose", async () => {
@@ -115,7 +117,7 @@ describe("T1 - the judge adapter returns typed answers", () => {
 });
 
 describe("T1 - fail-closed normalization", () => {
-	test("POLICY.failureNeverApproves: a missing key never reaches the transport and never approves", async () => {
+	test("fail-closed: a missing key never reaches the transport and never approves", async () => {
 		const { client, requests } = transportReturning({ model: "m", answers: {} });
 		const judge = createTypeSafeJudge({ resolveKey: async () => undefined, createClient: () => client });
 
@@ -125,7 +127,7 @@ describe("T1 - fail-closed normalization", () => {
 		expect(requests).toHaveLength(0);
 	});
 
-	test("POLICY.failureNeverApproves: the key is handed to the client and never enters the request", async () => {
+	test("fail-closed: the key is handed to the client and never enters the request", async () => {
 		const { client, requests } = transportReturning({
 			model: "m",
 			answers: { decision: { type: "choice", choice: "keep", confidence: 0.9 }, effort: { type: "score", score: 0 }, worth: { type: "noul", noul: 0.9 } },
@@ -145,7 +147,7 @@ describe("T1 - fail-closed normalization", () => {
 		expect(JSON.stringify(requests[0])).not.toContain("secret-key");
 	});
 
-	test("POLICY.failureNeverApproves: malformed answers never approve", () => {
+	test("fail-closed: malformed answers never approve", () => {
 		const cases: Array<[string, unknown]> = [
 			["no answers key", { model: "m" }],
 			["missing answer", { model: "m", answers: { effort: { type: "score", score: 1, confidence: 0.9 }, worth: { type: "noul", noul: 0.9 } } }],
@@ -153,6 +155,10 @@ describe("T1 - fail-closed normalization", () => {
 			["confidence outside [0,1]", { model: "m", answers: { decision: { type: "choice", choice: "keep", confidence: 1.4 }, effort: { type: "score", score: 1, confidence: 0.9 }, worth: { type: "noul", noul: 0.9 } } }],
 			["answer for a question that was not asked", { model: "m", answers: { other: { type: "noul", noul: 0.9 }, decision: { type: "choice", choice: "keep", confidence: 0.9 }, effort: { type: "score", score: 1, confidence: 0.9 }, worth: { type: "noul", noul: 0.9 } } }],
 			["score missing", { model: "m", answers: { decision: { type: "choice", choice: "keep", confidence: 0.9 }, effort: { type: "score", confidence: 0.9 }, worth: { type: "noul", noul: 0.9 } } }],
+			["choice type missing", { model: "m", answers: { decision: { choice: "keep", confidence: 0.9 }, effort: { type: "score", score: 1, confidence: 0.9 }, worth: { type: "noul", noul: 0.9 } } }],
+			["choice type not choice", { model: "m", answers: { decision: { type: "score", choice: "keep", confidence: 0.9 }, effort: { type: "score", score: 1, confidence: 0.9 }, worth: { type: "noul", noul: 0.9 } } }],
+			["score type missing", { model: "m", answers: { decision: { type: "choice", choice: "keep", confidence: 0.9 }, effort: { score: 1, confidence: 0.9 }, worth: { type: "noul", noul: 0.9 } } }],
+			["score type not score", { model: "m", answers: { decision: { type: "choice", choice: "keep", confidence: 0.9 }, effort: { type: "choice", score: 1, confidence: 0.9 }, worth: { type: "noul", noul: 0.9 } } }],
 		];
 		for (const [name, payload] of cases) {
 			const outcome = normalizeAnswers(THREE_MODES, payload);
@@ -167,14 +173,14 @@ describe("T1 - fail-closed normalization", () => {
 		expect(saidTrue(outcome, "worth")).toBe(false);
 	});
 
-	test("POLICY.failureNeverApproves: reject unsupported Boolean fields and scores outside the rubric", () => {
+	test("fail-closed: reject unsupported Boolean fields and scores outside the rubric", () => {
 		const unsupportedBoolean = normalizeAnswers([WORTH], { model: "m", answers: { worth: { boolean: 0.99 } } });
 		const outsideRubric = normalizeAnswers([EFFORT], { model: "m", answers: { effort: { type: "score", score: 3, confidence: 0.99 } } });
 		expect(unsupportedBoolean.ok).toBe(false);
 		expect(outsideRubric.ok).toBe(false);
 	});
 
-	test("POLICY.failureNeverApproves: a transport error never echoes the API key", async () => {
+	test("fail-closed: a transport error never echoes the API key", async () => {
 		const judge = createTypeSafeJudge({
 			resolveKey: async () => "secret-key",
 			createClient: () => ({
@@ -186,7 +192,7 @@ describe("T1 - fail-closed normalization", () => {
 		expect(JSON.stringify(outcome)).not.toContain("secret-key");
 	});
 
-	test("POLICY.failureNeverApproves: a malformed request is refused before any call", async () => {
+	test("fail-closed: a malformed request is refused before any call", async () => {
 		const { client, requests } = transportReturning({ model: "m", answers: {} });
 		const judge = createTypeSafeJudge({ resolveKey: async () => "key", createClient: () => client });
 
@@ -199,7 +205,7 @@ describe("T1 - fail-closed normalization", () => {
 		expect(questionProblem(THREE_MODES)).toBeUndefined();
 	});
 
-	test("POLICY.failureNeverApproves: a transport failure never approves", async () => {
+	test("fail-closed: a transport failure never approves", async () => {
 		const judge = createTypeSafeJudge({
 			resolveKey: async () => "key",
 			createClient: () => ({
@@ -214,7 +220,7 @@ describe("T1 - fail-closed normalization", () => {
 		expect(outcome.ok).toBe(false);
 	});
 
-	test("POLICY.failureNeverApproves: an answer below the floor is not an approval", () => {
+	test("fail-closed: an answer below the floor is not an approval", () => {
 		const low = normalizeAnswers(THREE_MODES, {
 			model: "m",
 			answers: {

@@ -56,10 +56,12 @@ import {
 	invalidatePlan,
 	markDeviation,
 	recordAction,
+	recordActivityOutcome,
 	recordAntiSlopWaiver,
 	recordFailedAction,
 	recordRefusedCall,
 	recordStopBlock,
+	permitAfterIgnoredCalls,
 	screenRequest,
 	sha256,
 	type JevState,
@@ -72,7 +74,6 @@ import { PLAN_BOUNDARY, POLICY, asRecord, type JevConfig, type PlanTopic, type T
 
 /** A schema node as this extension builds it; the host validates the built schema itself. */
 export interface SchemaLike {
-	describe(text: string): SchemaLike;
 	optional(): SchemaLike;
 }
 
@@ -81,7 +82,6 @@ export interface SchemaBuilder {
 	object(shape: Record<string, SchemaLike>): SchemaLike;
 	array(element: SchemaLike): SchemaLike;
 	string(): SchemaLike;
-	boolean(): SchemaLike;
 	number(): SchemaLike;
 	enum(values: readonly [string, ...string[]]): SchemaLike;
 }
@@ -106,29 +106,42 @@ export interface PiApi {
 	on(event: string, handler: (event: unknown, ctx: unknown) => unknown): void;
 	registerTool(tool: PiToolDefinition): void;
 	registerCommand?(name: string, options: { description: string; handler: (args: string, ctx: unknown) => void }): void;
-	sendMessage?(
-		payload: unknown,
-		options?: { deliverAs?: "steer" | "followUp" | "nextTurn" | "aside"; triggerTurn?: boolean },
-	): void;
+	sendMessage?(payload: unknown, options?: { deliverAs?: "steer" | "followUp" | "nextTurn" | "aside"; triggerTurn?: boolean }): void;
 	logger?: { warn?(...args: unknown[]): void };
 }
 
-export interface ControllerDeps {
+/** Optional runtime hooks; the ordinary controller has no dependency on their implementation. */
+export interface ControllerRuntime {
+	stateFor(ctx: unknown): JevState;
+	judgeFor(ctx: unknown): Judge;
+	readArtifact(ctx: unknown, url: string): Promise<string | null>;
+	consequential(toolName: string, input: unknown): boolean;
+	beforeTool(ctx: unknown, event: unknown): GateVerdict | undefined;
+	admit(ctx: unknown, state: JevState, event: unknown): Promise<void>;
+	checkpoint(ctx: unknown, state: JevState, reason: string, params?: unknown): Promise<void>;
+	toolResult(ctx: unknown, state: JevState, event: unknown, delivery?: boolean): Promise<void>;
+	stop(ctx: unknown, state: JevState, deps: ActivityDeps): Promise<{ decision: "block"; reason: string } | undefined>;
+}
+
+interface ControllerDeps {
 	judge: Judge;
 	config: JevConfig;
 	zod: SchemaBuilder;
+	autonomy?: ControllerRuntime;
 }
 
-export interface JevController {
+interface JevController {
 	register(pi: PiApi): void;
 }
 
 const CONSULT_DESCRIPTION =
 	"Use one decision: choice needs alternatives, score needs at least two criteria, boolean needs trueMeaning and falseMeaning. Fill question and relevant context; add exact source quotes when useful. To clear a hold, ask whether a specific corrective action resolves its finding. A below-floor result is not approval.";
 
-
 const WORKFLOW_NOTE =
 	" Read-only work needs no triage. Development normally requires requirements, a plan and both acceptance aspects. The owner can permit continuation with /jev-continue or an explicit approval message. After the attempt limit, continue with unresolved findings marked OPEN; permission to proceed is not Jev approval.";
+
+const STRICT_WORKFLOW_NOTE =
+	" Strict autonomous run: the immutable owner objective is already registered as development. Start with Jev requirements and the staged artifact-bound plan; use Jev for consequential decisions. Owner text, repeated refusals and unavailable judgment never grant permission. Preserve durable evidence; use jev_autonomy to inspect, reconcile an unknown effect, request a judged rotation or establish infeasibility. Ordinary triage, re-aim and continuation overrides do not apply.";
 
 const TRIAGE_DESCRIPTION =
 	"Before a consequential change, submit the owner's request and concrete task topics. A development result requires requirements review and plan review: derive one checkable obligation per part of the request yourself and submit it with jev_requirements, then plan. No owner confirmation step exists - do not ask the owner to confirm the obligation list. The same call records whether the deliverable is external-facing; the anti-slop review applies only then. A simple result names skipped stages; an unsettled result registers nothing.";
@@ -151,12 +164,12 @@ const REVIEW_DESCRIPTION =
 	"Submit review kind (checkpoint, commit or diff), target, one claim, changed-code evidence and verification output. A finding holds changes until jev_consult resolves it. This review never replaces business or architecture acceptance.";
 
 const TEXT_REVIEW_DESCRIPTION =
-	"Submit the text and exact rules as {class, rule}. Jev returns violating fragments and the submitted rules they break; revise only those fragments. No returned defects means the text meets the submitted rules.";
+	"Submit the text and exact rules as {class, rule, scope}. scope=text judges the whole text once and is the default; scope=fragment judges each prose fragment, and headings and table blocks are never judged as sentences. Jev returns the violating fragments and the rules they break in the result; revise only those. No returned defects means the text meets the submitted rules.";
 
 const ANTI_SLOP_DESCRIPTION =
 	"Use for an external document, research output or legal communication. Submit the exact artifact, declared language/register/purpose/audience, owner rules, factual claims with quoted evidence and sourceClass, hypotheses with falsifiers, and inferences with premises, warrant and conclusion. Jev marks each claim and inference trusted, low_trust, distrusted or unverified and returns findings; advisory by default. A large artifact is split into numbered parts. No meta-text in the artifact or the result.";
 
-const JEV_SKILL = readFileSync(new URL("./jev-skill.md", import.meta.url), "utf8").trim();
+export const JEV_SKILL = readFileSync(new URL("./jev-skill.md", import.meta.url), "utf8").trim();
 
 
 /** Best-effort reading of one string-valued method off the session manager. */
@@ -190,9 +203,9 @@ function notify(ctx: unknown, text: string): void {
 	}
 }
 
-function sendMessage(pi: PiApi, customType: string, text: string, deliverAs: "aside" | "nextTurn"): void {
+function sendMessage(pi: PiApi, customType: string, text: string): void {
 	try {
-		pi.sendMessage?.({ customType, content: text, display: true }, { deliverAs });
+		pi.sendMessage?.({ customType, content: text, display: true }, { deliverAs: "aside" });
 	} catch (error) {
 		pi.logger?.warn?.("jevstice: could not deliver a session message", error);
 	}
@@ -239,10 +252,13 @@ function changeOf(input: unknown): string {
 	return `${text.slice(0, POLICY.maxActionExcerptChars)}...`;
 }
 
+/** A dollar amount with six decimals, trailing zeros removed, for the session status. */
+function formatUsd(value: number): string {
+	return value.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
+}
+
 /** A plan approval granted in a session the host is about to replace with the execution session. */
 interface PlanHandoff {
-	/** The session the approval was granted in; the approval is never restored back into it. */
-	fromSessionId: string;
 	task: TaskIdentity;
 	plan: PlanApproval;
 	planTopics: PlanTopic[];
@@ -257,12 +273,41 @@ export function createJevController(deps: ControllerDeps): JevController {
 
 	const stateFor = (ctx: unknown): JevState => {
 		const id = sessionIdOf(ctx);
+		if (deps.autonomy !== undefined) {
+			const state = deps.autonomy.stateFor(ctx);
+			states.set(id, state);
+			return state;
+		}
 		let state = states.get(id);
 		if (state === undefined) {
 			state = freshState();
 			states.set(id, state);
 		}
 		return state;
+	};
+
+	/** The owner-facing session status: per-tool outcomes, judge calls and spend. */
+	const statusText = (state: JevState): string => {
+		const activities = Object.entries(state.stats)
+			.sort(([left], [right]) => left.localeCompare(right))
+			.map(([name, count]) => `${name} ${count.ok}/${count.fail}`)
+			.join(", ");
+		const spend =
+			(state.usage.inputTokens * deps.config.billing.inputCostPerMillion +
+				state.usage.outputTokens * deps.config.billing.outputCostPerMillion) /
+			1_000_000;
+		const balance = deps.config.billing.balance;
+		const money =
+			balance === undefined
+				? `spend ${formatUsd(spend)}$ (balance not configured)`
+				: `spend ${formatUsd(spend)}/${formatUsd(balance)}$`;
+		const calls = state.usage.judgeCalls;
+		return `Jevstice status: ${activities.length > 0 ? activities : "no activity calls"}; judge ${calls} call${calls === 1 ? "" : "s"}; ${money}`;
+	};
+
+	const emitStatusIfDue = (pi: PiApi, state: JevState): void => {
+		const total = Object.values(state.stats).reduce((sum, count) => sum + count.ok + count.fail, 0);
+		if (total > 0 && total % POLICY.statusEveryCalls === 0) sendMessage(pi, "jev.status", statusText(state));
 	};
 
 	/**
@@ -286,9 +331,10 @@ export function createJevController(deps: ControllerDeps): JevController {
 	};
 
 	const activitiesFor = (ctx: unknown): ActivityDeps => ({
-		judge: deps.judge,
+		judge: deps.autonomy?.judgeFor(ctx) ?? deps.judge,
 		config: deps.config,
 		readArtifact: async url => {
+			if (deps.autonomy !== undefined) return deps.autonomy.readArtifact(ctx, url);
 			if (!url.startsWith("local://")) return null;
 			const manager = sessionManagerOf(ctx);
 			return readLocalArtifact(
@@ -364,20 +410,25 @@ export function createJevController(deps: ControllerDeps): JevController {
 			state.openItemNotified = signature;
 			notify(
 				ctx,
-				`Jevstice recorded ${openItem.boundary} as OPEN after the attempt limit. Continuing this request is permitted; no refused decision is approved.`,
+				state.autonomous === true
+					? `Jevstice recorded ${openItem.boundary} as OPEN. Strict autonomy still requires a current Jev decision; refusal counts authorize no effect.`
+					: `Jevstice recorded ${openItem.boundary} as OPEN after the attempt limit. Continuing this request is permitted; no refused decision is approved.`,
 			);
 			sendMessage(
 				pi,
 				"jev.open_item",
-				`Jevstice stopped retrying ${openItem.boundary}. Continue the current request with this finding OPEN, not approved. Prior refused material remains recorded.`,
-				"aside",
+				state.autonomous === true
+					? `The ${openItem.boundary} decision remains OPEN. Observe missing evidence or submit a materially changed proposal; do not repeat refused material or bypass the decision.`
+					: `Jevstice stopped retrying ${openItem.boundary}. Continue the current request with this finding OPEN, not approved. Prior refused material remains recorded.`,
 			);
 		}
 		if (state.judgeUnavailable === true && state.judgeUnavailableNotified !== true) {
 			state.judgeUnavailableNotified = true;
 			notify(
 				ctx,
-				`Jevstice: the judge could not be reached for ${POLICY.maxJudgeFailures} calls. Continue this request with unjudged decisions OPEN; no Jev approval is recorded.`,
+				state.autonomous === true
+					? "Jevstice: the judge is unavailable. Strict autonomy waits durably; no consequential call or completion is authorized."
+					: `Jevstice: the judge could not be reached for ${POLICY.maxJudgeFailures} calls. Continue this request with unjudged decisions OPEN; no Jev approval is recorded.`,
 			);
 		}
 	};
@@ -392,19 +443,22 @@ export function createJevController(deps: ControllerDeps): JevController {
 		pi: PiApi,
 		ctx: unknown,
 		state: JevState,
-		toolName: string,
-		input: unknown,
 		verdict: GateVerdict,
 	): { block: true; reason: string } => {
 		const boundary = verdict.boundary ?? "gate";
 		const reason = verdict.reason ?? `Jevstice holds this change at the ${boundary} boundary.`;
-		const count = recordRefusedCall(state, boundary, `${toolName} ${targetOf(input)}`);
-		if (count === 1) sendMessage(pi, "jev.boundary", reason, "aside");
+		const count = recordRefusedCall(state, boundary);
+		if (count === 1) sendMessage(pi, "jev.boundary", reason);
 		if (count === POLICY.maxIgnoredBoundaryCalls) {
-			exhaustBoundary(state, boundary);
-			notify(ctx, `Jevstice: ${count} refused calls reached the attempt limit. Continuation is permitted; the ${boundary} finding remains OPEN.`);
-			sendMessage(pi, "jev.open_item", `The ${boundary} gate reached ${count} refused calls. Retry the operation: continuation of this request is now permitted with the finding OPEN, not approved.`, "aside");
+			permitAfterIgnoredCalls(state, boundary, count);
+			notify(ctx, state.autonomous === true
+				? `Jevstice: ${count} refused calls left the ${boundary} finding OPEN. Strict autonomy has no attempt-limit override.`
+				: `Jevstice: ${count} refused calls reached the attempt limit. Continuation is permitted; the ${boundary} finding remains OPEN.`);
+			sendMessage(pi, "jev.open_item", state.autonomous === true
+				? `The ${boundary} decision remains unapproved. Obtain actual evidence or change the proposal; repeated blocked calls grant no authority.`
+				: `The ${boundary} gate reached ${count} refused calls. Retry the operation: continuation of this request is now permitted with the finding OPEN, not approved.`);
 		}
+		if (state.autonomous === true) return { block: true, reason: `${reason} Strict autonomy requires current Jev authorization; use jev_autonomy status for durable recovery state.` };
 		return { block: true, reason: continuationAllowed(state) ? `${reason} Attempt limit reached: retry the operation; continuation is permitted with the finding OPEN.` : `${reason} The owner may permit continuation with /jev-continue or an explicit approval message.` };
 	};
 
@@ -419,7 +473,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 				const state = states.get(id);
 				return state === undefined ? undefined : courseCheck(activitiesFor(ctx), state);
 			});
-			if (outcome !== undefined) sendMessage(pi, "jev.course_check", outcome.text, "aside");
+			if (outcome !== undefined) sendMessage(pi, "jev.course_check", outcome.text);
 		} catch (error) {
 			pi.logger?.warn?.("jevstice: the course check failed", error);
 		} finally {
@@ -434,12 +488,20 @@ export function createJevController(deps: ControllerDeps): JevController {
 			const deliveryCalls = new Set<string>();
 			const approve = (ctx: unknown): void => {
 				const state = stateFor(ctx);
+				if (state.autonomous === true) {
+					notify(ctx, "Jevstice: strict autonomy does not accept continuation overrides; stop the supervised run to cancel it.");
+					return;
+				}
 				allowContinuation(state, "explicit owner approval; unresolved findings remain OPEN");
 				notify(ctx, "Jevstice: owner authorized continuation of this request. Unresolved findings remain OPEN; no Jev approval is recorded.");
-				sendMessage(pi, "jev.owner_approval", "The owner permits continuation of the current request despite Jev holds. Proceed; disclose unresolved findings as OPEN rather than claiming Jev approved them.", "aside");
+				sendMessage(pi, "jev.owner_approval", "The owner permits continuation of the current request despite Jev holds. Proceed; disclose unresolved findings as OPEN rather than claiming Jev approved them.");
 			};
 			const waive = (ctx: unknown, findingId: string, reason: string): void => {
 				const state = stateFor(ctx);
+				if (state.autonomous === true) {
+					notify(ctx, "Jevstice: strict autonomy requires correction and current Jev review; a waiver does not expand its initial authority.");
+					return;
+				}
 				const found = findAntiSlopFinding(state, findingId);
 				if (found === undefined) {
 					notify(ctx, `Jevstice: no anti-slop finding ${findingId} is recorded in this session.`);
@@ -462,10 +524,13 @@ export function createJevController(deps: ControllerDeps): JevController {
 					pi,
 					"jev.anti_slop_waiver",
 					`The owner waived anti-slop finding ${findingId}. It remains recorded as waived by the owner, not approved by Jev.`,
-					"aside",
 				);
 			};
 			pi.registerCommand?.("jev-continue", { description: "Continue the current request with unresolved Jev findings OPEN", handler: (_args, ctx) => approve(ctx) });
+			pi.registerCommand?.("jev-status", {
+				description: "Show Jevstice session calls, outcomes and spend",
+				handler: (_args, ctx) => sendMessage(pi, "jev.status", statusText(stateFor(ctx))),
+			});
 			pi.registerCommand?.("jev-waive", {
 				description: "Waive one anti-slop finding by its id",
 				handler: (args: string, ctx: unknown) => {
@@ -478,6 +543,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 				},
 			});
 			pi.on("input", (event, ctx) => {
+				if (deps.autonomy !== undefined) return;
 				const input = asRecord(event);
 				if (input?.["source"] !== "interactive" && input?.["source"] !== "rpc") return;
 				const text = input["text"];
@@ -496,13 +562,37 @@ export function createJevController(deps: ControllerDeps): JevController {
 			});
 			const z = deps.zod;
 			/** One registered description: the tool's own text and the note every tool shares. */
-			const described = (body: string): string => `${body}${WORKFLOW_NOTE}`;
+			const described = (body: string): string => `${body}${deps.autonomy === undefined ? WORKFLOW_NOTE : STRICT_WORKFLOW_NOTE}`;
 			const evidence = z.array(z.object({ kind: z.string(), quote: z.string(), source: z.string().optional() }));
 			const run =
-				(runActivity: (activity: ActivityDeps, state: JevState, params: unknown) => Promise<ToolOutcome>) =>
+				(name: string, runActivity: (activity: ActivityDeps, state: JevState, params: unknown) => Promise<ToolOutcome>) =>
 				async (_id: string, params: unknown, _signal: unknown, _onUpdate: unknown, ctx: unknown) => {
 					const id = sessionIdOf(ctx);
-					const outcome = await serialized(id, () => runActivity(activitiesFor(ctx), stateFor(ctx), params));
+					const state = stateFor(ctx);
+					const request = state.request;
+					const task = state.task;
+					const simple = state.simple;
+					const revision = state.revision;
+					const outcome = await serialized(id, async (): Promise<ToolOutcome> => {
+						if (
+							states.get(id) !== state ||
+							sessionIdOf(ctx) !== id ||
+							state.request !== request ||
+							state.task !== task ||
+							state.simple !== simple ||
+							state.revision !== revision
+						) {
+							return {
+								ok: false,
+								text: "The queued activity was refused: its session, request, task or work changed while it waited. No judgment ran and nothing was approved; submit it again for the current context.",
+							};
+						}
+						const result = await runActivity(activitiesFor(ctx), state, params);
+						await deps.autonomy?.checkpoint(ctx, state, name, params);
+						return result;
+					});
+					recordActivityOutcome(state, name, outcome.ok);
+					emitStatusIfDue(pi, state);
 					return { content: [{ type: "text", text: outcome.text }], details: outcome.details ?? {}, isError: !outcome.ok };
 				};
 
@@ -520,7 +610,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 					trueMeaning: z.string().optional(),
 					falseMeaning: z.string().optional(),
 				}),
-				execute: run(consult),
+				execute: run("jev_consult", consult),
 			});
 
 			pi.registerTool({
@@ -532,7 +622,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 					topics: z.array(z.string()).optional(),
 					evidence: evidence.optional(),
 				}),
-				execute: run(triage),
+				execute: run("jev_triage", triage),
 			});
 
 			pi.registerTool({
@@ -543,7 +633,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 					interjection: z.string(),
 					evidence,
 				}),
-				execute: run(reaim),
+				execute: run("jev_reaim", reaim),
 			});
 
 			pi.registerTool({
@@ -554,7 +644,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 					query: z.string(),
 					candidates: z.array(z.object({ title: z.string().optional(), url: z.string().optional(), evidence: z.string(), reason: z.string() })),
 				}),
-				execute: run(searchRelevance),
+				execute: run("jev_search_relevance", searchRelevance),
 			});
 
 			pi.registerTool({
@@ -567,7 +657,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 					candidateNeeds: z.array(z.string()).optional(),
 					evidence: evidence.optional(),
 				}),
-				execute: run(requirements),
+				execute: run("jev_requirements", requirements),
 			});
 
 			pi.registerTool({
@@ -590,7 +680,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 						.optional(),
 					evidence,
 				}),
-				execute: run(planReview),
+				execute: run("jev_plan_review", planReview),
 			});
 
 			pi.registerTool({
@@ -602,7 +692,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 					claim: z.string(),
 					evidence,
 				}),
-				execute: run(acceptance),
+				execute: run("jev_acceptance", acceptance),
 			});
 
 			pi.registerTool({
@@ -615,7 +705,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 					claim: z.string(),
 					evidence,
 				}),
-				execute: run(review),
+				execute: run("jev_review", review),
 			});
 
 			pi.registerTool({
@@ -624,9 +714,9 @@ export function createJevController(deps: ControllerDeps): JevController {
 				description: described(TEXT_REVIEW_DESCRIPTION),
 				parameters: z.object({
 					text: z.string(),
-					rules: z.array(z.object({ class: z.string(), rule: z.string() })),
+					rules: z.array(z.object({ class: z.string(), rule: z.string(), scope: z.enum(["text", "fragment"]).optional() })),
 				}),
-				execute: run(textReview),
+				execute: run("jev_text_review", textReview),
 			});
 
 			pi.registerTool({
@@ -681,7 +771,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 						.optional(),
 					part: z.object({ index: z.number(), total: z.number() }).optional(),
 				}),
-				execute: run(antiSlop),
+				execute: run("jev_anti_slop", antiSlop),
 			});
 
 			pi.on("session_start", (_event, ctx) => {
@@ -698,40 +788,53 @@ export function createJevController(deps: ControllerDeps): JevController {
 			// completion check approved the current revision is finished and dropped, and an unfinished
 			// task keeps its walls - no prompt text opens them. The request is read once here, for free.
 			pi.on("before_agent_start", (event, ctx) => {
+				const input = asRecord(event);
+				const policy = input?.["systemPrompt"];
+				const systemPrompt = [...(Array.isArray(policy) ? policy : []), deps.autonomy === undefined ? JEV_SKILL : STRICT_WORKFLOW_NOTE];
 				const state = stateFor(ctx);
+				if (deps.autonomy !== undefined) return { systemPrompt };
 				const approval = approvedInputs.get(sessionIdOf(ctx));
 				approvedInputs.delete(sessionIdOf(ctx));
-				const incoming = asRecord(event)?.["prompt"];
-				if (approval !== undefined && incoming === approval) return { systemPromptAppend: JEV_SKILL };
-				if (continuationAllowed(state) && typeof incoming === "string" && /^(?:continue|proceed|продолжай|дальше)[.!]?$/iu.test(incoming.trim())) return { systemPromptAppend: JEV_SKILL };
+				const incoming = input?.["prompt"];
+				if (approval !== undefined && incoming === approval) return { systemPrompt };
+				if (continuationAllowed(state) && typeof incoming === "string" && /^(?:continue|proceed|продолжай|дальше)[.!]?$/iu.test(incoming.trim())) return { systemPrompt };
 				delete state.simple;
 				clearFinishedTask(state);
-				const prompt = asRecord(event)?.["prompt"];
+				const prompt = incoming;
 				screenRequest(state, typeof prompt === "string" ? prompt : "");
 				// An unfinished task plus a message the screen reads as a change of direction: nothing
 				// moves until a judged re-aim decides it. A routine follow-up keeps the task and its
-				// gate; read-only work stays free under either.
-				if (state.task !== undefined && state.request?.weight === "judged" && typeof prompt === "string" && prompt.trim().length > 0) {
-					state.directionPending = { text: prompt.trim() };
+				// gate and clears an older pending direction, so the gate never quotes a stale message.
+				const promptText = typeof prompt === "string" ? prompt.trim() : "";
+				if (promptText.length > 0) {
+					if (state.task !== undefined && state.request?.weight === "judged") {
+						state.directionPending = { text: promptText };
+					} else {
+						delete state.directionPending;
+					}
 				}
-				return { systemPromptAppend: JEV_SKILL };
+				return { systemPrompt };
 			});
 
 			// The approve-and-execute switch arms here; the approval is restored after the switch,
 			// because omp copies the artifacts over only once the switch has been emitted.
 			pi.on("session_before_switch", (event, _ctx) => {
+				if (deps.autonomy !== undefined) return;
 				switchArmed = asRecord(event)?.["reason"] === "new" && handoff !== undefined;
 			});
 
 			pi.on("session_switch", (event, ctx) => {
+				if (deps.autonomy !== undefined) return;
 				if (switchArmed && asRecord(event)?.["reason"] === "new" && handoff !== undefined) {
 					handoffSessionId = sessionIdOf(ctx);
 				}
 				switchArmed = false;
 			});
 
-			pi.on("tool_call", async (event, ctx) => {
-				await restoreApprovedPlan(ctx);
+			const toolCall = async (event: unknown, ctx: unknown) => {
+				const strictVerdict = await deps.autonomy?.beforeTool(ctx, event);
+				if (strictVerdict?.block === true) return { block: true as const, reason: strictVerdict.reason ?? "Strict autonomous authorization is unavailable." };
+				if (deps.autonomy === undefined) await restoreApprovedPlan(ctx);
 				const toolName = asRecord(event)?.["toolName"];
 				if (typeof toolName !== "string") return undefined;
 				const toolCallId = asRecord(event)?.["toolCallId"];
@@ -741,25 +844,25 @@ export function createJevController(deps: ControllerDeps): JevController {
 				if (continuationAllowed(state)) return undefined;
 				const triageVerdict = triageBeforeInspectionGate(state, deps.config, toolName, input);
 				if (triageVerdict.block) {
-					return refuse(pi, ctx, state, toolName, input, triageVerdict);
+					return refuse(pi, ctx, state, triageVerdict);
 				}
 				const requirementsVerdict = requirementsBeforePlanGate(state, deps.config, toolName, input);
 				if (requirementsVerdict.block) {
-					return refuse(pi, ctx, state, toolName, input, requirementsVerdict);
+					return refuse(pi, ctx, state, requirementsVerdict);
 				}
 				if (isProposeCall(toolName, input)) {
 					const verdict = proposeGate(state, deps.config, input);
 					if (!verdict.block && verdict.url !== undefined && state.plan !== undefined) {
 						const artifact = await activitiesFor(ctx).readArtifact?.(verdict.url);
 						if (artifact === null || artifact === undefined) {
-							return refuse(pi, ctx, state, toolName, input, {
+							return refuse(pi, ctx, state, {
 								block: true,
 								boundary: PROPOSE_BOUNDARY,
 								reason: planArtifactUnreadableReason(verdict.url),
 							});
 						}
 						if (sha256(artifact) !== state.plan.planDigest) {
-							return refuse(pi, ctx, state, toolName, input, {
+							return refuse(pi, ctx, state, {
 								block: true,
 								boundary: PROPOSE_BOUNDARY,
 								reason: planArtifactChangedReason(verdict.url),
@@ -767,7 +870,6 @@ export function createJevController(deps: ControllerDeps): JevController {
 						}
 						if (state.task !== undefined) {
 							handoff = {
-								fromSessionId: sessionIdOf(ctx),
 								task: state.task,
 								plan: state.plan,
 								planTopics: state.planTopics,
@@ -777,14 +879,14 @@ export function createJevController(deps: ControllerDeps): JevController {
 						}
 					}
 					return verdict.block
-						? refuse(pi, ctx, state, toolName, input, { ...verdict, boundary: verdict.boundary ?? PROPOSE_BOUNDARY })
+						? refuse(pi, ctx, state, { ...verdict, boundary: verdict.boundary ?? PROPOSE_BOUNDARY })
 						: undefined;
 				}
-				if (!isConsequentialMutation(toolName, input)) return undefined;
-				const verdict = mutationGate(state, deps.config, toolName, input);
-				if (verdict.block) return refuse(pi, ctx, state, toolName, input, verdict);
+				if (!(deps.autonomy?.consequential(toolName, input) ?? isConsequentialMutation(toolName, input))) return undefined;
+				const verdict = mutationGate(state, deps.config, toolName, input, true);
+				if (verdict.block) return refuse(pi, ctx, state, verdict);
 				// An owner who turned the gates off asked for no boundary at all.
-				if (!deps.config.gates.mutation) return undefined;
+				if (!deps.config.gates.mutation && deps.autonomy === undefined) return undefined;
 				// Every consequential candidate the deterministic gates admit is judged on its own
 				// payload before it runs: a registered task against its approved plan, a quiet or simple
 				// request against the owner's request itself. No tool name is trusted on its own.
@@ -792,23 +894,30 @@ export function createJevController(deps: ControllerDeps): JevController {
 				const admittedRevision = state.revision;
 				const admittedRequest = state.request?.text;
 				const binding = await planBindingVerdict(ctx, state);
-				if (binding !== undefined) return refuse(pi, ctx, state, toolName, input, binding);
+				if (binding !== undefined) return refuse(pi, ctx, state, binding);
 				// The judge receives the complete call, not the bounded evidence excerpt: a payload
 				// can hide its real content after the excerpt cap, and a truncated check would pass it.
-				const action = { tool: toolName, target: targetOf(input), change: JSON.stringify(input ?? null) };
+				const action = {
+					tool: toolName, target: targetOf(input), change: JSON.stringify(input ?? null),
+					...(deps.autonomy === undefined ? {} : { callId: typeof toolCallId === "string" ? toolCallId : undefined }),
+				};
 				let outcome: ToolOutcome;
 				try {
-					outcome = await serialized(sessionIdOf(ctx), () => actionCheck(activitiesFor(ctx), state, action));
+					outcome = await serialized(sessionIdOf(ctx), async () => {
+						const result = await actionCheck(activitiesFor(ctx), state, action);
+						await deps.autonomy?.checkpoint(ctx, state, "action_check", action);
+						return result;
+					});
 				} catch (error) {
 					pi.logger?.warn?.("jevstice: the action check failed", error);
-					return refuse(pi, ctx, state, toolName, input, {
+					return refuse(pi, ctx, state, {
 						block: true,
 						boundary: "action",
 						reason: `Jevstice holds this change: the action check could not run (${error instanceof Error ? error.message : String(error)}). The call was not executed; retry it once the judge answers.`,
 					});
 				}
 				if (!outcome.ok || outcome.details["approved"] !== true) {
-					return refuse(pi, ctx, state, toolName, input, {
+					return refuse(pi, ctx, state, {
 						block: true,
 						boundary: "action",
 						reason: `${outcome.text} The call was not executed.`,
@@ -818,42 +927,58 @@ export function createJevController(deps: ControllerDeps): JevController {
 				// approved artifact are re-read before execution, so an owner prompt or a concurrent
 				// write arriving while the answer was in flight cannot retarget the call.
 				if (state.task?.fingerprint !== admittedTask?.fingerprint || state.revision !== admittedRevision) {
-					return refuse(pi, ctx, state, toolName, input, { block: true, boundary: PLAN_BOUNDARY, reason: PLAN_REQUIRED_REASON });
+					return refuse(pi, ctx, state, { block: true, boundary: PLAN_BOUNDARY, reason: PLAN_REQUIRED_REASON });
 				}
 				// A request-judged call is stale the moment the owner's message changes; nothing of the
 				// old authorisation carries over to it.
 				if (admittedTask === undefined && state.request?.text !== admittedRequest) {
-					return refuse(pi, ctx, state, toolName, input, {
+					return refuse(pi, ctx, state, {
 						block: true,
 						boundary: "action",
 						reason:
 							"Jevstice holds this change: the owner's latest message arrived while the call was being judged, so the authorisation is stale. The call was not executed; submit the new request for triage.",
 					});
 				}
-				const requeued = mutationGate(state, deps.config, toolName, input);
-				if (requeued.block) return refuse(pi, ctx, state, toolName, input, requeued);
+				const requeued = mutationGate(state, deps.config, toolName, input, true);
+				if (requeued.block) return refuse(pi, ctx, state, requeued);
 				const rechecked = await planBindingVerdict(ctx, state);
-				if (rechecked !== undefined) return refuse(pi, ctx, state, toolName, input, rechecked);
-				const finalVerdict = mutationGate(state, deps.config, toolName, input);
-				if (finalVerdict.block) return refuse(pi, ctx, state, toolName, input, finalVerdict);
+				if (rechecked !== undefined) return refuse(pi, ctx, state, rechecked);
+				const finalVerdict = mutationGate(state, deps.config, toolName, input, true);
+				if (finalVerdict.block) return refuse(pi, ctx, state, finalVerdict);
 				if (outcome.details["antiSlopDelivery"] === true && typeof toolCallId === "string") {
 					deliveryCalls.add(toolCallId);
 				}
+				await deps.autonomy?.admit(ctx, state, event);
 				return undefined;
+			};
+			pi.on("tool_call", async (event, ctx) => {
+				try {
+					return await toolCall(event, ctx);
+				} catch (error) {
+					if (deps.autonomy === undefined) throw error;
+					pi.logger?.warn?.("jevstice: strict autonomous admission failed", error);
+					return { block: true, reason: `Strict autonomous admission failed closed: ${error instanceof Error ? error.message : String(error)}. No call was admitted.` };
+				}
 			});
 
 			pi.on("tool_result", async (event, ctx) => {
-				await restoreApprovedPlan(ctx);
+				if (deps.autonomy === undefined) await restoreApprovedPlan(ctx);
 				const record = asRecord(event);
 				if (record === undefined) return undefined;
 				const toolName = record["toolName"];
 				const input = record["input"];
-				if (typeof toolName !== "string" || !isConsequentialMutation(toolName, input)) return undefined;
+				if (typeof toolName !== "string") return undefined;
+				if (!(deps.autonomy?.consequential(toolName, input) ?? isConsequentialMutation(toolName, input))) {
+					if (deps.autonomy !== undefined) await deps.autonomy.toolResult(ctx, stateFor(ctx), event);
+					return undefined;
+				}
 				const callId = record["toolCallId"];
 				const delivery = typeof callId === "string" && deliveryCalls.delete(callId);
 				const state = stateFor(ctx);
-				// Only the registered development task carries the interval, the evidence and the hold.
-				if (state.task === undefined) return undefined;
+				if (deps.autonomy !== undefined && asRecord(record["details"])?.["async"] !== undefined) {
+					await deps.autonomy.toolResult(ctx, state, event, delivery);
+					return undefined;
+				}
 				const target = targetOf(input);
 				const action = {
 					tool: toolName,
@@ -864,14 +989,17 @@ export function createJevController(deps: ControllerDeps): JevController {
 				// acceptance, but it is not progress and advances no check interval.
 				if (record["isError"] === true) {
 					recordFailedAction(state, action);
+					await deps.autonomy?.toolResult(ctx, state, event);
 					return undefined;
 				}
 				recordAction(state, action, !delivery);
-				// A change outside the approved plan is a trigger of its own (FR-25): the plan named the
-				// paths its topics change, so an action elsewhere is a possible change of course.
-				if (state.deviation === undefined && targetOutsidePlan(toolName, target, state.planTopics)) {
+				// A change outside the approved plan is a trigger of its own (FR-25).
+				if (state.task !== undefined && state.deviation === undefined && targetOutsidePlan(toolName, target, state.planTopics)) {
 					markDeviation(state, toolName, target);
 				}
+				await deps.autonomy?.toolResult(ctx, state, event);
+				// Simple and quiet requests also need revision-bound external reviews.
+				if (state.task === undefined) return undefined;
 				// Completion-only checking defers every course check to completion (FR-12).
 				if (continuationAllowed(state)) return undefined;
 				if (deps.config.courseCheck.mode !== "interval") return undefined;
@@ -883,13 +1011,22 @@ export function createJevController(deps: ControllerDeps): JevController {
 				state.actionsSinceCheck = 0;
 				// The check is in flight: a change decided before its verdict returns would bypass it,
 				// and only this check may clear the marker it set.
-				const marker: PendingCheck = { taskFingerprint: state.task.fingerprint, revision: state.revision };
+				const marker: PendingCheck = {};
 				state.checkPending = marker;
 				void runCourseCheck(pi, ctx, sessionIdOf(ctx), marker);
 				return undefined;
 			});
 
 			pi.on("session_stop", async (_event, ctx) => {
+				if (deps.autonomy !== undefined) {
+					try {
+						const state = stateFor(ctx);
+						return await serialized(sessionIdOf(ctx), () => deps.autonomy!.stop(ctx, state, activitiesFor(ctx)));
+					} catch (error) {
+						pi.logger?.warn?.("jevstice: strict autonomous completion failed", error);
+						return { decision: "block", reason: `Strict autonomous completion failed closed: ${error instanceof Error ? error.message : String(error)}.` };
+					}
+				}
 				await restoreApprovedPlan(ctx);
 				const state = stateFor(ctx);
 				announce(pi, ctx, state);
@@ -909,7 +1046,6 @@ export function createJevController(deps: ControllerDeps): JevController {
 									pi,
 									"jev.anti_slop_advisory",
 									"The external deliverable has no complete anti-slop review at this revision. Completion is not held in advisory mode; the gap is disclosed, not approved.",
-									"aside",
 								);
 							}
 						}
@@ -942,7 +1078,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 				const { blocks, exhausted } = recordStopBlock(state, sha256(reason));
 				if (!exhausted) return { decision: "block", reason: `${reason} The owner may permit continuation with /jev-continue.` };
 				exhaustBoundary(state, "completion");
-				sendMessage(pi, "jev.open_item", `Completion remains OPEN after ${blocks} blocked stops: ${reason}. Stopping is permitted without claiming Jev acceptance.`, "aside");
+				sendMessage(pi, "jev.open_item", `Completion remains OPEN after ${blocks} blocked stops: ${reason}. Stopping is permitted without claiming Jev acceptance.`);
 				return undefined;
 			});
 		},

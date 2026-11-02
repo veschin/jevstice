@@ -3,13 +3,18 @@ import {
 	acceptanceAt,
 	boundaryExhausted,
 	clearFinishedTask,
+	continuationAllowed,
 	exhaustBoundary,
 	freshState,
+	permitAfterIgnoredCalls,
 	reaimTask,
 	recordAcceptance,
 	recordAction,
+	recordActivityOutcome,
 	recordFailedAction,
+	recordJudgeCall,
 	recordRefusal,
+	recordRefusedCall,
 	recordStopBlock,
 	registerTask,
 	sha256,
@@ -22,21 +27,20 @@ import { POLICY } from "../src/types.js";
 function workedTask(): JevState {
 	const state = freshState();
 	registerTask(state, "first task");
-	state.plan = { taskFingerprint: state.task?.fingerprint ?? "", planUrl: "local://a-plan.md", planDigest: "d", confidence: 0.9 };
+	state.plan = { taskFingerprint: state.task?.fingerprint ?? "", planUrl: "local://a-plan.md", planDigest: "d" };
 	state.requirementsApproval = { taskFingerprint: state.task?.fingerprint ?? "", items: ["an obligation"] };
 	state.planDraft = { taskFingerprint: state.task?.fingerprint ?? "", requirementsDigest: "r", steps: [], outlineApproved: true, details: [] };
 	state.planTopics = [{ id: "old", section: "old section", paths: ["src/old.ts"], requirement: "old requirement" }];
 	state.hold = { reason: "a finding" };
 	state.directionPending = { text: "a later owner message" };
 	state.deviation = { tool: "write", target: "docs/x.md", revision: 0 };
-	state.courseCheck = { revision: 0, label: "on_course", approved: true, confidence: 0.9 };
 	state.completion = { revision: 0, label: "follows", approved: true, confidence: 0.9 };
-	state.checkPending = { revision: 0 };
-	state.openItem = { boundary: "plan:outline", attempts: 3, digests: ["a"] };
+	state.checkPending = {};
+	state.openItem = { boundary: "plan:outline", attempts: 3 };
 	state.openItemNotified = "plan:outline:3";
 	state.exhausted = ["plan"];
 	state.stop = { signature: "a reason", blocks: 2 };
-	state.refusedCalls = { boundary: "plan", count: 2, calls: ["write src/a.ts"] };
+	state.refusedCalls.set("plan", 2);
 	recordAcceptance(state, { aspect: "business", revision: 0, label: "serves_business_need", approved: true, confidence: 0.9 });
 	return state;
 }
@@ -61,14 +65,13 @@ describe("T3 - task registration and work revision", () => {
 		expect(state.hold).toBeUndefined();
 		expect(state.directionPending).toBeUndefined();
 		expect(state.deviation).toBeUndefined();
-		expect(state.courseCheck).toBeUndefined();
 		expect(state.completion).toBeUndefined();
 		expect(state.checkPending).toBeUndefined();
 		expect(state.openItem).toBeUndefined();
 		expect(state.openItemNotified).toBeUndefined();
 		expect(state.exhausted).toEqual([]);
 		expect(state.stop).toBeUndefined();
-		expect(state.refusedCalls).toEqual({ boundary: "", count: 0, calls: [] });
+		expect(recordRefusedCall(state, "plan")).toBe(1);
 		expect(state.acceptance).toEqual([]);
 		expect(state.actions).toEqual([]);
 		expect(state.submissions).toEqual([]);
@@ -176,7 +179,7 @@ describe("FR-22, FR-23 - the refusal ledger and the OPEN item", () => {
 	test("the ledger counts every refusal of a boundary permanently and reports the exact material", () => {
 		const state = freshState();
 		registerTask(state, "task");
-		recordRefusal(state, { boundary: "plan:outline", digest: "a", verdict: "revise" });
+		recordRefusal(state, { boundary: "plan:outline", digest: "a" });
 
 		expect(submissionLedger(state, "plan:outline", "a")).toEqual({ repeat: true, attempts: 1, exhausted: false });
 		expect(submissionLedger(state, "plan:outline", "b")).toEqual({ repeat: false, attempts: 1, exhausted: false });
@@ -187,14 +190,14 @@ describe("FR-22, FR-23 - the refusal ledger and the OPEN item", () => {
 		const state = freshState();
 		const task = registerTask(state, "task");
 		for (const digest of ["a", "b", "c"]) {
-			recordRefusal(state, { boundary: "plan:outline", digest, verdict: "revise" });
+			recordRefusal(state, { boundary: "plan:outline", digest });
 		}
 
 		expect(state.plan).toBeUndefined();
 		expect(state.task?.fingerprint).toBe(task.fingerprint);
 		expect(state.exhausted).toEqual(["plan"]);
 		expect(boundaryExhausted(state, "plan:detail:abc")).toBe(true);
-		expect(state.openItem).toEqual({ boundary: "plan:outline", attempts: 3, digests: ["a", "b", "c"] });
+		expect(state.openItem).toEqual({ boundary: "plan:outline", attempts: 3 });
 		// A new framing at the spent boundary is still exhausted: the budget ends automated retries.
 		expect(submissionLedger(state, "plan:outline", "d").exhausted).toBe(true);
 	});
@@ -209,11 +212,11 @@ describe("FR-22, FR-23 - the refusal ledger and the OPEN item", () => {
 
 	test("exhaustBoundary keeps the refusals it judged and nothing else", () => {
 		const state = freshState();
-		recordRefusal(state, { boundary: "hold", digest: "a", verdict: "below_floor" });
+		recordRefusal(state, { boundary: "hold", digest: "a" });
 
 		const item = exhaustBoundary(state, "hold");
 
-		expect(item).toEqual({ boundary: "hold", attempts: 1, digests: ["a"] });
+		expect(item).toEqual({ boundary: "hold", attempts: 1 });
 		expect(state.hold).toBeUndefined();
 		expect(state.exhausted).toEqual(["hold"]);
 	});
@@ -223,12 +226,12 @@ describe("FR-29 - re-aiming and finishing a task", () => {
 	test("a re-aim clears every approval and does not exhaust the plan on the new course", () => {
 		const state = freshState();
 		registerTask(state, "first task");
-		state.plan = { taskFingerprint: state.task?.fingerprint ?? "", planUrl: "local://a-plan.md", planDigest: "d", confidence: 0.9 };
+		state.plan = { taskFingerprint: state.task?.fingerprint ?? "", planUrl: "local://a-plan.md", planDigest: "d" };
 		state.requirementsApproval = { taskFingerprint: state.task?.fingerprint ?? "", items: ["an obligation"] };
 		state.hold = { reason: "a finding" };
 		state.directionPending = { text: "new direction" };
 		for (const digest of ["a", "b", "c"]) {
-			recordRefusal(state, { boundary: "plan:outline", digest, verdict: "revise" });
+			recordRefusal(state, { boundary: "plan:outline", digest });
 		}
 
 		const task = reaimTask(state, "new direction");
@@ -270,5 +273,46 @@ describe("FR-29 - re-aiming and finishing a task", () => {
 
 		expect(clearFinishedTask(state)).toBe(false);
 		expect(state.task).toBeDefined();
+	});
+});
+
+describe("session accounting and ignored-call continuation", () => {
+	test("ignored gate calls permit continuation without exhausting the activity budget", () => {
+		const state = freshState();
+
+		permitAfterIgnoredCalls(state, "triage", 3);
+
+		expect(state.openItem).toEqual({ boundary: "triage", attempts: 3 });
+		expect(boundaryExhausted(state, "triage")).toBe(false);
+		expect(continuationAllowed(state)).toBe(true);
+	});
+
+	test("activity outcomes and judge usage survive a task change", () => {
+		const state = freshState();
+		recordActivityOutcome(state, "jev_text_review", true);
+		recordActivityOutcome(state, "jev_text_review", false);
+		recordJudgeCall(state, { inputTokens: 120, outputTokens: 12 });
+
+		registerTask(state, "first task");
+		registerTask(state, "second task");
+
+		expect(state.stats).toEqual({ jev_text_review: { ok: 1, fail: 1 } });
+		expect(state.usage).toEqual({ judgeCalls: 1, inputTokens: 120, outputTokens: 12 });
+	});
+});
+
+describe("FR-57 - strict autonomous authorization", () => {
+	test("an exhausted boundary remains OPEN without authorizing autonomous continuation", () => {
+		const state = Object.assign(freshState(), { autonomous: true as const });
+		registerTask(state, "Implement the bound autonomous objective");
+		for (const digest of ["first", "second", "third"]) {
+			recordRefusal(state, { boundary: "action", digest });
+		}
+
+		exhaustBoundary(state, "action");
+
+		expect(state.openItem).toEqual({ boundary: "action", attempts: 3 });
+		expect(continuationAllowed(state)).toBe(false);
+		expect(state.continuation).toBeUndefined();
 	});
 });

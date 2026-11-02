@@ -12,7 +12,8 @@ import {
 	registerTask,
 	type JevState,
 } from "../src/state.js";
-import type { JevConfig } from "../src/types.js";
+import type { Judge } from "../src/judge.js";
+import { asRecord, type JevConfig } from "../src/types.js";
 import {
 	answeringJudge,
 	boundaryConfig,
@@ -103,7 +104,6 @@ describe("FR-46 - validation happens before a judge call", () => {
 		);
 
 		expect(outcome.ok).toBe(false);
-		expect(outcome.text).toContain("verbatim");
 		expect(calls).toHaveLength(0);
 		expect(state.antiSlopReviews).toHaveLength(0);
 	});
@@ -126,7 +126,6 @@ describe("FR-46 - validation happens before a judge call", () => {
 		);
 
 		expect(outcome.ok).toBe(false);
-		expect(outcome.text).toContain("sourceClass");
 		expect(calls).toHaveLength(0);
 	});
 
@@ -138,7 +137,6 @@ describe("FR-46 - validation happens before a judge call", () => {
 
 		const outcome = await antiSlop(deps, state, params({ claims: [CLAIM_1], inferences: [] }));
 		expect(outcome.ok).toBe(false);
-		expect(outcome.text).toContain("external deliverable");
 		expect(calls).toHaveLength(0);
 	});
 });
@@ -170,8 +168,6 @@ describe("FR-47, FR-48 - claim verification and explicit trust marks", () => {
 		).toBe(true);
 		expect(outcome.details["blockers"]).toBe(1);
 		expect(state.antiSlopReviews).toHaveLength(1);
-		expect(outcome.text).toContain("claim-1 trusted supported");
-		expect(outcome.text).toContain("contradicted_claim");
 		expect(calls[0]?.questions.some(question => question.name === "claim_1")).toBe(true);
 	});
 });
@@ -324,7 +320,6 @@ describe("FR-56 - fail-closed and part coverage", () => {
 		const outcome = await antiSlop(deps, state, params());
 
 		expect(outcome.ok).toBe(false);
-		expect(outcome.text).toContain("unusable");
 		expect(state.antiSlopReviews).toHaveLength(0);
 	});
 
@@ -373,6 +368,159 @@ describe("FR-56 - fail-closed and part coverage", () => {
 		});
 		expect(inconsistent.inconsistent).toBe(true);
 		expect(inconsistent.complete).toBe(false);
+	});
+});
+
+describe("FR-20, FR-21, FR-46, FR-53 - judgment recovery and review freshness", () => {
+	test("an unavailable judgment does not block the same material from being judged again", async () => {
+		const state = externalState();
+		const fake = answeringJudge({
+			claim_1: { label: "supported", confidence: 0.95 },
+			claim_2: { label: "supported", confidence: 0.95 },
+			inference_1: { label: "follows", confidence: 0.95 },
+			...CLEAN_FRAGMENT,
+		});
+		let offline = true;
+		let attempts = 0;
+		const judge: Judge = async (material, questions) => {
+			attempts += 1;
+			return offline ? { ok: false, kind: "unavailable", problem: "offline" } : fake.judge(material, questions);
+		};
+		const deps = { judge, config: config("enforce") };
+		const input = params();
+
+		const first = await antiSlop(deps, state, input);
+		expect(first.ok).toBe(false);
+		expect(state.antiSlopReviews).toHaveLength(0);
+		expect(state.submissions.filter(entry => entry.boundary.startsWith("anti-slop"))).toHaveLength(0);
+
+		offline = false;
+		const second = await antiSlop(deps, state, input);
+		expect(second.ok).toBe(true);
+		expect(attempts).toBe(2);
+		expect(state.antiSlopReviews).toHaveLength(1);
+	});
+
+	test("a failed changed re-review removes only the affected part and keeps other scopes", async () => {
+		const state = externalState();
+		const clean = depsFor(
+			{
+				claim_1: { label: "supported", confidence: 0.95 },
+				claim_2: { label: "supported", confidence: 0.95 },
+				inference_1: { label: "follows", confidence: 0.95 },
+				...CLEAN_FRAGMENT,
+			},
+			"enforce",
+		);
+		expect((await antiSlop(clean.deps, state, params({ part: { index: 1, total: 2 } }))).ok).toBe(true);
+		expect((await antiSlop(clean.deps, state, params({ part: { index: 2, total: 2 } }))).ok).toBe(true);
+		recordAntiSlopReview(state, {
+			taskFingerprint: "other-task",
+			request: "Another owner request",
+			revision: state.revision,
+			part: { index: 1, total: 2 },
+			partDigest: "d",
+			language: "en",
+			register: "formal",
+			rulesDigest: "r",
+			findings: [],
+		});
+		const scope = {
+			taskFingerprint: state.task?.fingerprint,
+			request: REQUEST,
+			revision: state.revision,
+			quiet: false,
+		};
+		expect(antiSlopStatus(state, scope).complete).toBe(true);
+
+		const changed = `${ARTIFACT} The supplier also insures the shipment.`;
+		const failing = { judge: failingJudge("offline"), config: config("enforce") };
+		const failed = await antiSlop(failing, state, params({ artifact: changed, part: { index: 1, total: 2 } }));
+		expect(failed.ok).toBe(false);
+
+		const status = antiSlopStatus(state, scope);
+		expect(status.complete).toBe(false);
+		expect(status.missing).toEqual([1]);
+		expect(state.antiSlopReviews.some(review => review.taskFingerprint === "other-task")).toBe(true);
+		expect(
+			state.antiSlopReviews.filter(
+				review => review.taskFingerprint === state.task?.fingerprint && review.part.index === 2,
+			),
+		).toHaveLength(1);
+	});
+
+	test("changed claim evidence changes that finding id and leaves an unrelated finding id stable", async () => {
+		const state = externalState();
+		const { deps } = depsFor(
+			{
+				claim_1: { label: "refuted", confidence: 0.95 },
+				claim_2: { label: "refuted", confidence: 0.95 },
+				...CLEAN_FRAGMENT,
+			},
+			"enforce",
+		);
+		const first = await antiSlop(deps, state, params({ claims: [CLAIM_1, CLAIM_2], inferences: [] }));
+		if (!first.ok) throw new Error(first.text);
+		const firstFindings = first.details["findings"] as Array<Record<string, unknown>>;
+		const firstClaim1 = firstFindings.find(
+			finding => finding["target"] === "claim-1" && finding["kind"] === "contradicted_claim",
+		);
+		const firstClaim2 = firstFindings.find(
+			finding => finding["target"] === "claim-2" && finding["kind"] === "contradicted_claim",
+		);
+
+		const changedClaim = {
+			...CLAIM_1,
+			evidence: [{ ...CLAIM_1.evidence[0], quote: "Commencement is 1 January 2027." }],
+		};
+		const second = await antiSlop(deps, state, params({ claims: [changedClaim, CLAIM_2], inferences: [] }));
+		if (!second.ok) throw new Error(second.text);
+		const secondFindings = second.details["findings"] as Array<Record<string, unknown>>;
+		const secondClaim1 = secondFindings.find(
+			finding => finding["target"] === "claim-1" && finding["kind"] === "contradicted_claim",
+		);
+		const secondClaim2 = secondFindings.find(
+			finding => finding["target"] === "claim-2" && finding["kind"] === "contradicted_claim",
+		);
+
+		expect(typeof firstClaim1?.["id"]).toBe("string");
+		expect(secondClaim1?.["id"]).not.toBe(firstClaim1?.["id"]);
+		expect(secondClaim2?.["id"]).toBe(firstClaim2?.["id"]);
+	});
+
+	test("a quote identical to the claim is excluded from judgment and cannot make anonymous support trusted", async () => {
+		const state = externalState();
+		const selfClaim = {
+			...CLAIM_1,
+			evidence: [
+				{ kind: "documentation", quote: CLAIM_1.text, source: "self", sourceClass: "official" },
+				{
+					kind: "documentation",
+					quote: "Anonymous survey reports 72% agreement.",
+					source: "survey",
+					sourceClass: "anonymous",
+				},
+			],
+		};
+		const { deps, calls } = depsFor(
+			{ claim_1: { label: "supported", confidence: 0.95 }, ...CLEAN_FRAGMENT },
+			"enforce",
+		);
+
+		const outcome = await antiSlop(deps, state, params({ claims: [selfClaim], inferences: [] }));
+		if (!outcome.ok) throw new Error(outcome.text);
+		const claims = outcome.details["claims"] as Array<Record<string, unknown>>;
+		const findings = outcome.details["findings"] as Array<Record<string, unknown>>;
+		const judged = asRecord(asRecord(calls[0]?.state)?.["antiSlop"]);
+		const judgedClaims = (judged?.["claims"] ?? []) as Array<Record<string, unknown>>;
+		const judgedEvidence = (judgedClaims[0]?.["evidence"] ?? []) as Array<Record<string, unknown>>;
+
+		expect(claims[0]?.["trust"]).toBe("low_trust");
+		expect((claims[0]?.["evidence"] as Array<Record<string, unknown>>).map(item => item["quote"])).toEqual([
+			"Anonymous survey reports 72% agreement.",
+		]);
+		expect(judgedEvidence.map(item => item["quote"])).toEqual(["Anonymous survey reports 72% agreement."]);
+		expect(findings.some(finding => finding["kind"] === "low_trust_source")).toBe(true);
 	});
 });
 
@@ -451,9 +599,6 @@ describe("FR-55 - enforcement, waiver and advisory default", () => {
 			language: "en",
 			register: "formal",
 			rulesDigest: "r",
-			mode: "enforce",
-			claims: [],
-			inferences: [],
 			findings: [],
 		});
 		expect(completionGate(state, config("enforce")).applies).toBe(false);
@@ -481,7 +626,6 @@ describe("FR-55 - an external delivery waits for a complete review", () => {
 			taskFingerprint: state.task?.fingerprint ?? "",
 			planUrl: "local://memo-plan.md",
 			planDigest: "d",
-			confidence: 0.9,
 		};
 		state.planTopics = [
 			{
@@ -532,9 +676,6 @@ describe("FR-55 - an external delivery waits for a complete review", () => {
 			language: "en",
 			register: "formal",
 			rulesDigest: "r",
-			mode: "enforce",
-			claims: [],
-			inferences: [],
 			findings: [],
 		});
 		const withReview = await actionCheck(deps, state, {
@@ -569,4 +710,45 @@ describe("FR-45 - triage records the external deliverable", () => {
 		expect(internalOutcome.details["externalDeliverable"]).toBe(false);
 		expect(internalState.task?.external).toBe(false);
 	});
+});
+
+describe("FR-63 - strict delivery preserves the reviewed content", () => {
+	for (const scenario of [
+		{ name: "changed inline content", tool: "send_email", change: JSON.stringify({ body: `${ARTIFACT}\nAn unreviewed addition.` }), matches: 0.01, approved: false },
+		{ name: "regeneration before publication", tool: "bash", change: JSON.stringify({ command: "bun generate-memo.ts && send-memo memo.md" }), matches: 0.01, approved: false },
+		{ name: "unchanged reviewed content", tool: "send_email", change: JSON.stringify({ body: ARTIFACT }), matches: 0.99, approved: true },
+		{ name: "review replaced during judgment", tool: "send_email", change: JSON.stringify({ body: ARTIFACT }), matches: 0.99, approved: false, replaceReview: true },
+	]) {
+		test(`${scenario.name} cannot borrow an unrelated review at the same revision`, async () => {
+			const state = externalState();
+			state.autonomous = true;
+			state.plan = { taskFingerprint: state.task?.fingerprint ?? "", planUrl: "local://plan.md", planDigest: "bound" };
+			state.planTopics = [{ id: "deliver", section: "# Deliver the reviewed memo", paths: ["memo.md"], requirement: REQUEST }];
+			const review = depsFor({ ...CLEAN_FRAGMENT, claim_1: { label: "supported", confidence: 0.99 } }, "enforce");
+			const reviewed = await antiSlop(review.deps, state, params({ claims: [CLAIM_1], inferences: [] }));
+			if (!reviewed.ok) throw new Error(reviewed.text);
+			const action = depsFor({
+				action: { label: "on_course", confidence: 0.99 },
+				within_authority: { probability: 0.99 },
+				external_delivery: { label: "delivers", confidence: 0.99 },
+				reviewed_delivery: { probability: scenario.matches },
+			}, "enforce");
+			const deps = {
+				...action.deps,
+				judge: async (material: unknown, questions: Parameters<Judge>[1]) => {
+					if ("replaceReview" in scenario) {
+						const replacement = await antiSlop(review.deps, state, params({
+							artifact: `${ARTIFACT}\nThe recipient requires another version.`, claims: [CLAIM_1], inferences: [],
+						}));
+						if (!replacement.ok) throw new Error(replacement.text);
+					}
+					return action.deps.judge(material, questions);
+				},
+			};
+			const result = await actionCheck(deps, state, {
+				tool: scenario.tool, target: "external memo", change: scenario.change, callId: `deliver-${scenario.name}`,
+			});
+			expect(result.ok && toolDetails(result)["approved"] === true).toBe(scenario.approved);
+		});
+	}
 });

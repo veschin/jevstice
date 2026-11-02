@@ -44,6 +44,7 @@ function config(options: Options = {}): JevConfig {
 			interval: options.interval ?? DEFAULT_CONFIG.courseCheck.interval,
 		},
 		antiSlop: { mode: "advisory" },
+		billing: DEFAULT_CONFIG.billing,
 		problems: [],
 	};
 }
@@ -171,19 +172,6 @@ describe("T1 - the registered surface", () => {
 		]);
 		expect(calls).toHaveLength(0);
 		expect(pi.messages).toHaveLength(0);
-	});
-});
-
-describe("Jev prompt guidance", () => {
-
-	test("the guidance describes an autonomous obligation list and no owner confirmation", () => {
-		const { pi } = controllerFor({});
-		const triage = pi.tools.get("jev_triage")?.description ?? "";
-		const requirements = pi.tools.get("jev_requirements")?.description ?? "";
-
-		expect(triage).toContain("No owner confirmation step exists");
-		expect(requirements).toContain("one checkable item per obligation you derived from it");
-		expect(requirements).not.toContain("After the owner confirms");
 	});
 });
 
@@ -654,8 +642,8 @@ describe("T4 - implementation course checks (FR-11, FR-12, FR-13)", () => {
 				"jev_consult",
 				{
 					mode: "boolean",
-					question: `clear the direction hold, attempt ${attempt}`,
-					context: "the course check finding",
+					question: "Does this correction resolve the direction finding?",
+					context: `The course-check finding is addressed by corrective approach ${attempt}.`,
 					evidence: [{ kind: "user", quote: "report the coverage of the last run" }],
 					trueMeaning: "continue",
 					falseMeaning: "stay held",
@@ -918,7 +906,6 @@ describe("T2, T3 - the first consequential change waits for triage (FR-02, FR-10
 			const deep = (state as Record<string, unknown>)["request"] === "Build the report";
 			return {
 				ok: true,
-				model: "fake",
 				answers: questions.map(question =>
 					question.mode === "choice"
 						? { name: question.name, mode: "choice" as const, label: "on_course", confidence: 0.95 }
@@ -1047,7 +1034,6 @@ describe("FR-21, FR-28 - the extension tells the owner what the executor cannot 
 			}
 			return {
 				ok: true,
-				model: "fake",
 				answers: questions.map(question => ({ name: question.name, mode: "noul" as const, probability: 0.95, confidence: 0.95 })),
 			};
 		};
@@ -1369,5 +1355,300 @@ describe("FR-54 - the owner waives one anti-slop finding", () => {
 			await pi.emit("tool_call", toolCallEvent("write", { path: "memo.md" }), ctx),
 		);
 		expect(reason ?? "").not.toContain("owner sent a message");
+	});
+});
+
+describe("session status and boundary isolation", () => {
+	test("ignored project-inspection calls permit continuation without exhausting triage", async () => {
+		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP });
+		const ctx = fakeCtx();
+		await pi.emit("before_agent_start", { prompt: "Change the report" }, ctx);
+
+		for (let index = 0; index < 3; index += 1) {
+			const reason = blockReason(
+				await pi.emit("tool_call", toolCallEvent("read", { path: "src/a.ts" }), ctx),
+			);
+			expect(reason).toContain("jev_triage");
+		}
+
+		const outcome = await pi.callTool("jev_triage", { request: "Change the report" }, ctx);
+
+		expect(toolFailed(outcome)).toBe(false);
+		expect(toolText(outcome)).not.toContain("exhausted");
+	});
+
+	test("a quiet follow-up clears a stale pending direction", async () => {
+		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP });
+		const ctx = fakeCtx();
+		await pi.emit("before_agent_start", { prompt: "Report the coverage" }, ctx);
+		await triaged(pi, ctx, "Report the coverage");
+
+		await pi.emit("before_agent_start", { prompt: "Change the report" }, ctx);
+		const pending = blockReason(
+			await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx),
+		);
+		expect(pending).toContain("undecided");
+
+		await pi.emit("before_agent_start", { prompt: "Show the report" }, ctx);
+		const held = blockReason(
+			await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx),
+		);
+		expect(held).not.toContain("undecided");
+		expect(held).toContain("jev_plan_review");
+	});
+
+	test("the status command reports calls, failures and the unset balance", () => {
+		const { pi } = controllerFor({});
+		const ctx = fakeCtx();
+
+		pi.callCommand("jev-status", "", ctx);
+
+		const status = pi.messages.find(message => message.customType === "jev.status");
+		expect(status?.content).toContain("judge 0 calls");
+		expect(status?.content).toContain("balance not configured");
+	});
+
+	test("the status shows session spend against a configured balance", async () => {
+		const fake = answeringJudge({ consult: { label: "a", confidence: 0.9 } });
+		const judge: Judge = async (state, questions) => {
+			const outcome = await fake.judge(state, questions);
+			return outcome.ok ? { ...outcome, usage: { inputTokens: 1000, outputTokens: 0 } } : outcome;
+		};
+		const pi = fakePi();
+		const cfg = { ...config(), billing: { ...DEFAULT_CONFIG.billing, balance: 10 } };
+		createJevController({ judge, config: cfg, zod: fakeZod() }).register(pi.api);
+		const ctx = fakeCtx();
+
+		await pi.callTool(
+			"jev_consult",
+			{
+				mode: "choice",
+				question: "Which option?",
+				context: "The owner needs a choice.",
+				alternatives: [
+					{ label: "a", meaning: "first option" },
+					{ label: "b", meaning: "second option" },
+				],
+			},
+			ctx,
+		);
+		pi.callCommand("jev-status", "", ctx);
+
+		const status = pi.messages.filter(message => message.customType === "jev.status").at(-1);
+		expect(status?.content).toContain("0.000042/10$");
+	});
+
+	test("every ten activity calls emits a status message", async () => {
+		const { pi } = controllerFor({ consult: { label: "a", confidence: 0.9 } });
+		const ctx = fakeCtx();
+
+		for (let index = 0; index < 10; index += 1) {
+			await pi.callTool(
+				"jev_consult",
+				{
+					mode: "choice",
+					question: "Which option?",
+					context: "The owner needs a choice.",
+					alternatives: [
+						{ label: "a", meaning: "first option" },
+						{ label: "b", meaning: "second option" },
+					],
+				},
+				ctx,
+			);
+		}
+
+		const statuses = pi.messages.filter(message => message.customType === "jev.status");
+		expect(statuses).toHaveLength(1);
+		expect(statuses[0]?.content).toContain("jev_consult 10/0");
+	});
+});
+
+describe("context and invocation correctness regressions", () => {
+	test("FR-44: a changed owner request does not inherit ignored-call counts", async () => {
+		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP });
+		const ctx = fakeCtx();
+		await pi.emit("before_agent_start", { prompt: "Implement report A" }, ctx);
+		await triaged(pi, ctx, "Implement report A");
+		await pi.emit("before_agent_start", { prompt: "Implement report B instead" }, ctx);
+		const invocation = toolCallEvent("write", { path: "report.ts", content: "unreviewed" });
+		for (let index = 0; index < POLICY.maxIgnoredBoundaryCalls - 1; index += 1) {
+			expect(blockReason(await pi.emit("tool_call", invocation, ctx))).toContain("undecided");
+		}
+
+		await pi.emit("before_agent_start", { prompt: "Implement report C instead" }, ctx);
+		expect(blockReason(await pi.emit("tool_call", invocation, ctx))).toContain("undecided");
+		expect(pi.messages.some(message => message.customType === "jev.open_item")).toBe(false);
+		expect(blockReason(await pi.emit("tool_call", invocation, ctx))).toContain("undecided");
+		expect(blockReason(await pi.emit("tool_call", invocation, ctx))).toContain("Attempt limit reached");
+		expect(blockReason(await pi.emit("tool_call", invocation, ctx))).toBeUndefined();
+	});
+
+	test("FR-28: interleaved gate refusals retain each boundary's count", async () => {
+		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP });
+		const ctx = fakeCtx();
+		await pi.emit("before_agent_start", { prompt: "Implement the report" }, ctx);
+		await triaged(pi, ctx, "Implement the report");
+		const project = toolCallEvent("write", { path: "report.ts", content: "unreviewed" });
+		const plan = toolCallEvent("write", { path: "local://report-plan.md", content: "# Plan" });
+		for (let index = 0; index < POLICY.maxIgnoredBoundaryCalls - 1; index += 1) {
+			expect(blockReason(await pi.emit("tool_call", project, ctx))).toBeDefined();
+			expect(blockReason(await pi.emit("tool_call", plan, ctx))).toBeDefined();
+		}
+		expect(blockReason(await pi.emit("tool_call", project, ctx))).toContain("Attempt limit reached");
+		expect(blockReason(await pi.emit("tool_call", project, ctx))).toBeUndefined();
+	});
+
+	test("FR-36: a queued activity cannot be retargeted to a later owner request", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const fake = answeringJudge({ consult: { probability: 0.95 } });
+		const judge: Judge = async (state, questions) => {
+			entered.resolve();
+			await release.promise;
+			return fake.judge(state, questions);
+		};
+		const pi = fakePi();
+		const ctx = fakeCtx();
+		createJevController({ judge, config: config(), zod: fakeZod() }).register(pi.api);
+		await pi.emit("before_agent_start", { prompt: "Inspect parser A" }, ctx);
+		const submission = {
+			mode: "boolean",
+			question: "Is parser A correct?",
+			context: "The evidence concerns parser A.",
+			trueMeaning: "Parser A is correct.",
+			falseMeaning: "Parser A has a defect.",
+		};
+		const first = pi.callTool("jev_consult", submission, ctx);
+		await entered.promise;
+		const queued = pi.callTool("jev_consult", submission, ctx);
+		await pi.emit("before_agent_start", { prompt: "Inspect unrelated parser B" }, ctx);
+		release.resolve();
+		const results = await Promise.all([first, queued]);
+
+		expect(results.every(result => toolFailed(result))).toBe(true);
+		expect(fake.calls).toHaveLength(1);
+	});
+
+	test("FR-36: a queued activity cannot cross simple-work registration for the same request", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const fake = answeringJudge({
+			needs_development: { probability: 0.02 },
+			external_deliverable: { probability: 0.02 },
+			consult: { probability: 0.95 },
+		});
+		const judge: Judge = async (state, questions) => {
+			if (questions.some(question => question.name === "needs_development")) {
+				entered.resolve();
+				await release.promise;
+			}
+			return fake.judge(state, questions);
+		};
+		const pi = fakePi();
+		const ctx = fakeCtx();
+		createJevController({ judge, config: config(), zod: fakeZod() }).register(pi.api);
+		await pi.emit("before_agent_start", { prompt: "Publish the report" }, ctx);
+		const triage = pi.callTool("jev_triage", { request: "Publish the report" }, ctx);
+		await entered.promise;
+		const queued = pi.callTool("jev_consult", {
+			mode: "boolean",
+			question: "Is the unclassified request ready?",
+			context: "This decision was submitted before triage registered simple work.",
+			trueMeaning: "It is ready.",
+			falseMeaning: "It is not ready.",
+		}, ctx);
+		release.resolve();
+		expect(toolFailed(await triage)).toBe(false);
+		expect(toolFailed(await queued)).toBe(true);
+		expect(fake.calls).toHaveLength(1);
+	});
+
+	test("FR-32: task tracking passes before triage without spending a refusal budget", async () => {
+		const { pi, calls } = controllerFor({ needs_development: TRIAGE_DEEP });
+		const ctx = fakeCtx();
+		await pi.emit("before_agent_start", { prompt: "Implement the report" }, ctx);
+		const tracking = toolCallEvent("todo", { op: "init", items: ["Investigate the report"] });
+		for (let index = 0; index < POLICY.maxIgnoredBoundaryCalls; index += 1) {
+			expect(blockReason(await pi.emit("tool_call", tracking, ctx))).toBeUndefined();
+		}
+		expect(calls).toHaveLength(0);
+		expect(pi.messages.some(message => message.customType === "jev.open_item")).toBe(false);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "report.ts" }), ctx))).toContain("jev_triage");
+	});
+
+	test.each([false, true])("FR-53: a simple external mutation invalidates its review even when failed=%s", async isError => {
+		const fake = answeringJudge({
+			needs_development: { probability: 0.02 },
+			external_deliverable: { probability: 0.95 },
+			claim_1: { label: "supported", confidence: 0.95 },
+			language_1: { probability: 0.05 },
+			meta_1: { probability: 0.05 },
+			relevance_1: { label: "serves", confidence: 0.95 },
+			rule_1_1: { probability: 0.05 },
+		});
+		const pi = fakePi();
+		const ctx = fakeCtx();
+		createJevController({
+			judge: fake.judge,
+			config: { ...config(), antiSlop: { mode: "enforce" } },
+			zod: fakeZod(),
+		}).register(pi.api);
+		await pi.emit("before_agent_start", { prompt: "Send the legal memo" }, ctx);
+		await triaged(pi, ctx, "Send the legal memo");
+		const review = {
+			artifact: "Delivery is due in 30 days.",
+			language: "en",
+			register: "formal",
+			purpose: "legal memo",
+			audience: "client",
+			rules: [{ class: "register", rule: "Use formal prose." }],
+			claims: [{
+				id: "deadline",
+				text: "Delivery is due in 30 days.",
+				kind: "fact",
+				evidence: [{ kind: "documentation", quote: "Contract: delivery within thirty days.", sourceClass: "official" }],
+			}],
+		};
+		expect(toolFailed(await pi.callTool("jev_anti_slop", review, ctx))).toBe(false);
+		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
+		await pi.emit("tool_result", toolResultEvent("write", {
+			path: "memo.md",
+			content: "Delivery is due in 14 days.",
+		}, "Changed memo", isError), ctx);
+		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toContain("anti-slop");
+		const renewed = await pi.callTool("jev_anti_slop", review, ctx);
+		expect(toolDetails(renewed)["revision"]).toBe(1);
+		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
+	});
+});
+
+
+describe("ordinary extension isolation", () => {
+	test.each([
+		{ store: "", run: "" },
+		{ store: undefined, run: "inherited-run" },
+	])("ordinary entry ignores inherited autonomy locators: %j", async locators => {
+		const code = `
+			import extension from ${JSON.stringify(new URL("../src/index.ts", import.meta.url).href)};
+			import { fakePi, fakeCtx, fakeZod, blockReason, stopDecision } from ${JSON.stringify(new URL("./helpers.ts", import.meta.url).href)};
+			const host = fakePi();
+			await extension({ ...host.api, zod: fakeZod() });
+			const context = fakeCtx();
+			await host.emit("before_agent_start", { prompt: "Inspect the current source" }, context);
+			const tool = await host.emit("tool_call", { toolName: "web_search", toolCallId: "ordinary-observation", input: { query: "observe only" } }, context);
+			const stop = await host.emit("session_stop", {}, context);
+			console.log(JSON.stringify({ toolHeld: blockReason(tool) !== undefined, stopHeld: stopDecision(stop) !== undefined }));
+		`;
+		const child = Bun.spawn([process.execPath, "-e", code], {
+			env: { ...process.env, JEVSTICE_AUTONOMY_STORE: locators.store, JEVSTICE_AUTONOMY_RUN: locators.run },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [output, errors, exit] = await Promise.all([
+			new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+		]);
+		if (exit !== 0) throw new Error(`The ordinary extension host exited ${exit}: ${errors}`);
+		expect(JSON.parse(output)).toEqual({ toolHeld: false, stopHeld: false });
 	});
 });

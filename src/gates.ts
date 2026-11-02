@@ -20,7 +20,6 @@ import {
 	boundaryExhausted,
 	boundaryKey,
 	continuationAllowed,
-	type AntiSlopScope,
 	type AntiSlopStatus,
 	type JevState,
 } from "./state.js";
@@ -51,6 +50,7 @@ const READ_ONLY_TOOLS: Record<string, true> = {
 	glob: true,
 	web_search: true,
 	wait: true,
+	todo: true,
 	ast_grep: true,
 	jev_acceptance: true,
 	jev_anti_slop: true,
@@ -177,29 +177,28 @@ function isWriteFlag(argument: string): boolean {
 	return joined !== "-" && WRITE_FLAGS[joined] === true;
 }
 
-/**
- * `git` subcommands that move no working-tree file: the inspection subcommands only read, and staging
- * and publication (`add`, `commit`, `push`) write the index, the object store or a remote - the
- * owner asked for those not to be held at all. Everything else reaches the working tree.
- */
-const NON_MUTATING_GIT_SUBCOMMANDS: Record<string, true> = {
-	add: true,
-	commit: true,
-	push: true,
-	fetch: true,
-	status: true,
-	diff: true,
-	log: true,
-	show: true,
-	"rev-parse": true,
-	describe: true,
-	"ls-files": true,
-	"ls-remote": true,
-	blame: true,
-	shortlog: true,
-	whatchanged: true,
-	version: true,
-	help: true,
+/** Potential effects: ordinary mode exempts repository metadata and publication; strict mode does not. */
+const SHELL_TREE_CHANGE = 1;
+const SHELL_NON_TREE_CHANGE = 2;
+const SHELL_PUBLICATION = 4;
+const GIT_SUBCOMMAND_EFFECTS: Record<string, number> = {
+	add: SHELL_NON_TREE_CHANGE,
+	commit: SHELL_NON_TREE_CHANGE,
+	push: SHELL_PUBLICATION,
+	fetch: SHELL_NON_TREE_CHANGE,
+	status: 0,
+	diff: 0,
+	log: 0,
+	show: 0,
+	"rev-parse": 0,
+	describe: 0,
+	"ls-files": 0,
+	"ls-remote": 0,
+	blame: 0,
+	shortlog: 0,
+	whatchanged: 0,
+	version: 0,
+	help: 0,
 };
 
 /** Explicitly read-only or judge routes; every unknown xd device is consequential by default. */
@@ -245,7 +244,7 @@ export interface GateVerdict {
 	boundary?: string;
 }
 
-export interface ProposeVerdict extends GateVerdict {
+interface ProposeVerdict extends GateVerdict {
 	/** The artifact URL whose digest still has to match the recorded approval. */
 	url?: string;
 }
@@ -279,7 +278,7 @@ const ANTI_SLOP_CALL =
 	`jev_anti_slop({"artifact": "<exact external artifact text>", "language": "<declared language>", "register": "<declared register>", "purpose": "<declared purpose>", "audience": "external", "rules": [{"class": "<rule class>", "rule": "<owner rule>"}], "claims": [{"id": "claim-1", "text": "<verbatim artifact sentence>", "kind": "fact", "evidence": [{"kind": "documentation", "quote": "<source quote>", "source": "<source locator>", "sourceClass": "official"}]}], "inferences": []})`;
 
 /** Why an external deliverable cannot settle yet (FR-55). */
-function antiSlopReason(state: JevState, scope: AntiSlopScope, status: AntiSlopStatus): string {
+function antiSlopReason(state: JevState, status: AntiSlopStatus): string {
 	if (status.reviews.length === 0) {
 		return refusal(
 			`Jevstice holds this completion: the external deliverable has no anti-slop review at the current work revision (${state.revision}).`,
@@ -315,7 +314,7 @@ export const PLAN_REQUIRED_REASON = refusal(
 	"A plan is approved only when every topic you submit passes on its own. Registered jev_ tools, xd://, agent://, local:// and proc:// writes pass this gate.",
 );
 
-export const TRIAGE_REQUIRED_REASON = refusal(
+const TRIAGE_REQUIRED_REASON = refusal(
 	"Jevstice holds this change: no request has been triaged in this session, so no decision on it is known.",
 	TRIAGE_CALL,
 	"A development task then waits for requirements and jev_plan_review. Registered jev_ tools, xd://, agent://, local:// and proc:// writes pass this gate.",
@@ -332,10 +331,18 @@ const REAIM_CALL =
 function directionReason(state: JevState): string {
 	const quoted = state.directionPending?.text ?? "";
 	const short = quoted.length > 160 ? `${quoted.slice(0, 160)}...` : quoted;
+	const next =
+		state.task === undefined
+			? "Next call: jev_triage with the current owner request, or /jev-continue."
+			: REAIM_CALL;
+	const why =
+		state.task === undefined
+			? "No development task is registered, so there is no direction to re-aim; triage registers the task."
+			: "A new plan cannot settle it: only a judged re-aim replaces the task direction, and the re-aimed task then needs its own requirements and plan review.";
 	return refusal(
 		`Jevstice holds this change: the owner sent a message after the task was registered ("${short}"), so the current direction is undecided.`,
-		REAIM_CALL,
-		"A new plan cannot settle it: only a judged re-aim replaces the task direction, and the re-aimed task then needs its own requirements and plan review.",
+		next,
+		why,
 	);
 }
 
@@ -356,15 +363,19 @@ function openItemReason(state: JevState, boundary: string, what: string): string
 	const attempts = item !== undefined && boundaryKey(item.boundary) === boundaryKey(boundary) ? item.attempts : 0;
 	return refusal(
 		`Jevstice holds ${what}: the ${boundary} boundary is an OPEN item after ${attempts} refused submissions, and nothing was approved.`,
-		"obtain current-request owner permission with /jev-continue, or register the owner's changed direction with jev_reaim",
-		"The prior request's continuation permission does not carry over to a changed request.",
+		state.autonomous === true
+			? "observe the missing evidence or submit a materially changed proposal to Jev; strict autonomy has no continuation override"
+			: "obtain current-request owner permission with /jev-continue, or register the owner's changed direction with jev_reaim",
+		state.autonomous === true
+			? "Refusal accounting preserves the OPEN finding; it never authorizes an autonomous effect."
+			: "The prior request's continuation permission does not carry over to a changed request.",
 	);
 }
 
 const REQUIREMENTS_CALL =
 	`jev_requirements({"request": "<the owner's request>", "items": [{"text": "<one checkable obligation>", "source": "<the request line it comes from>"}], "candidateNeeds": [], "evidence": [{"kind": "user", "quote": "<a line from the request>"}]})`;
 
-export const REQUIREMENTS_REQUIRED_REASON = refusal(
+const REQUIREMENTS_REQUIRED_REASON = refusal(
 	"Jevstice holds plan preparation: the registered task has no approved requirements review.",
 	REQUIREMENTS_CALL,
 	"Derive one checkable obligation per part of the owner's request and submit them with the request as evidence; an implementation choice the request does not state is not an owner instruction. Plan files and jev_plan_review remain held until coverage is established and every submitted obligation is supported.",
@@ -460,37 +471,43 @@ function pathOf(record: Record<string, unknown> | undefined): string | undefined
 }
 
 
-/**
- * Whether one operator-free shell segment only reports state: a reporting program without a write
- * flag, or a `git` subcommand that stages, publishes or inspects. A leading `VAR=value` assignment
- * only sets the environment of this command. A program named by a path is never trusted - `/tmp/ls`
- * may be anything - and an unknown program or subcommand answers false, so an unrecognised command
- * keeps the consequential handling.
- */
-function isNonMutatingSegment(segment: string): boolean {
+/** Unknown syntax/programs remain potential writes; environment assignments cannot prove strict observation. */
+function commandSegmentEffects(segment: string): number {
 	const tokens = segment.split(/\s+/).filter(token => token.length > 0);
 	let index = 0;
 	while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index] ?? "")) index += 1;
+	const prefix = index > 0 ? SHELL_NON_TREE_CHANGE : 0;
 	const program = tokens[index];
-	if (program === undefined) return true;
-	if (program.includes("/")) return false;
-	const args = tokens.slice(index + 1);
-	if (args.some(isWriteFlag)) return false;
-	if (program !== "git") return NON_MUTATING_PROGRAMS[program] === true;
-	const subcommand = args[0];
-	return subcommand !== undefined && NON_MUTATING_GIT_SUBCOMMANDS[subcommand] === true;
+	if (program === undefined) return prefix;
+	if (program.includes("/") || tokens.some(isWriteFlag)) return prefix | SHELL_TREE_CHANGE;
+	if (program !== "git") return prefix | (NON_MUTATING_PROGRAMS[program] === true ? 0 : SHELL_TREE_CHANGE);
+	return prefix | (GIT_SUBCOMMAND_EFFECTS[tokens[index + 1] ?? ""] ?? SHELL_TREE_CHANGE);
 }
 
-/**
- * Recognize only unquoted literal reporting commands. Quoting and escaping require a shell parser;
- * stripping their contents hides executable substitutions and output flags (FR-31).
- */
-export function isNonMutatingCommand(command: string): boolean {
-	if (/['"`\\$]/.test(command)) return false;
+const combineSegmentEffects = (effects: number, segment: string): number => effects | commandSegmentEffects(segment);
+
+/** One conservative literal parser serves both domains; opaque payloads still require full judgment (FR-31). */
+function commandEffects(command: string): number {
+	if (/['"`\\$]/.test(command)) return SHELL_TREE_CHANGE;
 	const text = command.replace(/\|\||&&/g, "\n").trim();
-	if (text.length === 0) return true;
-	if (/[<>&]/.test(text)) return false;
-	return text.split(/[;|\n]/).every(isNonMutatingSegment);
+	if (text.length === 0) return 0;
+	if (/[<>&]/.test(text)) return SHELL_TREE_CHANGE;
+	return text.split(/[;|\n]/).reduce(combineSegmentEffects, 0);
+}
+
+/** Ordinary working-tree policy deliberately exempts repository metadata and publication (FR-31). */
+export function isNonMutatingCommand(command: string): boolean {
+	return (commandEffects(command) & SHELL_TREE_CHANGE) === 0;
+}
+
+/** Strict observation excludes publication, repository changes and unproved environment effects. */
+export function isReadOnlyCommand(command: string): boolean {
+	return commandEffects(command) === 0;
+}
+
+/** Recognized literal publication; opaque/mixed executable effects still need the full authority judgment. */
+export function isPublishingCommand(command: string): boolean {
+	return (commandEffects(command) & SHELL_PUBLICATION) !== 0;
 }
 
 const PRE_TRIAGE_INSPECTION_TOOLS: Record<string, true> = {
@@ -640,16 +657,18 @@ export function targetOutsidePlan(toolName: string, target: string, topics: read
  * pending. A change is admitted by an approved plan for the registered task and nothing else: a
  * quiet reading and a simple verdict both cover read-only work, so neither authorises a working-tree
  * change, and an unjudged owner message closes the gate until a re-aim decides the direction.
+ * A caller may strengthen the normal working-tree classification for a stricter effect policy.
  */
 export function mutationGate(
 	state: JevState,
 	config: JevConfig,
 	toolName: string,
 	input: unknown,
+	forceConsequential?: true,
 ): GateVerdict {
-	if (!config.gates.mutation) return { block: false };
+	if (!config.gates.mutation && state.autonomous !== true) return { block: false };
 	if (continuationAllowed(state)) return { block: false };
-	if (!isConsequentialMutation(toolName, input)) return { block: false };
+	if (forceConsequential !== true && !isConsequentialMutation(toolName, input)) return { block: false };
 	// No current-request continuation grant applies; unavailable judgment cannot approve a call.
 	if (state.judgeUnavailable === true) {
 		return { block: true, boundary: "judge", reason: JUDGE_UNAVAILABLE_REASON };
@@ -680,7 +699,7 @@ export function mutationGate(
 					),
 		};
 	}
-	if (boundaryExhausted(state, PLAN_BOUNDARY)) {
+	if (state.autonomous !== true && boundaryExhausted(state, PLAN_BOUNDARY)) {
 		return { block: true, boundary: PLAN_BOUNDARY, reason: openItemReason(state, PLAN_BOUNDARY, "this change") };
 	}
 	// Only a request that entered the judged workflow opens the gate by itself: triage either confirms
@@ -688,7 +707,7 @@ export function mutationGate(
 	// request read as a publication or an inspection never asks the judge anything (FR-30); the
 	// controller still judges each consequential candidate on its own payload before it runs.
 	if (state.task === undefined) {
-		if (boundaryExhausted(state, TRIAGE_BOUNDARY)) {
+		if (state.autonomous !== true && boundaryExhausted(state, TRIAGE_BOUNDARY)) {
 			return { block: true, boundary: TRIAGE_BOUNDARY, reason: openItemReason(state, TRIAGE_BOUNDARY, "this change") };
 		}
 		if (state.request?.weight === "quiet") return { block: false };
@@ -792,7 +811,7 @@ export function proposeGate(state: JevState, config: JevConfig, input: unknown):
 }
 
 /** The completion boundary's decision: whether the extension holds this stop, and why. */
-export interface CompletionGate {
+interface CompletionGate {
 	/** Whether the extension holds stops of this session at all. */
 	applies: boolean;
 	/** A refusal decided from the recorded state alone, so no judge call is spent on it. */
@@ -805,19 +824,22 @@ export interface CompletionGate {
  * without acceptance calls); `applies` with no reason means the completion check decides.
  */
 export function completionGate(state: JevState, config: JevConfig): CompletionGate {
-	if (!config.gates.completion) return { applies: false };
+	if (!config.gates.completion && state.autonomous !== true) return { applies: false };
 	if (continuationAllowed(state)) return { applies: false };
+	if (state.autonomous === true && state.task === undefined) {
+		return { applies: true, reason: "Strict autonomous completion requires its bound registered objective and current evidence." };
+	}
 	if (state.task === undefined) {
 		if (state.simple?.external === true && config.antiSlop.mode === "enforce") {
 			const scope = antiSlopScope(state);
 			if (scope !== undefined) {
 				const status = antiSlopStatus(state, scope);
-				if (!status.complete) return { applies: true, reason: antiSlopReason(state, scope, status) };
+				if (!status.complete) return { applies: true, reason: antiSlopReason(state, status) };
 			}
 		}
 		return { applies: false };
 	}
-	if (state.revision === 0) return { applies: false };
+	if (state.revision === 0 && state.autonomous !== true) return { applies: false };
 	// Permission is checked above; without it, unavailable judgment cannot approve completion.
 	if (state.judgeUnavailable === true) return { applies: true, reason: JUDGE_UNAVAILABLE_REASON };
 	// The course check in flight owns the revision it started on: wait for its verdict first.
@@ -849,11 +871,11 @@ export function completionGate(state: JevState, config: JevConfig): CompletionGa
 		const scope = antiSlopScope(state);
 		if (scope !== undefined && !scope.quiet) {
 			const status = antiSlopStatus(state, scope);
-			if (!status.complete) return { applies: true, reason: antiSlopReason(state, scope, status) };
+			if (!status.complete) return { applies: true, reason: antiSlopReason(state, status) };
 		}
 	}
 	const missing = (["business", "architecture"] as const).filter(aspect => acceptanceAt(state, aspect)?.approved !== true);
-	const spent = missing.find(aspect => boundaryExhausted(state, `acceptance:${aspect}`));
+	const spent = state.autonomous === true ? undefined : missing.find(aspect => boundaryExhausted(state, `acceptance:${aspect}`));
 	if (spent !== undefined) {
 		return {
 			applies: true,

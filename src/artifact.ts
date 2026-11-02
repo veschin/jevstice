@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 /** The session surface the artifact path is derived from. */
-export interface ArtifactHost {
+interface ArtifactHost {
 	getArtifactsDir?(): string | null;
 	getSessionId?(): string | null;
 }

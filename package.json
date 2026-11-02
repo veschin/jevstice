@@ -1,11 +1,12 @@
 {
   "name": "jevstice",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "omp": { "extensions": ["src/index.ts"] },
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "autonomy": "bun autonomy/driver.ts"
   },
   "engines": {
     "bun": ">=1.1"

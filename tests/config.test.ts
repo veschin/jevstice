@@ -155,4 +155,110 @@ describe("T4 - configuration of the gates and the course check", () => {
 		expect(config.problems).toHaveLength(1);
 		expect(config.problems.join(" ")).toContain(`${PROJECT_FILE}: antiSlop must be a JSON object`);
 	});
+
+	test("billing reads a balance and cost overrides and validates them", () => {
+		const overridden = loadJevConfig({
+			cwd: "/work",
+			home: "/home/owner",
+			read: reader({
+				[PROJECT_FILE]: JSON.stringify({
+					billing: { balance: 10, inputCostPerMillion: 0.05, outputCostPerMillion: 0.01 },
+				}),
+			}),
+		});
+
+		expect(overridden.billing).toEqual({ balance: 10, inputCostPerMillion: 0.05, outputCostPerMillion: 0.01 });
+		expect(overridden.problems).toEqual([]);
+
+		const invalid = loadJevConfig({
+			cwd: "/work",
+			home: "/home/owner",
+			read: reader({
+				[PROJECT_FILE]: JSON.stringify({ billing: { balance: -1, inputCostPerMillion: "x" } }),
+			}),
+		});
+
+		expect(invalid.billing).toEqual(DEFAULT_CONFIG.billing);
+		expect(invalid.problems).toHaveLength(2);
+		expect(invalid.problems.join(" ")).toContain(`${PROJECT_FILE}: billing.balance`);
+	});
+
+	test("an invalid project section keeps inherited user values and reports their retained values", () => {
+		const config = loadJevConfig({
+			cwd: "/work",
+			home: "/home/owner",
+			read: reader({
+				[USER_FILE]: JSON.stringify({
+					gates: { mutation: false },
+					courseCheck: { mode: "interval", interval: 5 },
+					antiSlop: { mode: "enforce" },
+					billing: { balance: 7 },
+				}),
+				[PROJECT_FILE]: JSON.stringify({
+					gates: ["mutation"],
+					courseCheck: "interval",
+					antiSlop: 42,
+					billing: "later",
+				}),
+			}),
+		});
+
+		expect(config.gates).toEqual({ mutation: false, completion: true });
+		expect(config.courseCheck).toEqual({ mode: "interval", interval: 5 });
+		expect(config.antiSlop).toEqual({ mode: "enforce" });
+		expect(config.billing.balance).toBe(7);
+		expect(config.problems).toHaveLength(4);
+		const text = config.problems.join(" ");
+		for (const problem of config.problems) expect(problem).toContain(PROJECT_FILE);
+		expect(text).toContain("gates.mutation");
+		expect(text).toContain("courseCheck.mode");
+		expect(text).toContain("antiSlop.mode");
+		expect(text).toContain("billing.balance");
+		expect(text).toContain("false");
+		expect(text).toContain("true");
+		expect(text).toContain("interval");
+		expect(text).toContain("5");
+		expect(text).toContain("enforce");
+		expect(text).toContain("7");
+		expect(text).not.toContain("stays unset");
+		expect(text).not.toContain("default");
+	});
+
+	test("invalid project values and unparseable files describe the retained inherited values", () => {
+		const scalar = loadJevConfig({
+			cwd: "/work",
+			home: "/home/owner",
+			read: reader({
+				[USER_FILE]: JSON.stringify({ gates: { mutation: false }, billing: { balance: 7 } }),
+				[PROJECT_FILE]: JSON.stringify({ gates: { mutation: "yes" }, billing: { balance: -1 } }),
+			}),
+		});
+
+		expect(scalar.gates.mutation).toBe(false);
+		expect(scalar.billing.balance).toBe(7);
+		const scalarText = scalar.problems.join(" ");
+		for (const problem of scalar.problems) expect(problem).toContain(PROJECT_FILE);
+		expect(scalarText).toContain("gates.mutation");
+		expect(scalarText).toContain("billing.balance");
+		expect(scalarText).toContain("false");
+		expect(scalarText).toContain("7");
+		expect(scalarText).not.toContain("stays unset");
+		expect(scalarText).not.toContain("default");
+
+		const broken = loadJevConfig({
+			cwd: "/work",
+			home: "/home/owner",
+			read: reader({
+				[USER_FILE]: JSON.stringify({ gates: { mutation: false }, billing: { balance: 7 } }),
+				[PROJECT_FILE]: "{oops",
+			}),
+		});
+
+		expect(broken.gates.mutation).toBe(false);
+		expect(broken.billing.balance).toBe(7);
+		const brokenText = broken.problems.join(" ");
+		expect(broken.problems).toHaveLength(1);
+		expect(brokenText).toContain(PROJECT_FILE);
+		expect(brokenText).not.toContain("fail-closed defaults");
+	});
 });

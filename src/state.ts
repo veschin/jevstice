@@ -1,8 +1,8 @@
 /**
  * Per-session gate state and the digests that bind an approval to concrete work.
  *
- * The state lives in memory for the session: a host restart loses an approval and the gate closes
- * again, which is the safe direction (approvals are never restored from disk and never inferred).
+ * Normal-mode state lives in memory: a restart loses its approvals and closes its gates.
+ * Strict autonomous runs restore only validated ledger checkpoints and exact artifact bindings.
  */
 import { createHash } from "node:crypto";
 import {
@@ -30,7 +30,6 @@ export interface PlanApproval {
 	taskFingerprint: string;
 	planUrl: string;
 	planDigest: string;
-	confidence: number;
 }
 
 /** The task-bound partial state retained between plan-review stages. */
@@ -43,7 +42,7 @@ export interface PlanDraft {
 }
 
 /** One acceptance verdict for one aspect at one work revision. */
-export interface AcceptanceRecord {
+interface AcceptanceRecord {
 	aspect: Aspect;
 	revision: number;
 	label: string;
@@ -52,22 +51,14 @@ export interface AcceptanceRecord {
 }
 
 /** One successful consequential action, kept as evidence for the course and completion checks. */
-export interface ActionRecord {
+interface ActionRecord {
 	tool: string;
 	target: string;
 	excerpt: string;
 }
 
-/** The last course check and what it said. */
-export interface CourseCheckRecord {
-	revision: number;
-	label: string;
-	approved: boolean;
-	confidence: number;
-}
-
 /** The last completion check and what it said. */
-export interface CompletionRecord {
+interface CompletionRecord {
 	revision: number;
 	label: string;
 	approved: boolean;
@@ -75,50 +66,53 @@ export interface CompletionRecord {
 }
 
 /** The stop-block ledger for one unchanged refusal. */
-export interface StopRecord {
+interface StopRecord {
 	signature: string;
 	blocks: number;
 }
 
-/** One judged submission: the material's digest and the verdict it received (FR-22). */
-export interface SubmissionRecord {
+/** One judged submission: the boundary that judged it and the material's digest (FR-22). */
+interface SubmissionRecord {
 	/** The boundary that judged it, so one boundary's refusals never block another's. */
 	boundary: string;
 	/** SHA-256 of the material as submitted. */
 	digest: string;
-	/** The verdict the judge returned, or the refusal that replaced it. */
-	verdict: string;
 }
 
 /** A boundary whose refusal budget is spent, kept as the OPEN item the owner has to settle (FR-23). */
-export interface OpenItemRecord {
+interface OpenItemRecord {
 	boundary: string;
 	attempts: number;
-	digests: string[];
 }
 
-/** The consequential calls one standing boundary refused (FR-28). */
-export interface RefusedCalls {
-	boundary: string;
-	count: number;
-	calls: string[];
-}
 
 /** The first recorded action whose target left the approved plan's topics (FR-25). */
-export interface Deviation {
+interface Deviation {
 	tool: string;
 	target: string;
 	revision: number;
 }
 
-/** The course check in flight, and the task/revision whose verdict it is allowed to record. */
-export interface PendingCheck {
-	taskFingerprint?: string;
-	revision: number;
+/** The course check in flight; only the check that set this token may clear it. */
+export type PendingCheck = object;
+
+/** Session-wide judge usage; a task change does not reset it. */
+export interface SessionUsage {
+	judgeCalls: number;
+	inputTokens: number;
+	outputTokens: number;
+}
+
+/** One activity's success and failure counts. */
+export interface ActivityCount {
+	ok: number;
+	fail: number;
 }
 
 /** Everything the gates read and write for one session. */
 export interface JevState {
+	/** Strict autonomous policy never substitutes continuation permission for approval (FR-57). */
+	autonomous?: true;
 	task?: TaskIdentity;
 	/** The approved obligations of the registered task. */
 	requirementsApproval?: { taskFingerprint: string; items: string[] };
@@ -166,11 +160,10 @@ export interface JevState {
 	 * permits continuation of the current request without manufacturing approval (FR-23).
 	 */
 	exhausted: string[];
-	/** The consequential calls one standing boundary refused (FR-28). */
-	refusedCalls: RefusedCalls;
+	/** Per-boundary ignored-call counts for the current owner request (FR-28, FR-44). */
+	refusedCalls: Map<string, number>;
 	/** The first action whose target left the approved plan (FR-25). */
 	deviation?: Deviation;
-	courseCheck?: CourseCheckRecord;
 	completion?: CompletionRecord;
 	acceptance: AcceptanceRecord[];
 	stop?: StopRecord;
@@ -182,6 +175,10 @@ export interface JevState {
 	antiSlopWaivers: AntiSlopWaiver[];
 	/** The advisory anti-slop disclosure already sent for this revision and finding set. */
 	antiSlopNotice?: string;
+	/** Session-wide judge calls and token usage; it survives a task change. */
+	usage: SessionUsage;
+	/** Session-wide activity outcomes, keyed by tool name. */
+	stats: Record<string, ActivityCount>;
 }
 
 export function freshState(): JevState {
@@ -193,19 +190,22 @@ export function freshState(): JevState {
 		planTopics: [],
 		submissions: [],
 		exhausted: [],
-		refusedCalls: { boundary: "", count: 0, calls: [] },
+		refusedCalls: new Map(),
 		judgeFailures: 0,
 		antiSlopReviews: [],
 		antiSlopWaivers: [],
+		usage: { judgeCalls: 0, inputTokens: 0, outputTokens: 0 },
+		stats: {},
 	};
 }
 
 export function allowContinuation(state: JevState, reason: string): void {
+	if (state.autonomous === true) return;
 	state.continuation = { taskFingerprint: state.task?.fingerprint, request: state.request?.text ?? "", reason };
 }
 
 export function continuationAllowed(state: JevState): boolean {
-	return state.continuation !== undefined &&
+	return state.autonomous !== true && state.continuation !== undefined &&
 		state.continuation.taskFingerprint === state.task?.fingerprint &&
 		state.continuation.request === (state.request?.text ?? "");
 }
@@ -245,7 +245,6 @@ function clearWork(state: JevState): void {
 	delete state.openItemNotified;
 	delete state.checkPending;
 	delete state.deviation;
-	delete state.courseCheck;
 	delete state.completion;
 	delete state.stop;
 	delete state.continuation;
@@ -254,7 +253,7 @@ function clearWork(state: JevState): void {
 	state.submissions = [];
 	state.exhausted = [];
 	state.planTopics = [];
-	state.refusedCalls = { boundary: "", count: 0, calls: [] };
+	state.refusedCalls = new Map();
 	state.antiSlopReviews = [];
 	state.antiSlopWaivers = [];
 	delete state.antiSlopNotice;
@@ -316,6 +315,10 @@ export function registerSimple(state: JevState, request: string, external = fals
  * cheap half of the decision, with the judge answering the expensive half if the request enters.
  */
 export function screenRequest(state: JevState, request: string): RequestWeight {
+	if (state.request?.text !== request) {
+		state.refusedCalls.clear();
+		delete state.stop;
+	}
 	state.request = { text: request, weight: weightOf(request) };
 	return state.request.weight;
 }
@@ -405,11 +408,7 @@ export function submissionLedger(
  */
 export function exhaustBoundary(state: JevState, boundary: string): OpenItemRecord {
 	const refused = state.submissions.filter(entry => entry.boundary === boundary);
-	const openItem: OpenItemRecord = {
-		boundary,
-		attempts: refused.length,
-		digests: refused.map(entry => entry.digest),
-	};
+	const openItem: OpenItemRecord = { boundary, attempts: refused.length };
 	state.openItem = openItem;
 	const key = boundaryKey(boundary);
 	if (!state.exhausted.includes(key)) state.exhausted = [...state.exhausted, key];
@@ -422,13 +421,36 @@ export function boundaryExhausted(state: JevState, boundary: string): boolean {
 	return state.exhausted.includes(boundaryKey(boundary));
 }
 
-/** Count one consequential call a standing boundary refused, and keep the call it named (FR-28). */
-export function recordRefusedCall(state: JevState, boundary: string, call: string): number {
-	const same = state.refusedCalls.boundary === boundary;
-	const count = same ? state.refusedCalls.count + 1 : 1;
-	const calls = same ? [...state.refusedCalls.calls, call] : [call];
-	state.refusedCalls = { boundary, count, calls: calls.slice(-POLICY.maxIgnoredBoundaryCalls * 2) };
+/** Count one consequential call a standing boundary refused (FR-28). */
+export function recordRefusedCall(state: JevState, boundary: string): number {
+	const count = (state.refusedCalls.get(boundary) ?? 0) + 1;
+	state.refusedCalls.set(boundary, count);
 	return count;
+}
+
+/**
+ * Record the ignored-call limit as an OPEN item and permit continuation without spending the
+ * activity refusal budget. The gate's own refusals must never exhaust the activity they protect.
+ */
+export function permitAfterIgnoredCalls(state: JevState, boundary: string, attempts: number): OpenItemRecord {
+	const openItem: OpenItemRecord = { boundary, attempts };
+	state.openItem = openItem;
+	allowContinuation(state, `ignored-call limit at ${boundary}; the decision remains OPEN`);
+	return openItem;
+}
+
+/** Record one activity outcome for the session status. */
+export function recordActivityOutcome(state: JevState, tool: string, ok: boolean): void {
+	const current = state.stats[tool] ?? { ok: 0, fail: 0 };
+	state.stats[tool] = ok ? { ok: current.ok + 1, fail: current.fail } : { ok: current.ok, fail: current.fail + 1 };
+}
+
+/** Record one judge attempt and its token usage; a failed attempt still counts as a call. */
+export function recordJudgeCall(state: JevState, usage?: { inputTokens: number; outputTokens: number }): void {
+	state.usage.judgeCalls += 1;
+	if (usage === undefined) return;
+	state.usage.inputTokens += usage.inputTokens;
+	state.usage.outputTokens += usage.outputTokens;
 }
 
 /** Remember the first action whose target left the approved plan's topics (FR-25). */
@@ -437,7 +459,7 @@ export function markDeviation(state: JevState, tool: string, target: string): vo
 }
 
 /** The external deliverable the anti-slop review belongs to (FR-45, FR-46). */
-export interface AntiSlopScope {
+interface AntiSlopScope {
 	taskFingerprint?: string;
 	request: string;
 	revision: number;

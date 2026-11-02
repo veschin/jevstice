@@ -30,6 +30,7 @@ import {
 	invalidatePlan,
 	recordAcceptance,
 	recordAntiSlopReview,
+	recordJudgeCall,
 	recordRefusal,
 	registerSimple,
 	registerTask,
@@ -40,7 +41,6 @@ import {
 	type JevState,
 } from "./state.js";
 import {
-	HOLD_BOUNDARY,
 	PLAN_BOUNDARY,
 	POLICY,
 	asRecord,
@@ -51,7 +51,6 @@ import {
 	type AntiSlopFindingKind,
 	type AntiSlopInference,
 	type AntiSlopInferenceResult,
-	type AntiSlopMode,
 	type AntiSlopPart,
 	type AntiSlopReviewRecord,
 	type AntiSlopSourceClass,
@@ -191,6 +190,12 @@ function unusable(problem: string): ToolOutcome {
 }
 function text(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+/** Compare owner requests by content, not by line endings, spaces or Unicode normalization. */
+function sameOwnerMessage(left: string, right: string): boolean {
+	const normalize = (value: string): string => value.normalize("NFC").replace(/\s+/gu, " ").trim();
+	return normalize(left) === normalize(right);
 }
 
 function readStrings(value: unknown): string[] {
@@ -346,7 +351,6 @@ function topicName(index: number): string {
 	return `topic_${index}`;
 }
 
-
 function withRequest(request: string | undefined, evidence: readonly Evidence[]): Evidence[] {
 	return request === undefined ? [...evidence] : [{ kind: "user", quote: request }, ...evidence];
 }
@@ -379,13 +383,14 @@ async function askJudge(
 ): Promise<JudgeOutcome> {
 	const task = state.task;
 	const revision = state.revision;
-	const context = () => JSON.stringify([state.request?.text, state.simple, state.requirementsApproval, state.planDraft, state.plan, state.planTopics, state.hold]);
+	const context = () => JSON.stringify([state.request?.text, state.simple, state.requirementsApproval, state.planDraft, state.plan, state.planTopics, state.hold, state.autonomous === true ? state.antiSlopReviews : undefined]);
 	const submittedContext = context();
 	const outcome: JudgeOutcome = await Promise.resolve().then(() => deps.judge(judged, questions)).catch(() => ({
 		ok: false as const,
 		kind: "unavailable" as const,
 		problem: "the judge call failed",
 	}));
+	recordJudgeCall(state, outcome.ok ? outcome.usage : undefined);
 	if (state.task !== task || state.revision !== revision || context() !== submittedContext) {
 		return { ok: false, kind: "unusable", problem: "the request, approvals or work changed during judgment; the stale answer was discarded" };
 	}
@@ -428,7 +433,7 @@ async function submitToJudge(
 				`The submission was refused and nothing was approved: this exact material was already judged and refused at ${boundary}, so it is not a new attempt (${ledger.attempts} refused so far). ${MATERIAL_FAULT} Next action: change the material itself - the line it quotes, the width of its claim, or the approach - and submit that.`,
 		};
 	}
-	if (ledger.exhausted) {
+	if (ledger.exhausted && state.autonomous !== true) {
 		exhaustBoundary(state, boundary);
 		return {
 			ok: false,
@@ -510,9 +515,9 @@ export async function consult(deps: ActivityDeps, state: JevState, params: unkno
 		});
 	}
 
-	// A consultation while a finding holds the work is judged at the finding's boundary, so the same
-	// unrelated answer cannot be sent twice (FR-22); otherwise it is an ordinary consultation.
-	const boundary = held === undefined ? `${CONSULT_BOUNDARY}:${sha256(question).slice(0, 12)}` : HOLD_BOUNDARY;
+	// Each question keeps its own refusal budget even while a finding holds the work.
+	// Identical refused material at that question's boundary still costs no call (FR-22).
+	const boundary = `${CONSULT_BOUNDARY}:${sha256(question).slice(0, 12)}`;
 	const judged = material(state, { question, context, heldFinding: held ?? null }, withRequest(state.task?.request, evidence.evidence));
 	const call = await submitToJudge(deps, state, boundary, judged, questions);
 	if (!call.ok) return { ok: false, text: call.text };
@@ -527,7 +532,7 @@ export async function consult(deps: ActivityDeps, state: JevState, params: unkno
 		const meaning = judgeQuestion.options?.[label] ?? "";
 		const usable = choseLabel(outcome, CONSULT_QUESTION, label);
 		if (usable && resolved) delete state.hold;
-		if (!usable || (held !== undefined && !resolved)) recordRefusal(state, { boundary, digest: call.digest, verdict: "unresolved" });
+		if (!usable || (held !== undefined && !resolved)) recordRefusal(state, { boundary, digest: call.digest });
 		const release = usable && resolved ? " The held finding is resolved; consequential changes continue." : "";
 		const summary = `consult (choice): ${label} - ${meaning} (confidence ${percent(answer.confidence)})${usable ? "" : `, below the ${POLICY.minConfidenceToApprove} floor - not usable as an answer.${LOW_SCORE_RECOVERY}`}${release}`;
 		return usable
@@ -539,7 +544,7 @@ export async function consult(deps: ActivityDeps, state: JevState, params: unkno
 		const level = Math.max(0, Math.min(criteria.length - 1, Math.round(value)));
 		const usable = answer.confidence >= POLICY.minConfidenceToApprove;
 		if (usable && resolved) delete state.hold;
-		if (!usable || (held !== undefined && !resolved)) recordRefusal(state, { boundary, digest: call.digest, verdict: "unresolved" });
+		if (!usable || (held !== undefined && !resolved)) recordRefusal(state, { boundary, digest: call.digest });
 		const release = usable && resolved ? " The held finding is resolved; consequential changes continue." : "";
 		const summary = `consult (score): ${value.toFixed(2)} - nearest rubric step ${level}: ${criteria[level] ?? ""} (confidence ${percent(answer.confidence)})${usable ? "" : `, below the ${POLICY.minConfidenceToApprove} floor - not usable as an answer.${LOW_SCORE_RECOVERY}`}${release}`;
 		return usable
@@ -549,7 +554,7 @@ export async function consult(deps: ActivityDeps, state: JevState, params: unkno
 	const yes = probabilityOf(outcome, CONSULT_QUESTION) ?? 0;
 	const usable = yes >= POLICY.minProbabilityToApprove || 1 - yes >= POLICY.minProbabilityToApprove;
 	if (usable && resolved) delete state.hold;
-	if (!usable || (held !== undefined && !resolved)) recordRefusal(state, { boundary, digest: call.digest, verdict: "unresolved" });
+	if (!usable || (held !== undefined && !resolved)) recordRefusal(state, { boundary, digest: call.digest });
 	const release = usable && resolved ? " The held finding is resolved; consequential changes continue." : "";
 	const verdict = !usable ? "unsettled" : yes >= POLICY.minProbabilityToApprove ? "yes" : "no";
 	const summary = `consult (boolean): ${verdict} - probability of yes ${percent(yes)}${usable ? "" : `, neither outcome reaches the ${POLICY.minProbabilityToApprove} floor - not usable as an answer.${LOW_SCORE_RECOVERY}`}${release}`;
@@ -563,7 +568,9 @@ export async function reaim(deps: ActivityDeps, state: JevState, params: unknown
 	const record = asRecord(params) ?? {};
 	const interjection = text(record["interjection"]);
 	if (interjection === undefined) return refused("a non-empty interjection is required: submit the owner's words verbatim");
-	if (state.task === undefined) return refused("there is no registered development task to re-aim");
+	if (state.task === undefined) {
+		return refused("there is no registered development task to re-aim; register the current request with jev_triage, or use /jev-continue to continue the current request without a re-aim");
+	}
 	const ownerMessage = state.request?.text.trim();
 	if (ownerMessage === undefined || !ownerMessage.includes(interjection)) {
 		return refused("the interjection must quote words from the current owner message; caller-supplied evidence cannot establish who said it");
@@ -597,7 +604,7 @@ export async function reaim(deps: ActivityDeps, state: JevState, params: unknown
 	const yes = probabilityOf(outcome, REAIM_QUESTION);
 	const externalProbability = probabilityOf(outcome, EXTERNAL_QUESTION);
 	if (yes === undefined || externalProbability === undefined || yes < POLICY.minProbabilityToApprove) {
-		if (yes !== undefined) recordRefusal(state, { boundary: "reaim", digest: call.digest, verdict: "below_floor" });
+		if (yes !== undefined) recordRefusal(state, { boundary: "reaim", digest: call.digest });
 		return {
 			ok: false,
 			text: `re-aim refused (probability of yes ${yes === undefined ? "returned nothing" : percent(yes)}): nothing changed. Quote the owner's interjection verbatim and submit again.${LOW_SCORE_RECOVERY}`,
@@ -623,9 +630,14 @@ export async function triage(deps: ActivityDeps, state: JevState, params: unknow
 	const request = text(record["request"]);
 	if (request === undefined) return refused("a non-empty request is required: submit the owner's request text");
 	if (state.task !== undefined) return refused("a development task is already registered; continue its requirements or plan, or use jev_reaim for an actual owner change of direction");
-	if (state.request !== undefined && request !== state.request.text.trim()) {
-		return refused("request must match the current owner message; a caller cannot substitute a simpler task");
+	if (state.request !== undefined && !sameOwnerMessage(request, state.request.text)) {
+		const expected = state.request.text.trim();
+		const preview = expected.length > 800 ? `${expected.slice(0, 400)}...${expected.slice(-400)}` : expected;
+		return refused(
+			`request must match the current owner message; the current owner message is "${preview}" (sha256 ${sha256(expected).slice(0, 12)}). Whitespace, line endings and Unicode normalization are ignored; submit that text.`,
+		);
 	}
+	const ownerRequest = state.request?.text.trim() ?? request;
 	const evidence = readEvidence(record["evidence"], { required: false, what: "the triage" });
 	if (!evidence.ok) return refused(evidence.problem);
 	const topics = readStrings(record["topics"]);
@@ -656,7 +668,7 @@ export async function triage(deps: ActivityDeps, state: JevState, params: unknow
 			falseMeaning: "this topic is generic or not needed by this request",
 		});
 	});
-	const judged = material(state, { request, candidateTopics: topics }, withRequest(request, evidence.evidence));
+	const judged = material(state, { request: ownerRequest, candidateTopics: topics }, withRequest(ownerRequest, evidence.evidence));
 	const call = await submitToJudge(deps, state, TRIAGE_BOUNDARY, judged, questions);
 	if (!call.ok) return { ok: false, text: call.text };
 	const outcome = call.outcome;
@@ -673,7 +685,7 @@ export async function triage(deps: ActivityDeps, state: JevState, params: unknow
 	const needsDevelopment = depth >= POLICY.minProbabilityToApprove;
 	const isSimple = 1 - depth >= POLICY.minProbabilityToApprove;
 	if (!needsDevelopment && !isSimple) {
-		recordRefusal(state, { boundary: TRIAGE_BOUNDARY, digest: call.digest, verdict: "unsettled" });
+		recordRefusal(state, { boundary: TRIAGE_BOUNDARY, digest: call.digest });
 		return {
 			ok: false,
 			text: `Triage is unsettled (development probability ${percent(depth)}); no task was registered. Next action: quote the requested outcome and clarify its observable effect to Jev without changing the owner's request.${LOW_SCORE_RECOVERY}`,
@@ -681,14 +693,14 @@ export async function triage(deps: ActivityDeps, state: JevState, params: unknow
 	}
 	const selected = topics.filter((_, index) => saidTrue(outcome, topicName(index + 1)));
 	if (isSimple) {
-		registerSimple(state, request, external);
+		registerSimple(state, ownerRequest, external);
 		return {
 			ok: true,
 			text: `simple task (probability ${percent(1 - depth)}): no deeper development activities are required. Skipped: plan review, course checks, business acceptance, architecture acceptance. Any consequential invocation still needs automatic authorization against this request.${external ? " External deliverable: the anti-slop review applies." : ""}`,
 			details: { needsDevelopment: false, simpleProbability: 1 - depth, externalDeliverable: external, topics: [] },
 		};
 	}
-	const task = registerTask(state, request, external);
+	const task = registerTask(state, ownerRequest, external);
 	const topicLines = selected.map(topic => `  - ${topic}`).join("\n");
 	return {
 		ok: true,
@@ -762,7 +774,7 @@ export async function searchRelevance(
 	}
 	if (answer.label === NONE_RELEVANT) {
 		if (answer.confidence < POLICY.minConfidenceToApprove) {
-			recordRefusal(state, { boundary: SEARCH_BOUNDARY, digest: call.digest, verdict: NONE_RELEVANT });
+			recordRefusal(state, { boundary: SEARCH_BOUNDARY, digest: call.digest });
 			return {
 				ok: false,
 				text: `the judge marked no candidate relevant with confidence ${percent(answer.confidence)}, below the ${POLICY.minConfidenceToApprove} floor; re-search and submit candidates that carry evidence for the query.${LOW_SCORE_RECOVERY}`,
@@ -778,7 +790,7 @@ export async function searchRelevance(
 	const selected = Number.isInteger(index) ? candidates[index - 1] : undefined;
 	if (selected === undefined) return unusable("the judge selected a candidate that was not submitted");
 	if (answer.confidence < POLICY.minConfidenceToApprove) {
-		recordRefusal(state, { boundary: SEARCH_BOUNDARY, digest: call.digest, verdict: "below_floor" });
+		recordRefusal(state, { boundary: SEARCH_BOUNDARY, digest: call.digest });
 		return {
 			ok: false,
 			text: `the judge selected ${selected.title} with confidence ${percent(answer.confidence)}, below the ${POLICY.minConfidenceToApprove} floor; re-search and submit stronger evidence.${LOW_SCORE_RECOVERY}`,
@@ -805,9 +817,12 @@ export async function requirements(
 	if (request === undefined) return refused("a non-empty request is required: submit the owner's request text");
 	const registeredTask = state.task;
 	if (registeredTask === undefined) return refused("a development task must be registered through jev_triage before its requirements can be reviewed");
-	if (request.trim() !== registeredTask.request.trim()) {
-		return refused("the requirements request must match the development task registered by jev_triage; use jev_reaim for a changed direction");
+	if (!sameOwnerMessage(request, registeredTask.request)) {
+		return refused(state.autonomous === true
+			? "The request must match this strict run's immutable objective. Submit the exact text below; Unicode normalization and whitespace differences are ignored. Do not hash guessed variants or call triage/re-aim to change it.\nExpected immutable objective:\n" + registeredTask.request
+			: "the requirements request must match the development task registered by jev_triage; use jev_reaim for a changed direction");
 	}
+	const judgedRequest = registeredTask.request;
 	const items = readItems(record["items"]);
 	if (!items.ok) return refused(items.problem);
 	const needs = readStrings(record["candidateNeeds"]);
@@ -847,11 +862,11 @@ export async function requirements(
 	const judged = material(
 		state,
 		{
-			request,
+			request: judgedRequest,
 			items: items.items.map((item, index) => ({ id: itemName(index + 1), text: item.text, source: item.source })),
 			candidateNeeds: needs,
 		},
-		withRequest(request, evidence.evidence),
+		withRequest(judgedRequest, evidence.evidence),
 	);
 	const call = await submitToJudge(deps, state, REQUIREMENTS_BOUNDARY, judged, questions);
 	if (!call.ok) return { ok: false, text: call.text };
@@ -892,7 +907,7 @@ export async function requirements(
 		state.requirementsApproval = { taskFingerprint: registeredTask.fingerprint, items: items.items.map(item => item.text) };
 	} else {
 		delete state.requirementsApproval;
-		recordRefusal(state, { boundary: REQUIREMENTS_BOUNDARY, digest: call.digest, verdict: "not_approved" });
+		recordRefusal(state, { boundary: REQUIREMENTS_BOUNDARY, digest: call.digest });
 	}
 	const missingLines = missing.map(need => `  - ${need}`).join("\n");
 	const coverageLine =
@@ -1064,7 +1079,7 @@ async function reviewPlanOutline(
 	};
 	invalidatePlan(state);
 	if (!outlineApproved) {
-		recordRefusal(state, { boundary: `${PLAN_BOUNDARY}:outline`, digest: call.digest, verdict: PLAN_REVISE });
+		recordRefusal(state, { boundary: `${PLAN_BOUNDARY}:outline`, digest: call.digest });
 		const rejectedLines = rejected
 			.map(entry => `  - ${entry.step.id} (${percent(entry.probability ?? 0)}): ${entry.step.summary}`)
 			.join("\n");
@@ -1192,7 +1207,7 @@ async function reviewPlanDetail(
 			details: { verdict: PLAN_SERVES, step: topic.id, confidence, approvedDetails: draft.details.map(entry => entry.id) },
 		};
 	}
-	recordRefusal(state, { boundary, digest: call.digest, verdict: PLAN_REVISE });
+	recordRefusal(state, { boundary, digest: call.digest });
 	return {
 		ok: true,
 		text: `detail for '${topic.id}' is not approved: ${verdict} (confidence ${percent(confidence)}). ${confidence < POLICY.minConfidenceToApprove || verdict === "unclear" ? "The judgment is inconclusive; no defect is established." : `Jev selected: ${verdict}.`} Next action: revise only this step against the returned category or submit evidence that settles it; retain other approved steps.`,
@@ -1267,7 +1282,7 @@ async function finalizePlan(
 		...(scope === undefined || scope < POLICY.minCoverageConfidence ? ["additional material scope"] : []),
 	];
 	if (failed.length > 0) {
-		recordRefusal(state, { boundary: `${PLAN_BOUNDARY}:finalize`, digest: call.digest, verdict: PLAN_REVISE });
+		recordRefusal(state, { boundary: `${PLAN_BOUNDARY}:finalize`, digest: call.digest });
 		return {
 			ok: true,
 			text: `Final assembly is not approved: ${failed.join(", ")} (${percent(confidence)}). Accepted step details remain approved. Next action: resolve only these assembly checks; do not rewrite accepted details without evidence of a conflict.`,
@@ -1278,7 +1293,7 @@ async function finalizePlan(
 	if (currentArtifact !== artifact) return refused("the plan artifact changed during judgment; finalize its current contents");
 	const topics = draft.steps.map(step => draft.details.find(detail => detail.id === step.id)).filter((topic): topic is PlanTopic => topic !== undefined);
 	const digest = sha256(artifact);
-	state.plan = { taskFingerprint: context.taskFingerprint, planUrl: plan, planDigest: digest, confidence };
+	state.plan = { taskFingerprint: context.taskFingerprint, planUrl: plan, planDigest: digest };
 	state.planTopics = topics;
 	return {
 		ok: true,
@@ -1297,7 +1312,7 @@ export async function planReview(deps: ActivityDeps, state: JevState, params: un
 	const phase = text(record["phase"]);
 	if (phase !== "outline" && phase !== "detail" && phase !== "finalize") return refused('phase must be "outline", "detail" or "finalize"');
 	if (state.task === undefined) return refused("triage must register a development task before plan review");
-	if (state.exhausted.includes(PLAN_BOUNDARY)) return { ok: false, text: "The plan decision remains OPEN after its attempt limit. Do not resubmit it. Continue the current request without claiming plan approval." };
+	if (state.autonomous !== true && state.exhausted.includes(PLAN_BOUNDARY)) return { ok: false, text: "The plan decision remains OPEN after its attempt limit. Do not resubmit it. Continue the current request without claiming plan approval." };
 	const context = planContext(state);
 	if (context === undefined) return refused("complete Jev requirements approval before starting the plan");
 	if (
@@ -1352,7 +1367,7 @@ export async function acceptance(deps: ActivityDeps, state: JevState, params: un
 					name: "acceptance",
 					mode: "choice",
 					instructions:
-						"Does the finished work serve the owner's business need stated in the registered task, judged from the quoted evidence alone?",
+						"Does the implemented work serve the owner's business need, established by the quoted evidence? For a purely procedural obligation that is this acceptance or a downstream completion step, assess whether the recorded preceding approvals and current transition legitimately satisfy it; do not require a verdict to have occurred before deciding it. This does not exempt unfinished implementation or unperformed verification.",
 					options: {
 						[approving]: "the quoted evidence shows the owner's need is served",
 						business_gap: "a business gap remains: the quoted evidence shows the need is not served",
@@ -1363,7 +1378,7 @@ export async function acceptance(deps: ActivityDeps, state: JevState, params: un
 					name: "acceptance",
 					mode: "choice",
 					instructions:
-						"Does the implemented design support the approved behavior, judged from quoted code and execution evidence? Assess correctness of component responsibilities, dependencies and failure handling required by this task. Do not require speculative future features.",
+						"Does the implemented design support the approved behavior, judged from quoted code and execution evidence? Assess required responsibilities, dependencies and failure handling, not speculative features. A purely procedural acceptance/completion obligation may be ready through this current transition when its preceding approvals are recorded; unfinished implementation and unperformed verification still require actual evidence.",
 					options: {
 						[approving]: "the evidence shows the design supports the approved behavior",
 						architecture_defect: "the evidence establishes a design defect in the approved behavior",
@@ -1373,15 +1388,30 @@ export async function acceptance(deps: ActivityDeps, state: JevState, params: un
 		...state.planTopics.map((topic, index) => ({
 			name: topicName(index + 1),
 			mode: "noul" as const,
-			instructions: `Does the quoted evidence show the topic '${topic.id}' met for its requirement "${topic.requirement}"? Judge only from the quoted execution and code items; evidence that does not carry this requirement is a no.`,
-			trueMeaning: "the quoted evidence shows this topic met",
-			falseMeaning: "the quoted evidence does not show this topic met",
+			instructions: `Does the evidence establish topic '${topic.id}' for requirement "${topic.requirement}"? Implementation and verification outcomes require actual quoted code and execution evidence. For a purely procedural workflow obligation, use the recorded workflow approvals and held transition: this acceptance and downstream completion need not have happened before this verdict, but all preceding conditions must hold. Never reinterpret an unimplemented feature or an unperformed real-world test as a procedural exemption.`,
+			trueMeaning: "the implementation outcome is evidenced, or the purely procedural obligation is validly established by the recorded preceding steps and this held transition",
+			falseMeaning: "an implementation or verification outcome lacks evidence, or a procedural prerequisite or transition is invalid",
 		})),
 	];
 	const boundary = `acceptance:${named}`;
 	const submitted = material(
 		state,
-		{ aspect: named, claim, task: state.task.request, requirements: state.requirementsApproval?.items, planTopics: state.planTopics, changedPaths: state.actions.map(action => action.target) },
+		{
+			aspect: named,
+			claim,
+			task: state.task.request,
+			requirements: state.requirementsApproval?.items,
+			planTopics: state.planTopics,
+			changedPaths: state.actions.map(action => action.target),
+			workflow: {
+				taskFingerprint: state.task.fingerprint,
+				requirementsApproval: state.requirementsApproval ?? null,
+				planApproval: state.plan ?? null,
+				business: acceptanceAt(state, "business") ?? null,
+				architecture: acceptanceAt(state, "architecture") ?? null,
+				heldTransition: { kind: "acceptance", aspect: named, revision: state.revision },
+			},
+		},
 		withRequest(state.task.request, evidence.evidence),
 	);
 	const call = await submitToJudge(deps, state, boundary, submitted, questions);
@@ -1397,9 +1427,11 @@ export async function acceptance(deps: ActivityDeps, state: JevState, params: un
 		.filter(entry => (entry.probability ?? 0) < POLICY.minProbabilityToApprove);
 	const approved = choseLabel(outcome, "acceptance", approving) && unmet.length === 0;
 	recordAcceptance(state, { aspect: named, revision: state.revision, label, approved, confidence: answer.confidence });
-	if (!approved) recordRefusal(state, { boundary, digest: call.digest, verdict: label });
+	if (!approved) recordRefusal(state, { boundary, digest: call.digest });
 	const spent = state.submissions.filter(entry => entry.boundary === boundary).length;
-	const budget = approved ? "" : ` Refusal budget: ${spent}/${POLICY.maxRefusalsPerStage}; at the limit, continuation is permitted with this decision OPEN, not approved.`;
+	const budget = approved ? "" : state.autonomous === true
+		? ` Refused submissions: ${spent}. Strict autonomy remains unapproved; provide new evidence or a materially changed proposal. Counts never release this decision.`
+		: ` Refusal budget: ${spent}/${POLICY.maxRefusalsPerStage}; at the limit, continuation is permitted with this decision OPEN, not approved.`;
 	if (approved) {
 		const other = named === "business" ? "architecture" : "business";
 		const otherRecord = acceptanceAt(state, other as Aspect);
@@ -1499,7 +1531,7 @@ export async function review(deps: ActivityDeps, state: JevState, params: unknow
 			details: { kind, target, verdict: label, confidence: answer.confidence },
 		};
 	}
-	recordRefusal(state, { boundary: REVIEW_BOUNDARY, digest: call.digest, verdict: label });
+	recordRefusal(state, { boundary: REVIEW_BOUNDARY, digest: call.digest });
 	state.hold = { reason: `the developer review of ${kind} ${target} answered "${label}" (confidence ${percent(answer.confidence)})` };
 	return {
 		ok: true,
@@ -1530,9 +1562,20 @@ export async function textReview(deps: ActivityDeps, state: JevState, params: un
 			`the text carries ${fragments.length} fragments and only ${POLICY.maxTextFragments} are reviewed; split it and submit each part (FR-27).`,
 		);
 	}
+	const proseFragments = proseFragmentsOf(fragments);
 	const questions: JudgeQuestion[] = [];
-	fragments.forEach((_, fragmentIndex) => {
-		rules.rules.forEach((rule, ruleIndex) => {
+	rules.rules.forEach((rule, ruleIndex) => {
+		if ((rule.scope ?? "text") === "text") {
+			questions.push({
+				name: textRuleQuestionName(ruleIndex),
+				mode: "noul",
+				instructions: `Does the whole submitted text violate this rule - "${rule.rule}" (class: ${rule.class})? Answer from the text as quoted in the material alone; Markdown headings and tables count only when the rule names structure explicitly.`,
+				trueMeaning: "the whole text violates the rule",
+				falseMeaning: "the whole text satisfies the rule",
+			});
+			return;
+		}
+		proseFragments.forEach((_, fragmentIndex) => {
 			questions.push({
 				name: fragmentQuestionName(fragmentIndex, ruleIndex),
 				mode: "noul",
@@ -1542,56 +1585,96 @@ export async function textReview(deps: ActivityDeps, state: JevState, params: un
 			});
 		});
 	});
+	if (questions.length === 0) {
+		return refused("the text has no prose fragment for the fragment-scoped rules; add a text-scoped rule or submit prose");
+	}
 	const call = await submitToJudge(
 		deps,
 		state,
 		TEXT_BOUNDARY,
-		material(state, { text: body, fragments, rules: rules.rules }, []),
+		material(state, { text: body, fragments: proseFragments, rules: rules.rules }, []),
 		questions,
 	);
 	if (!call.ok) return { ok: false, text: call.text };
 	if (!call.outcome.ok) return unusable(call.outcome.problem);
-	const defects = fragments.flatMap((fragment, fragmentIndex) =>
-		rules.rules.flatMap((rule, ruleIndex) => {
-			const probability = probabilityOf(call.outcome, fragmentQuestionName(fragmentIndex, ruleIndex)) ?? 0;
-			return probability >= POLICY.minProbabilityToApprove ? [{ fragment, rule, probability }] : [];
-		}),
-	);
-	const unsettled = fragments.flatMap((fragment, fragmentIndex) =>
-		rules.rules.flatMap((rule, ruleIndex) => {
-			const probability = probabilityOf(call.outcome, fragmentQuestionName(fragmentIndex, ruleIndex));
-			return probability === undefined || (probability < POLICY.minProbabilityToApprove && 1 - probability < POLICY.minProbabilityToApprove)
-				? [{ fragment, rule, probability }]
-				: [];
-		}),
-	);
+	const defects: Array<{ fragment: string; rule: TextRule; probability: number }> = [];
+	const unsettled: Array<{ fragment: string; rule: TextRule; probability?: number }> = [];
+	const check = (fragment: string, rule: TextRule, probability: number | undefined): void => {
+		if (probability !== undefined && probability >= POLICY.minProbabilityToApprove) {
+			defects.push({ fragment, rule, probability });
+			return;
+		}
+		if (probability === undefined || (probability < POLICY.minProbabilityToApprove && 1 - probability < POLICY.minProbabilityToApprove)) {
+			unsettled.push({ fragment, rule, probability });
+		}
+	};
+	rules.rules.forEach((rule, ruleIndex) => {
+		if ((rule.scope ?? "text") === "text") {
+			check(body, rule, probabilityOf(call.outcome, textRuleQuestionName(ruleIndex)));
+			return;
+		}
+		proseFragments.forEach((fragment, fragmentIndex) => {
+			check(fragment, rule, probabilityOf(call.outcome, fragmentQuestionName(fragmentIndex, ruleIndex)));
+		});
+	});
+	const lines = [
+		...defects.map(
+			defect =>
+				`  "${readableFragment(defect.fragment)}"\n    violates [${defect.rule.class}] "${defect.rule.rule}" (probability ${percent(defect.probability)})`,
+		),
+		...unsettled.map(
+			entry =>
+				`  "${readableFragment(entry.fragment)}"\n    unsettled against [${entry.rule.class}] "${entry.rule.rule}" (${entry.probability === undefined ? "no usable answer" : `probability ${percent(entry.probability)}`})`,
+		),
+	].join("\n");
 	if (unsettled.length > 0) {
-		recordRefusal(state, { boundary: TEXT_BOUNDARY, digest: call.digest, verdict: "unsettled" });
 		return {
 			ok: false,
-			text: `Text review is unsettled for ${unsettled.length} fragment/rule pairs; no clean review is approved. Established defects: ${defects.length}. Submit evidence or revised fragments for only the listed checks.`,
+			text: `Text review is unsettled for ${unsettled.length} fragment/rule checks; no clean review is approved. Established defects: ${defects.length}.\n${lines}\n${MATERIAL_FAULT} Next action: revise the named fragments or submit evidence that settles the listed checks; unrelated text is not the problem.`,
 			details: { approved: false, defects, unsettled },
 		};
 	}
 	if (defects.length === 0) {
 		return {
 			ok: true,
-			text: `text review: no fragment violates the ${rules.rules.length} submitted rule${rules.rules.length === 1 ? "" : "s"} at the ${POLICY.minProbabilityToApprove} floor.`,
-			details: { approved: true, defects: [], rules: rules.rules.length, fragments: fragments.length },
+			text: `text review: no violation of the ${rules.rules.length} submitted rule${rules.rules.length === 1 ? "" : "s"} at the ${POLICY.minProbabilityToApprove} floor.`,
+			details: { approved: true, defects: [], rules: rules.rules.length, fragments: proseFragments.length },
 		};
 	}
-	recordRefusal(state, { boundary: TEXT_BOUNDARY, digest: call.digest, verdict: "defects" });
-	const lines = defects
-		.map(
-			defect =>
-				`  "${readableFragment(defect.fragment)}"\n    violates [${defect.rule.class}] "${defect.rule.rule}" (probability ${percent(defect.probability)})`,
-		)
-		.join("\n");
+	recordRefusal(state, { boundary: TEXT_BOUNDARY, digest: call.digest });
 	return {
 		ok: false,
-		text: `text review: ${defects.length} defect${defects.length === 1 ? "" : "s"} in ${fragments.length} fragment${fragments.length === 1 ? "" : "s"}:\n${lines}\n${MATERIAL_FAULT} Next action: rewrite those fragments in the form the named rule lines require, then submit the text again.`,
+		text: `text review: ${defects.length} defect${defects.length === 1 ? "" : "s"}:\n${lines}\n${MATERIAL_FAULT} Next action: revise the quoted text to satisfy the named rule lines, then submit it again.`,
 		details: { approved: false, defects: defects.map(defect => ({ class: defect.rule.class, rule: defect.rule.rule, fragment: defect.fragment })) },
 	};
+}
+
+/** Remove structural lines without losing adjacent prose; fences can span blank-line fragments. */
+function proseFragmentsOf(fragments: readonly string[]): string[] {
+	const fence = { marker: "", size: 0 };
+	return fragments.flatMap(fragment => {
+		const prose = fragment.split(/\r?\n/).filter(line => {
+			const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+			if (fence.marker !== "") {
+				if (marker?.[1]?.[0] === fence.marker && marker[1].length >= fence.size && marker[2]?.trim() === "") {
+					fence.marker = "";
+				}
+				return false;
+			}
+			if (marker?.[1] !== undefined) {
+				fence.marker = marker[1][0]!;
+				fence.size = marker[1].length;
+				return false;
+			}
+			return !/^(?:#{1,6}[ \t]|\|)/.test(line.trimStart());
+		}).join("\n").trim();
+		return prose.length === 0 ? [] : [prose];
+	});
+}
+
+/** The question name of one whole-text rule. */
+function textRuleQuestionName(ruleIndex: number): string {
+	return `text_rule_${ruleIndex + 1}`;
 }
 
 /** The question name of one fragment-and-rule pair, so every answer is attributed on its own. */
@@ -1620,7 +1703,11 @@ function readRules(value: unknown): { ok: true; rules: TextRule[] } | { ok: fals
 		if (ruleClass === undefined || rule === undefined) {
 			return { ok: false, problem: "every rule needs a non-empty class and its own text, quoted verbatim" };
 		}
-		rules.push({ class: ruleClass, rule });
+		const scope = record?.["scope"];
+		if (scope !== undefined && scope !== "text" && scope !== "fragment") {
+			return { ok: false, problem: 'rule scope must be "text" or "fragment"' };
+		}
+		rules.push(scope === undefined ? { class: ruleClass, rule, scope: "text" } : { class: ruleClass, rule, scope });
 	}
 	return { ok: true, rules };
 }
@@ -1761,7 +1848,7 @@ function readAntiSlop(params: unknown): { ok: true; input: AntiSlopInput } | { o
 			id,
 			text: claimText,
 			kind: kind as AntiSlopClaim["kind"],
-			evidence,
+			evidence: evidence.filter(item => item.quote !== claimText),
 			...(falsifier === undefined ? {} : { falsifier }),
 		});
 	}
@@ -1863,9 +1950,10 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 		target: string,
 		verdict: string,
 		confidence: number,
+		basis: AntiSlopClaim | AntiSlopInference | string,
 		rule?: string,
 	): void => {
-		const id = `finding-${sha256(JSON.stringify({ subject, part: partDigest, language: input.language, register: input.register, rules: rulesDigest, kind, target, verdict, rule: rule ?? null })).slice(0, 12)}`;
+		const id = `finding-${sha256(JSON.stringify({ subject, part: partDigest, language: input.language, register: input.register, rules: rulesDigest, kind, target, verdict, basis, rule: rule ?? null })).slice(0, 12)}`;
 		findings.push({
 			id,
 			kind,
@@ -1888,7 +1976,7 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 				falseMeaning: "the falsifier is not observable, does not refute the hypothesis, or is not a condition at all",
 			});
 		}
-		if (claim.evidence.some(item => item.quote !== claim.text)) {
+		if (claim.evidence.length > 0) {
 			const evidenceLines = claim.evidence
 				.map(item => `[${item.sourceClass}] ${item.quote}${item.source === undefined ? "" : ` (source: ${item.source})`}`)
 				.join("\n");
@@ -1979,14 +2067,25 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 		},
 		[],
 	);
+	state.antiSlopReviews = state.antiSlopReviews.filter(existing => {
+		const sameTask =
+			scope.taskFingerprint === undefined
+				? existing.taskFingerprint === undefined
+				: existing.taskFingerprint === scope.taskFingerprint;
+		if (existing.request !== scope.request || !sameTask) return true;
+		if (existing.part.index === input.part.index) return false;
+		if (existing.part.total !== input.part.total) return false;
+		return (
+			existing.language === input.language &&
+			existing.register === input.register &&
+			existing.rulesDigest === rulesDigest
+		);
+	});
 	const boundary = `${ANTI_SLOP_BOUNDARY}:${input.part.index}`;
 	const call = await submitToJudge(deps, state, boundary, judged, questions);
 	if (!call.ok) return { ok: false, text: call.text };
 	const outcome = call.outcome;
-	if (!outcome.ok) {
-		recordRefusal(state, { boundary, digest: call.digest, verdict: "unusable" });
-		return unusable(outcome.problem);
-	}
+	if (!outcome.ok) return unusable(outcome.problem);
 	const findings: AntiSlopFinding[] = [];
 	const claimResults: AntiSlopClaimResult[] = [];
 	let fatal: string | undefined;
@@ -1995,11 +2094,12 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 		let trust: AntiSlopTrust = "unverified";
 		let verdict = "unverified";
 		let confidence = 0;
-		const usableEvidence = claim.evidence.some(item => item.quote !== claim.text);
+		const basis = claim;
+		const usableEvidence = claim.evidence.length > 0;
 		if (claim.kind === "hypothesis" && claim.falsifier === undefined) {
 			trust = "distrusted";
 			verdict = "unfalsifiable";
-			addFinding(findings, "unfalsifiable_hypothesis", "blocker", claim.id, verdict, 1);
+			addFinding(findings, "unfalsifiable_hypothesis", "blocker", claim.id, verdict, 1, basis);
 		} else {
 			let falsifierOk = true;
 			if (claim.kind === "hypothesis") {
@@ -2020,7 +2120,7 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 					trust = "distrusted";
 					verdict = "unfalsifiable";
 					confidence = falsifierAnswer.confidence;
-					addFinding(findings, "unfalsifiable_hypothesis", "blocker", claim.id, verdict, confidence);
+					addFinding(findings, "unfalsifiable_hypothesis", "blocker", claim.id, verdict, confidence, basis);
 				} else {
 					falsifierOk = false;
 					trust = "unverified";
@@ -2032,7 +2132,7 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 				if (!usableEvidence) {
 					trust = "distrusted";
 					verdict = "unsupported";
-					addFinding(findings, "unsupported_claim", "blocker", claim.id, verdict, 1);
+					addFinding(findings, "unsupported_claim", "blocker", claim.id, verdict, 1, basis);
 				} else {
 					const answer = answerOf(outcome, claimQuestionName(index));
 					if (answer === undefined) {
@@ -2048,20 +2148,20 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 						trust = accepted ? "trusted" : "low_trust";
 						verdict = "supported";
 						if (!accepted) {
-							addFinding(findings, "low_trust_source", "warning", claim.id, verdict, confidence);
+							addFinding(findings, "low_trust_source", "warning", claim.id, verdict, confidence, basis);
 						}
 					} else if (label === "refuted" && confidence >= POLICY.antiSlopFloor) {
 						trust = "distrusted";
 						verdict = "refuted";
-						addFinding(findings, "contradicted_claim", "blocker", claim.id, verdict, confidence);
+						addFinding(findings, "contradicted_claim", "blocker", claim.id, verdict, confidence, basis);
 					} else {
 						trust = "unverified";
 						verdict = label === "supported" || label === "refuted" ? label : "not_enough_info";
-						addFinding(findings, "unverified_claim", "warning", claim.id, verdict, confidence);
+						addFinding(findings, "unverified_claim", "warning", claim.id, verdict, confidence, basis);
 					}
 				}
 			} else if (trust === "unverified") {
-				addFinding(findings, "unverified_claim", "warning", claim.id, verdict, confidence);
+				addFinding(findings, "unverified_claim", "warning", claim.id, verdict, confidence, basis);
 			}
 		}
 		claimResults.push({ id: claim.id, trust, verdict, confidence });
@@ -2075,12 +2175,13 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 			break;
 		}
 		const label = answer.label ?? "unclear";
+		const basis = inference;
 		if (label === "follows" && answer.confidence >= POLICY.antiSlopFloor) {
 			inferenceResults.push({ id: inference.id, trust: "trusted", verdict: label, confidence: answer.confidence });
 			continue;
 		}
 		if (label === "does_not_follow" && answer.confidence >= POLICY.antiSlopFloor) {
-			addFinding(findings, "invalid_inference", "blocker", inference.id, label, answer.confidence);
+			addFinding(findings, "invalid_inference", "blocker", inference.id, label, answer.confidence, basis);
 			inferenceResults.push({ id: inference.id, trust: "distrusted", verdict: label, confidence: answer.confidence });
 			continue;
 		}
@@ -2089,6 +2190,7 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 	for (const [fragmentIndex] of fragments.entries()) {
 		if (fatal !== undefined) break;
 		const target = `fragment-${fragmentIndex + 1}`;
+		const basis = fragments[fragmentIndex] ?? "";
 		const languageAnswer = answerOf(outcome, languageQuestionName(fragmentIndex));
 		const metaAnswer = answerOf(outcome, metaQuestionName(fragmentIndex));
 		const relevanceAnswer = answerOf(outcome, relevanceQuestionName(fragmentIndex));
@@ -2097,17 +2199,17 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 			break;
 		}
 		if (saidTrue(outcome, languageQuestionName(fragmentIndex), POLICY.antiSlopFloor)) {
-			addFinding(findings, "language_mismatch", "blocker", target, "outside_language", languageAnswer.confidence);
+			addFinding(findings, "language_mismatch", "blocker", target, "outside_language", languageAnswer.confidence, basis);
 		}
 		if (saidTrue(outcome, metaQuestionName(fragmentIndex), POLICY.antiSlopFloor)) {
-			addFinding(findings, "meta_text", "blocker", target, "meta_text", metaAnswer.confidence);
+			addFinding(findings, "meta_text", "blocker", target, "meta_text", metaAnswer.confidence, basis);
 		}
 		const relevance = relevanceAnswer.label ?? "unclear";
 		if (
 			(relevance === "repeats" || relevance === "off_topic") &&
 			relevanceAnswer.confidence >= POLICY.antiSlopFloor
 		) {
-			addFinding(findings, "redundant_material", "warning", target, relevance, relevanceAnswer.confidence);
+			addFinding(findings, "redundant_material", "warning", target, relevance, relevanceAnswer.confidence, basis);
 		}
 		for (const [ruleIndex, rule] of input.rules.entries()) {
 			const answer = answerOf(outcome, antiSlopRuleQuestionName(fragmentIndex, ruleIndex));
@@ -2123,28 +2225,24 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 					target,
 					"violates",
 					answer.confidence,
+					basis,
 					rule.rule,
 				);
 			}
 		}
 		if (fatal !== undefined) break;
 	}
-	if (fatal !== undefined) {
-		recordRefusal(state, { boundary, digest: call.digest, verdict: "unusable" });
-		return unusable(fatal);
-	}
+	if (fatal !== undefined) return unusable(fatal);
 	const review: AntiSlopReviewRecord = {
 		...(scope.taskFingerprint === undefined ? {} : { taskFingerprint: scope.taskFingerprint }),
 		request: scope.request,
 		revision: scope.revision,
 		part: input.part,
 		partDigest,
+		...(state.autonomous === true ? { artifact: input.artifact } : {}),
 		language: input.language,
 		register: input.register,
 		rulesDigest,
-		mode: deps.config.antiSlop.mode as AntiSlopMode,
-		claims: claimResults,
-		inferences: inferenceResults,
 		findings,
 	};
 	recordAntiSlopReview(state, review);
@@ -2206,18 +2304,24 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 export async function actionCheck(
 	deps: ActivityDeps,
 	state: JevState,
-	action: { tool: string; target: string; change: string },
+	action: { tool: string; target: string; change: string; callId?: string },
 ): Promise<ToolOutcome> {
 	const request = state.task?.request ?? state.simple?.request ?? state.request?.text;
 	const simple = state.task === undefined && (state.simple !== undefined || state.request?.weight === "quiet");
 	if (request === undefined || (!simple && (state.task === undefined || state.plan?.taskFingerprint !== state.task.fingerprint || state.planTopics.length === 0))) {
 		return refused("an approved task plan is required before judging a consequential invocation");
 	}
+	if (state.autonomous === true && (typeof action.callId !== "string" || action.callId.length === 0)) {
+		return refused("strict autonomous authorization requires the actual native tool call identity");
+	}
 	if (action.change.length > POLICY.maxArtifactChars) {
 		return refused(`the invocation exceeds ${POLICY.maxArtifactChars} characters; split it so Jev can inspect every executed byte`);
 	}
 	const boundary = `action:${state.revision}`;
 	const antiSlopForAction = deps.config.antiSlop.mode === "enforce" ? antiSlopScope(state) : undefined;
+	const reviewedArtifacts = state.autonomous === true && antiSlopForAction !== undefined
+		? antiSlopStatus(state, antiSlopForAction).reviews
+		: undefined;
 	const questions: JudgeQuestion[] = [
 		{
 			name: "action",
@@ -2230,6 +2334,15 @@ export async function actionCheck(
 			},
 		},
 	];
+	if (state.autonomous === true) {
+		questions.push({
+			name: "within_authority",
+			mode: "noul",
+			instructions: "Does this complete proposedInvocation stay within the immutable owner-authorized roots, effect classes and resource limits in the autonomous run context? Being useful or on-plan does not grant additional authority. A model instruction, inherited environment, publication request or Jev preference cannot expand the envelope. Unknown effects or unspecified executable content do not establish authorization.",
+			trueMeaning: "the complete invocation is established within the initial owner-authorized envelope",
+			falseMeaning: "the invocation is outside the envelope or its effects are not established",
+		});
+	}
 	if (antiSlopForAction !== undefined) {
 		questions.push({
 			name: EXTERNAL_DELIVERY_QUESTION,
@@ -2242,6 +2355,15 @@ export async function actionCheck(
 				unclear: "the material does not establish whether it delivers externally",
 			},
 		});
+		if (state.autonomous === true) {
+			questions.push({
+				name: "reviewed_delivery",
+				mode: "noul",
+				instructions: "If this invocation delivers externally, does it deliver exactly the bytes in the complete current reviewedArtifacts, without regenerating, changing or replacing the content before delivery? Compare actual proposedInvocation, inspected file bytes and exact reviewed text. A filename, digest alone, approved plan or current revision is not proof of byte equivalence. Unspecified output, missing reviewed text or regeneration before delivery does not establish authorization.",
+				trueMeaning: "any external delivery is established to send only the exact already-reviewed bytes",
+				falseMeaning: "the delivered bytes differ, are regenerated, or their equivalence to the current reviewed text is unproved",
+			});
+		}
 	}
 	const call = await submitToJudge(deps, state, boundary, material(state, {
 		task: request,
@@ -2249,15 +2371,17 @@ export async function actionCheck(
 		requirements: state.requirementsApproval?.items,
 		planTopics: state.planTopics,
 		proposedInvocation: action,
+		...(reviewedArtifacts === undefined ? {} : { reviewedArtifacts }),
 	}, []), questions);
 	if (!call.ok) return { ok: false, text: call.text };
 	if (!call.outcome.ok) return unusable(call.outcome.problem);
-	const approved = choseLabel(call.outcome, "action", DIRECTION_ON_COURSE);
+	const withinAuthority = state.autonomous !== true || saidTrue(call.outcome, "within_authority");
+	const approved = choseLabel(call.outcome, "action", DIRECTION_ON_COURSE) && withinAuthority;
 	const answer = answerOf(call.outcome, "action");
 	let deliveryLabel: string | undefined;
 	let antiSlopDelivery = false;
 	if (!approved) {
-		recordRefusal(state, { boundary, digest: call.digest, verdict: answer?.label ?? "no_answer" });
+		recordRefusal(state, { boundary, digest: call.digest });
 	} else if (antiSlopForAction !== undefined) {
 		const deliveryAnswer = answerOf(call.outcome, EXTERNAL_DELIVERY_QUESTION);
 		deliveryLabel = deliveryAnswer?.label;
@@ -2290,18 +2414,28 @@ export async function actionCheck(
 					},
 				};
 			}
+			if (state.autonomous === true && (!delivers || !saidTrue(call.outcome, "reviewed_delivery", POLICY.antiSlopFloor) ||
+				reviewedArtifacts === undefined || reviewedArtifacts.some(review =>
+					review.artifact === undefined || sha256(review.artifact) !== review.partDigest))) {
+				return {
+					ok: true,
+					text: "Invocation not authorized: delivery of exactly the current reviewed bytes is unproved. Regenerate or change content separately, review its final bytes, then submit a delivery-only invocation.",
+					details: { approved: false, antiSlopRequired: true, delivery: deliveryAnswer?.label },
+				};
+			}
 			if (delivers) antiSlopDelivery = true;
 		}
 	}
 	return {
 		ok: true,
-		text: `Invocation ${approved ? "authorized" : "not authorized"}: ${answer?.label ?? "no_answer"} (confidence ${percent(answer?.confidence ?? 0)}).${approved ? "" : " Submit an explicit in-plan operation; no call was executed."}`,
+		text: `Invocation ${approved ? "authorized" : "not authorized"}: ${answer?.label ?? "no_answer"} (confidence ${percent(answer?.confidence ?? 0)}).${withinAuthority ? "" : " Authorization within the initial owner envelope was not established."}${approved ? "" : " Submit an explicit in-plan operation; no call was executed."}`,
 		details: {
 			approved,
 			label: answer?.label,
 			confidence: answer?.confidence,
 			delivery: deliveryLabel,
 			antiSlopDelivery,
+			...(state.autonomous === true ? { withinAuthority, callId: action.callId } : {}),
 		},
 	};
 }
@@ -2338,7 +2472,6 @@ export async function courseCheck(deps: ActivityDeps, state: JevState): Promise<
 	const answers = questions.map(question => ({ question, answer: answerOf(outcome, question.name) }));
 	if (!outcome.ok || answers.some(entry => entry.answer === undefined)) {
 		const problem = outcome.ok ? "the judge returned no direction answer" : outcome.problem;
-		state.courseCheck = { revision: state.revision, label: "no_answer", approved: false, confidence: 0 };
 		state.hold = { reason: `the course check at revision ${state.revision} could not be answered (${problem})` };
 		return unusable(problem);
 	}
@@ -2347,7 +2480,6 @@ export async function courseCheck(deps: ActivityDeps, state: JevState): Promise<
 		.join(", ");
 	const approved = answers.every(entry => choseLabel(outcome, entry.question.name, DIRECTION_ON_COURSE));
 	const lowest = Math.min(...answers.map(entry => entry.answer?.confidence ?? 0));
-	state.courseCheck = { revision: state.revision, label: summary, approved, confidence: lowest };
 	if (approved) {
 		if (state.hold?.reason.startsWith("the course check ")) delete state.hold;
 		delete state.deviation;
@@ -2412,6 +2544,10 @@ export async function completionCheck(
 			{
 				task: state.task?.request ?? null,
 				requirements: state.requirementsApproval?.items,
+				requirementsApproval: state.requirementsApproval ?? null,
+				planApproval: state.plan ?? null,
+				taskFingerprint: state.task?.fingerprint ?? null,
+				heldTransition: { kind: "completion", revision: state.revision },
 				planTopics: state.planTopics,
 				deviation: state.deviation ?? null,
 				acceptance: state.acceptance,

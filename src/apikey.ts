@@ -11,8 +11,8 @@ import { POLICY } from "./types.js";
 const execFileAsync = promisify(execFile);
 const KEY_COMMAND_TIMEOUT_MS = 15000;
 
-export type KeyEnv = Record<string, string | undefined>;
-export type KeyCommandRunner = (command: string) => Promise<string>;
+type KeyEnv = Record<string, string | undefined>;
+type KeyCommandRunner = (command: string) => Promise<string>;
 
 const runKeyCommand: KeyCommandRunner = async command => {
 	const { stdout } = await execFileAsync("/bin/sh", ["-c", command], { timeout: KEY_COMMAND_TIMEOUT_MS });

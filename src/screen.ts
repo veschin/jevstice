@@ -23,7 +23,7 @@ export type RequestWeight = "quiet" | "judged";
 
 /** What the request asks for: publishing, inspecting or verifying work that already exists. */
 const ROUTINE =
-	/\b(?:commit|push|tag|rebase|merge|revert|status|diff|log|show|explain|describe|summari[sz]e|read|find|search|where|what|how|why|review|tests?|lint|typecheck|tsc|benchmark|run|check)\w*\b|(?:коммит|закоммит|пуш|запуш|тег|перебазир|мердж|покаж|показат|посмотр|объясн|расскаж|как работает|где |что тут|что там|найд|поищ|прочита|тест|линт|тип(?:ы|ов)|сборк|запусти|прогони|проверь|проверить|просто проверь)/iu;
+	/\b(?:commit|push|tag|rebase|merge|revert|status|diff|log|show|explain|describe|summari[sz]e|read|find|search|where|what|how|why|review|tests?|lint|typecheck|tsc|benchmark|run|check|broken|debug|diagnos|crash|failing)\w*\b|(?:коммит|закоммит|пуш|запуш|тег|перебазир|мердж|покаж|показат|посмотр|объясн|расскаж|как работает|где |что тут|что там|найд|поищ|прочита|тест|линт|тип(?:ы|ов)|сборк|запусти|прогони|проверь|проверить|просто проверь|почему|отчего|сломан|слома|не работает|баг|проблем|дебаж|диагност|чинил|падает)/iu;
 
 /** What the request changes: these words beat every routine signal, wherever they appear. */
 const CHANGE =

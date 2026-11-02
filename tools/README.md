@@ -1,8 +1,11 @@
 # Live Jevstice smoke
 
-`live-smoke.ts` is the one live-verification entry that replaced the old measurement and review
-harnesses. It uses the production judge (`createTypeSafeJudge`) and the real activity/controller
-paths; a refusal is recorded and reported, never treated as a pass.
+`live-smoke.ts` verifies the ordinary workflow through the package's only manifest entry,
+`src/index.ts`. `autonomy-smoke.ts` verifies the optional strict module, which the manifest never
+loads: its only activation path is the separate CLI (`bun run autonomy`, i.e. `autonomy/driver.ts`),
+which launches the child with `autonomy/index.ts` as its extension entry.
+Both use the production judge and real OMP where indicated. A refusal or a missing prerequisite
+is recorded rather than treated as a pass.
 
 Two live modes, plus an offline validator:
 
@@ -76,6 +79,7 @@ same proposal without changing the approach does not count.
 | factorio attempt 1 | factorio | `/tmp/jev-live-smoke-CSEgkD` | Refused only on requirement 8, automated browser checks, at `0.73`; product requirements 1-7 scored `0.85-0.97`; coverage `0.93`. |
 | factorio attempt 2 | factorio (direct) | `/tmp/jev-live-smoke-pRaYzU` | PASS |
 | factorio host | factorio (host) | `/tmp/jev-live-smoke-0NDYTX` | PASS: requirements `0.87`, outline `0.93`, seven detail choices `ready` at confidence `0.96-1.00`, final plan `0.91`; no game implementation claimed. |
+| ordinary consultation-budget repair | workflow | `/tmp/jev-live-smoke-zYZwyh` | PASS in a fresh real OMP process with the production judge; exit 0, 4542 events, no validation problems. The changed held-finding path was exercised separately in a fresh Bun process with a deterministic injected judge: `/tmp/jev-consult-boundary-QxUbwo/summary.json` records four distinct decisions for each of Choice, Score and Boolean, all reaching the judge without clearing the finding, permitting continuation or releasing mutations. The two permanent regressions failed before the fix; the integrated suite then passed 486 tests / 2170 expectations / 16 files, and strict unused-code typechecking passed. |
 
 ## Evidence
 
@@ -107,6 +111,53 @@ The shipped defaults in `src/config.ts` are `completion` mode with interval 3 an
 `gates.mutation`, `gates.completion`, `courseCheck.mode`, `courseCheck.interval` and
 `antiSlop.mode` are read. `antiSlop.mode` accepts `off`, `advisory` and `enforce`. The live smoke
 does not yet exercise the anti-slop review; `tests/anti-slop.test.ts` covers it.
+
+## Strict autonomy smoke
+
+Strict scenarios need the same judge credentials and authenticated OMP model, plus Linux `/proc`,
+cgroup v2 and a working systemd user manager. Those prerequisites belong to the optional module
+alone; an ordinary host run needs none of them and never imports `autonomy/`. The scenarios start
+disposable supervised projects outside this checkout, exercise actual native tool results and
+operator commands, and retain their evidence.
+The harness cleans up owned child scopes and refuses an evidence directory inside the checkout.
+
+```sh
+# List scenarios and separately labelled deterministic coverage without starting a run.
+bun tools/autonomy-smoke.ts --list
+
+# One live startup or completion path; --deadline is the per-scenario deadline in seconds.
+bun tools/autonomy-smoke.ts --scenario startup --deadline 300
+bun tools/autonomy-smoke.ts --scenario completion --deadline 600
+
+# All eight live scenarios, or a comma-separated subset.
+bun tools/autonomy-smoke.ts --scenario all --deadline 600
+bun tools/autonomy-smoke.ts --scenario async,async-result,cancel,crash --deadline 600
+
+# Optional model, OMP executable and private evidence root.
+bun tools/autonomy-smoke.ts --scenario admission --model deepseek/deepseek-flash --omp omp --out /tmp/jev-strict-admission
+```
+
+| Scenario | Live observation |
+| --- | --- |
+| `startup` | Native RPC readiness, bound bootstrap/context, committed custom wake, actual provider start and judged work. |
+| `completion` | One immutable objective reaches current-revision acceptance and completion without later owner input. |
+| `async` | A real native Bash background invocation remains pending until the matching native wait-tool terminal result. |
+| `async-result` | Automatic custom async-result delivery settles exactly the matching pending invocation. |
+| `compaction` | Native compaction preserves the committed objective, plan and fresh provider context. |
+| `cancel` | Operator stop fences the entire executor scope, preserves an unresolved effect and closes later admission. |
+| `crash` | Supervisor loss and recovery fence surviving detached processes without claiming or replaying the unknown effect. |
+| `admission` | Overlapping roots and a competing supervisor are refused; cancellation releases the roots. |
+
+`matrix.json` distinguishes executed/passed live scenarios from deterministic test coverage.
+Each scenario directory contains `summary.json`, `events.json`, `state.json` and bounded process
+output; the exact observations and cleanup result accompany the pass/fail status. Exit 0 means
+the selected live checks passed, exit 1 means a failed scenario, exit 2 means invalid CLI input,
+and exit 78 means a real deployment prerequisite was missing. Listing deterministic coverage
+does not execute those tests; run `bun test` separately.
+
+The strict smoke uses explicit disposable authorization envelopes. It does not authorize running
+an arbitrary objective against a user's project, expand a production run's budget or prove
+exactly-once remote effects. See [the autonomy reference](../docs/autonomy.md) for those limits.
 
 ## Removed harnesses
 

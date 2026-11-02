@@ -8,8 +8,6 @@
 
 /** Fail-closed floors, transport defaults and evidence bounds. */
 export const POLICY = {
-	/** Judge failure, malformed payload and uncertainty can never approve. */
-	failureNeverApproves: true,
 	/**
 	 * Choice and score confidence below this floor never approves. Confidence is the judge's
 	 * probability spread over the options ((3*p_max-1)/2 for three): 0.6 means roughly 73% of
@@ -37,6 +35,11 @@ export const POLICY = {
 	maxIgnoredBoundaryCalls: 3,
 	/** Fragments a submitted text is split into for the text review (FR-27). */
 	maxTextFragments: 12,
+	/** Cost per million input and output tokens for the installed jev-latest model card. */
+	modelInputCostPerMillion: 0.042,
+	modelOutputCostPerMillion: 0,
+	/** Activity calls between periodic status messages. */
+	statusEveryCalls: 10,
 	/** Anti-slop claim, inference and part bounds (FR-46, FR-56). */
 	maxAntiSlopClaims: 40,
 	maxAntiSlopInferences: 20,
@@ -116,6 +119,8 @@ export interface TextRule {
 	class: string;
 	/** The rule line the executor submitted; the tool returns it and writes none of its own. */
 	rule: string;
+	/** Where the rule applies: the whole text or each prose fragment. Defaults to the whole text. */
+	scope?: "text" | "fragment";
 }
 
 /** How the external-artifact review is enforced (FR-55). */
@@ -213,12 +218,11 @@ export interface AntiSlopReviewRecord {
 	revision: number;
 	part: AntiSlopPart;
 	partDigest: string;
+	/** Exact strict-mode review bytes; a digest-only legacy record cannot authorize strict delivery. */
+	artifact?: string;
 	language: string;
 	register: string;
 	rulesDigest: string;
-	mode: AntiSlopMode;
-	claims: AntiSlopClaimResult[];
-	inferences: AntiSlopInferenceResult[];
 	findings: AntiSlopFinding[];
 }
 
@@ -233,20 +237,28 @@ export interface AntiSlopWaiver {
 }
 
 /** The anti-slop configuration (FR-55). */
-export interface AntiSlopConfig {
+interface AntiSlopConfig {
 	mode: AntiSlopMode;
 }
 
 /** How often implementation is checked against the task direction. */
-export interface CourseCheckConfig {
+interface CourseCheckConfig {
 	mode: "interval" | "completion";
 	interval: number;
 }
 
 /** Which boundaries hold work. Both are on by default; turning one off stops that boundary. */
-export interface GateConfig {
+interface GateConfig {
 	mutation: boolean;
 	completion: boolean;
+}
+
+/** Session spend and the owner's balance snapshot; the public API exposes no balance endpoint. */
+export interface BillingConfig {
+	/** Account balance in dollars when the owner supplies it; absent means it is not configured. */
+	balance?: number;
+	inputCostPerMillion: number;
+	outputCostPerMillion: number;
 }
 
 /**
@@ -259,6 +271,7 @@ export interface JevConfig {
 	gates: GateConfig;
 	courseCheck: CourseCheckConfig;
 	antiSlop: AntiSlopConfig;
+	billing: BillingConfig;
 	problems: readonly string[];
 }
 

@@ -19,7 +19,7 @@ export function boundaryConfig(gates: { mutation?: boolean; completion?: boolean
 	return { ...DEFAULT_CONFIG, gates: { ...DEFAULT_CONFIG.gates, ...gates } };
 }
 
-export interface JudgeCall {
+interface JudgeCall {
 	state: unknown;
 	questions: readonly JudgeQuestion[];
 }
@@ -32,7 +32,7 @@ export interface FakeAnswer {
 	confidence?: number;
 }
 
-export interface FakeJudge {
+interface FakeJudge {
 	judge: Judge;
 	calls: JudgeCall[];
 }
@@ -69,7 +69,7 @@ export function answeringJudge(table: Record<string, FakeAnswerSource>): FakeJud
 			}
 			answers.push({ name: question.name, mode: "noul", probability: spec.probability ?? 0, confidence });
 		}
-		return { ok: true, model: "fake", answers };
+		return { ok: true, answers };
 	};
 	return { judge, calls };
 }
@@ -81,18 +81,17 @@ export function failingJudge(problem: string, kind: JudgeFailureKind = "unavaila
 
 /** The schema builder the host injects; it only has to build, never validate. */
 export function fakeZod(): SchemaBuilder {
-	const node = (): SchemaLike => ({ describe: () => node(), optional: () => node() });
+	const node = (): SchemaLike => ({ optional: () => node() });
 	return {
 		object: () => node(),
 		array: () => node(),
 		string: () => node(),
-		boolean: () => node(),
 		number: () => node(),
 		enum: () => node(),
 	};
 }
 
-export interface EmittedMessage {
+interface EmittedMessage {
 	customType: string;
 	content: string;
 	deliverAs?: string;

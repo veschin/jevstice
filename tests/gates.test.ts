@@ -40,12 +40,12 @@ function developed(): JevState {
 /** A developed state whose plan approval belongs to the registered task. */
 function planned(): JevState {
 	const state = developed();
-	state.plan = { taskFingerprint: state.task?.fingerprint ?? "", planUrl: "local://x-plan.md", planDigest: "d", confidence: 0.9 };
+	state.plan = { taskFingerprint: state.task?.fingerprint ?? "", planUrl: "local://x-plan.md", planDigest: "d" };
 	return state;
 }
 
 function spendBoundary(state: JevState, boundary: string): void {
-	for (const digest of ["a", "b", "c"]) recordRefusal(state, { boundary, digest, verdict: "refused" });
+	for (const digest of ["a", "b", "c"]) recordRefusal(state, { boundary, digest });
 }
 
 describe("T3 - what counts as a consequential change", () => {
@@ -259,7 +259,7 @@ describe("T3 - the mutation gate", () => {
 
 	test("FR-11: a course check in flight holds consequential changes until its verdict returns", () => {
 		const state = planned();
-		state.checkPending = { revision: state.revision };
+		state.checkPending = {};
 
 		const verdict = mutationGate(state, config(), "write", { path: "src/a.ts" });
 
@@ -275,13 +275,13 @@ describe("T3 - the mutation gate", () => {
 		expect(mutationGate(state, config(), "write", { path: "xd://jev_plan_review" }).block).toBe(false);
 		expect(mutationGate(state, config(), "write", { path: "agent://helper" }).block).toBe(false);
 
-		state.plan = { taskFingerprint: task.fingerprint, planUrl: "local://x-plan.md", planDigest: sha256("plan"), confidence: 0.9 };
+		state.plan = { taskFingerprint: task.fingerprint, planUrl: "local://x-plan.md", planDigest: sha256("plan") };
 		expect(mutationGate(state, config(), "write", { path: "src/a.ts" }).block).toBe(false);
 	});
 
 	test("an approval of another task does not open the gate", () => {
 		const state = developed();
-		state.plan = { taskFingerprint: sha256("some other task"), planUrl: "local://x-plan.md", planDigest: "d", confidence: 0.9 };
+		state.plan = { taskFingerprint: sha256("some other task"), planUrl: "local://x-plan.md", planDigest: "d" };
 
 		expect(mutationGate(state, config(), "write", { path: "src/a.ts" }).block).toBe(true);
 	});
@@ -336,7 +336,7 @@ describe("FR-21, FR-23 - boundaries are bounded without manufacturing approval",
 		const state = freshState();
 		registerTask(state, "Report the coverage of the last run");
 		spendBoundary(state, "plan:outline");
-		state.checkPending = { revision: 0 };
+		state.checkPending = {};
 
 		registerTask(state, "Write the migration guide");
 
@@ -498,7 +498,6 @@ describe("T3 - the plan-mode proposal boundary", () => {
 			taskFingerprint: task.fingerprint,
 			planUrl: planArtifactUrl("Coverage-report"),
 			planDigest: sha256("plan body"),
-			confidence: 0.93,
 		};
 
 		const spaced = proposeGate(state, config(), { path: "xd://propose", content: "Coverage report" });
@@ -514,7 +513,6 @@ describe("T3 - the plan-mode proposal boundary", () => {
 			taskFingerprint: task.fingerprint,
 			planUrl: "local://coverage-report-plan.md",
 			planDigest: "d",
-			confidence: 0.9,
 		};
 
 		expect(proposeGate(state, config(), { path: "xd://propose", content: "coverage-report-plan" }).block).toBe(false);
@@ -528,7 +526,6 @@ describe("T3 - the plan-mode proposal boundary", () => {
 			taskFingerprint: task.fingerprint,
 			planUrl: planArtifactUrl("coverage-report"),
 			planDigest: sha256("plan body"),
-			confidence: 0.93,
 		};
 
 		const verdict = proposeGate(state, config(), { path: "xd://propose", content: "coverage-report" });
@@ -540,7 +537,7 @@ describe("T3 - the plan-mode proposal boundary", () => {
 	test("a proposal of a different artifact than the approved one is blocked", () => {
 		const state = freshState();
 		const task = registerTask(state, "Add the coverage report");
-		state.plan = { taskFingerprint: task.fingerprint, planUrl: planArtifactUrl("other"), planDigest: "d", confidence: 0.9 };
+		state.plan = { taskFingerprint: task.fingerprint, planUrl: planArtifactUrl("other"), planDigest: "d" };
 
 		const verdict = proposeGate(state, config(), { path: "xd://propose", content: "coverage report" });
 
@@ -610,7 +607,7 @@ describe("T5 - the completion boundary", () => {
 		const state = planned();
 		recordAcceptance(state, { aspect: "business", revision: state.revision, label: "serves_business_need", approved: true, confidence: 0.9 });
 		recordAcceptance(state, { aspect: "architecture", revision: state.revision, label: "sound_for_next_change", approved: true, confidence: 0.9 });
-		state.checkPending = { revision: state.revision };
+		state.checkPending = {};
 
 		const gate = completionGate(state, boundaryConfig());
 
@@ -665,6 +662,12 @@ describe("FR-30 - the request screen decides whether a request enters the workfl
 		expect(weightOf("review and improve parser")).toBe("judged");
 	});
 
+	test("a diagnostic question about a failure is quiet, a fix request is judged", () => {
+		expect(weightOf("почему джев триаж сломан? у меня не работает")).toBe("quiet");
+		expect(weightOf("ты уже чинил этот баг?")).toBe("quiet");
+		expect(weightOf("почини баг в триаже")).toBe("judged");
+	});
+
 	test("the screen does not override a task that already entered the workflow", () => {
 		const state = freshState();
 		registerTask(state, "добавь отчёт по покрытию");
@@ -695,4 +698,36 @@ describe("FR-30 - the request screen decides whether a request enters the workfl
 		expect(proposeGate(state, config({ mutation: false }), { path: "xd://propose", content: "coverage-report" }).block).toBe(false);
 		expect(completionGate(state, config({ completion: false })).applies).toBe(false);
 	});
+});
+
+describe("FR-57 - strict completion cannot be released by ordinary shortcuts", () => {
+	test("a bound autonomous observation task requires acceptance even without a mutation", () => {
+		const state = freshState();
+		state.autonomous = true;
+		registerTask(state, "Inspect the implementation and return verified results");
+
+		const verdict = completionGate(state, config());
+
+		expect(verdict.applies).toBe(true);
+		expect(verdict.reason).toContain("business");
+	});
+
+	test("disabled normal gates do not disable an explicitly strict run", () => {
+		const state = freshState();
+		state.autonomous = true;
+		registerTask(state, "Implement the bound objective");
+
+		expect(mutationGate(state, config({ mutation: false }), "write", { path: "src/report.ts" }).block).toBe(true);
+		expect(completionGate(state, config({ completion: false })).applies).toBe(true);
+	});
+});
+
+test("FR-57: a known consequential publication cannot bypass a standing strict finding", () => {
+	const state = planned();
+	state.autonomous = true;
+	state.hold = { reason: "a confirmed defect remains unresolved" };
+
+	const verdict = mutationGate(state, config(), "bash", { command: "git push" }, true);
+
+	expect(verdict.block).toBe(true);
 });

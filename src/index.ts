@@ -1,5 +1,5 @@
 /**
- * Jevstice entry point.
+ * Ordinary Jevstice entry point; optional autonomy has its own explicit entry.
  *
  * Load manifest (integrator-owned package.json): `{ "omp": { "extensions": ["src/index.ts"] } }`.
  * An installed checkout loads in ordinary sessions; `omp --no-extensions -e <path>` loads this
@@ -11,7 +11,7 @@
 import { memoizedApiKeyResolver } from "./apikey.js";
 import { loadJevConfig } from "./config.js";
 import { createJevController, type PiApi, type SchemaBuilder } from "./controller.js";
-import { createTypeSafeJudge, type Judge } from "./judge.js";
+import { createTypeSafeJudge } from "./judge.js";
 import { POLICY } from "./types.js";
 
 /** The host surface the factory reads: the extension API plus the injected schema builder. */
@@ -19,18 +19,14 @@ interface ExtensionHost extends PiApi {
 	zod: SchemaBuilder;
 }
 
-/** Build the factory omp calls with its ExtensionAPI; `deps` exists for tests and embedding. */
-export function createJevExtension(
-	deps: { judge?: Judge; cwd?: string; home?: string } = {},
-): (pi: ExtensionHost) => void {
+/** Build the factory omp calls with its ExtensionAPI. */
+function createJevExtension(): (pi: ExtensionHost) => void {
 	return pi => {
-		const config = loadJevConfig({ cwd: deps.cwd ?? process.cwd(), home: deps.home });
-		const judge =
-			deps.judge ??
-			createTypeSafeJudge({
-				resolveKey: memoizedApiKeyResolver(process.env),
-				model: POLICY.defaultModel,
-			});
+		const config = loadJevConfig({ cwd: process.cwd() });
+		const judge = createTypeSafeJudge({
+			resolveKey: memoizedApiKeyResolver(process.env),
+			model: POLICY.defaultModel,
+		});
 		createJevController({ judge, config, zod: pi.zod }).register(pi);
 	};
 }
