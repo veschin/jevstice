@@ -17,8 +17,16 @@ export const POLICY = {
 	 * that carry rule tension or one inference step.
 	 */
 	minConfidenceToApprove: 0.6,
-	/** Boolean probability floor for activities other than plan-topic execution. */
-	minProbabilityToApprove: 0.8,
+	/**
+	 * Boolean probability floor for workflow decisions: triage depth, per-item requirement
+	 * support, review, acceptance, completion and both recovery phases. Calibrated 2026-10-08
+	 * on a ground-truth domain (evidence/jev-calibration-2026-10-08.md): no false claim was
+	 * ever approved at any threshold, while well-evidenced true claims measured 0.66-1.00.
+	 * Lowered from 0.8 to 0.7 on 2026-11-13 by owner decision: a recorded live recovery was
+	 * refused at 0.79 and honest requirement items at 0.7x, both inside the measured
+	 * true-claim band. The anti-slop floor stays at 0.8 because FR-47 through FR-52 fix it.
+	 */
+	minProbabilityToApprove: 0.7,
 	/** Requirement-list coverage floor; inferred implementation choices are reviewed against the objective. */
 	minRequirementsCoverageConfidence: 0.6,
 	/** Outline-step support floor; detail choices use minConfidenceToApprove. */
@@ -29,9 +37,9 @@ export const POLICY = {
 	maxStopBlocks: 3,
 	/** Consecutive availability failures before the judge is declared unavailable for the session (FR-21). */
 	maxJudgeFailures: 3,
-	/** Refusals of one decision before continuation is permitted with that decision OPEN (FR-22, FR-23). */
+	/** Refusals of one decision before it is recorded OPEN with the finding unresolved (FR-22, FR-23). */
 	maxRefusalsPerStage: 3,
-	/** Calls one standing boundary may refuse before notifying the owner and permitting continuation (FR-28). */
+	/** Calls one standing boundary may refuse before the owner is notified and the item stays OPEN (FR-28). */
 	maxIgnoredBoundaryCalls: 3,
 	/** Fragments a submitted text is split into for the text review (FR-27). */
 	maxTextFragments: 12,
@@ -75,14 +83,20 @@ export interface Evidence {
 	kind: EvidenceKind;
 	quote: string;
 	source?: string;
+	/**
+	 * A trusted source identifier returned by jev_context. The controller resolves it against the
+	 * project archive and verifies the quote before judgment; a free quote without one stays
+	 * explicitly unverified submitted material.
+	 */
+	sourceId?: string;
 }
 
 /** The two perspectives a finished task is defended from at acceptance. */
 export type Aspect = "business" | "architecture";
 
 /**
- * Boundary names used by gates and refusal ledgers (FR-22, FR-23). Exhaustion permits continuation
- * of the current request while preserving the unapproved plan or unresolved finding.
+ * Boundary names used by gates and refusal ledgers (FR-22, FR-23). Exhaustion records the decision
+ * as OPEN: it preserves the unresolved finding and authorizes no continuation by itself.
  */
 export const PLAN_BOUNDARY = "plan";
 export const HOLD_BOUNDARY = "hold";

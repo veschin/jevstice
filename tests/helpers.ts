@@ -87,6 +87,7 @@ export function fakeZod(): SchemaBuilder {
 		array: () => node(),
 		string: () => node(),
 		number: () => node(),
+		unknown: () => node(),
 		enum: () => node(),
 	};
 }

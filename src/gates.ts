@@ -20,6 +20,8 @@ import {
 	boundaryExhausted,
 	boundaryKey,
 	continuationAllowed,
+	permittedRepair,
+	recoveryFeedback,
 	type AntiSlopStatus,
 	type JevState,
 } from "./state.js";
@@ -52,6 +54,8 @@ const READ_ONLY_TOOLS: Record<string, true> = {
 	wait: true,
 	todo: true,
 	ast_grep: true,
+	jev_context: true,
+	jev_course_check: true,
 	jev_acceptance: true,
 	jev_anti_slop: true,
 	jev_consult: true,
@@ -93,8 +97,8 @@ const LSP_READ_ACTIONS: Record<string, true> = {
 /**
  * Shell programs whose plain invocation only reports state: they read the working tree, the
  * environment or the clock and write no file. Programs taking an output file positionally (`uniq`,
- * `xxd`) are deliberately absent, as is every program with a shell escape. `git` is read by
- * subcommand instead (below).
+ * `xxd`) are deliberately absent, and each reporting program's own output or execution options are
+ * guarded below. `git` is read by subcommand instead.
  */
 const NON_MUTATING_PROGRAMS: Record<string, true> = {
 	ls: true,
@@ -147,35 +151,9 @@ const NON_MUTATING_PROGRAMS: Record<string, true> = {
 	shasum: true,
 	sha256sum: true,
 	md5sum: true,
+	test: true,
+	"[": true,
 };
-
-/**
- * Argument tokens that turn an otherwise reporting program into a writer, so a command carrying one
- * is handled as a change even when its program reports state. The `--flag=value` and joined short
- * (`-ofile`, `-i.bak`) forms count too.
- */
-const WRITE_FLAGS: Record<string, true> = {
-	"-i": true,
-	"--in-place": true,
-	"-o": true,
-	"--output": true,
-	"-exec": true,
-	"-execdir": true,
-	"-delete": true,
-	"-fprint": true,
-	"-fls": true,
-	"-ok": true,
-};
-
-/** Whether one argument is a write flag, in its bare, `--flag=value` or joined short form. */
-function isWriteFlag(argument: string): boolean {
-	if (WRITE_FLAGS[argument] === true) return true;
-	const equals = argument.indexOf("=");
-	if (equals > 0 && WRITE_FLAGS[argument.slice(0, equals)] === true) return true;
-	if (argument.startsWith("--") || argument.length < 2) return false;
-	const joined = argument.slice(0, 2);
-	return joined !== "-" && WRITE_FLAGS[joined] === true;
-}
 
 /** Potential effects: ordinary mode exempts repository metadata and publication; strict mode does not. */
 const SHELL_TREE_CHANGE = 1;
@@ -210,6 +188,8 @@ const NON_MUTATING_DEVICES: Record<string, true> = {
 	lsp: true,
 	ast_grep: true,
 	propose: true,
+	jev_context: true,
+	jev_course_check: true,
 	jev_acceptance: true,
 	jev_consult: true,
 	jev_plan_review: true,
@@ -223,6 +203,9 @@ const NON_MUTATING_DEVICES: Record<string, true> = {
 	mcp__google_sheets_list_sheets: true,
 	mcp__google_sheets_list_spreadsheets: true,
 };
+/** Fetching a URL reads an external artifact, not the project tree. */
+const EXTERNAL_READ_SCHEMES: Record<string, true> = { http: true, https: true };
+
 /** Schemes reaching coordination, session artifacts or judge tools rather than the working tree. */
 const COORDINATION_SCHEMES: Record<string, true> = {
 	xd: true,
@@ -250,32 +233,29 @@ interface ProposeVerdict extends GateVerdict {
 }
 
 /**
- * One refusal text (FR-20, FR-28): what is held, the one call that resolves it - written out with its
- * arguments so it can be made as it stands - and why nothing else will move the boundary.
+ * One refusal text (FR-20, FR-28): the decision, the concrete next call, then the missing
+ * prerequisite and the evidence reads that stay open. The machine boundary stays on `GateVerdict`.
  */
 function refusal(headline: string, nextCall: string, why: string): string {
-	return `${headline} Next call: ${nextCall} ${why}`;
+	const separator = /[.!?]$/.test(nextCall) ? " " : ". ";
+	return `${headline} Next call: ${nextCall}${separator}${why}`;
 }
 
 /** The call that opens the mutation gate on an untriaged session (FR-18, FR-28). */
 const TRIAGE_CALL =
-	`jev_triage({"request": "<the owner's request, verbatim>", "topics": ["<a narrow topic this task needs>"], "evidence": [{"kind": "user", "quote": "<a line from the request>"}]})`;
+	`jev_triage({"request": "<owner request, verbatim>", "topics": ["<narrow topic>"], "evidence": [{"kind": "user", "quote": "<line from the request>"}]})`;
 
 /** The call that opens the mutation gate on a registered development task (FR-18, FR-24, FR-28). */
 const PLAN_CALL =
-	`write local://<slug>-plan.md, then jev_plan_review({"phase":"outline","steps":[{"id":"<step-id>","summary":"<one high-level action>","requirement":"<exact Jev-approved requirement>"}],"evidence":[{"kind": "user", "quote": "<request or owner reply>"}]}). After Jev approves the full outline, call jev_plan_review once per step with {"phase":"detail","plan":"local://<slug>-plan.md","topic":{"id":"<step-id>","section":"<complete verbatim section>","paths":["<changed path>"],"requirement":"<exact approved requirement>"},"evidence":[{"kind": "user", "quote": "<request or owner reply>"}]}; after every step passes, call jev_plan_review({"phase":"finalize","plan":"local://<slug>-plan.md","evidence":[{"kind": "user", "quote": "<request or owner reply>"}]}).`;
-
-/** The call that answers a finding holding the work (FR-13, FR-28). */
-const HOLD_CALL =
-	`jev_consult({"mode": "boolean", "question": "<the finding, as a question>", "context": "<the task context>", "trueMeaning": "<what yes commits to>", "falseMeaning": "<what no commits to>"})`;
+	`write local://<slug>-plan.md, then jev_plan_review with phase "outline" (one id, summary and requirement per step, plus user evidence), one phase "detail" submission per step (verbatim section and changed paths), and phase "finalize"`;
 
 /** The call that defends finished work before completion (FR-14, FR-15, FR-26, FR-28). */
 const ACCEPTANCE_CALL = (aspect: string): string =>
-	`jev_acceptance({"aspect": "${aspect}", "claim": "<what the finished work achieves>", "evidence": [{"kind": "execution", "quote": "<the command and its output>"}, {"kind": "code", "quote": "<a diagnostic, a diff or a size measurement>"}]})`;
+	`jev_acceptance({"aspect":"${aspect}","claim":"<what the finished work achieves>","evidence":[{"kind":"execution","quote":"<command and output>"},{"kind":"code","quote":"<diff, diagnostic or measurement>"}]})`;
 
 /** The call that reviews the external deliverable (FR-46, FR-56). */
 const ANTI_SLOP_CALL =
-	`jev_anti_slop({"artifact": "<exact external artifact text>", "language": "<declared language>", "register": "<declared register>", "purpose": "<declared purpose>", "audience": "external", "rules": [{"class": "<rule class>", "rule": "<owner rule>"}], "claims": [{"id": "claim-1", "text": "<verbatim artifact sentence>", "kind": "fact", "evidence": [{"kind": "documentation", "quote": "<source quote>", "source": "<source locator>", "sourceClass": "official"}]}], "inferences": []})`;
+	`jev_anti_slop({"artifact":"<exact artifact text>","language":"<declared language>","register":"<declared register>","purpose":"<declared purpose>","audience":"external","rules":[...],"claims":[...],"inferences":[]})`;
 
 /** Why an external deliverable cannot settle yet (FR-55). */
 function antiSlopReason(state: JevState, status: AntiSlopStatus): string {
@@ -283,46 +263,46 @@ function antiSlopReason(state: JevState, status: AntiSlopStatus): string {
 		return refusal(
 			`Jevstice holds this completion: the external deliverable has no anti-slop review at the current work revision (${state.revision}).`,
 			ANTI_SLOP_CALL,
-			"The review binds to the exact artifact and the current revision; a later change needs a fresh review.",
+			"A review of the exact artifact at this revision is the missing prerequisite. Evidence reads and jev_context stay open.",
 		);
 	}
 	if (status.missing.length > 0) {
 		return refusal(
 			`Jevstice holds this completion: the anti-slop review covers part(s) ${status.reviews.map(review => review.part.index).join(", ")} but not part(s) ${status.missing.join(", ")}.`,
 			ANTI_SLOP_CALL,
-			"Every part of the deliverable must be reviewed at the current revision.",
+			"Every part reviewed at the current revision is the missing prerequisite. Evidence reads stay open.",
 		);
 	}
 	if (status.inconsistent) {
 		return refusal(
 			"Jevstice holds this completion: the anti-slop parts were reviewed under different languages, registers or rule sets.",
 			ANTI_SLOP_CALL,
-			"Review every part with one declared language, register and rule set.",
+			"One declared language, register and rule set across every part is the missing prerequisite; evidence reads stay open.",
 		);
 	}
 	const blockers = status.blockers.map(finding => `${finding.id} (${finding.kind})`).join(", ");
 	return refusal(
 		`Jevstice holds this completion: the anti-slop review has unwaived blocker(s): ${blockers}.`,
 		`owner: /jev-waive <finding-id> <reason>; executor: jev_anti_slop with a revised artifact`,
-		"A waiver records the owner's acceptance of that finding; it is not Jev approval. A revised artifact needs a fresh review.",
+		"A waiver records the owner's acceptance of that finding, not Jev approval; a revised artifact needs a fresh review. Evidence reads stay open.",
 	);
 }
 
 export const PLAN_REQUIRED_REASON = refusal(
 	"Jevstice holds this change: the registered development task has no approved plan.",
 	PLAN_CALL,
-	"A plan is approved only when every topic you submit passes on its own. Registered jev_ tools, xd://, agent://, local:// and proc:// writes pass this gate.",
+	"The approved plan is the missing prerequisite. Evidence reads, jev_context and xd:// coordination stay open; each topic is approved on its own.",
 );
 
 const TRIAGE_REQUIRED_REASON = refusal(
-	"Jevstice holds this change: no request has been triaged in this session, so no decision on it is known.",
+	"Jevstice holds this change: the current request has not been triaged.",
 	TRIAGE_CALL,
-	"A development task then waits for requirements and jev_plan_review. Registered jev_ tools, xd://, agent://, local:// and proc:// writes pass this gate.",
+	"Triage is the missing prerequisite. Evidence reads, jev_context and xd:// coordination stay open.",
 );
 
 /** The call that re-aims the task at the owner's latest message (FR-29). */
 const REAIM_CALL =
-	`jev_reaim({"interjection": "<the owner's latest message, verbatim>", "evidence": [{"kind": "user", "quote": "<the same words>"}]})`;
+	`jev_reaim({"interjection":"<owner's latest message, verbatim>","evidence":[{"kind":"user","quote":"<the same words>"}]})`;
 
 /**
  * The refusal of a change while the owner's latest message is unjudged (FR-29): the words may name a
@@ -331,54 +311,51 @@ const REAIM_CALL =
 function directionReason(state: JevState): string {
 	const quoted = state.directionPending?.text ?? "";
 	const short = quoted.length > 160 ? `${quoted.slice(0, 160)}...` : quoted;
-	const next =
-		state.task === undefined
-			? "Next call: jev_triage with the current owner request, or /jev-continue."
-			: REAIM_CALL;
+	const next = state.task === undefined ? TRIAGE_CALL : REAIM_CALL;
 	const why =
 		state.task === undefined
-			? "No development task is registered, so there is no direction to re-aim; triage registers the task."
-			: "A new plan cannot settle it: only a judged re-aim replaces the task direction, and the re-aimed task then needs its own requirements and plan review.";
+			? "Triage is the missing prerequisite because no development task is registered. Evidence reads and jev_context stay open."
+			: "A judged re-aim is the missing prerequisite. It decides whether the message continues, extends or replaces the course; earlier approvals do not carry over. Evidence reads, jev_context and xd:// coordination stay open.";
 	return refusal(
-		`Jevstice holds this change: the owner sent a message after the task was registered ("${short}"), so the current direction is undecided.`,
+		`Jevstice holds this change: the latest owner message may replace the current course ("${short}").`,
 		next,
 		why,
 	);
 }
 
 /**
- * Refusal while availability has not granted current-request continuation (FR-21).
+ * Refusal while availability has not granted current-request continuation (FR-21). No decision was
+ * obtained, so the class is unavailable judgment, not a defect and not an approval.
  */
 const JUDGE_UNAVAILABLE_REASON = refusal(
-	"Jevstice holds this change: the judge could not be reached, so no decision on it can be obtained and nothing is approved.",
-	"retry the pending jev_ call (jev_triage, jev_requirements or jev_plan_review) with the same material",
-	"Owner permission or the availability attempt limit permits continuation without judge approval.",
+	"Jevstice holds this decision: no usable judge answer was obtained, so nothing is approved.",
+	"restore judge availability and resubmit the same material unchanged; it was never judged",
+	"The attempt count records the outage and is not an approval. Evidence reads, jev_context and xd:// coordination stay open.",
 );
 
 /**
- * A prior exhausted decision does not authorize a changed request. Its finding remains OPEN.
+ * A prior exhausted decision does not authorize a changed request. Its finding remains OPEN and
+ * only materially new evidence can move the work.
  */
 function openItemReason(state: JevState, boundary: string, what: string): string {
 	const item = state.openItem;
 	const attempts = item !== undefined && boundaryKey(item.boundary) === boundaryKey(boundary) ? item.attempts : 0;
 	return refusal(
-		`Jevstice holds ${what}: the ${boundary} boundary is an OPEN item after ${attempts} refused submissions, and nothing was approved.`,
+		`Jevstice holds ${what}: the ${boundary} decision is OPEN after ${attempts} refused submissions; nothing was approved.`,
+		"submit materially new evidence that addresses the finding, then use recovery phase repair for an exact corrective call or phase resolve for observed correction evidence",
 		state.autonomous === true
-			? "observe the missing evidence or submit a materially changed proposal to Jev; strict autonomy has no continuation override"
-			: "obtain current-request owner permission with /jev-continue, or register the owner's changed direction with jev_reaim",
-		state.autonomous === true
-			? "Refusal accounting preserves the OPEN finding; it never authorizes an autonomous effect."
-			: "The prior request's continuation permission does not carry over to a changed request.",
+			? "Strict autonomy has no continuation override, and the spent budget never authorizes an effect. Evidence reads and jev_context stay open."
+			: "A repeated submission without new evidence changes nothing. Evidence reads and jev_context stay open.",
 	);
 }
 
 const REQUIREMENTS_CALL =
-	`jev_requirements({"request": "<the owner's request>", "items": [{"text": "<one checkable obligation>", "source": "<the request line it comes from>"}], "candidateNeeds": [], "evidence": [{"kind": "user", "quote": "<a line from the request>"}]})`;
+	`jev_requirements({"request":"<owner request>","items":[{"text":"<one checkable obligation>","source":"<request line>"}],"candidateNeeds":[],"evidence":[{"kind":"user","quote":"<request line>"}]})`;
 
 const REQUIREMENTS_REQUIRED_REASON = refusal(
 	"Jevstice holds plan preparation: the registered task has no approved requirements review.",
 	REQUIREMENTS_CALL,
-	"Derive one checkable obligation per part of the owner's request and submit them with the request as evidence; an implementation choice the request does not state is not an owner instruction. Plan files and jev_plan_review remain held until coverage is established and every submitted obligation is supported.",
+	"One checkable obligation per part of the owner's request is the missing prerequisite. Evidence reads and jev_context stay open; plan files and jev_plan_review remain held until requirements pass.",
 );
 
 /** Hold plan artifacts and reviews until the registered task's requirements pass. */
@@ -412,7 +389,7 @@ export function requirementsBeforePlanGate(
 const TRIAGE_INSPECTION_REASON = refusal(
 	"Jevstice holds this project inspection: the current request has not been triaged.",
 	TRIAGE_CALL,
-	"Read the required skills and update task tracking, then triage before inspecting project files or submitting requirements.",
+	"Triage is the missing prerequisite. skill:// instructions, jev_context, external URL reads and non-project reads stay open.",
 );
 
 /** The boundaries the gates refuse at; each one is counted on its own (FR-28). */
@@ -424,18 +401,18 @@ export const PROPOSE_BOUNDARY = "propose";
 /** The refusal of a proposal whose artifact could not be read back (FR-07, FR-28). */
 export function planArtifactUnreadableReason(url: string): string {
 	return refusal(
-		`Jevstice holds this plan proposal: the artifact ${url} could not be read, so the approval cannot be bound to what is being proposed.`,
+		`Jevstice holds this plan proposal: the artifact ${url} could not be read back.`,
 		`write ${url}`,
-		"An approval binds to the artifact's bytes and never to a copy of them.",
+		"A readable artifact is the missing prerequisite; the approval binds to its bytes, not to a copy. Evidence reads stay open.",
 	);
 }
 
 /** The refusal of a proposal whose artifact changed after the review (FR-07, FR-28). */
 export function planArtifactChangedReason(url: string): string {
 	return refusal(
-		`Jevstice holds this plan proposal: ${url} changed after the plan review, so the recorded approval no longer binds it.`,
+		`Jevstice holds this plan proposal: ${url} changed after the plan review.`,
 		PLAN_CALL,
-		"The approval is bound to the digest that was reviewed, so a changed artifact needs its own review.",
+		"A fresh review of the current artifact is the missing prerequisite; the approval binds the reviewed digest, not an earlier copy. Evidence reads stay open.",
 	);
 }
 
@@ -471,28 +448,398 @@ function pathOf(record: Record<string, unknown> | undefined): string | undefined
 }
 
 
-/** Unknown syntax/programs remain potential writes; environment assignments cannot prove strict observation. */
-function commandSegmentEffects(segment: string): number {
-	const tokens = segment.split(/\s+/).filter(token => token.length > 0);
-	let index = 0;
-	while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index] ?? "")) index += 1;
-	const prefix = index > 0 ? SHELL_NON_TREE_CHANGE : 0;
-	const program = tokens[index];
-	if (program === undefined) return prefix;
-	if (program.includes("/") || tokens.some(isWriteFlag)) return prefix | SHELL_TREE_CHANGE;
-	if (program !== "git") return prefix | (NON_MUTATING_PROGRAMS[program] === true ? 0 : SHELL_TREE_CHANGE);
-	return prefix | (GIT_SUBCOMMAND_EFFECTS[tokens[index + 1] ?? ""] ?? SHELL_TREE_CHANGE);
+/**
+ * A literal shell word. Quoted text is inert, `expanded` records a value taken from a tracked
+ * binding, and `dynamic` marks an expansion or syntax this parser will not follow.
+ */
+interface ShellWord {
+	text: string;
+	quoted: boolean;
+	expanded: boolean;
+	dynamic: boolean;
 }
 
-const combineSegmentEffects = (effects: number, segment: string): number => effects | commandSegmentEffects(segment);
+interface ShellWordBuffer extends ShellWord {
+	content: boolean;
+}
 
-/** One conservative literal parser serves both domains; opaque payloads still require full judgment (FR-31). */
+/** `null` means the binding was reassigned in a scope this parser cannot follow. */
+type ShellBindings = Map<string, string | null>;
+
+type SegmentJoin = "start" | "sequence" | "and" | "or" | "pipe" | "background" | "end";
+
+/**
+ * Output and execution options that turn an otherwise reporting program into a writer. Options are
+ * per program: `grep -i` and `rg -i` only ignore case, `df --output` selects fields and `ls -o`
+ * only changes the listing, while these forms write or execute. `--flag=value` and joined short
+ * (`-ofile`) forms count.
+ */
+const PROGRAM_WRITE_OPTIONS: Record<string, Record<string, true>> = {
+	git: { "--output": true, "--ext-diff": true, "--textconv": true, "--show-signature": true },
+	sort: {
+		"-o": true,
+		"--output": true,
+		"-T": true,
+		"--temporary-directory": true,
+		"--compress-program": true,
+	},
+	tree: { "-o": true },
+	file: { "-C": true, "--compile": true },
+	rg: { "--pre": true, "--hostname-bin": true },
+};
+
+function isProgramWriteOption(program: string, word: ShellWord): boolean {
+	const options = PROGRAM_WRITE_OPTIONS[program];
+	if (options === undefined) return false;
+	if (options[word.text] === true) return true;
+	const equals = word.text.indexOf("=");
+	if (equals > 0 && options[word.text.slice(0, equals)] === true) return true;
+	if (word.text.startsWith("--") || word.text.length < 2) return false;
+	return options[word.text.slice(0, 2)] === true;
+}
+
+/** Skip a backtick substitution: its content is opaque, so the caller marks the word dynamic. */
+function skipBacktick(command: string, start: number): number {
+	let index = start + 1;
+	while (index < command.length) {
+		if (command[index] === "\\") {
+			index += 2;
+			continue;
+		}
+		if (command[index] === "`") return index + 1;
+		index += 1;
+	}
+	return command.length;
+}
+
+/** Skip a `$(...)` or `$((...))` body so its operators cannot be read as the outer command. */
+function skipBalancedParen(command: string, start: number): number {
+	let depth = 0;
+	let quote: "'" | '"' | null = null;
+	let index = start;
+	while (index < command.length) {
+		const character = command[index] ?? "";
+		if (quote === "'") {
+			if (character === "'") quote = null;
+			index += 1;
+			continue;
+		}
+		if (quote === '"') {
+			if (character === "\\") {
+				index += 2;
+				continue;
+			}
+			if (character === '"') quote = null;
+			index += 1;
+			continue;
+		}
+		if (character === "\\") {
+			index += 2;
+			continue;
+		}
+		if (character === "'" || character === '"') {
+			quote = character;
+			index += 1;
+			continue;
+		}
+		if (character === "`") {
+			index = skipBacktick(command, index);
+			continue;
+		}
+		if (character === "(") {
+			depth += 1;
+			index += 1;
+			continue;
+		}
+		if (character === ")") {
+			depth -= 1;
+			index += 1;
+			if (depth === 0) return index;
+			continue;
+		}
+		index += 1;
+	}
+	return command.length;
+}
+
+interface ShellExpansion {
+	text: string;
+	dynamic: boolean;
+	next: number;
+}
+
+function bindingExpansion(name: string, bindings: ShellBindings, quoted: boolean, next: number): ShellExpansion {
+	const value = bindings.get(name);
+	if (value === undefined || value === null) return { text: "", dynamic: true, next };
+	// Unquoted expansion word-splits and globs, so an option or argument can change shape.
+	if (quoted) return { text: value, dynamic: false, next };
+	const unsafe = /\s/.test(value) || value.includes("*") || value.includes("?") || value.includes("[");
+	return { text: value, dynamic: unsafe, next };
+}
+
+/**
+ * Resolve one `$` form. Only a plain `$NAME` or `${NAME}` naming a literal binding is followed;
+ * command substitution, arithmetic, special parameters and every braced modifier stay dynamic.
+ */
+function expandShellVariable(command: string, start: number, bindings: ShellBindings, quoted: boolean): ShellExpansion {
+	const following = command[start + 1];
+	if (following === "(") return { text: "", dynamic: true, next: skipBalancedParen(command, start + 1) };
+	if (following === "{") {
+		const close = command.indexOf("}", start + 2);
+		if (close < 0) return { text: "", dynamic: true, next: command.length };
+		const name = command.slice(start + 2, close);
+		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return { text: "", dynamic: true, next: close + 1 };
+		return bindingExpansion(name, bindings, quoted, close + 1);
+	}
+	if (following !== undefined) {
+		// ANSI-C `$'...'` and locale `$"..."` quoting are expansions this parser does not follow.
+		if (following === "'" || following === '"') return { text: "", dynamic: true, next: start + 1 };
+		const name = /^[A-Za-z_][A-Za-z0-9_]*/.exec(command.slice(start + 1))?.[0];
+		if (name !== undefined) return bindingExpansion(name, bindings, quoted, start + 1 + name.length);
+		if (following === "[") return { text: "", dynamic: true, next: start + 2 };
+		if (/^[0-9?@*#$!_-]/.test(following)) {
+			let end = start + 1;
+			while (end < command.length && /[0-9]/.test(command[end] ?? "")) end += 1;
+			if (end === start + 1) end += 1;
+			return { text: "", dynamic: true, next: end };
+		}
+	}
+	return { text: "$", dynamic: false, next: start + 1 };
+}
+
+function gitCommandEffects(args: readonly ShellWord[]): number {
+	const subcommand = args[0];
+	if (subcommand === undefined || subcommand.dynamic || subcommand.expanded) return SHELL_TREE_CHANGE;
+	const effects = GIT_SUBCOMMAND_EFFECTS[subcommand.text] ?? SHELL_TREE_CHANGE;
+	if (effects === SHELL_TREE_CHANGE) return effects;
+	return args.some(argument => isProgramWriteOption("git", argument)) ? effects | SHELL_TREE_CHANGE : effects;
+}
+
+/**
+ * One literal segment. Leading assignments are prefix effects for a command and only an environment
+ * change on their own. A binding persists only across an unconditional `;`/newline (or into a
+ * command after `&`) and never out of a pipeline or a conditional branch, so a skipped reassignment
+ * leaves the name unknown instead of hiding a write flag.
+ */
+function commandSegmentEffects(
+	words: readonly ShellWord[],
+	join: SegmentJoin,
+	nextJoin: SegmentJoin,
+	bindings: ShellBindings,
+): number {
+	let index = 0;
+	let prefix = 0;
+	const assignments: Array<{ name: string; value: string | null }> = [];
+	while (index < words.length) {
+		const word = words[index];
+		if (word === undefined) break;
+		const match = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word.text);
+		if (match === null) break;
+		prefix = SHELL_NON_TREE_CHANGE;
+		assignments.push({ name: match[1] ?? "", value: word.dynamic ? null : (match[2] ?? "") });
+		index += 1;
+	}
+	if (index === words.length) {
+		const persists =
+			(join === "start" || join === "sequence" || join === "background") &&
+			nextJoin !== "pipe" &&
+			nextJoin !== "background";
+		for (const assignment of assignments) bindings.set(assignment.name, persists ? assignment.value : null);
+		// A dynamic assignment value may be command substitution, so it can execute even alone.
+		return assignments.some(assignment => assignment.value === null) ? prefix | SHELL_TREE_CHANGE : prefix;
+	}
+	const program = words[index];
+	if (program === undefined) return prefix;
+	const args = words.slice(index + 1);
+	if (assignments.some(assignment => assignment.value === null)) prefix |= SHELL_TREE_CHANGE;
+	// A quoted, expanded or absolute program name is not a statically known reporting binary.
+	if (program.dynamic || program.expanded || program.quoted || program.text.length === 0 || program.text.includes("/")) {
+		return prefix | SHELL_TREE_CHANGE;
+	}
+	if (args.some(argument => argument.dynamic)) return prefix | SHELL_TREE_CHANGE;
+	if (program.text === "git") return prefix | gitCommandEffects(args);
+	if (NON_MUTATING_PROGRAMS[program.text] !== true) return prefix | SHELL_TREE_CHANGE;
+	return prefix | (args.some(argument => isProgramWriteOption(program.text, argument)) ? SHELL_TREE_CHANGE : 0);
+}
+
+/**
+ * One conservative literal parser serves both domains; opaque payloads still require full judgment
+ * (FR-31). Quotes and backslash escapes are read literally, `;`, newlines, `&&`, `||` and `|` split
+ * segments outside quotes, and literal `NAME=value` assignments are followed for `$NAME`/`${NAME}`.
+ * Command substitution, process or arithmetic syntax, real redirections, background operators,
+ * unknown expansions, quoted or expanded programs and unsupported syntax stay consequential.
+ */
 function commandEffects(command: string): number {
-	if (/['"`\\$]/.test(command)) return SHELL_TREE_CHANGE;
-	const text = command.replace(/\|\||&&/g, "\n").trim();
-	if (text.length === 0) return 0;
-	if (/[<>&]/.test(text)) return SHELL_TREE_CHANGE;
-	return text.split(/[;|\n]/).reduce(combineSegmentEffects, 0);
+	const bindings: ShellBindings = new Map();
+	let effects = 0;
+	let words: ShellWord[] = [];
+	let word: ShellWordBuffer = { text: "", quoted: false, expanded: false, dynamic: false, content: false };
+	let quote: "'" | '"' | null = null;
+	let unsafe = false;
+	let join: SegmentJoin = "start";
+	let index = 0;
+
+	const flushWord = (): void => {
+		if (word.content || word.text.length > 0) {
+			words.push({ text: word.text, quoted: word.quoted, expanded: word.expanded, dynamic: word.dynamic });
+		}
+		word = { text: "", quoted: false, expanded: false, dynamic: false, content: false };
+	};
+	const flushSegment = (nextJoin: SegmentJoin): void => {
+		flushWord();
+		if (unsafe) effects |= SHELL_TREE_CHANGE;
+		effects |= commandSegmentEffects(words, join, nextJoin, bindings);
+		words = [];
+		unsafe = false;
+		join = nextJoin;
+	};
+
+	while (index < command.length) {
+		const character = command[index] ?? "";
+		if (quote === "'") {
+			if (character === "'") quote = null;
+			else word.text += character;
+			index += 1;
+			continue;
+		}
+		if (quote === '"') {
+			if (character === '"') {
+				quote = null;
+				index += 1;
+				continue;
+			}
+			if (character === "\\") {
+				const escaped = command[index + 1];
+				if (escaped === undefined) word.dynamic = true;
+				else if (escaped === "\n") index += 1;
+				else if (escaped === "$" || escaped === "`" || escaped === '"' || escaped === "\\") {
+					word.text += escaped;
+					word.content = true;
+					index += 1;
+				} else {
+					word.text += "\\";
+					word.content = true;
+				}
+				index += 1;
+				continue;
+			}
+			if (character === "`") {
+				word.dynamic = true;
+				word.expanded = true;
+				word.content = true;
+				index = skipBacktick(command, index);
+				continue;
+			}
+			if (character === "$") {
+				const expansion = expandShellVariable(command, index, bindings, true);
+				word.text += expansion.text;
+				word.expanded = true;
+				word.content = true;
+				word.dynamic ||= expansion.dynamic;
+				index = expansion.next;
+				continue;
+			}
+			word.text += character;
+			index += 1;
+			continue;
+		}
+		if (character === "'" || character === '"') {
+			quote = character;
+			word.quoted = true;
+			word.content = true;
+			index += 1;
+			continue;
+		}
+		if (character === "\\") {
+			const escaped = command[index + 1];
+			if (escaped === undefined) {
+				unsafe = true;
+				index += 1;
+				continue;
+			}
+			if (escaped === "\n") {
+				index += 2;
+				continue;
+			}
+			word.text += escaped;
+			word.content = true;
+			index += 2;
+			continue;
+		}
+		if (character === "`") {
+			word.dynamic = true;
+			word.expanded = true;
+			word.content = true;
+			index = skipBacktick(command, index);
+			continue;
+		}
+		if (character === "$") {
+			const expansion = expandShellVariable(command, index, bindings, false);
+			word.text += expansion.text;
+			word.expanded = true;
+			word.content = true;
+			word.dynamic ||= expansion.dynamic;
+			index = expansion.next;
+			continue;
+		}
+		if (character === "<" || character === ">") {
+			flushWord();
+			unsafe = true;
+			index += 1;
+			continue;
+		}
+		if (character === "&") {
+			flushWord();
+			if (command[index + 1] === "&") {
+				flushSegment("and");
+				index += 2;
+			} else {
+				unsafe = true;
+				flushSegment("background");
+				index += 1;
+			}
+			continue;
+		}
+		if (character === "|") {
+			flushWord();
+			if (command[index + 1] === "|") {
+				flushSegment("or");
+				index += 2;
+			} else {
+				flushSegment("pipe");
+				index += 1;
+			}
+			continue;
+		}
+		if (character === ";" || character === "\n") {
+			flushWord();
+			flushSegment("sequence");
+			index += 1;
+			continue;
+		}
+		if (character === "(" || character === ")" || character === "{" || character === "}") {
+			flushWord();
+			unsafe = true;
+			index += 1;
+			continue;
+		}
+		if (character === "#" && !word.content) {
+			const newline = command.indexOf("\n", index);
+			index = newline < 0 ? command.length : newline;
+			continue;
+		}
+		if (/\s/.test(character)) {
+			flushWord();
+			index += 1;
+			continue;
+		}
+		word.text += character;
+		word.content = true;
+		index += 1;
+	}
+	if (quote !== null) unsafe = true;
+	flushSegment("end");
+	return effects;
 }
 
 /** Ordinary working-tree policy deliberately exempts repository metadata and publication (FR-31). */
@@ -537,7 +884,10 @@ export function triageBeforeInspectionGate(
 	const record = asRecord(input);
 	const path = pathOf(record);
 	const isNonMutatingShell = toolName === "bash" && typeof record?.["command"] === "string" && isNonMutatingCommand(record["command"]);
-	const isNonProjectRead = toolName === "read" && path !== undefined && (!isProjectTarget(path) || path.startsWith("skill://"));
+	const isNonProjectRead =
+		toolName === "read" &&
+		path !== undefined &&
+		(!isProjectTarget(path) || path.startsWith("skill://") || EXTERNAL_READ_SCHEMES[schemeOf(path) ?? ""] === true);
 	const isLocalPlan = toolName === "write" && path?.startsWith("local://") === true;
 	const isPlanProposal = toolName === "write" && path === PROPOSE_PATH;
 	const isInspectionDevice = toolName === "write" && ["lsp", "ast_grep"].includes(deviceOf(path ?? "") ?? "");
@@ -679,28 +1029,20 @@ export function mutationGate(
 			boundary: CHECK_BOUNDARY,
 			reason: refusal(
 				"Jevstice holds this change: a course check is in flight and its verdict is not in yet.",
-				"(none - wait for the course check message, then continue)",
-				"A change decided before the check's verdict returns would bypass it.",
+				"wait for the course check message, then retry the change",
+				"The check owns the revision it started on; evidence reads stay open.",
 			),
 		};
 	}
-	// A finding holds the work until a consultation the judge accepts resolves it; a spent refusal
-	// budget leaves it blocked as an OPEN item (FR-13, FR-23).
-	if (state.hold !== undefined) {
+	// A supported repair opens only its exact payload; the rest of the finding stays held.
+	if (state.hold !== undefined && permittedRepair(state, toolName, input) === undefined) {
 		return {
 			block: true,
 			boundary: HOLD_BOUNDARY,
 			reason: boundaryExhausted(state, HOLD_BOUNDARY)
-				? openItemReason(state, HOLD_BOUNDARY, "this change")
-				: refusal(
-						`Jevstice holds this change: ${state.hold.reason}.`,
-						HOLD_CALL,
-						"An unrelated consultation, or one whose answer leaves the finding standing, does not clear it.",
-					),
+				? `${recoveryFeedback(state)}\n${openItemReason(state, HOLD_BOUNDARY, "this change")}`
+				: recoveryFeedback(state),
 		};
-	}
-	if (state.autonomous !== true && boundaryExhausted(state, PLAN_BOUNDARY)) {
-		return { block: true, boundary: PLAN_BOUNDARY, reason: openItemReason(state, PLAN_BOUNDARY, "this change") };
 	}
 	// Only a request that entered the judged workflow opens the gate by itself: triage either confirms
 	// a simple task or registers the development task whose plan review the next change waits for. A
@@ -719,8 +1061,50 @@ export function mutationGate(
 	if (state.directionPending !== undefined) {
 		return { block: true, boundary: DIRECTION_BOUNDARY, reason: directionReason(state) };
 	}
+	// An approved plan opens the gate even after its refusal budget was spent: the budget records
+	// the OPEN finding, and a corrected plan that passes is the recovery that resolves it.
 	if (state.plan !== undefined && state.plan.taskFingerprint === state.task.fingerprint) return { block: false };
+	if (state.autonomous !== true && boundaryExhausted(state, PLAN_BOUNDARY)) {
+		return { block: true, boundary: PLAN_BOUNDARY, reason: openItemReason(state, PLAN_BOUNDARY, "this change") };
+	}
 	return { block: true, boundary: PLAN_BOUNDARY, reason: PLAN_REQUIRED_REASON };
+}
+
+/**
+ * Decision-state submissions that cannot replace an unrelated finding. Corrective requirement and
+ * plan reviews remain open, as does a fresh submission to the exact failed review.
+ */
+const HELD_JUDGE_TOOLS: Record<string, true> = {
+	jev_triage: true,
+	jev_reaim: true,
+	jev_review: true,
+	jev_text_review: true,
+	jev_anti_slop: true,
+	jev_acceptance: true,
+};
+
+/** Diagnostics, source lookup and corrective planning do not execute project effects. */
+const RECOVERY_PERMITTED_TOOLS: Record<string, true> = {
+	jev_consult: true,
+	jev_context: true,
+	jev_course_check: true,
+	jev_requirements: true,
+	jev_plan_review: true,
+};
+
+/**
+ * A finding holds normal effects. Its exact approved repair may pass to the remaining gates;
+ * evidence, diagnosis, corrective planning and the failed review remain available.
+ */
+export function recoveryGate(state: JevState, toolName: string, input: unknown): GateVerdict {
+	if (state.hold === undefined || permittedRepair(state, toolName, input) !== undefined) return { block: false };
+	if (RECOVERY_PERMITTED_TOOLS[toolName] === true) return { block: false };
+	if (state.hold.boundary === toolName || (toolName === "jev_reaim" && state.directionPending !== undefined)) return { block: false };
+	if (HELD_JUDGE_TOOLS[toolName] === true) {
+		return { block: true, boundary: HOLD_BOUNDARY, reason: recoveryFeedback(state) };
+	}
+	if (!isConsequentialMutation(toolName, input)) return { block: false };
+	return { block: true, boundary: HOLD_BOUNDARY, reason: recoveryFeedback(state) };
 }
 
 /** Whether a tool call is the plan-mode proposal `write xd://propose`. */
@@ -768,7 +1152,7 @@ export function proposeGate(state: JevState, config: JevConfig, input: unknown):
 		return {
 			block: true,
 			reason:
-				"the plan proposal carries no plan slug. Write the plan slug (matching local://<slug>-plan.md) as plain text to xd://propose.",
+				"Jevstice holds this plan proposal: the submitted text carries no usable plan slug. Next call: write the slug itself (for example, coverage-report) to xd://propose; it becomes local://<slug>-plan.md. Evidence reads stay open.",
 		};
 	}
 	const url = planArtifactUrl(slug);
@@ -784,9 +1168,9 @@ export function proposeGate(state: JevState, config: JevConfig, input: unknown):
 			block: true,
 			boundary: PLAN_BOUNDARY,
 			reason: refusal(
-				`Jevstice holds this plan proposal: no Jev plan review has passed for ${url}.`,
+				`Jevstice holds this plan proposal: no plan review has passed for ${url}.`,
 				PLAN_CALL,
-				`The approval binds to ${url} and to the task; proposing the artifact before that review is refused.`,
+				`The review binds ${url} to the current task and is the missing prerequisite. Evidence reads and jev_context stay open.`,
 			),
 		};
 	}
@@ -794,14 +1178,14 @@ export function proposeGate(state: JevState, config: JevConfig, input: unknown):
 		return {
 			block: true,
 			boundary: PLAN_BOUNDARY,
-			reason: `the recorded plan approval belongs to a different task (${state.plan.planUrl}). Review ${url} for the current task first.`,
+			reason: `Jevstice holds this plan proposal: the recorded plan approval belongs to a different task (${state.plan.planUrl}). Next call: review ${url} for the current task. Evidence reads stay open.`,
 		};
 	}
 	if (state.plan.planUrl !== url) {
 		return {
 			block: true,
 			boundary: PLAN_BOUNDARY,
-			reason: `the approved plan is ${state.plan.planUrl}, not ${url}. Review the artifact you are proposing.`,
+			reason: `Jevstice holds this plan proposal: the approved plan is ${state.plan.planUrl}, not ${url}. Next call: review ${url} or propose the approved artifact. Evidence reads stay open.`,
 		};
 	}
 	if (state.directionPending !== undefined) {
@@ -827,7 +1211,11 @@ export function completionGate(state: JevState, config: JevConfig): CompletionGa
 	if (!config.gates.completion && state.autonomous !== true) return { applies: false };
 	if (continuationAllowed(state)) return { applies: false };
 	if (state.autonomous === true && state.task === undefined) {
-		return { applies: true, reason: "Strict autonomous completion requires its bound registered objective and current evidence." };
+		return {
+			applies: true,
+			reason:
+				"Jevstice holds strict autonomous completion: no bound registered objective is recorded. Next call: register the objective at triage, then supply current execution evidence. Evidence reads stay open.",
+		};
 	}
 	if (state.task === undefined) {
 		if (state.simple?.external === true && config.antiSlop.mode === "enforce") {
@@ -848,8 +1236,8 @@ export function completionGate(state: JevState, config: JevConfig): CompletionGa
 			applies: true,
 			reason: refusal(
 				"Jevstice holds this completion: a course check is in flight and its verdict is not in yet.",
-				"(none - wait for the course check message, then stop again)",
-				"A stop decided before the check's verdict returns would settle work the check has not seen.",
+				"wait for the course check message, then stop again",
+				"A stop before the verdict would settle work the check has not seen; evidence reads stay open.",
 			),
 		};
 	}
@@ -857,12 +1245,8 @@ export function completionGate(state: JevState, config: JevConfig): CompletionGa
 		return {
 			applies: true,
 			reason: boundaryExhausted(state, HOLD_BOUNDARY)
-				? openItemReason(state, HOLD_BOUNDARY, "this completion")
-				: refusal(
-						`Jevstice holds this completion: ${state.hold.reason}.`,
-						HOLD_CALL,
-						"An unrelated consultation, or one whose answer leaves the finding standing, does not clear it.",
-					),
+				? `${recoveryFeedback(state)}\n${openItemReason(state, HOLD_BOUNDARY, "this completion")}`
+				: recoveryFeedback(state),
 		};
 	}
 	// The owner's latest message is unjudged: completion would report on a direction no longer known.
@@ -879,7 +1263,7 @@ export function completionGate(state: JevState, config: JevConfig): CompletionGa
 	if (spent !== undefined) {
 		return {
 			applies: true,
-			reason: openItemReason(state, `acceptance:${spent}`, `this completion (acceptance for ${spent} is an OPEN item)`),
+			reason: openItemReason(state, `acceptance:${spent}`, "this completion"),
 		};
 	}
 	if (missing.length > 0) {
@@ -887,9 +1271,9 @@ export function completionGate(state: JevState, config: JevConfig): CompletionGa
 		return {
 			applies: true,
 			reason: refusal(
-				`developed work cannot be reported complete: acceptance has not passed for ${missing.join(" and ")} at the current work revision (${state.revision} consequential changes).`,
+				`Jevstice holds this completion: acceptance has not passed for ${missing.join(" and ")} at the current revision (${state.revision} consequential changes).`,
 				ACCEPTANCE_CALL(aspect),
-				`Acceptance for ${missing.join(" and ")} is required at the current revision; any later change invalidates an approval.`,
+				`Acceptance for ${missing.join(" and ")} is the missing prerequisite; any later change invalidates an approval. Evidence reads stay open.`,
 			),
 		};
 	}

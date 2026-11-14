@@ -10,6 +10,7 @@
  */
 import { memoizedApiKeyResolver } from "./apikey.js";
 import { loadJevConfig } from "./config.js";
+import { createContextArchive } from "./context.js";
 import { createJevController, type PiApi, type SchemaBuilder } from "./controller.js";
 import { createTypeSafeJudge } from "./judge.js";
 import { POLICY } from "./types.js";
@@ -27,7 +28,7 @@ function createJevExtension(): (pi: ExtensionHost) => void {
 			resolveKey: memoizedApiKeyResolver(process.env),
 			model: POLICY.defaultModel,
 		});
-		createJevController({ judge, config, zod: pi.zod }).register(pi);
+		createJevController({ judge, config, zod: pi.zod, context: createContextArchive(process.cwd()) }).register(pi);
 	};
 }
 

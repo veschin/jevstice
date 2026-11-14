@@ -49,8 +49,16 @@ export function configPaths(options: { cwd: string; home?: string }): string[] {
 	];
 }
 
+/** The offending value as it appears in the file: strings quoted, structured values as JSON. */
 function describeValue(value: unknown): string {
-	return typeof value === "string" ? JSON.stringify(value) : String(value);
+	if (typeof value === "string") return JSON.stringify(value);
+	try {
+		const rendered = JSON.stringify(value);
+		if (rendered !== undefined) return rendered;
+	} catch {
+		// Fall through to the plain string form for a value JSON cannot render.
+	}
+	return String(value);
 }
 
 function booleanValue(
@@ -62,7 +70,7 @@ function booleanValue(
 ): boolean {
 	if (value === undefined) return fallback;
 	if (typeof value === "boolean") return value;
-	problems.push(`${file}: ${key} must be true or false, got ${describeValue(value)} - the effective value ${String(fallback)} stays in force`);
+	problems.push(`${file}: ${key} must be true or false, got ${describeValue(value)} - kept ${fallback}`);
 	return fallback;
 }
 
@@ -74,14 +82,14 @@ function courseModeValue(
 ): "interval" | "completion" {
 	if (value === undefined) return fallback;
 	if (value === "interval" || value === "completion") return value;
-	problems.push(`${file}: courseCheck.mode must be "interval" or "completion", got ${describeValue(value)} - the effective value ${JSON.stringify(fallback)} stays in force`);
+	problems.push(`${file}: courseCheck.mode must be "interval" or "completion", got ${describeValue(value)} - kept ${JSON.stringify(fallback)}`);
 	return fallback;
 }
 
 function intervalValue(value: unknown, fallback: number, file: string, problems: string[]): number {
 	if (value === undefined) return fallback;
 	if (typeof value === "number" && Number.isInteger(value) && value >= 1) return value;
-	problems.push(`${file}: courseCheck.interval must be a whole number of actions of 1 or more, got ${describeValue(value)} - the effective value ${String(fallback)} stays in force`);
+	problems.push(`${file}: courseCheck.interval must be an integer of 1 or more actions, got ${describeValue(value)} - kept ${fallback}`);
 	return fallback;
 }
 
@@ -93,7 +101,7 @@ function antiSlopModeValue(
 ): AntiSlopMode {
 	if (value === undefined) return fallback;
 	if (value === "off" || value === "advisory" || value === "enforce") return value;
-	problems.push(`${file}: antiSlop.mode must be "off", "advisory" or "enforce", got ${describeValue(value)} - the effective value ${JSON.stringify(fallback)} stays in force`);
+	problems.push(`${file}: antiSlop.mode must be "off", "advisory" or "enforce", got ${describeValue(value)} - kept ${JSON.stringify(fallback)}`);
 	return fallback;
 }
 
@@ -106,7 +114,7 @@ function nonNegativeNumberValue(
 ): number {
 	if (value === undefined) return fallback;
 	if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
-	problems.push(`${file}: ${key} must be a non-negative number, got ${describeValue(value)} - the effective value ${String(fallback)} stays in force`);
+	problems.push(`${file}: ${key} must be a non-negative number, got ${describeValue(value)} - kept ${fallback}`);
 	return fallback;
 }
 
@@ -120,9 +128,7 @@ function optionalNonNegativeNumberValue(
 	if (value === undefined) return fallback;
 	if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
 	problems.push(
-		`${file}: ${key} must be a non-negative number, got ${describeValue(value)} - ${
-			fallback === undefined ? "the value stays unset" : `the effective value ${String(fallback)} stays in force`
-		}`,
+		`${file}: ${key} must be a non-negative number, got ${describeValue(value)} - kept ${fallback === undefined ? "unset" : fallback}`,
 	);
 	return fallback;
 }
@@ -147,19 +153,19 @@ export function loadJevConfig(options: { cwd: string; home?: string; read?: Conf
 			parsed = JSON.parse(text);
 		} catch (error) {
 			const reason = error instanceof Error ? error.message : String(error);
-			problems.push(`${path}: not valid JSON (${reason}) - the values already in force stay unchanged`);
+			problems.push(`${path}: not valid JSON (${reason}) - no values were changed`);
 			continue;
 		}
 		const root = asRecord(parsed);
 		if (root === undefined) {
-			problems.push(`${path}: a JSON object is expected at the top level - the values already in force stay unchanged`);
+			problems.push(`${path}: the top level must be a JSON object, got ${describeValue(parsed)} - no values were changed`);
 			continue;
 		}
 		const gatesValue = root["gates"];
 		const gates = asRecord(gatesValue);
 		if (gatesValue !== undefined && gates === undefined) {
 			problems.push(
-				`${path}: gates must be a JSON object, got ${describeValue(gatesValue)} - gates.mutation and gates.completion keep their effective values (${mutationGate}, ${completionGate})`,
+				`${path}: gates must be a JSON object, got ${describeValue(gatesValue)} - kept gates.mutation=${mutationGate}, gates.completion=${completionGate}`,
 			);
 		} else {
 			mutationGate = booleanValue(gates?.["mutation"], mutationGate, path, "gates.mutation", problems);
@@ -169,7 +175,7 @@ export function loadJevConfig(options: { cwd: string; home?: string; read?: Conf
 		const courseCheck = asRecord(courseCheckValue);
 		if (courseCheckValue !== undefined && courseCheck === undefined) {
 			problems.push(
-				`${path}: courseCheck must be a JSON object, got ${describeValue(courseCheckValue)} - courseCheck.mode and courseCheck.interval keep their effective values (${JSON.stringify(courseMode)}, ${interval})`,
+				`${path}: courseCheck must be a JSON object, got ${describeValue(courseCheckValue)} - kept courseCheck.mode=${JSON.stringify(courseMode)}, courseCheck.interval=${interval}`,
 			);
 		} else {
 			courseMode = courseModeValue(courseCheck?.["mode"], courseMode, path, problems);
@@ -179,7 +185,7 @@ export function loadJevConfig(options: { cwd: string; home?: string; read?: Conf
 		const antiSlop = asRecord(antiSlopValue);
 		if (antiSlopValue !== undefined && antiSlop === undefined) {
 			problems.push(
-				`${path}: antiSlop must be a JSON object, got ${describeValue(antiSlopValue)} - antiSlop.mode keeps its effective value ${JSON.stringify(antiSlopMode)}`,
+				`${path}: antiSlop must be a JSON object, got ${describeValue(antiSlopValue)} - kept antiSlop.mode=${JSON.stringify(antiSlopMode)}`,
 			);
 		} else {
 			antiSlopMode = antiSlopModeValue(antiSlop?.["mode"], antiSlopMode, path, problems);
@@ -188,7 +194,7 @@ export function loadJevConfig(options: { cwd: string; home?: string; read?: Conf
 		const billing = asRecord(billingValue);
 		if (billingValue !== undefined && billing === undefined) {
 			problems.push(
-				`${path}: billing must be a JSON object, got ${describeValue(billingValue)} - billing.balance, billing.inputCostPerMillion and billing.outputCostPerMillion keep their effective values (${billingBalance === undefined ? "unset" : billingBalance}, ${inputCostPerMillion}, ${outputCostPerMillion})`,
+				`${path}: billing must be a JSON object, got ${describeValue(billingValue)} - kept billing.balance=${billingBalance === undefined ? "unset" : billingBalance}, billing.inputCostPerMillion=${inputCostPerMillion}, billing.outputCostPerMillion=${outputCostPerMillion}`,
 			);
 		} else {
 			billingBalance = optionalNonNegativeNumberValue(billing?.["balance"], billingBalance, path, "billing.balance", problems);

@@ -50,8 +50,9 @@ export interface JudgeAnswer {
 /**
  * The adapter's result: typed answers, or the problem that prevented a usable one. `kind` separates
  * the failures the executor must read differently (FR-20): `unavailable` is the judge failing to
- * answer (transport, authentication, a missing key), `unusable` is an answer that could not be read.
- * Neither counts as an approval; only `unavailable` counts towards the availability bound (FR-21).
+ * answer (transport, authentication, a missing key), `unusable` is an answer that could not be read
+ * or a request refused before the call. Neither counts as an approval; only `unavailable` counts
+ * towards the availability bound (FR-21).
  */
 export type JudgeOutcome =
 	| { ok: true; answers: readonly JudgeAnswer[]; usage?: { inputTokens: number; outputTokens: number } }
@@ -72,30 +73,29 @@ export interface SystemOneClient {
 export function questionProblem(questions: readonly JudgeQuestion[]): string | undefined {
 	if (questions.length === 0) return "no questions were submitted";
 	const names = new Set<string>();
-	for (const question of questions) {
-		if (question.name.length === 0) return "a question has no name";
+	for (const [index, question] of questions.entries()) {
+		if (question.name.length === 0) return `question ${index + 1} has no name`;
 		if (names.has(question.name)) return `two questions share the name '${question.name}'`;
 		names.add(question.name);
-		if (question.instructions.trim().length === 0) return `question '${question.name}' carries no text`;
+		if (question.instructions.trim().length === 0) return `question '${question.name}' has no instructions`;
 		if (question.mode === "choice") {
 			const options = Object.entries(question.options ?? {});
-			if (options.length < 2) return `question '${question.name}' offers fewer than two alternatives`;
-			if (options.length > 255) return `question '${question.name}' offers more than 255 alternatives`;
+			if (options.length < 2) return `question '${question.name}' needs at least 2 alternatives, got ${options.length}`;
+			if (options.length > 255) return `question '${question.name}' allows at most 255 alternatives, got ${options.length}`;
 			for (const [label, meaning] of options) {
-				if (label.trim().length === 0) return `question '${question.name}' has an empty label`;
-				if (meaning.trim().length === 0) return `alternative '${label}' states no meaning`;
+				if (label.trim().length === 0) return `question '${question.name}' has an empty alternative label`;
+				if (meaning.trim().length === 0) return `question '${question.name}' alternative '${label}' has no meaning`;
 			}
 		}
 		if (question.mode === "score") {
 			const criteria = question.criteria ?? [];
-			if (criteria.length < 2) return `question '${question.name}' has fewer than two rubric steps`;
-			if (criteria.some(step => step.trim().length === 0)) {
-				return `question '${question.name}' has an empty rubric step`;
-			}
+			if (criteria.length < 2) return `question '${question.name}' needs at least 2 rubric steps, got ${criteria.length}`;
+			const empty = criteria.findIndex(step => step.trim().length === 0);
+			if (empty !== -1) return `question '${question.name}' rubric step ${empty + 1} is empty`;
 		}
 		if (question.mode === "noul") {
-			if ((question.trueMeaning ?? "").trim().length === 0) return `question '${question.name}' does not state what yes means`;
-			if ((question.falseMeaning ?? "").trim().length === 0) return `question '${question.name}' does not state what no means`;
+			if ((question.trueMeaning ?? "").trim().length === 0) return `question '${question.name}' does not say what yes means`;
+			if ((question.falseMeaning ?? "").trim().length === 0) return `question '${question.name}' does not say what no means`;
 		}
 	}
 	return undefined;
@@ -151,37 +151,47 @@ export function normalizeAnswers(
 		outputTokens >= 0
 			? { inputTokens, outputTokens }
 			: undefined;
-	if (answers === undefined) return { ok: false, kind: "unusable", problem: "the judge returned no answers" };
+	if (answers === undefined) return { ok: false, kind: "unusable", problem: "the judge response carries no answers" };
 	const extra = Object.keys(answers).filter(name => !questions.some(question => question.name === name));
-	if (extra.length > 0) return { ok: false, kind: "unusable", problem: `the judge answered unknown questions: ${extra.join(", ")}` };
+	if (extra.length > 0) return { ok: false, kind: "unusable", problem: `the judge answered questions that were not asked: ${extra.map(name => JSON.stringify(name)).join(", ")}` };
 
 	const normalized: JudgeAnswer[] = [];
 	for (const question of questions) {
 		const answer = asRecord(answers[question.name]);
-		if (answer === undefined) return { ok: false, kind: "unusable", problem: `the judge returned no answer for '${question.name}'` };
+		if (answer === undefined) return { ok: false, kind: "unusable", problem: `the judge response has no answer for '${question.name}'` };
 		if (question.mode === "noul") {
+			if (answer["type"] !== "noul") return { ok: false, kind: "unusable", problem: `answer '${question.name}' is not a yes/no answer` };
 			const yes = probability(answer["noul"]);
-			if (answer["type"] !== "noul" || yes === undefined) return { ok: false, kind: "unusable", problem: `answer '${question.name}' carries no probability` };
+			if (yes === undefined) return { ok: false, kind: "unusable", problem: `answer '${question.name}' has no yes probability between 0 and 1` };
 			normalized.push({ name: question.name, mode: "noul", probability: yes, confidence: Math.max(yes, 1 - yes) });
 			continue;
 		}
 		const confidence = probability(answer["confidence"]);
 		if (confidence === undefined) {
-			return { ok: false, kind: "unusable", problem: `answer '${question.name}' reports no usable confidence` };
+			return { ok: false, kind: "unusable", problem: `answer '${question.name}' has no confidence between 0 and 1` };
 		}
 		if (question.mode === "choice") {
-			if (answer["type"] !== "choice") return { ok: false, kind: "unusable", problem: `answer '${question.name}' is not typed as a choice` };
+			if (answer["type"] !== "choice") return { ok: false, kind: "unusable", problem: `answer '${question.name}' is not a choice answer` };
 			const label = answer["choice"];
-			if (typeof label !== "string" || !Object.hasOwn(question.options ?? {}, label)) {
-				return { ok: false, kind: "unusable", problem: `answer '${question.name}' selected a label that was not offered` };
+			if (typeof label !== "string") return { ok: false, kind: "unusable", problem: `answer '${question.name}' has no choice label` };
+			if (!Object.hasOwn(question.options ?? {}, label)) {
+				return { ok: false, kind: "unusable", problem: `answer '${question.name}' selected ${JSON.stringify(label)}, which was not offered` };
 			}
 			normalized.push({ name: question.name, mode: "choice", label, confidence });
 			continue;
 		}
 		const value = answer["score"];
-		if (answer["type"] !== "score") return { ok: false, kind: "unusable", problem: `answer '${question.name}' is not typed as a score` };
-		if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > (question.criteria?.length ?? 0) - 1) {
-			return { ok: false, kind: "unusable", problem: `answer '${question.name}' carries a score outside the submitted rubric` };
+		if (answer["type"] !== "score") return { ok: false, kind: "unusable", problem: `answer '${question.name}' is not a score answer` };
+		const highest = (question.criteria?.length ?? 0) - 1;
+		if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > highest) {
+			return {
+				ok: false,
+				kind: "unusable",
+				problem:
+					typeof value === "number"
+						? `answer '${question.name}' has score ${value}, outside the submitted rubric 0..${highest}`
+						: `answer '${question.name}' has no numeric score; the submitted rubric runs 0..${highest}`,
+			};
 		}
 		normalized.push({ name: question.name, mode: "score", score: value, confidence });
 	}
@@ -201,7 +211,7 @@ function defaultClient(apiKey: string, model: string): SystemOneClient {
 
 /**
  * The production judge. The key resolves lazily on every call, so a resolver command failure
- * stays retryable and a missing key is reported as an unusable answer instead of throwing.
+ * stays retryable and a missing key is reported as an unavailable judge instead of throwing.
  */
 export function createTypeSafeJudge(deps: {
 	resolveKey: () => Promise<string | undefined>;
@@ -214,7 +224,9 @@ export function createTypeSafeJudge(deps: {
 	let clientKey: string | undefined;
 	return async (state, questions) => {
 		const malformed = questionProblem(questions);
-		if (malformed !== undefined) return { ok: false, kind: "unusable", problem: malformed };
+		if (malformed !== undefined) {
+			return { ok: false, kind: "unusable", problem: `the judge request was refused before any call: ${malformed}` };
+		}
 		let key: string | undefined;
 		try {
 			key = await deps.resolveKey();
@@ -225,7 +237,7 @@ export function createTypeSafeJudge(deps: {
 			return {
 				ok: false,
 				kind: "unavailable",
-				problem: `no TypeSafe API key (${POLICY.apiKeyEnv}, ${POLICY.altApiKeyEnvs.join(", ")} or a resolver in ${POLICY.apiKeyCommandEnv})`,
+				problem: `no TypeSafe API key: set ${POLICY.apiKeyEnv} or ${POLICY.altApiKeyEnvs.join(" or ")}, or a command in ${POLICY.apiKeyCommandEnv}`,
 			};
 		}
 		try {
@@ -236,7 +248,7 @@ export function createTypeSafeJudge(deps: {
 			const raw = await client.systemOne({ state: state as EntryType, questions: buildQuestions(questions), model });
 			return normalizeAnswers(questions, raw);
 		} catch {
-			return { ok: false, kind: "unavailable", problem: "the judge call failed (transport, authentication or service error)" };
+			return { ok: false, kind: "unavailable", problem: "the judge service did not answer (transport, authentication or service error)" };
 		}
 	};
 }

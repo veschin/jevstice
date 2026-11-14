@@ -5,6 +5,7 @@ import {
 	completionCheck,
 	consult,
 	courseCheck,
+	ownerUpdate,
 	planReview,
 	reaim,
 	requirements,
@@ -15,9 +16,32 @@ import {
 	type ActivityDeps,
 } from "../src/activities.js";
 import { mutationGate } from "../src/gates.js";
-import { acceptanceAt, continuationAllowed, freshState, recordAction, registerTask, sha256, type JevState } from "../src/state.js";
+import {
+	acceptanceAt,
+	continuationAllowed,
+	freshState,
+	queueOwnerMessage,
+	recordAction,
+	recordRecovery,
+	registerTask,
+	sha256,
+	type JevState,
+} from "../src/state.js";
 import { asRecord, POLICY, type PlanTopic } from "../src/types.js";
 import { answeringJudge, boundaryConfig, failingJudge, type FakeAnswerSource } from "./helpers.js";
+
+/** A consultation binding for the standing finding, naming its exact id and a changed correction. */
+function boundRecovery(state: JevState, correction: string) {
+	return {
+		recovery: {
+			findingId: state.hold?.id ?? "legacy",
+			diagnosis: "the refused material showed the named defect",
+			correction,
+			phase: "resolve" as const,
+		},
+		evidence: [{ kind: "code" as const, quote: correction }],
+	};
+}
 
 /** Activity dependencies over a fake judge table and an optional artifact reader. */
 function depsFor(table: Record<string, FakeAnswerSource>, readArtifact?: ActivityDeps["readArtifact"]) {
@@ -664,68 +688,107 @@ describe("T1 - the flexible consultation (FR-08, FR-09, FR-13)", () => {
 		expect(booleanOutcome.details?.["verdict"]).toBe("yes");
 	});
 
-	test("FR-13: a judge-supported corrective consultation clears the finding that held the gate, an unusable one does not", async () => {
+	test("FR-13: a judge-supported bound consultation clears the named finding, an unusable one does not", async () => {
 		const usable = depsFor({ consult: { label: "fix", confidence: 0.9 }, resolves_hold: { probability: 0.93 } });
 		const state = freshState();
-		state.hold = { reason: "the course check answered off_course" };
+		const hold = recordRecovery(state, "course-check", { claim: "off course" }, {
+			ok: true,
+			text: 'the course check answered "off_course"',
+			details: { approved: false, label: "off_course" },
+		});
 
 		const cleared = await consult(usable.deps, state, {
-			mode: "choice",
-			question: "How does the work return to the registered direction?",
-			context: "the last three actions left the task; the finding is off_course",
-			alternatives: [
-				{ label: "fix", meaning: "return to the registered task" },
-				{ label: "change", meaning: "change the direction" },
-			],
+			mode: "recovery",
+			...boundRecovery(state, "return to the registered task"),
+			recovery: {
+				findingId: hold?.id ?? "",
+				diagnosis: "the last actions left the task",
+				correction: "return to the registered task",
+				phase: "resolve",
+			},
+			evidence: [{ kind: "code", quote: "the corrected branch serves the plan" }],
 		});
 
 		expect(cleared.ok).toBe(true);
 		expect(state.hold).toBeUndefined();
 
-		state.hold = { reason: "the course check answered off_course" };
-		const weak = depsFor({ consult: { label: "fix", confidence: POLICY.minConfidenceToApprove - 0.2 }, resolves_hold: { probability: 0.93 } });
+		recordRecovery(state, "course-check", { claim: "off course again" }, {
+			ok: true,
+			text: 'the course check answered "off_course"',
+			details: { approved: false, label: "off_course" },
+		});
+		const weak = depsFor({ resolves_hold: { probability: POLICY.minProbabilityToApprove - 0.2 } });
 		const weakOutcome = await consult(weak.deps, state, {
-			mode: "choice",
-			question: "Is the direction right?",
-			context: "unclear",
-			alternatives: [
-				{ label: "fix", meaning: "return to the registered task" },
-				{ label: "change", meaning: "change the direction" },
-			],
+			mode: "recovery",
+			...boundRecovery(state, "return to the registered task"),
 		});
 
 		expect(weakOutcome.ok).toBe(false);
 		expect(state.hold).toBeDefined();
 	});
 
+	test("FR-13: a diagnostic consultation stays usable without clearing the held finding", async () => {
+		const state = freshState();
+		const hold = recordRecovery(state, "course-check", { claim: "x" }, {
+			ok: true,
+			text: "off course",
+			details: { approved: false },
+		});
+		const { deps, calls } = depsFor({ consult: { probability: 0.99 }, resolves_hold: { probability: 0.99 } });
+
+		const unbound = await consult(deps, state, {
+			mode: "boolean",
+			question: "Does this fix it?",
+			context: "a correction",
+			trueMeaning: "yes",
+			falseMeaning: "no",
+			evidence: [{ kind: "code", quote: "a corrected branch" }],
+		});
+		expect(unbound.ok).toBe(true);
+		expect(calls).toHaveLength(1);
+		expect(state.hold).toEqual(hold);
+
+		const wrong = await consult(deps, state, {
+			mode: "recovery",
+			recovery: { phase: "resolve", findingId: "finding-other", diagnosis: "d", correction: "a new branch" },
+			evidence: [{ kind: "code", quote: "a corrected branch" }],
+		});
+		expect(wrong.ok).toBe(false);
+		expect(calls).toHaveLength(1);
+	});
+
 	test("FR-13: an unrelated consultation never clears a finding, however usable its own answer", async () => {
 		const state = freshState();
 		registerTask(state, "Report the coverage of the last run");
 		state.plan = { taskFingerprint: state.task?.fingerprint ?? "", planUrl: "local://x-plan.md", planDigest: "d" };
-		state.hold = { reason: 'the course check at revision 2 answered "off_course" (confidence 0.91)' };
+		recordRecovery(state, "course-check", { claim: "off course" }, {
+			ok: true,
+			text: 'the course check at revision 2 answered "off_course" (confidence 0.91)',
+			details: { approved: false, label: "off_course" },
+		});
 
 		const unrelated = depsFor({ consult: { label: "tabs", confidence: 0.92 }, resolves_hold: { probability: 0.08 } });
 		const outcome = await consult(unrelated.deps, state, {
-			mode: "choice",
-			question: "Which indentation should the new module use?",
-			context: "style only; the direction is unchanged",
-			alternatives: [
-				{ label: "tabs", meaning: "indent with tabs" },
-				{ label: "spaces", meaning: "indent with spaces" },
-			],
+			mode: "recovery",
+			...boundRecovery(state, "indent with tabs"),
 		});
 
-		expect(outcome.ok).toBe(true);
+		expect(outcome.ok).toBe(false);
+		expect(outcome.text).toContain("remains unresolved");
+		expect(asRecord(outcome.details)?.["resolutionProbability"]).toBe(0.08);
 		expect(state.hold).toBeDefined();
 		expect(mutationGate(state, boundaryConfig(), "write", { path: "src/a.ts" }).block).toBe(true);
 	});
 
-	test("FR-13, FR-22: distinct consultations remain available without exhausting an unrelated finding", async () => {
+	test("FR-22: rewording a held recovery buys no judge call without new evidence", async () => {
 		const state = freshState();
 		registerTask(state, "Report the coverage of the last run");
 		state.plan = { taskFingerprint: state.task?.fingerprint ?? "", planUrl: "local://x-plan.md", planDigest: "d" };
-		const hold = { reason: "the developer review found an unresolved parser defect" };
-		state.hold = hold;
+		const hold = recordRecovery(state, "review", { target: "parser.ts" }, {
+			ok: false,
+			text: "the developer review found an unresolved parser defect",
+			details: { approved: false, label: "defect" },
+		});
 		const { deps, calls } = depsFor({ consult: { label: "keep", confidence: 0.95 }, resolves_hold: { probability: 0.05 } });
 
 		for (const question of [
@@ -735,72 +798,74 @@ describe("T1 - the flexible consultation (FR-08, FR-09, FR-13)", () => {
 			"Which documentation needs an update?",
 		]) {
 			const outcome = await consult(deps, state, {
-				mode: "choice",
-				question,
-				context: "This independent decision does not correct the parser defect.",
-				alternatives: [
-					{ label: "keep", meaning: "retain the supported existing choice" },
-					{ label: "replace", meaning: "replace it with the proposed alternative" },
-				],
+				mode: "recovery",
+				...boundRecovery(state, question),
+				evidence: [{ kind: "execution", quote: "The same parser regression still fails." }],
 			});
-			expect(outcome.ok).toBe(true);
+			expect(outcome.ok).toBe(false);
 			expect(state.hold).toEqual(hold);
 			expect(continuationAllowed(state)).toBe(false);
 			expect(mutationGate(state, boundaryConfig(), "write", { path: "src/a.ts" }).block).toBe(true);
 		}
-		expect(calls).toHaveLength(4);
+		expect(calls).toHaveLength(1);
+		await consult(deps, state, {
+			mode: "recovery",
+			...boundRecovery(state, "Use the observed parser correction."),
+			evidence: [{ kind: "execution", quote: "The parser regression now passes." }],
+		});
+		expect(calls).toHaveLength(2);
 	});
 
-	test("FR-22, FR-23: held consultations retain their own repeat and exhaustion budgets across other questions", async () => {
+	test("FR-22, FR-23: a spent consult budget keeps the finding OPEN and still judges materially new corrections", async () => {
 		const state = freshState();
 		registerTask(state, "Repair the parser");
-		state.hold = { reason: "the developer review found a parser defect" };
-		const { deps, calls } = depsFor({ consult: { probability: 0.5 }, resolves_hold: { probability: 0.05 } });
-		const submission = (question: string, context: string) => ({
-			mode: "boolean",
-			question,
-			context,
-			trueMeaning: "the submitted correction is supported",
-			falseMeaning: "the submitted correction is unsupported",
+		recordRecovery(state, "review", { target: "parser.ts" }, {
+			ok: false,
+			text: "the developer review found a parser defect",
+			details: { approved: false, label: "defect" },
 		});
-		const correction = "Does this correction resolve the parser finding?";
-		const independent = "Does the coverage report need a separate source?";
-		const first = submission(correction, "The correction changes the empty-input branch.");
+		const { deps, calls } = depsFor({ consult: { probability: 0.5 }, resolves_hold: { probability: 0.05 } });
+		const submission = (context: string) => ({
+			mode: "recovery" as const,
+			...boundRecovery(state, context),
+		});
+		const first = submission("The correction changes the empty-input branch.");
 		expect((await consult(deps, state, first)).ok).toBe(false);
 		expect((await consult(deps, state, first)).ok).toBe(false);
 		expect(calls).toHaveLength(1);
-		await consult(deps, state, submission(independent, "The report cites the latest run."));
-		await consult(deps, state, submission(correction, "The correction changes the malformed-input branch."));
-		await consult(deps, state, submission(independent, "The report also cites the raw coverage file."));
+
+		await consult(deps, state, submission("The correction changes the malformed-input branch."));
+		await consult(deps, state, submission("The correction changes the incomplete-input branch."));
+		expect(calls).toHaveLength(3);
+		expect(continuationAllowed(state)).toBe(false);
+		expect(state.hold).toBeDefined();
+
+		// Recovery stays possible after the budget: new evidence is judged, the count authorizes nothing.
+		await consult(deps, state, submission("The correction changes the trailing-input branch."));
 		expect(calls).toHaveLength(4);
 		expect(continuationAllowed(state)).toBe(false);
-
-		await consult(deps, state, submission(correction, "The correction changes the incomplete-input branch."));
-		expect(calls).toHaveLength(5);
-		expect(continuationAllowed(state)).toBe(true);
 		expect(state.hold).toBeDefined();
-		await consult(deps, state, submission("Should the documentation retain its existing format?", "The format is unrelated to the parser finding."));
-		expect(calls).toHaveLength(6);
-		await consult(deps, state, submission(correction, "The correction changes the trailing-input branch."));
-		expect(calls).toHaveLength(6);
-		expect(state.hold).toBeDefined();
+		// An unchanged replay costs no judge call even after exhaustion.
+		await consult(deps, state, submission("The correction changes the trailing-input branch."));
+		expect(calls).toHaveLength(4);
 	});
 
 	test("FR-13: a negative answer does not clear a finding either", async () => {
 		const state = freshState();
 		registerTask(state, "Report the coverage of the last run");
-		state.hold = { reason: "the developer review answered defect" };
+		recordRecovery(state, "review", { target: "report.ts" }, {
+			ok: false,
+			text: "the developer review answered defect",
+			details: { approved: false, label: "defect" },
+		});
 
 		const negative = depsFor({ consult: { probability: 0.03 }, resolves_hold: { probability: 0.1 } });
 		const outcome = await consult(negative.deps, state, {
-			mode: "boolean",
-			question: "Should the work continue as it stands?",
-			context: "the review found a defect",
-			trueMeaning: "continue",
-			falseMeaning: "the defect stands",
+			mode: "recovery",
+			...boundRecovery(state, "correct the reported defect"),
 		});
 
-		expect(outcome.ok).toBe(true);
+		expect(outcome.ok).toBe(false);
 		expect(state.hold).toBeDefined();
 	});
 
@@ -888,6 +953,56 @@ describe("autonomous safety", () => {
 		expect(state.planDraft?.outlineApproved).toBe(true);
 	});
 
+	test("FR-38: action and recovery judgments retain decisions outside approved step sections", async () => {
+		const artifact = "# Plan\n\n## Decisions\nUse the configured provider key resolver, never a literal key.\n\n## Configure\nWrite the provider configuration.\n";
+		const state = planState("Configure the provider", ["Write the provider configuration"]);
+		state.planTopics = PLAN_TOPICS;
+		state.plan = { taskFingerprint: state.task!.fingerprint, planUrl: PLAN_URL, planDigest: sha256(artifact) };
+		const { deps } = depsFor({}, planReader(artifact));
+		deps.judge = async (material, questions) => answeringJudge(Object.fromEntries(questions.map(question => [
+			question.name,
+			question.name === "action"
+				? { label: asRecord(material)?.["approvedPlanArtifact"] === artifact ? "on_course" : "unclear", confidence: 0.95 }
+				: { probability: asRecord(material)?.["approvedPlanArtifact"] === artifact ? 0.95 : 0.2 },
+		]))).judge(material, questions);
+		const input = { path: "src/report.ts", content: "apiKey: configured-resolver" };
+		const outcome = await actionCheck(deps, state, { tool: "write", target: input.path, change: JSON.stringify(input) }, input);
+		expect(outcome.details?.["approved"]).toBe(true);
+		recordRecovery(state, "action:0", { input }, { ok: true, text: "The provider configuration needs authorization.", details: { kind: "unclear", approved: false } });
+		const repair = await consult(deps, state, {
+			mode: "recovery",
+			recovery: {
+				phase: "repair", findingId: state.hold?.id,
+				diagnosis: "The decision outside the step section was missing from the action context.",
+				correction: "Apply the configured resolver authorized by the complete approved plan.",
+				nextAction: { tool: "write", input },
+			},
+			evidence: [{ kind: "spec", quote: "Use the configured provider key resolver, never a literal key." }],
+		});
+		expect(repair.details?.["repairApproved"]).toBe(true);
+	});
+
+	test("FR-38: changed approved plan bytes cannot supply action authorization", async () => {
+		const state = planState("Configure the provider", ["Write the provider configuration"]);
+		state.planTopics = PLAN_TOPICS;
+		state.plan = { taskFingerprint: state.task!.fingerprint, planUrl: PLAN_URL, planDigest: sha256("approved plan") };
+		const { deps, calls } = depsFor({ action: { label: "on_course", confidence: 0.99 } }, planReader("changed plan"));
+		const outcome = await actionCheck(deps, state, { tool: "write", target: "src/report.ts", change: "{}" });
+		expect(outcome.details?.["approved"]).not.toBe(true);
+		expect(calls).toHaveLength(0);
+	});
+
+	test("FR-38: a below-floor off-course answer is uncertainty, not an established defect", async () => {
+		const state = planState("Configure the provider", ["Write the provider configuration"]);
+		state.planTopics = PLAN_TOPICS;
+		state.plan = { taskFingerprint: state.task!.fingerprint, planUrl: PLAN_URL, planDigest: "bound" };
+		const { deps } = depsFor({ action: { label: "off_course", confidence: 0.26 } });
+		const outcome = await actionCheck(deps, state, { tool: "write", target: "src/report.ts", change: "{}" });
+		expect(outcome.details?.["approved"]).toBe(false);
+		expect(outcome.text).toContain("Class: inconclusive");
+		expect(asRecord(state.hold?.result)?.["kind"]).toBe("unclear");
+	});
+
 	test("an off-task proposed action is blocked before it changes revision or history", async () => {
 		const state = planState("Report coverage", ["Collect run data"]);
 		state.planTopics = PLAN_TOPICS;
@@ -898,12 +1013,13 @@ describe("autonomous safety", () => {
 		expect(outcome.details?.["approved"]).toBe(false);
 		expect(state.revision).toBe(0);
 		expect(state.actions).toEqual([]);
-		expect(state.hold).toBeUndefined();
+		expect(state.hold?.boundary).toBe("action:0");
+		expect(state.continuation).toBeUndefined();
 	});
 });
 
 describe("FR-23 - staged plan refusal remains an open item", () => {
-	test("repeated material costs no call and exhaustion permits execution without approval", async () => {
+	test("repeated material costs no call and exhaustion keeps blocking while new evidence is judged", async () => {
 		const state = planState("Report coverage", ["Collect run data"]);
 		const { deps, calls } = depsFor({
 			outline_requirement_1: { probability: 0.3 },
@@ -926,9 +1042,12 @@ describe("FR-23 - staged plan refusal remains an open item", () => {
 		expect(state.openItem?.boundary).toBe("plan:outline");
 		expect(state.exhausted).toContain("plan");
 		expect(state.plan).toBeUndefined();
-		expect(mutationGate(state, boundaryConfig(), "write", { path: "src/report.ts" }).block).toBe(false);
-		expect((await planReview(deps, state, submission(99))).ok).toBe(false);
-		expect(calls).toHaveLength(POLICY.maxRefusalsPerStage);
+		expect(state.continuation).toBeUndefined();
+		expect(mutationGate(state, boundaryConfig(), "write", { path: "src/report.ts" }).block).toBe(true);
+		// Materially new plan evidence is still judged after the budget; the count releases nothing.
+		expect((await planReview(deps, state, submission(99))).ok).toBe(true);
+		expect(calls).toHaveLength(POLICY.maxRefusalsPerStage + 1);
+		expect(state.plan).toBeUndefined();
 	});
 	test("FR-37: outline reports the exact confirmed requirement that its approved steps miss", async () => {
 		const state = planState("Build a report", ["Collect run data", "Show coverage"]);
@@ -1272,7 +1391,7 @@ describe("T5 - acceptance and developer review (FR-14, FR-15, FR-16)", () => {
 		expect(calls).toHaveLength(0);
 	});
 
-	test("FR-16: a defect holds consequential changes and a sound verdict clears the finding", async () => {
+	test("FR-16: a defect hold is cleared only by a bound consultation, not by a sound review", async () => {
 		const defect = depsFor({ review: { label: "defect", confidence: 0.9 } });
 		const state = freshState();
 		registerTask(state, "Report the coverage");
@@ -1285,8 +1404,9 @@ describe("T5 - acceptance and developer review (FR-14, FR-15, FR-16)", () => {
 			evidence: [{ kind: "code", quote: "shared Map without a lock" }],
 		});
 
-		expect(outcome.ok).toBe(true);
-		expect(state.hold?.reason).toContain("defect");
+		expect(outcome.ok).toBe(false);
+		const hold = recordRecovery(state, "review", { target: "HEAD~1..HEAD" }, outcome);
+		expect(hold?.reason).toContain("defect");
 		expect(mutationGate(state, boundaryConfig(), "write", { path: "src/a.ts" }).block).toBe(true);
 
 		const sound = depsFor({ review: { label: "sound", confidence: 0.92 }, resolves_hold: { probability: 0.95 } });
@@ -1295,6 +1415,14 @@ describe("T5 - acceptance and developer review (FR-14, FR-15, FR-16)", () => {
 			target: "HEAD~1..HEAD",
 			claim: "the report writer is thread safe",
 			evidence: [{ kind: "code", quote: "the map is guarded by a lock" }],
+		});
+
+		expect(state.hold).toBeDefined();
+
+		const consultDeps = depsFor({ consult: { probability: 0.95 }, resolves_hold: { probability: 0.95 } });
+		await consult(consultDeps.deps, state, {
+			mode: "recovery",
+			...boundRecovery(state, "guard the shared map with a lock"),
 		});
 
 		expect(state.hold).toBeUndefined();
@@ -1502,5 +1630,274 @@ describe("FR-57 - strict autonomous decisions", () => {
 		});
 
 		expect(state.planDraft?.outlineApproved).toBe(true);
+	});
+});
+
+describe("FR-25 - an unreliable action answer is no decision, not a deviation", () => {
+	test("a below-floor on_course refuses the call without claiming a proven deviation", async () => {
+		const state = freshState();
+		registerTask(state, "Report the coverage of the last run");
+		state.planTopics = PLAN_TOPICS;
+		state.plan = { taskFingerprint: state.task!.fingerprint, planUrl: PLAN_URL, planDigest: "d" };
+		const { deps } = depsFor({ action: { label: "on_course", confidence: POLICY.minConfidenceToApprove - 0.2 } });
+
+		const outcome = await actionCheck(deps, state, {
+			tool: "bash",
+			target: "git log",
+			change: 'git log --oneline | head -3 && echo "---" && git diff --stat',
+		});
+
+		expect(outcome.details?.["approved"]).toBe(false);
+		expect(asRecord(state.hold?.result)?.["kind"]).toBe("unclear");
+		expect(outcome.text).toContain("no reliable decision");
+		expect(outcome.text).toContain("not a proven deviation");
+		expect(continuationAllowed(state)).toBe(false);
+	});
+
+	test("a missing plan is a prerequisite and creates no finding", async () => {
+		const state = freshState();
+		const { deps, calls } = depsFor({});
+
+		const outcome = await actionCheck(deps, state, { tool: "write", target: "src/a.ts", change: "x" });
+
+		expect(calls).toHaveLength(0);
+		expect(asRecord(outcome.details)?.["prerequisite"]).toBe(true);
+		expect(recordRecovery(state, "action", { tool: "write" }, outcome)).toBeUndefined();
+		expect(state.hold).toBeUndefined();
+	});
+});
+
+describe("FR-29 - owner follow-ups are classified, not automatically re-aimed", () => {
+	test("a continuation preserves every approval", async () => {
+		const state = freshState();
+		const task = registerTask(state, "Build a coverage report");
+		state.requirementsApproval = { taskFingerprint: task.fingerprint, items: ["Report coverage"] };
+		queueOwnerMessage(state, "Which format will it use?");
+		const { deps } = depsFor({ owner_update: { label: "continue", confidence: 0.94 } });
+
+		const outcome = await ownerUpdate(deps, state);
+
+		expect(outcome.ok).toBe(true);
+		expect(asRecord(outcome.details)?.["classification"]).toBe("continue");
+		expect(state.task?.fingerprint).toBe(task.fingerprint);
+		expect(state.requirementsApproval?.items).toEqual(["Report coverage"]);
+		expect(state.pendingOwnerMessages).toEqual([]);
+	});
+
+	test("an additive requirement extends the objective and invalidates only dependent reviews", async () => {
+		const state = freshState();
+		const task = registerTask(state, "Build a coverage report");
+		state.requirementsApproval = { taskFingerprint: task.fingerprint, items: ["Report coverage"] };
+		state.plan = { taskFingerprint: task.fingerprint, planUrl: "local://x-plan.md", planDigest: "d" };
+		const hold = recordRecovery(state, "review", { target: "a.ts" }, {
+			ok: false,
+			text: "a defect",
+			details: { approved: false },
+		});
+		const submissionCount = state.submissions.length;
+		queueOwnerMessage(state, "Also keep the previous format as an option");
+		const { deps } = depsFor({ owner_update: { label: "amend", confidence: 0.93 } });
+
+		const outcome = await ownerUpdate(deps, state);
+
+		expect(outcome.ok).toBe(true);
+		expect(state.task?.request).toContain("Also keep the previous format");
+		expect(state.task?.request).toContain("Build a coverage report");
+		expect(state.task?.fingerprint).not.toBe(task.fingerprint);
+		expect(state.requirementsApproval).toBeUndefined();
+		expect(state.plan).toBeUndefined();
+		expect(state.hold?.id).toBe(hold?.id);
+		expect(state.submissions).toHaveLength(submissionCount);
+	});
+
+	test("a replacement sets the reaim requirement without clearing approvals", async () => {
+		const state = freshState();
+		const task = registerTask(state, "Build a coverage report");
+		state.requirementsApproval = { taskFingerprint: task.fingerprint, items: ["Report coverage"] };
+		queueOwnerMessage(state, "Stop the report and build a dashboard instead");
+		const { deps } = depsFor({ owner_update: { label: "replace", confidence: 0.97 } });
+
+		const outcome = await ownerUpdate(deps, state);
+
+		expect(outcome.ok).toBe(true);
+		expect(state.directionPending?.text).toContain("dashboard");
+		expect(state.task?.request).toBe("Build a coverage report");
+		expect(state.requirementsApproval?.items).toEqual(["Report coverage"]);
+	});
+
+	test("an unclear classification holds execution for a bound consultation", async () => {
+		const state = freshState();
+		registerTask(state, "Build a coverage report");
+		queueOwnerMessage(state, "Do the thing we discussed");
+		const { deps } = depsFor({ owner_update: { label: "unclear", confidence: 0.55 } });
+
+		const outcome = await ownerUpdate(deps, state);
+
+		expect(outcome.ok).toBe(false);
+		expect(state.hold?.boundary).toBe("owner-update");
+		expect(state.hold?.reason).toContain("owner-update");
+	});
+
+	test("a below-floor classification label changes nothing and holds execution", async () => {
+		const state = freshState();
+		const task = registerTask(state, "Build a coverage report");
+		state.requirementsApproval = { taskFingerprint: task.fingerprint, items: ["Report coverage"] };
+		queueOwnerMessage(state, "Also keep the previous format as an option");
+		const { deps } = depsFor({ owner_update: { label: "amend", confidence: POLICY.minConfidenceToApprove - 0.2 } });
+
+		const outcome = await ownerUpdate(deps, state);
+
+		expect(outcome.ok).toBe(false);
+		expect(asRecord(outcome.details)?.["classification"]).toBe("unclear");
+		expect(state.task?.request).toBe("Build a coverage report");
+		expect(state.task?.fingerprint).toBe(task.fingerprint);
+		expect(state.requirementsApproval?.items).toEqual(["Report coverage"]);
+		expect(state.hold?.boundary).toBe("owner-update");
+	});
+
+	test("a message arriving during classification invalidates the result", async () => {
+		const state = freshState();
+		registerTask(state, "Build a coverage report");
+		queueOwnerMessage(state, "Also keep the old format");
+		const { deps } = depsFor({ owner_update: { label: "amend", confidence: 0.95 } });
+		const base = deps.judge;
+		deps.judge = async (material, questions) => {
+			queueOwnerMessage(state, "A newer message");
+			return base(material, questions);
+		};
+
+		const outcome = await ownerUpdate(deps, state);
+
+		expect(outcome.ok).toBe(false);
+		expect(state.task?.request).toBe("Build a coverage report");
+		expect(state.pendingOwnerMessages).toEqual(["Also keep the old format", "A newer message"]);
+	});
+});
+
+describe("FR-06 - the callable course check", () => {
+	test("without an approved plan it names the prerequisite instead of passing", async () => {
+		const state = freshState();
+		registerTask(state, "Build a coverage report");
+		const { deps, calls } = depsFor({});
+
+		const outcome = await courseCheck(deps, state, { claim: "wrote the report reader" });
+
+		expect(outcome.ok).toBe(false);
+		expect(asRecord(outcome.details)?.["skipped"]).toBe(true);
+		expect(asRecord(outcome.details)?.["prerequisite"]).toBe("approved plan");
+		expect(calls).toHaveLength(0);
+	});
+
+	test("it works before any recent action once a plan exists", async () => {
+		const state = freshState();
+		const task = registerTask(state, "Report the coverage of the last run");
+		state.plan = { taskFingerprint: task.fingerprint, planUrl: PLAN_URL, planDigest: "d" };
+		state.planTopics = PLAN_TOPICS;
+		const { deps, calls } = depsFor({ course: { label: "on_course", confidence: 0.9 } });
+
+		const outcome = await courseCheck(deps, state, {
+			claim: "the report reads the recorded coverage",
+			nextAction: "render the table",
+			evidence: [{ kind: "code", quote: "reads coverage.json" }],
+		});
+
+		expect(outcome.ok).toBe(true);
+		expect(asRecord(outcome.details)?.["approved"]).toBe(true);
+		expect(calls).toHaveLength(1);
+		expect(state.hold).toBeUndefined();
+	});
+
+	test("an off-course claim records a finding and blocks consequential work", async () => {
+		const state = freshState();
+		const task = registerTask(state, "Report the coverage of the last run");
+		state.plan = { taskFingerprint: task.fingerprint, planUrl: PLAN_URL, planDigest: "d" };
+		state.planTopics = PLAN_TOPICS;
+		const off = depsFor({ course: { label: "off_course", confidence: 0.92 } });
+
+		const outcome = await courseCheck(off.deps, state, { claim: "wrote an unrelated marketing page" });
+
+		expect(outcome.ok).toBe(false);
+		expect(state.hold?.boundary).toBe("course-check");
+		expect(mutationGate(state, boundaryConfig(), "write", { path: "src/a.ts" }).block).toBe(true);
+	});
+
+	test("an approving check leaves an unrelated finding alone", async () => {
+		const state = freshState();
+		const task = registerTask(state, "Report the coverage of the last run");
+		state.plan = { taskFingerprint: task.fingerprint, planUrl: PLAN_URL, planDigest: "d" };
+		state.planTopics = PLAN_TOPICS;
+		const unrelated = recordRecovery(state, "review", { target: "a.ts" }, {
+			ok: false,
+			text: "a defect",
+			details: { approved: false },
+		});
+		const on = depsFor({ course: { label: "on_course", confidence: 0.94 } });
+
+		const outcome = await courseCheck(on.deps, state, { claim: "render the coverage table" });
+
+		expect(outcome.ok).toBe(true);
+		expect(state.hold?.id).toBe(unrelated?.id);
+		expect(state.hold?.boundary).toBe("review");
+	});
+});
+
+describe("FR-22 - repeated reaim attempts use the actual owner and task identity", () => {
+	test("rewording the quote and evidence does not buy another judge call", async () => {
+		const state = freshState();
+		registerTask(state, "old course");
+		state.request = { text: "replace the report with a dashboard", weight: "judged" };
+		const { deps, calls } = depsFor({ reaim: { probability: 0.2 } });
+
+		const first = await reaim(deps, state, {
+			interjection: "replace the report with a dashboard",
+			evidence: [{ kind: "user", quote: "replace the report with a dashboard" }],
+		});
+		const second = await reaim(deps, state, {
+			interjection: "replace the report with a dashboard",
+			evidence: [{ kind: "user", quote: "replace the report with a dashboard" }, { kind: "spec", quote: "a different wording" }],
+		});
+
+		expect(first.ok).toBe(false);
+		expect(second.ok).toBe(false);
+		expect(calls).toHaveLength(1);
+		expect(continuationAllowed(state)).toBe(false);
+	});
+});
+
+describe("FR-08 - the trusted source context reaches the judge", () => {
+	test("the introduction, owner history and selected file contents are evaluated as data", async () => {
+		const state = freshState();
+		registerTask(state, "Report the coverage of the last run");
+		queueOwnerMessage(state, "Report the coverage of the last run");
+		state.trustedContext = {
+			introduction: "These sources are authenticated for this task.",
+			ownerMessages: [],
+			selectedSources: [
+				{
+					id: "source-1",
+					kind: "requirements",
+					sessionId: "session-1",
+					content: "The exact approved requirements text",
+					digest: "d",
+					origin: "judge_approved",
+				},
+			],
+		};
+		const { deps, calls } = depsFor({ consult: { probability: 0.9 } });
+
+		await consult(deps, state, {
+			mode: "boolean",
+			question: "Does the report satisfy the approved requirements?",
+			context: "the selected requirements are attached",
+			trueMeaning: "yes",
+			falseMeaning: "no",
+		});
+
+		const judged = asRecord(calls[0]?.state);
+		const trusted = asRecord(judged?.["trustedContext"]);
+		expect(trusted?.["introduction"]).toContain("authenticated");
+		expect(asRecord((trusted?.["selectedSources"] as unknown[])[0])?.["content"]).toBe("The exact approved requirements text");
+		expect(judged?.["ownerMessages"]).toEqual(["Report the coverage of the last run"]);
+		expect(judged?.["provenanceRule"]).toContain("data");
 	});
 });

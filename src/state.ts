@@ -5,6 +5,7 @@
  * Strict autonomous runs restore only validated ledger checkpoints and exact artifact bindings.
  */
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import {
 	PLAN_BOUNDARY,
 	POLICY,
@@ -14,8 +15,11 @@ import {
 	type Aspect,
 	type PlanOutlineStep,
 	type PlanTopic,
+	type ToolOutcome,
+	asRecord,
 } from "./types.js";
 import { namesExternalDeliverable, weightOf, type RequestWeight } from "./screen.js";
+import type { ContextSource } from "./context.js";
 /** The development task the gate belongs to. */
 export interface TaskIdentity {
 	/** SHA-256 of the request text; the approval ledger is keyed by it. */
@@ -93,6 +97,42 @@ interface Deviation {
 	revision: number;
 }
 
+/** Why a recovery hold was recorded; the classes must stay distinguishable in feedback. */
+export type RecoveryKind = "refusal" | "invalid" | "unavailable" | "unclear" | "defect" | "stale";
+
+/**
+ * A finding that holds consequential work until a supported correction resolves it. The legacy
+ * `{reason}` shape stays readable; a recorded finding carries the identity and exact material its
+ * recovery consultation must name.
+ */
+export interface RecoveryHold {
+	reason: string;
+	/** Stable finding id bound to the task, boundary, class and judged material. */
+	id?: string;
+	boundary?: string;
+	revision?: number;
+	/** The exact failed submission, serialized. */
+	material?: string;
+	/** The exact returned result or details. */
+	result?: unknown;
+}
+
+/** One Jev-approved corrective invocation; it grants no permission to any other payload. */
+export interface RepairPermit {
+	findingId: string;
+	tool: string;
+	input: Record<string, unknown>;
+	probability: number;
+	binding: string;
+}
+
+/** The source provenance the controller resolves before an activity reads its evidence. */
+export interface TrustedContext {
+	introduction: string;
+	ownerMessages: readonly ContextSource[];
+	selectedSources: readonly ContextSource[];
+}
+
 /** The course check in flight; only the check that set this token may clear it. */
 export type PendingCheck = object;
 
@@ -135,17 +175,25 @@ export interface JevState {
 	actionsSinceCheck: number;
 	/** A course check is in flight; consequential changes wait for its verdict. */
 	checkPending?: PendingCheck;
-	/** A finding that holds consequential changes until the executor consults. */
-	hold?: { reason: string };
+	/** A finding that holds consequential changes until a supported correction resolves it. */
+	hold?: RecoveryHold;
+	/** A single corrective invocation approved while the rest of the finding remains held. */
+	repair?: RepairPermit;
+	/** Every authentic owner message of this session, in chronological order. */
+	ownerMessages: string[];
+	/** Complete owner messages not yet classified against the active task. */
+	pendingOwnerMessages?: string[];
+	/** Trusted sources the controller resolved for the activity currently being judged. */
+	trustedContext?: TrustedContext;
 	/**
-	 * The owner's latest message arrived while the task was active. Its words may name a new course,
-	 * so the direction is undecided until a judged re-aim replaces the task; nothing else opens it.
+	 * The owner's latest message replaces the active course. The direction is undecided until
+	 * jev_reaim establishes the replacement from authentic owner context; nothing else opens it.
 	 */
 	directionPending?: { text: string };
 	actions: ActionRecord[];
 	/** Consecutive judge calls that failed for availability, reset by any usable answer (FR-21). */
 	judgeFailures: number;
-	/** Availability attempts are exhausted; continuation is permitted without a judge approval (FR-21). */
+	/** Availability attempts are exhausted; the outage is recorded and authorizes no effect (FR-21). */
 	judgeUnavailable?: true;
 	/** The owner has been told the judge is unavailable; cleared when a usable answer restores it. */
 	judgeUnavailableNotified?: true;
@@ -156,8 +204,8 @@ export interface JevState {
 	/** The boundary whose refusal budget is spent (FR-23). */
 	openItem?: OpenItemRecord;
 	/**
-	 * Boundaries whose refusal budget is spent. The finding remains OPEN while the controller
-	 * permits continuation of the current request without manufacturing approval (FR-23).
+	 * Boundaries whose refusal budget is spent. The finding stays OPEN and keeps blocking until a
+	 * supported recovery resolves it; the count itself manufactures no approval and no permission (FR-23).
 	 */
 	exhausted: string[];
 	/** Per-boundary ignored-call counts for the current owner request (FR-28, FR-44). */
@@ -167,7 +215,7 @@ export interface JevState {
 	completion?: CompletionRecord;
 	acceptance: AcceptanceRecord[];
 	stop?: StopRecord;
-	/** Permission to continue this request with unresolved findings; never a Jev approval. */
+	/** The owner's explicit, current-request permission to continue; never set by a count or a Jev approval. */
 	continuation?: { taskFingerprint?: string; request: string; reason: string };
 	/** Recorded external-artifact review parts, newest last (FR-45..FR-56). */
 	antiSlopReviews: AntiSlopReviewRecord[];
@@ -186,6 +234,7 @@ export function freshState(): JevState {
 		revision: 0,
 		actionsSinceCheck: 0,
 		actions: [],
+		ownerMessages: [],
 		acceptance: [],
 		planTopics: [],
 		submissions: [],
@@ -208,6 +257,189 @@ export function continuationAllowed(state: JevState): boolean {
 	return state.autonomous !== true && state.continuation !== undefined &&
 		state.continuation.taskFingerprint === state.task?.fingerprint &&
 		state.continuation.request === (state.request?.text ?? "");
+}
+
+const RECOVERY_KINDS: Record<string, true> = {
+	refusal: true,
+	invalid: true,
+	unavailable: true,
+	unclear: true,
+	defect: true,
+	stale: true,
+};
+
+/**
+ * Add one authentic owner message to the chronological history and to the unclassified queue.
+ * The controller calls this with interactive/rpc input only; extension messages and tool arguments
+ * never reach it.
+ */
+export function queueOwnerMessage(state: JevState, message: string): void {
+	const trimmed = message.trim();
+	if (trimmed.length === 0) return;
+	state.ownerMessages = [...state.ownerMessages, trimmed];
+	state.pendingOwnerMessages = [...(state.pendingOwnerMessages ?? []), trimmed];
+}
+
+/** Take the queued owner messages for one serialized classification. */
+export function takePendingOwnerMessages(state: JevState): string[] {
+	const pending = state.pendingOwnerMessages ?? [];
+	state.pendingOwnerMessages = [];
+	return pending;
+}
+
+function classifyRecovery(outcome: ToolOutcome): RecoveryKind {
+	const named = asRecord(outcome.details)?.["kind"];
+	return typeof named === "string" && RECOVERY_KINDS[named] === true ? (named as RecoveryKind) : "refusal";
+}
+
+/**
+ * The one-line reason a finding records: the boundary and the answer it returned, with the reported
+ * confidence when the activity provided one. It stays short because the exact material and result
+ * are kept beside it, and the class is carried separately.
+ */
+function summarizeRecovery(boundary: string, outcome: ToolOutcome): string {
+	const details = asRecord(outcome.details);
+	const verdict = details?.["verdict"] ?? details?.["label"] ?? details?.["assessment"];
+	const confidence = details?.["confidence"];
+	const answer =
+		typeof verdict === "string" && verdict.length > 0
+			? typeof confidence === "number"
+				? ` (answer: ${verdict} at confidence ${confidence.toFixed(2)})`
+				: ` (answer: ${verdict})`
+			: "";
+	return `${boundary} did not approve the material${answer}`;
+}
+
+/**
+ * Record the hold every actual refusal creates. Only `ok: false` and an explicit
+ * `details.approved === false` count; a well-formed answer that merely says "no" to an ordinary
+ * question is not a workflow failure, and a skipped check is not a finding. An existing hold is
+ * preserved: an unrelated refusal never resets it.
+ */
+export function recordRecovery(
+	state: JevState,
+	boundary: string,
+	params: unknown,
+	outcome: ToolOutcome,
+): RecoveryHold | undefined {
+	const details = asRecord(outcome.details);
+	if (details?.["skipped"] === true) return undefined;
+	// Local argument validation is not a Jev verdict. Corrected arguments must remain callable.
+	if (details?.["kind"] === "invalid") return undefined;
+	// A stale answer was discarded before judgment: it is no finding and no current decision, so
+	// the corrected material must be judged again rather than held behind a manufactured finding.
+	if (details?.["kind"] === "stale") return undefined;
+	const failed = outcome.ok !== true || details?.["approved"] === false;
+	if (!failed) return undefined;
+	const kind = classifyRecovery(outcome);
+	let material: string;
+	try {
+		material = JSON.stringify(params) ?? "null";
+	} catch {
+		material = String(params);
+	}
+	const identity = sha256(
+		JSON.stringify({
+			task: state.task?.fingerprint ?? state.request?.text ?? null,
+			boundary: boundaryKey(boundary),
+			material,
+		}),
+	);
+	const id = `finding-${identity.slice(0, 12)}`;
+	// The exact returned text is the observable failure; the details stay alongside it so neither
+	// the validation/transport message nor the structured class is lost from the finding.
+	const result = { ...(details ?? {}), kind, text: outcome.text };
+	if (state.hold !== undefined) {
+		if (state.hold.boundary === undefined || boundaryKey(state.hold.boundary) === boundaryKey(boundary)) {
+			state.hold = {
+				...state.hold,
+				boundary: state.hold.boundary ?? boundary,
+				revision: state.hold.revision ?? state.revision,
+				material: state.hold.material ?? material,
+				result: state.hold.result ?? result,
+				id: state.hold.id ?? id,
+			};
+		}
+		return state.hold;
+	}
+	state.hold = {
+		reason: summarizeRecovery(boundary, outcome),
+		id,
+		boundary,
+		revision: state.revision,
+		material,
+		result,
+	};
+	return state.hold;
+}
+
+/** The finding id a recovery consultation must name, when the hold carries one. */
+export function recoveryHoldId(state: JevState): string | undefined {
+	return state.hold?.id;
+}
+
+/** What each recorded class establishes, so uncertainty is never read as a proven defect. */
+const RECOVERY_CLASS_GLOSS: Record<RecoveryKind, string> = {
+	refusal: "the judge answered and refused this material; the finding stands until it is materially corrected",
+	invalid: "the submission was malformed, so this is a local input problem and no judgment exists",
+	unavailable: "no judgment was obtained, so an outage establishes no defect and approves nothing",
+	unclear: "the answer settled neither side, so this is uncertainty, not a proven deviation",
+	defect: "a defect was established and stands until the material is corrected",
+	stale: "the answer was discarded as stale, so it is no finding and no current decision",
+};
+
+/**
+ * The concise decisive feedback for the standing hold: the finding's identity and class, the
+ * observable reason it was recorded, where its exact material remains readable, and one next step.
+ * The exact refused submission and the returned result stay in the hold and in the jev_context list,
+ * so they are never repeated here as a payload wall.
+ */
+export function recoveryFeedback(state: JevState): string {
+	const hold = state.hold;
+	if (hold === undefined) return "";
+	const recorded = asRecord(hold.result)?.["kind"];
+	const kind: RecoveryKind =
+		typeof recorded === "string" && RECOVERY_KINDS[recorded] === true ? (recorded as RecoveryKind) : "refusal";
+	const finding = hold.id ?? "(legacy finding without an id)";
+	const repair = state.repair === undefined ? undefined : permittedRepair(state, state.repair.tool, state.repair.input);
+	return [
+		`Finding ${finding} holds consequential work at boundary ${boundaryKey(hold.boundary ?? "hold")} (work revision ${hold.revision ?? state.revision}).`,
+		`Class: ${kind} - ${RECOVERY_CLASS_GLOSS[kind]}. Observable reason: ${hold.reason}.`,
+		`The exact refused submission and the returned result stay in this finding's structured details and in jev_context({"action":"list"}) under hold; read them there instead of repeating them.`,
+		"Evidence reads, diagnostic consultations, requirement/plan repairs and re-submission to the failed review remain open. A score alone does not explain a defect; do not invent its cause.",
+		repair === undefined
+			? `Next: inspect this finding and the approved plan. Use jev_consult with mode "recovery" and recovery.findingId "${finding}": phase "repair" authorizes one exact corrective {tool,input}, phase "resolve" clears the finding from observed proof. Neither phase needs a separate question.`
+			: `Next: execute exactly the approved repair ${repair.tool} with recovery.nextAction.input once. Any different payload still waits; the repair is not proof that the whole task is complete.`,
+		"Rewording the same proposal is not new evidence. An approved corrective invocation can run without an owner override; unresolved findings remain held.",
+		...(state.autonomous === true
+			? []
+			: ["The owner may permit continuation with /jev-continue or an explicit approval message; that permission is the owner's override, not Jev approval."]),
+	].join("\n");
+}
+
+/** Bind repair authority to the actual workflow, excluding transient source selections and counters. */
+export function repairBinding(state: JevState): string {
+	return sha256(JSON.stringify([
+		state.request, state.task, state.simple, state.revision, state.requirementsApproval,
+		state.plan, state.planTopics, state.planDraft, state.ownerMessages, state.pendingOwnerMessages,
+		state.actions, state.hold,
+	]));
+}
+
+/** A repair opens only its exact invocation, while the finding and governing state still match. */
+export function permittedRepair(state: JevState, tool: string, input: unknown): RepairPermit | undefined {
+	const repair = state.repair;
+	if (repair === undefined || repair.findingId !== state.hold?.id || repair.tool !== tool ||
+		!isDeepStrictEqual(repair.input, input) || repair.binding !== repairBinding(state)) return undefined;
+	return repair;
+}
+
+/** Clear the hold only when the consultation names its exact finding id. */
+export function clearResolvedHold(state: JevState, findingId: string): boolean {
+	if (state.hold === undefined || state.hold.id !== findingId) return false;
+	delete state.hold;
+	delete state.repair;
+	return true;
 }
 
 /** SHA-256 in hex; the fingerprint and the artifact binding are both built from it. */
@@ -240,7 +472,9 @@ function clearWork(state: JevState): void {
 	delete state.planDraft;
 	delete state.plan;
 	delete state.hold;
+	delete state.repair;
 	delete state.directionPending;
+	state.pendingOwnerMessages = [];
 	delete state.openItem;
 	delete state.openItemNotified;
 	delete state.checkPending;
@@ -372,7 +606,8 @@ export function recordStopBlock(state: JevState, signature: string): { blocks: n
 /**
  * Record one refusal at a boundary with the digest of the material it judged (FR-22). The ledger is
  * permanent for the task, so a refusal never falls out of the count. Once the budget is spent the
- * boundary is recorded as OPEN and continuation is permitted without approval (FR-23).
+ * boundary is recorded as OPEN; that record authorizes nothing, and the finding stays unresolved
+ * until materially new evidence or the owner's explicit continuation (FR-23).
  */
 export function recordRefusal(state: JevState, record: SubmissionRecord): void {
 	state.submissions = [...state.submissions, record];
@@ -403,8 +638,9 @@ export function submissionLedger(
 }
 
 /**
- * Record a spent refusal budget as OPEN and permit continuation of this request.
- * Refusals stay recorded with their digests; no plan or acceptance is approved (FR-23).
+ * Record a spent refusal budget as OPEN. It authorizes nothing: the finding stays open, only
+ * materially new evidence or the owner's explicit continuation can move the work, and neither is
+ * Jev approval (FR-23).
  */
 export function exhaustBoundary(state: JevState, boundary: string): OpenItemRecord {
 	const refused = state.submissions.filter(entry => entry.boundary === boundary);
@@ -412,7 +648,6 @@ export function exhaustBoundary(state: JevState, boundary: string): OpenItemReco
 	state.openItem = openItem;
 	const key = boundaryKey(boundary);
 	if (!state.exhausted.includes(key)) state.exhausted = [...state.exhausted, key];
-	allowContinuation(state, `attempt limit at ${boundary}; the decision remains OPEN`);
 	return openItem;
 }
 
@@ -429,13 +664,13 @@ export function recordRefusedCall(state: JevState, boundary: string): number {
 }
 
 /**
- * Record the ignored-call limit as an OPEN item and permit continuation without spending the
- * activity refusal budget. The gate's own refusals must never exhaust the activity they protect.
+ * Record the ignored-call limit as an OPEN item without spending the activity refusal budget.
+ * The gate's own refusals must never exhaust the activity they protect, and the count never
+ * releases the boundary: only a supported correction or explicit owner continuation can.
  */
 export function permitAfterIgnoredCalls(state: JevState, boundary: string, attempts: number): OpenItemRecord {
 	const openItem: OpenItemRecord = { boundary, attempts };
 	state.openItem = openItem;
-	allowContinuation(state, `ignored-call limit at ${boundary}; the decision remains OPEN`);
 	return openItem;
 }
 

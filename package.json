@@ -6,6 +6,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test",
+    "test:live": "bun tools/live-smoke.ts direct --scenario recovery && bun tools/live-smoke.ts host --scenario workflow --model deepseek/deepseek-flash --max-time 300",
     "autonomy": "bun autonomy/driver.ts"
   },
   "engines": {

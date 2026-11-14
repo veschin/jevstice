@@ -3,24 +3,31 @@ import {
 	acceptanceAt,
 	boundaryExhausted,
 	clearFinishedTask,
+	clearResolvedHold,
 	continuationAllowed,
 	exhaustBoundary,
 	freshState,
 	permitAfterIgnoredCalls,
+	queueOwnerMessage,
 	reaimTask,
+	recoveryFeedback,
+	recoveryHoldId,
 	recordAcceptance,
 	recordAction,
 	recordActivityOutcome,
 	recordFailedAction,
 	recordJudgeCall,
+	recordRecovery,
 	recordRefusal,
 	recordRefusedCall,
 	recordStopBlock,
 	registerTask,
 	sha256,
 	submissionLedger,
+	takePendingOwnerMessages,
 	type JevState,
 } from "../src/state.js";
+import { asRecord, type ToolOutcome } from "../src/types.js";
 import { POLICY } from "../src/types.js";
 
 /** A task with one approved plan, one accepted aspect and every task-bound marker set. */
@@ -222,6 +229,112 @@ describe("FR-22, FR-23 - the refusal ledger and the OPEN item", () => {
 	});
 });
 
+describe("FR-23 - a refusal records a recoverable finding, never authority", () => {
+	const refusalOutcome: ToolOutcome = {
+		ok: false,
+		text: "the judge selected defect (confidence 0.91)",
+		details: { approved: false, label: "defect", confidence: 0.91, kind: "defect" },
+	};
+
+	test("a refusal records a stable finding with the exact failed material and result", () => {
+		const state = freshState();
+		registerTask(state, "Repair the parser");
+
+		const hold = recordRecovery(state, "review", { kind: "diff", target: "a.ts" }, refusalOutcome);
+
+		expect(hold?.id).toMatch(/^finding-/);
+		expect(recoveryHoldId(state)).toBe(hold?.id);
+		expect(hold?.boundary).toBe("review");
+		expect(hold?.material).toContain("a.ts");
+		expect(hold?.result).toMatchObject(refusalOutcome.details ?? {});
+		expect(asRecord(hold?.result)?.["text"]).toBe(refusalOutcome.text);
+		expect(recoveryFeedback(state)).toContain(hold?.id ?? "");
+		expect(recoveryFeedback(state)).toContain("findingId");
+		expect(continuationAllowed(state)).toBe(false);
+	});
+
+	test("the recovery feedback names the class and where the original finding stays, not its payload", () => {
+		const state = freshState();
+		registerTask(state, "Repair the parser");
+		const hold = recordRecovery(state, "review", { kind: "diff", target: "a.ts" }, refusalOutcome);
+
+		const feedback = recoveryFeedback(state);
+
+		expect(feedback).toContain(hold?.id ?? "");
+		expect(feedback).toContain("Class: defect");
+		expect(feedback).toContain('jev_context({"action":"list"})');
+		// The exact returned text stays in the finding; the feedback points at it instead of pasting it.
+		expect(asRecord(hold?.result)?.["text"]).toBe(refusalOutcome.text);
+		expect(feedback).not.toContain(refusalOutcome.text);
+		expect(hold?.material).toBe(JSON.stringify({ kind: "diff", target: "a.ts" }));
+	});
+
+	test("an inconclusive finding is reported as uncertainty, not a proven deviation", () => {
+		const state = freshState();
+		registerTask(state, "Repair the parser");
+		recordRecovery(state, "course-check", { claim: "x" }, {
+			ok: false,
+			text: "the course check could not settle the relation",
+			details: { kind: "unclear", approved: false },
+		});
+
+		const feedback = recoveryFeedback(state);
+
+		expect(feedback).toContain("Class: unclear");
+		expect(feedback).toContain("not a proven deviation");
+		expect(feedback).toContain("/jev-continue");
+		expect(continuationAllowed(state)).toBe(false);
+	});
+
+	test("an ordinary well-formed answer and a skipped check record no finding", () => {
+		const state = freshState();
+
+		expect(recordRecovery(state, "consult", { question: "q" }, { ok: true, text: "yes", details: { verdict: "yes" } })).toBeUndefined();
+		expect(recordRecovery(state, "course-check", {}, { ok: false, text: "prerequisite", details: { skipped: true } })).toBeUndefined();
+		expect(recordRecovery(state, "triage", {}, { ok: false, text: "request is missing", details: { kind: "invalid" } })).toBeUndefined();
+		expect(state.hold).toBeUndefined();
+	});
+
+	test("an unrelated refusal preserves the standing finding, and only its exact id clears it", () => {
+		const state = freshState();
+		registerTask(state, "Repair the parser");
+		const first = recordRecovery(state, "review", { target: "a.ts" }, refusalOutcome);
+		const other = recordRecovery(state, "action", { tool: "edit" }, refusalOutcome);
+		recordRecovery(state, "review", { target: "rewritten-recovery" }, { ok: false, text: "recovery refused", details: { approved: false } });
+		expect(state.hold?.material).toBe(JSON.stringify({ target: "a.ts" }));
+		expect(state.hold?.result).toEqual(first?.result);
+
+		expect(other?.id).toBe(first?.id);
+		expect(state.hold?.boundary).toBe("review");
+		expect(clearResolvedHold(state, "finding-other")).toBe(false);
+		expect(state.hold).toBeDefined();
+		expect(clearResolvedHold(state, first?.id ?? "")).toBe(true);
+		expect(state.hold).toBeUndefined();
+	});
+
+	test("a spent budget records the boundary OPEN without continuation permission", () => {
+		const state = freshState();
+		registerTask(state, "task");
+		for (const digest of ["a", "b", "c"]) recordRefusal(state, { boundary: "plan:outline", digest });
+
+		expect(state.exhausted).toEqual(["plan"]);
+		expect(state.openItem).toEqual({ boundary: "plan:outline", attempts: 3 });
+		expect(continuationAllowed(state)).toBe(false);
+		expect(state.continuation).toBeUndefined();
+	});
+
+	test("owner messages keep chronological history and a takeable queue", () => {
+		const state = freshState();
+
+		queueOwnerMessage(state, "  Build the report  ");
+		queueOwnerMessage(state, "Also keep the old format");
+
+		expect(state.ownerMessages).toEqual(["Build the report", "Also keep the old format"]);
+		expect(takePendingOwnerMessages(state)).toEqual(["Build the report", "Also keep the old format"]);
+		expect(state.pendingOwnerMessages).toEqual([]);
+	});
+});
+
 describe("FR-29 - re-aiming and finishing a task", () => {
 	test("a re-aim clears every approval and does not exhaust the plan on the new course", () => {
 		const state = freshState();
@@ -277,14 +390,15 @@ describe("FR-29 - re-aiming and finishing a task", () => {
 });
 
 describe("session accounting and ignored-call continuation", () => {
-	test("ignored gate calls permit continuation without exhausting the activity budget", () => {
+	test("ignored gate calls record an OPEN item and authorize no continuation", () => {
 		const state = freshState();
 
 		permitAfterIgnoredCalls(state, "triage", 3);
 
 		expect(state.openItem).toEqual({ boundary: "triage", attempts: 3 });
 		expect(boundaryExhausted(state, "triage")).toBe(false);
-		expect(continuationAllowed(state)).toBe(true);
+		expect(continuationAllowed(state)).toBe(false);
+		expect(state.continuation).toBeUndefined();
 	});
 
 	test("activity outcomes and judge usage survive a task change", () => {

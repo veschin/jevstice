@@ -2,7 +2,7 @@
  * Key resolution: an environment variable first, then a resolver command whose trimmed stdout is
  * the key (`pass show token/jev`). The key is never logged, persisted or echoed - it reaches the
  * judge client and nothing else. A missing key or a failing command resolves to `undefined`, so the
- * judge reports an unusable answer instead of throwing and no call can be mistaken for an approval.
+ * judge reports an unavailable judge instead of throwing and no call can be mistaken for an approval.
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";

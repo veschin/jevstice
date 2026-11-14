@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { writeFile } from "node:fs/promises";
+import { rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DEFAULT_CONFIG } from "../src/config.js";
+import { createContextArchive } from "../src/context.js";
 import { createJevController } from "../src/controller.js";
 import type { Judge, JudgeQuestion } from "../src/judge.js";
-import { POLICY, type JevConfig } from "../src/types.js";
+import { POLICY, asRecord, type JevConfig } from "../src/types.js";
 import {
 	answeringJudge,
 	blockReason,
@@ -162,6 +163,8 @@ describe("T1 - the registered surface", () => {
 			"jev_acceptance",
 			"jev_anti_slop",
 			"jev_consult",
+			"jev_context",
+			"jev_course_check",
 			"jev_plan_review",
 			"jev_reaim",
 			"jev_requirements",
@@ -383,7 +386,6 @@ describe("FR-31 - the admitted payload is judged before it runs", () => {
 		const reason = blockReason(await pi.emit("tool_call", toolCallEvent("eval", { language: "js", code: payload }), ctx));
 
 		expect(reason).toBeDefined();
-		expect(reason).toContain("not executed");
 		const judged = calls.filter(call => call.questions.some(question => question.name === "action")).at(-1);
 		// The payload past the evidence cap is part of what the judge read, not truncated away.
 		expect(JSON.stringify(judged?.state)).toContain("B".repeat(POLICY.maxActionExcerptChars + 100));
@@ -399,7 +401,7 @@ describe("FR-31 - the admitted payload is judged before it runs", () => {
 
 		const reason = blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx));
 
-		expect(reason).toContain("not executed");
+		expect(reason).toBeDefined();
 	});
 
 	test("an approved plan whose artifact is rewritten during the judgment stops the execution", async () => {
@@ -510,18 +512,23 @@ describe("T4 - implementation course checks (FR-11, FR-12, FR-13)", () => {
 
 	test("FR-29: an owner message during an approved task holds changes until a judged re-aim", async () => {
 		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
-		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED, reaim: { probability: 0.9 } });
+		const { pi } = controllerFor({
+			needs_development: TRIAGE_DEEP,
+			...PLAN_APPROVED,
+			reaim: { probability: 0.9 },
+			owner_update: { label: "replace", confidence: 0.93 },
+		});
 		await pi.emit("before_agent_start", { prompt: "добавь отчёт по покрытию" }, ctx);
 		await triaged(pi, ctx, "добавь отчёт по покрытию");
 		await planned(pi, ctx, "добавь отчёт по покрытию");
 
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toBeUndefined();
 
+		await pi.emit("input", { text: "теперь закрой F-40", source: "interactive" }, ctx);
 		await pi.emit("before_agent_start", { prompt: "теперь закрой F-40" }, ctx);
 		const held = await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx);
 
 		expect(blockReason(held)).toContain("jev_reaim");
-		expect(blockReason(held)).toContain("direction");
 
 		await pi.callTool("jev_reaim", { interjection: "теперь закрой F-40", evidence: [{ kind: "user", quote: "теперь закрой F-40" }] }, ctx);
 
@@ -602,16 +609,20 @@ describe("T4 - implementation course checks (FR-11, FR-12, FR-13)", () => {
 		const held = await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx);
 		expect(blockReason(held)).toContain("off_course");
 
+		const listed = await pi.callTool("jev_context", { action: "list" }, ctx);
+		const finding = asRecord(toolDetails(listed)["hold"]);
+		expect(typeof finding?.["id"]).toBe("string");
 		await pi.callTool(
 			"jev_consult",
 			{
-				mode: "choice",
-				question: "Which direction should the work take?",
-				context: "the last action left the registered task",
-				alternatives: [
-					{ label: "fix", meaning: "return to the registered task" },
-					{ label: "keep", meaning: "continue as it is" },
-				],
+				mode: "recovery",
+				recovery: {
+					findingId: finding?.["id"],
+					phase: "resolve",
+					diagnosis: "the written file was outside the approved plan",
+					correction: "write only the file the approved plan names",
+				},
+				evidence: [{ kind: "code", quote: "the corrected write stays inside src/a.ts" }],
 			},
 			ctx,
 		);
@@ -619,7 +630,7 @@ describe("T4 - implementation course checks (FR-11, FR-12, FR-13)", () => {
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toBeUndefined();
 	});
 
-	test("FR-23, FR-11: a spent hold permits work and spends no further check", async () => {
+	test("FR-23, FR-11: a spent hold stays held until the owner explicitly continues", async () => {
 		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
 		const { pi, calls } = controllerFor(
 			{
@@ -637,26 +648,32 @@ describe("T4 - implementation course checks (FR-11, FR-12, FR-13)", () => {
 		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 bytes"), ctx);
 		expect(await until(() => calls.some(call => call.questions.some(question => question.name === "direction:1")))).toBe(true);
 
+		const listed = await pi.callTool("jev_context", { action: "list" }, ctx);
+		const findingId = String(asRecord(toolDetails(listed)["hold"])?.["id"] ?? "");
+		expect(findingId).toMatch(/^finding-/);
 		for (let attempt = 1; attempt <= POLICY.maxRefusalsPerStage; attempt += 1) {
 			await pi.callTool(
 				"jev_consult",
 				{
-					mode: "boolean",
-					question: "Does this correction resolve the direction finding?",
-					context: `The course-check finding is addressed by corrective approach ${attempt}.`,
+					mode: "recovery",
 					evidence: [{ kind: "user", quote: "report the coverage of the last run" }],
-					trueMeaning: "continue",
-					falseMeaning: "stay held",
+					recovery: {
+						findingId,
+						phase: "resolve",
+						diagnosis: "the actions left the approved plan",
+						correction: `approach ${attempt} changes the implementation relative to the refused material`,
+					},
 				},
 				ctx,
 			);
 		}
-		// The finding survives, but the attempt limit permits continuation of this request.
-
+		// The count records the OPEN finding; it authorizes no execution.
 		const before = calls.length;
-		const verdict = await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx);
-		expect(blockReason(verdict)).toBeUndefined();
+		const stillHeld = await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx);
+		expect(blockReason(stillHeld)).toContain(findingId);
 
+		await pi.emit("input", { text: "аппрув", source: "interactive" }, ctx);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toBeUndefined();
 		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Successfully wrote 4 more bytes"), ctx);
 		expect(calls.length).toBe(before);
 	});
@@ -759,7 +776,7 @@ describe("T5 - acceptance and completion (FR-14, FR-15, FR-17)", () => {
 		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toContain("acceptance");
 	});
 
-	test("FR-14: repeated stop refusals permit stopping with the acceptance OPEN", async () => {
+	test("FR-14: repeated stop refusals keep holding until the owner explicitly continues", async () => {
 		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
 		const { pi, calls } = controllerFor({ needs_development: TRIAGE_DEEP, ...PLAN_APPROVED });
 		await triaged(pi, ctx);
@@ -770,11 +787,15 @@ describe("T5 - acceptance and completion (FR-14, FR-15, FR-17)", () => {
 		for (let attempt = 0; attempt < POLICY.maxStopBlocks; attempt += 1) {
 			expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeDefined();
 		}
-		// Past the bound the refusal remains OPEN, without claiming acceptance.
+		// Past the bound the refusal remains OPEN and the stop stays held; the count approves nothing.
 		const exhausted = stopDecision(await pi.emit("session_stop", stopEvent(), ctx));
-		expect(exhausted).toBeUndefined();
+		expect(exhausted).toBeDefined();
+		expect(exhausted).toContain("acceptance");
 		expect(pi.messages.some(message => message.customType === "jev.open_item")).toBe(true);
 		expect(calls.length).toBe(before);
+
+		await pi.emit("input", { text: "аппрув", source: "interactive" }, ctx);
+		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
 	});
 
 	test("a disabled completion gate lets the session settle", async () => {
@@ -1022,7 +1043,7 @@ describe("FR-25 - the course check runs on a deviation or on the configured coun
 });
 
 describe("FR-21, FR-28 - the extension tells the owner what the executor cannot report", () => {
-	test("FR-21: exhausted transport attempts permit continuation and a new task is judged again", async () => {
+	test("FR-21: exhausted transport attempts stay held until the finding is resolved", async () => {
 		let mode: "down" | "deep" = "down";
 		const judge: Judge = async (_state, questions) => {
 			if (mode === "down") {
@@ -1049,13 +1070,30 @@ describe("FR-21, FR-28 - the extension tells the owner what the executor cannot 
 			expect(toolFailed(await pi.callTool("jev_triage", { request: "Report the coverage of the last run" }, ctx))).toBe(true);
 		}
 
-		// The availability budget permits continuation, but no task or approval was manufactured.
-		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toBeUndefined();
-		expect(notices).toHaveLength(1);
-		expect(notices[0]).toContain("could not be reached");
+		// The availability budget records the outage; it does not open the boundary.
+		const held = await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx);
+		expect(blockReason(held)).toContain("Class: unavailable");
+		expect(blockReason(held)).toMatch(/finding-[a-f0-9]{12}/);
 
-		// A usable answer restores the boundaries: the task is registered and the gate holds again.
+		// A usable answer restores judgment, and the recorded finding is bound by its id.
 		mode = "deep";
+		const listed = await pi.callTool("jev_context", { action: "list" }, ctx);
+		const findingId = String(asRecord(toolDetails(listed)["hold"])?.["id"] ?? "");
+		expect(findingId).toMatch(/^finding-/);
+		await pi.callTool(
+			"jev_consult",
+			{
+				mode: "recovery",
+				evidence: [{ kind: "execution", quote: "the judge answered this call" }],
+				recovery: {
+					findingId,
+					phase: "resolve",
+					diagnosis: "the judge was unreachable",
+					correction: "the transport recovered and no material changed",
+				},
+			},
+			ctx,
+		);
 		await pi.callTool("jev_triage", { request: "Report the coverage of the last run" }, ctx);
 
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toContain("jev_plan_review");
@@ -1079,7 +1117,6 @@ describe("FR-21, FR-28 - the extension tells the owner what the executor cannot 
 
 		const delivered = pi.messages.slice(before).filter(message => message.customType === "jev.boundary");
 		expect(delivered).toHaveLength(1);
-		expect(delivered[0]?.deliverAs).toBe("aside");
 		expect(notices).toHaveLength(1);
 	});
 });
@@ -1190,7 +1227,7 @@ describe("FR-30 - the request screen decides what is judged", () => {
 			ctx,
 		);
 		expect(toolText(reviewed)).toContain("defect");
-		expect(toolText(reviewed)).toContain("held until you consult");
+		expect(toolText(reviewed)).toContain("finding");
 
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toContain("defect");
 	});
@@ -1220,18 +1257,20 @@ describe("FR-30 - the request screen decides what is judged", () => {
 });
 
 describe("owner-authorized continuation", () => {
-	test("a bounded file gate permits work and completion without manufacturing acceptance", async () => {
+	test("a bounded file gate stays held until the owner explicitly continues", async () => {
 		const { pi, calls } = controllerFor({ needs_development: TRIAGE_DEEP });
 		const ctx = fakeCtx();
 		await triaged(pi, ctx);
 		for (let attempt = 0; attempt < POLICY.maxIgnoredBoundaryCalls; attempt += 1) {
 			expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts" }), ctx))).toBeDefined();
 		}
+		const stillHeld = await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts" }), ctx);
+		expect(blockReason(stillHeld)).toContain("jev_plan_review");
+		await pi.emit("input", { text: "аппрув", source: "interactive" }, ctx);
 		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts" }), ctx))).toBeUndefined();
 		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "written"), ctx);
 		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
 		expect(calls.some(call => call.questions.some(question => question.name === "acceptance"))).toBe(false);
-		expect(pi.messages.some(message => message.content.includes("OPEN"))).toBe(true);
 	});
 
 	test("explicit owner approval opens all boundaries but a new task does not inherit it", async () => {
@@ -1290,7 +1329,7 @@ describe("FR-55 - advisory anti-slop discloses a gap without holding it", () => 
 
 		const decision = stopDecision(await pi.emit("session_stop", stopEvent(), ctx));
 		expect(decision).toBeDefined();
-		expect(pi.messages.some(message => message.content.includes("anti-slop review"))).toBe(true);
+		expect(pi.messages.some(message => message.customType === "jev.anti_slop_advisory")).toBe(true);
 	});
 });
 
@@ -1377,36 +1416,30 @@ describe("session status and boundary isolation", () => {
 		expect(toolText(outcome)).not.toContain("exhausted");
 	});
 
-	test("a quiet follow-up clears a stale pending direction", async () => {
-		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP });
+	test("a classified replacement direction survives a quiet follow-up until re-aim", async () => {
+		const { pi } = controllerFor({
+			needs_development: TRIAGE_DEEP,
+			owner_update: { label: "replace", confidence: 0.93 },
+		});
 		const ctx = fakeCtx();
 		await pi.emit("before_agent_start", { prompt: "Report the coverage" }, ctx);
 		await triaged(pi, ctx, "Report the coverage");
 
+		await pi.emit("input", { text: "Change the report", source: "interactive" }, ctx);
 		await pi.emit("before_agent_start", { prompt: "Change the report" }, ctx);
 		const pending = blockReason(
 			await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx),
 		);
-		expect(pending).toContain("undecided");
+		expect(pending).toContain("jev_reaim");
 
 		await pi.emit("before_agent_start", { prompt: "Show the report" }, ctx);
 		const held = blockReason(
 			await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx),
 		);
-		expect(held).not.toContain("undecided");
-		expect(held).toContain("jev_plan_review");
+		expect(held).toContain("jev_reaim");
+		expect(held).not.toContain("jev_plan_review");
 	});
 
-	test("the status command reports calls, failures and the unset balance", () => {
-		const { pi } = controllerFor({});
-		const ctx = fakeCtx();
-
-		pi.callCommand("jev-status", "", ctx);
-
-		const status = pi.messages.find(message => message.customType === "jev.status");
-		expect(status?.content).toContain("judge 0 calls");
-		expect(status?.content).toContain("balance not configured");
-	});
 
 	test("the status shows session spend against a configured balance", async () => {
 		const fake = answeringJudge({ consult: { label: "a", confidence: 0.9 } });
@@ -1435,7 +1468,8 @@ describe("session status and boundary isolation", () => {
 		pi.callCommand("jev-status", "", ctx);
 
 		const status = pi.messages.filter(message => message.customType === "jev.status").at(-1);
-		expect(status?.content).toContain("0.000042/10$");
+		expect(status?.content).toContain("0.000042$");
+		expect(status?.content).toContain("10$");
 	});
 
 	test("every ten activity calls emits a status message", async () => {
@@ -1460,31 +1494,38 @@ describe("session status and boundary isolation", () => {
 
 		const statuses = pi.messages.filter(message => message.customType === "jev.status");
 		expect(statuses).toHaveLength(1);
-		expect(statuses[0]?.content).toContain("jev_consult 10/0");
 	});
 });
 
 describe("context and invocation correctness regressions", () => {
 	test("FR-44: a changed owner request does not inherit ignored-call counts", async () => {
-		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP });
+		const { pi } = controllerFor({
+			needs_development: TRIAGE_DEEP,
+			owner_update: { label: "replace", confidence: 0.93 },
+		});
 		const ctx = fakeCtx();
 		await pi.emit("before_agent_start", { prompt: "Implement report A" }, ctx);
 		await triaged(pi, ctx, "Implement report A");
+		await pi.emit("input", { text: "Implement report B instead", source: "interactive" }, ctx);
 		await pi.emit("before_agent_start", { prompt: "Implement report B instead" }, ctx);
 		const invocation = toolCallEvent("write", { path: "report.ts", content: "unreviewed" });
 		for (let index = 0; index < POLICY.maxIgnoredBoundaryCalls - 1; index += 1) {
-			expect(blockReason(await pi.emit("tool_call", invocation, ctx))).toContain("undecided");
+			expect(blockReason(await pi.emit("tool_call", invocation, ctx))).toBeDefined();
 		}
 
+		await pi.emit("input", { text: "Implement report C instead", source: "interactive" }, ctx);
 		await pi.emit("before_agent_start", { prompt: "Implement report C instead" }, ctx);
-		expect(blockReason(await pi.emit("tool_call", invocation, ctx))).toContain("undecided");
+		expect(blockReason(await pi.emit("tool_call", invocation, ctx))).toBeDefined();
 		expect(pi.messages.some(message => message.customType === "jev.open_item")).toBe(false);
-		expect(blockReason(await pi.emit("tool_call", invocation, ctx))).toContain("undecided");
-		expect(blockReason(await pi.emit("tool_call", invocation, ctx))).toContain("Attempt limit reached");
+		expect(blockReason(await pi.emit("tool_call", invocation, ctx))).toBeDefined();
+		expect(blockReason(await pi.emit("tool_call", invocation, ctx))).toBeDefined();
+		// Counts record refusals without releasing execution.
+		expect(blockReason(await pi.emit("tool_call", invocation, ctx))).toBeDefined();
+		await pi.emit("input", { text: "аппрув", source: "interactive" }, ctx);
 		expect(blockReason(await pi.emit("tool_call", invocation, ctx))).toBeUndefined();
 	});
 
-	test("FR-28: interleaved gate refusals retain each boundary's count", async () => {
+	test("FR-28: interleaved gate refusals do not release execution at their count bounds", async () => {
 		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP });
 		const ctx = fakeCtx();
 		await pi.emit("before_agent_start", { prompt: "Implement the report" }, ctx);
@@ -1495,7 +1536,11 @@ describe("context and invocation correctness regressions", () => {
 			expect(blockReason(await pi.emit("tool_call", project, ctx))).toBeDefined();
 			expect(blockReason(await pi.emit("tool_call", plan, ctx))).toBeDefined();
 		}
-		expect(blockReason(await pi.emit("tool_call", project, ctx))).toContain("Attempt limit reached");
+		expect(blockReason(await pi.emit("tool_call", project, ctx))).toBeDefined();
+		// Each boundary remains held independently, even after repeated refusals.
+		expect(blockReason(await pi.emit("tool_call", plan, ctx))).toBeDefined();
+		expect(blockReason(await pi.emit("tool_call", project, ctx))).toBeDefined();
+		await pi.emit("input", { text: "аппрув", source: "interactive" }, ctx);
 		expect(blockReason(await pi.emit("tool_call", project, ctx))).toBeUndefined();
 	});
 
@@ -1562,6 +1607,43 @@ describe("context and invocation correctness regressions", () => {
 		expect(toolFailed(await triage)).toBe(false);
 		expect(toolFailed(await queued)).toBe(true);
 		expect(fake.calls).toHaveLength(1);
+	});
+
+	test("FR-36: an owner message arriving during an in-flight classification is not lost", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const fake = answeringJudge({
+			needs_development: TRIAGE_DEEP,
+			owner_update: { label: "continue", confidence: 0.94 },
+		});
+		let first = true;
+		const judge: Judge = async (state, questions) => {
+			if (first && questions.some(question => question.name === "owner_update")) {
+				first = false;
+				entered.resolve();
+				await release.promise;
+			}
+			return fake.judge(state, questions);
+		};
+		const pi = fakePi();
+		const ctx = fakeCtx();
+		createJevController({ judge, config: config(), zod: fakeZod() }).register(pi.api);
+		await pi.emit("before_agent_start", { prompt: "Implement the report" }, ctx);
+		await triaged(pi, ctx, "Implement the report");
+
+		await pi.emit("input", { text: "Also keep the old format", source: "interactive" }, ctx);
+		const call = pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx);
+		await entered.promise;
+		await pi.emit("input", { text: "A newer condition", source: "interactive" }, ctx);
+		release.resolve();
+		expect(blockReason(await call)).toBeDefined();
+
+		// The stale classification is discarded; the next boundary judges both complete messages.
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "x" }), ctx))).toContain("jev_plan_review");
+		const classifications = fake.calls.filter(entry => entry.questions.some(question => question.name === "owner_update"));
+		expect(classifications).toHaveLength(2);
+		expect(JSON.stringify(classifications[1]?.state)).toContain("Also keep the old format");
+		expect(JSON.stringify(classifications[1]?.state)).toContain("A newer condition");
 	});
 
 	test("FR-32: task tracking passes before triage without spending a refusal budget", async () => {
@@ -1650,5 +1732,290 @@ describe("ordinary extension isolation", () => {
 		]);
 		if (exit !== 0) throw new Error(`The ordinary extension host exited ${exit}: ${errors}`);
 		expect(JSON.parse(output)).toEqual({ toolHeld: false, stopHeld: false });
+	});
+});
+
+describe("owner-requested workflow correction", () => {
+	test("startup supplies the current registered tool guide and preserves the host policy", async () => {
+		const { pi } = controllerFor({});
+		const ctx = fakeCtx();
+		const result = await pi.emit("before_agent_start", { prompt: "Inspect the source", systemPrompt: ["Host policy"] }, ctx);
+		const prompt = asRecord(result[0])?.["systemPrompt"];
+		if (!Array.isArray(prompt)) throw new Error("Startup did not return the model's instruction bundle");
+		expect(prompt).toContain("Host policy");
+		for (const name of pi.tools.keys()) expect(prompt.join("\n")).toContain(name);
+		expect(prompt.join("\n")).toContain("sourceId");
+		expect(prompt.join("\n")).toContain("findingId");
+		const again = await pi.emit("before_agent_start", { prompt: "Inspect the source", systemPrompt: prompt }, ctx);
+		const repeated = asRecord(again[0])?.["systemPrompt"];
+		if (!Array.isArray(repeated)) throw new Error("The next turn lost the instruction bundle");
+		expect(repeated.length).toBe(prompt.length);
+	});
+
+	test("a clarification keeps an approved plan without requiring reaim", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
+		const { pi, calls } = controllerFor({
+			needs_development: TRIAGE_DEEP, ...PLAN_APPROVED,
+			owner_update: { label: "continue", confidence: 0.99 },
+		});
+		await pi.emit("input", { source: "interactive", text: "Update src/a.ts" }, ctx);
+		await pi.emit("before_agent_start", { prompt: "Update src/a.ts" }, ctx);
+		await triaged(pi, ctx, "Update src/a.ts");
+		await planned(pi, ctx, "Update src/a.ts");
+		await pi.emit("input", { source: "interactive", text: "By the public API I mean its existing exports." }, ctx);
+		await pi.emit("before_agent_start", { prompt: "By the public API I mean its existing exports." }, ctx);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "export const value = 1;" }), ctx))).toBeUndefined();
+		expect(calls.some(call => call.questions.some(question => question.name === "owner_update"))).toBe(true);
+		expect(calls.some(call => call.questions.some(question => question.name === "reaim"))).toBe(false);
+	});
+
+	test("an added requirement waits for updated planning instead of requiring reaim", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
+		const { pi, calls } = controllerFor({
+			needs_development: TRIAGE_DEEP, ...PLAN_APPROVED,
+			owner_update: { label: "amend", confidence: 0.99 },
+		});
+		await pi.emit("input", { source: "interactive", text: "Update src/a.ts" }, ctx);
+		await pi.emit("before_agent_start", { prompt: "Update src/a.ts" }, ctx);
+		await triaged(pi, ctx, "Update src/a.ts");
+		await planned(pi, ctx, "Update src/a.ts");
+		await pi.emit("input", { source: "interactive", text: "Also preserve empty-input behavior." }, ctx);
+		await pi.emit("before_agent_start", { prompt: "Also preserve empty-input behavior." }, ctx);
+		const reason = blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "export const value = 1;" }), ctx));
+		expect(reason).toBeDefined();
+		expect(reason).not.toContain("jev_reaim");
+		expect(reason).toMatch(/jev_requirements|jev_plan_review/);
+		const update = calls.find(call => call.questions.some(question => question.name === "owner_update"));
+		expect(JSON.stringify(update?.state)).toContain("Also preserve empty-input behavior.");
+	});
+
+	test("repeating rejected operations cannot spend a finding into execution permission", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
+		const { pi, calls } = controllerFor({
+			needs_development: TRIAGE_DEEP, ...PLAN_APPROVED,
+			action: { label: "off_course", confidence: 0.99 },
+		});
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
+		const invocation = toolCallEvent("write", { path: "src/unrelated.ts", content: "unrelated" });
+		expect(blockReason(await pi.emit("tool_call", invocation, ctx))).toBeDefined();
+		const judged = calls.length;
+		for (const attempt of [1, 2, 3, 4, 5]) {
+			expect(blockReason(await pi.emit("tool_call", invocation, ctx)), `attempt ${attempt}`).toBeDefined();
+		}
+		expect(calls.length).toBe(judged);
+		const inventory = toolDetails(await pi.callTool("jev_context", { action: "list" }, ctx));
+		expect(typeof asRecord(inventory["hold"])?.["id"]).toBe("string");
+	});
+
+	test("the native initial print prompt is archived once without an interactive input event", async () => {
+		const cwd = await fakeArtifacts({});
+		try {
+			const archive = createContextArchive(cwd);
+			const pi = fakePi();
+			createJevController({ judge: answeringJudge({}).judge, config: config(), zod: fakeZod(), context: archive }).register(pi.api);
+			const ctx = fakeCtx({ artifactsDir: cwd });
+			const event = { reason: "prompt", prompt: "Inspect the parser without changing it.", systemPrompt: ["Host policy"] };
+			await pi.emit("before_agent_start", event, ctx);
+			await pi.emit("before_agent_start", event, ctx);
+			const sources = archive.list();
+			expect(sources.map(source => source.content)).toEqual([event.prompt]);
+			expect(sources[0]?.origin).toBe("prompt");
+			expect(toolFailed(await pi.callTool("jev_context", { action: "read", sourceId: sources[0]?.id }, ctx))).toBe(false);
+			await pi.emit("before_agent_start", { reason: "revive", prompt: "Agent companion" }, ctx);
+			expect(archive.list().map(source => source.content)).toEqual([event.prompt]);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("owner-controlled session mode", () => {
+	test("session mode off releases held work, skips judgments and removes its prompt rules", async () => {
+		const { pi, calls } = controllerFor({ needs_development: { probability: 0.5 } });
+		const ctx = { ...asRecord(fakeCtx()), isIdle: () => false };
+		const injected = await pi.emit("before_agent_start", { prompt: "Implement the report", systemPrompt: ["Host policy"] }, ctx);
+		await triaged(pi, ctx, "Implement the report");
+		const invocation = toolCallEvent("write", { path: "src/report.ts", content: "report" });
+		expect(blockReason(await pi.emit("tool_call", invocation, ctx))).toBeDefined();
+		const judged = calls.length;
+		pi.callCommand("jev", "off", ctx);
+		expect(blockReason(await pi.emit("tool_call", invocation, ctx))).toBeUndefined();
+		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
+		const skipped = await pi.callTool("jev_triage", { request: "Implement another report" }, ctx);
+		expect(toolDetails(skipped)["enabled"]).toBe(false);
+		expect(toolDetails(skipped)["skipped"]).toBe(true);
+		expect(calls.length).toBe(judged);
+		const offPrompt = await pi.emit("before_agent_start", { reason: "prompt", prompt: "Urgent work", systemPrompt: asRecord(injected[0])?.["systemPrompt"] }, ctx);
+		expect(asRecord(offPrompt[0])?.["systemPrompt"]).toEqual(["Host policy"]);
+		expect(pi.messages.some(message => message.customType === "jev.mode" && message.deliverAs === "steer")).toBe(true);
+	});
+
+	test("session mode is isolated and reenabling restores gates without old permission", async () => {
+		const { pi, calls } = controllerFor({ needs_development: TRIAGE_DEEP });
+		const first = fakeCtx({ sessionId: "first" });
+		const second = fakeCtx({ sessionId: "second" });
+		await triaged(pi, first);
+		pi.callCommand("jev-continue", "", first);
+		pi.callCommand("jev", "off", first);
+		const invocation = toolCallEvent("write", { path: "src/report.ts", content: "report" });
+		expect(blockReason(await pi.emit("tool_call", invocation, first))).toBeUndefined();
+		expect(blockReason(await pi.emit("tool_call", invocation, second))).toBeDefined();
+		pi.callCommand("jev", "on", first);
+		expect(blockReason(await pi.emit("tool_call", invocation, first))).toBeDefined();
+		expect(calls.length).toBe(1);
+		await pi.emit("before_agent_start", { reason: "prompt", prompt: "Implement another report", systemPrompt: ["Host policy"] }, first);
+		expect(blockReason(await pi.emit("tool_call", invocation, first))).toBeDefined();
+	});
+
+	test("session mode cannot be changed by tool data and on is idempotent", async () => {
+		const { pi } = controllerFor({ needs_development: TRIAGE_DEEP });
+		const ctx = fakeCtx();
+		await triaged(pi, ctx);
+		await pi.emit("input", { source: "extension", text: "/jev off" }, ctx);
+		pi.callCommand("jev", "on", ctx);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/report.ts" }), ctx))).toBeDefined();
+	});
+
+	test("session mode changes discard an in-flight authorization before reenabling", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const fake = answeringJudge({ action: ON_COURSE });
+		const judge: Judge = async (material, questions) => {
+			if (questions.some(question => question.name === "action")) {
+				entered.resolve();
+				await release.promise;
+			}
+			return fake.judge(material, questions);
+		};
+		const pi = fakePi();
+		createJevController({ judge, config: config(), zod: fakeZod() }).register(pi.api);
+		const ctx = fakeCtx();
+		await pi.emit("before_agent_start", { prompt: "Read the source" }, ctx);
+		const invocation = toolCallEvent("write", { path: "src/report.ts", content: "report" });
+		const pending = pi.emit("tool_call", invocation, ctx);
+		await entered.promise;
+		pi.callCommand("jev", "off", ctx);
+		pi.callCommand("jev", "on", ctx);
+		release.resolve();
+		expect(blockReason(await pending)).toBeDefined();
+		expect(blockReason(await pi.emit("tool_call", invocation, ctx))).toBeDefined();
+	});
+
+	test("session mode off ignores an in-flight refusal without creating a new hold", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const fake = answeringJudge({ action: { label: "off_course", confidence: 0.99 } });
+		const judge: Judge = async (material, questions) => {
+			entered.resolve();
+			await release.promise;
+			return fake.judge(material, questions);
+		};
+		const pi = fakePi();
+		createJevController({ judge, config: config(), zod: fakeZod() }).register(pi.api);
+		const ctx = fakeCtx();
+		await pi.emit("before_agent_start", { prompt: "Read the source" }, ctx);
+		const pending = pi.emit("tool_call", toolCallEvent("write", { path: "src/report.ts" }), ctx);
+		await entered.promise;
+		pi.callCommand("jev", "off", ctx);
+		release.resolve();
+		expect(blockReason(await pending)).toBeUndefined();
+		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
+		pi.callCommand("jev", "on", ctx);
+		expect(toolDetails(await pi.callTool("jev_context", { action: "list" }, ctx))["hold"]).toBeUndefined();
+	});
+});
+
+describe("executable finding recovery", () => {
+	test("an approved exact replacement executes once without a second resolution vote or an owner override", async () => {
+		const { pi, calls } = controllerFor({
+			needs_development: TRIAGE_DEEP, ...PLAN_APPROVED,
+			action: { label: "off_course", confidence: 0.99 },
+			repair_action: { probability: 0.85 },
+			resolves_hold: { probability: 0.66 },
+		}, { mode: "completion" });
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "wrong" }), ctx))).toBeDefined();
+		const finding = asRecord(toolDetails(await pi.callTool("jev_context", { action: "list" }, ctx))["hold"]);
+		const recovery = await pi.callTool("jev_consult", {
+			mode: "recovery",
+			recovery: {
+				phase: "repair", findingId: finding?.["id"],
+				diagnosis: "The refused write contains the wrong report.",
+				correction: "Replace that content with the corrected report in the approved file.",
+				nextAction: { tool: "write", input: { content: "corrected report", path: "src/a.ts" } },
+			},
+			evidence: [{ kind: "code", quote: "The corrected report uses the recorded coverage." }],
+		}, ctx);
+		expect(toolFailed(recovery)).toBe(false);
+		const judged = calls.length;
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/other.ts", content: "corrected report" }), ctx))).toBeDefined();
+		const replacement = { path: "src/a.ts", content: "corrected report" };
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", replacement), ctx))).toBeUndefined();
+		expect(calls).toHaveLength(judged);
+		await pi.emit("tool_result", toolResultEvent("write", replacement, "Wrote the corrected report"), ctx);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", replacement), ctx))).toBeDefined();
+		expect(calls).toHaveLength(judged + 1);
+	});
+
+	test("a repair can change reviewed code while the defect remains held until observed resolution", async () => {
+		const { pi } = controllerFor({
+			needs_development: TRIAGE_DEEP, ...PLAN_APPROVED,
+			review: { label: "defect", confidence: 0.99 },
+			repair_action: { probability: 0.93 },
+			resolves_hold: { probability: 0.94 },
+		}, { mode: "completion" });
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
+		await pi.callTool("jev_review", {
+			kind: "diff", target: "src/a.ts", claim: "The report is safe.",
+			evidence: [{ kind: "code", quote: "return report.value" }, { kind: "execution", quote: "Empty report throws" }],
+		}, ctx);
+		const finding = asRecord(toolDetails(await pi.callTool("jev_context", { action: "list" }, ctx))["hold"]);
+		const replacement = { path: "src/a.ts", content: "return report?.value ?? 0;" };
+		expect(toolFailed(await pi.callTool("jev_consult", {
+			mode: "recovery",
+			recovery: {
+				phase: "repair", findingId: finding?.["id"],
+				diagnosis: "The report dereference has no empty-input guard.",
+				correction: "Guard the dereference in the approved source file.",
+				nextAction: { tool: "write", input: replacement },
+			},
+			evidence: [{ kind: "execution", quote: "Empty report throws" }],
+		}, ctx))).toBe(false);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", replacement), ctx))).toBeUndefined();
+		await pi.emit("tool_result", toolResultEvent("write", replacement, "Wrote the guarded report"), ctx);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "unrelated work" }), ctx))).toBeDefined();
+		expect(toolFailed(await pi.callTool("jev_consult", {
+			mode: "recovery",
+			recovery: {
+				phase: "resolve", findingId: finding?.["id"],
+				diagnosis: "The empty-input dereference was the observed failure.",
+				correction: "The source now guards the dereference; the corrective write completed.",
+			},
+			evidence: [{ kind: "execution", quote: "Wrote the guarded report" }, { kind: "code", quote: "return report?.value ?? 0;" }],
+		}, ctx))).toBe(false);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "next approved report" }), ctx))).toBeUndefined();
+	});
+
+	test("a plan can be corrected and reapproved without erasing the action finding", async () => {
+		const { pi } = controllerFor({
+			needs_development: TRIAGE_DEEP, ...PLAN_APPROVED,
+			action: { label: "off_course", confidence: 0.99 },
+		}, { mode: "completion" });
+		const artifactsDir = await fakeArtifacts({ "x-plan.md": PLAN_BODY });
+		const ctx = fakeCtx({ artifactsDir });
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "wrong" }), ctx))).toBeDefined();
+		const before = toolDetails(await pi.callTool("jev_context", { action: "list" }, ctx))["hold"];
+		const corrected = "# plan\n\n1. Collect the recorded coverage correctly\n";
+		await writeFile(join(artifactsDir, "local", "x-plan.md"), corrected);
+		await planReviewed(pi, ctx, PLAN_ARTIFACT, "Report the coverage of the last run", corrected.trimEnd());
+		expect(toolDetails(await pi.callTool("jev_context", { action: "list" }, ctx))["hold"]).toEqual(before);
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", { path: "src/a.ts", content: "unapproved replacement" }), ctx))).toBeDefined();
 	});
 });

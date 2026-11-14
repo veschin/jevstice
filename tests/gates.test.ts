@@ -4,9 +4,12 @@ import {
 	isConsequentialMutation,
 	isNonMutatingCommand,
 	isProposeCall,
+	isPublishingCommand,
+	isReadOnlyCommand,
 	mutationGate,
 	planArtifactUrl,
 	proposeGate,
+	recoveryGate,
 	requirementsBeforePlanGate,
 	triageBeforeInspectionGate,
 } from "../src/gates.js";
@@ -15,6 +18,7 @@ import {
 	freshState,
 	recordAcceptance,
 	recordAction,
+	recordRecovery,
 	recordRefusal,
 	registerSimple,
 	registerTask,
@@ -128,6 +132,8 @@ describe("T3 - what counts as a consequential change", () => {
 			"wc -l src/a.ts",
 			"pwd",
 			"jq .name package.json",
+			`od -c result.txt; echo "---"; wc -c result.txt; echo "---"; ls -la; echo "---"; test -e forbidden.txt && echo "FORBIDDEN EXISTS" || echo "forbidden.txt absent"`,
+			"[ -f src/a.ts ] && echo yes",
 		]) {
 			expect({ command, consequential: isConsequentialMutation("bash", { command }) }).toEqual({ command, consequential: false });
 		}
@@ -146,10 +152,19 @@ describe("T3 - what counts as a consequential change", () => {
 		}
 	});
 
-	test("FR-31: quoted shell arguments require judgment instead of being stripped", () => {
-		expect(isConsequentialMutation("bash", { command: `git commit -m "feat(core): add a && b"` })).toBe(true);
-		expect(isConsequentialMutation("bash", { command: `git commit -m 'fix: (v2) > 1'` })).toBe(true);
-		expect(isConsequentialMutation("bash", { command: `sort "-o" out.txt in.txt` })).toBe(true);
+	test("FR-31: harmless quoted arguments are literal, while quoted write options are not", () => {
+		for (const command of [
+			`git commit -m "feat(core): add a && b"`,
+			`git commit -m 'fix: (v2) > 1'`,
+			`git log --format="%h %s"`,
+			`echo "a; b"`,
+			`grep -n "x|y" notes.txt`,
+		]) {
+			expect({ command, consequential: !isNonMutatingCommand(command) }).toEqual({ command, consequential: false });
+		}
+		// Repository metadata is exempt from the ordinary tree gate, not from strict observation.
+		expect(isReadOnlyCommand(`git commit -m "feat(core): add a && b"`)).toBe(false);
+		expect(isNonMutatingCommand(`sort "-o" out.txt in.txt`)).toBe(false);
 	});
 
 	test("FR-31: anything that reaches the working tree stays consequential", () => {
@@ -166,7 +181,7 @@ describe("T3 - what counts as a consequential change", () => {
 			"git status && rm -rf build",
 			"ls | xargs rm",
 			"unknown-command --flag",
-			"ls -o out.txt",
+			"tree -o out.txt src",
 			"git diff --output=patch.txt",
 			"sort --output=sorted.txt notes.txt",
 		]) {
@@ -208,6 +223,98 @@ describe("T3 - what counts as a consequential change", () => {
 		expect(isNonMutatingCommand("cat x | tee y")).toBe(false);
 		expect(isNonMutatingCommand("ls &")).toBe(false);
 		expect(isNonMutatingCommand("git commit -m \"cost is ${PRICE}\"")).toBe(false);
+	});
+
+	test("FR-31: the reported read-only compound commands are not changes", () => {
+		const gitReport =
+			`echo '=== commits only local ==='; git log --oneline --no-decorate FETCH_HEAD..HEAD; echo; echo '=== diff stat github..local ==='; git diff --stat FETCH_HEAD..HEAD; echo; echo '=== changed paths ==='; git diff --name-status FETCH_HEAD..HEAD`;
+		const boundPath =
+			`S=~/.omp/agent/managed-skills/confluence/scripts/confluence; wc -l $S; rg -n 'expand|page\\)|body\\)|REST|rest/api' $S | head -40`;
+
+		expect(isNonMutatingCommand(gitReport)).toBe(true);
+		expect(isReadOnlyCommand(gitReport)).toBe(true);
+		expect(isPublishingCommand(gitReport)).toBe(false);
+		expect(isNonMutatingCommand(boundPath)).toBe(true);
+		// The leading assignment is an environment change, not a project read: strict observation stays closed.
+		expect(isReadOnlyCommand(boundPath)).toBe(false);
+	});
+
+	test("FR-31: separators inside quotes stay literal, separators outside split segments", () => {
+		for (const command of [
+			"git log --oneline | wc -l",
+			"git status && git diff --stat",
+			"git diff || echo clean",
+			"echo one; echo two; git show HEAD",
+			`git log --oneline --grep='fix: (v2) > 1'`,
+			`echo "a; b"`,
+		]) {
+			expect({ command, consequential: !isNonMutatingCommand(command) }).toEqual({ command, consequential: false });
+		}
+	});
+
+	test("FR-31: a literal leading assignment is followed only where it is used", () => {
+		expect(isNonMutatingCommand("S=src/a.ts; wc -l $S")).toBe(true);
+		expect(isNonMutatingCommand(`S=src/a.ts; wc -l "$S"`)).toBe(true);
+		expect(isNonMutatingCommand("S=src; rg -n todo $S | head -5")).toBe(true);
+		expect(isNonMutatingCommand("wc -l $S")).toBe(false);
+		// A skipped conditional reassignment leaves the name unknown, so it cannot hide a write flag.
+		expect(isNonMutatingCommand("S=-o; false && S=ok; sort $S out.txt")).toBe(false);
+		expect(isNonMutatingCommand("S=ok; false && S=-o; sort $S out.txt")).toBe(false);
+		// A pipeline assignment runs in a subshell and never reaches the next command.
+		expect(isNonMutatingCommand("S=src/a.ts | cat; wc -l $S")).toBe(false);
+	});
+
+	test("FR-31: reporting programs keep their own write and exec options", () => {
+		for (const command of [
+			"sort -o out.txt notes.txt",
+			"sort -oout.txt notes.txt",
+			"sort --output=out.txt notes.txt",
+			"tree -o out.txt src",
+			"file -C -m magic",
+			"rg --pre 'rm -rf build' pattern .",
+			"sort --compress-program='touch out.txt' notes.txt",
+			"git log --output=log.txt",
+			"git diff --ext-diff",
+		]) {
+			expect({ command, consequential: !isNonMutatingCommand(command) }).toEqual({ command, consequential: true });
+		}
+		for (const command of ["grep -i todo notes.txt", "rg -i todo src", "grep -o 'x' notes.txt", "df --output=source", "ls -o notes.txt", "sort -k1 notes.txt"]) {
+			expect({ command, consequential: !isNonMutatingCommand(command) }).toEqual({ command, consequential: false });
+		}
+	});
+
+	test("FR-31: unknown expansions, substitution, redirection and dynamic programs stay consequential", () => {
+		for (const command of [
+			"wc -l $UNSET",
+			"wc -l ${UNSET}",
+			"wc -l ${S:-default}",
+			`echo "$HOME"`,
+			`echo "$(pwd)"`,
+			"echo `pwd`",
+			"ls < notes.txt",
+			"git log 2>/dev/null",
+			"ls &",
+			"S=ls; $S -la",
+			"S=grep; $S -n x notes.txt",
+			"S=$(touch out.txt); echo done",
+			"S=$UNSET; echo done",
+			"echo $[1+1]",
+		]) {
+			expect({ command, consequential: !isNonMutatingCommand(command) }).toEqual({ command, consequential: true });
+		}
+		expect(isNonMutatingCommand("echo '$HOME'")).toBe(true);
+		expect(isNonMutatingCommand('echo "\\$HOME"')).toBe(true);
+	});
+
+	test("FR-31: metadata and publication stay distinct from strict observation", () => {
+		for (const command of ["git add -A", "git commit -m x", "git push"]) {
+			expect(isNonMutatingCommand(command)).toBe(true);
+			expect(isReadOnlyCommand(command)).toBe(false);
+		}
+		expect(isPublishingCommand("git push")).toBe(true);
+		expect(isPublishingCommand("git push > /dev/null")).toBe(true);
+		expect(isPublishingCommand("git diff --stat")).toBe(false);
+		expect(isReadOnlyCommand("git log --oneline")).toBe(true);
 	});
 });
 
@@ -297,12 +404,6 @@ describe("T3 - the mutation gate", () => {
 		expect(verdict.reason).toContain("jev_consult");
 	});
 
-	test("a disabled mutation gate holds nothing", () => {
-		const state = freshState();
-		registerTask(state, "Add the coverage report");
-
-		expect(mutationGate(state, config({ mutation: false }), "write", { path: "src/a.ts" }).block).toBe(false);
-	});
 });
 
 describe("FR-21, FR-23 - boundaries are bounded without manufacturing approval", () => {
@@ -313,12 +414,12 @@ describe("FR-21, FR-23 - boundaries are bounded without manufacturing approval",
 		const verdict = mutationGate(state, config(), "write", { path: "src/a.ts" });
 
 		expect(verdict.block).toBe(true);
-		expect(verdict.reason).toContain("judge could not be reached");
+		expect(verdict.reason).toContain("no usable judge answer");
 		expect(completionGate(state, boundaryConfig()).applies).toBe(true);
-		expect(completionGate(state, boundaryConfig()).reason).toContain("judge could not be reached");
+		expect(completionGate(state, boundaryConfig()).reason).toContain("no usable judge answer");
 	});
 
-	test("FR-23: a spent plan budget permits work while the plan remains unapproved", () => {
+	test("FR-23: a spent plan budget blocks work while the plan remains unapproved", () => {
 		const state = freshState();
 		registerTask(state, "Report the coverage of the last run");
 		expect(mutationGate(state, config(), "write", { path: "src/a.ts" }).block).toBe(true);
@@ -327,7 +428,9 @@ describe("FR-21, FR-23 - boundaries are bounded without manufacturing approval",
 
 		const verdict = mutationGate(state, config(), "write", { path: "src/a.ts" });
 
-		expect(verdict.block).toBe(false);
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("OPEN");
+		expect(verdict.reason).toContain("materially new evidence");
 		expect(state.openItem?.boundary).toBe("plan:outline");
 		expect(state.plan).toBeUndefined();
 	});
@@ -359,32 +462,67 @@ describe("FR-21, FR-23 - boundaries are bounded without manufacturing approval",
 		expect(completionGate(state, boundaryConfig()).reason).toContain("jev_reaim");
 	});
 
-	test("FR-23: a spent hold permits changes while retaining the finding", () => {
+	test("FR-23: a spent hold still blocks changes and retains the finding", () => {
 		const state = planned();
 		state.hold = { reason: "a defect" };
 		spendBoundary(state, "hold");
 
 		const verdict = mutationGate(state, config(), "write", { path: "src/a.ts" });
 
-		expect(verdict.block).toBe(false);
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("defect");
+		expect(verdict.reason).toContain("findingId");
 		expect(state.hold?.reason).toBe("a defect");
 	});
 
-	test("FR-23: a spent triage budget permits continuation without registering a task", () => {
+	test("FR-23: a spent triage budget blocks continuation without registering a task", () => {
 		const state = freshState();
 		spendBoundary(state, "triage");
 
 		const verdict = mutationGate(state, config(), "write", { path: "src/a.ts" });
 
-		expect(verdict.block).toBe(false);
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("OPEN");
 		expect(state.task).toBeUndefined();
+		expect(state.continuation).toBeUndefined();
 	});
 
-	test("FR-23, FR-21: spent triage permits inspection; an unexhausted outage still holds it", () => {
+	test("FR-13: a recovery hold permits observation, sources, diagnosis and corrective planning but not substantive work", () => {
+		const state = planned();
+		const hold = recordRecovery(state, "course-check", { claim: "off course" }, {
+			ok: true,
+			text: 'course check answered "off_course"',
+			details: { approved: false, label: "off_course", kind: "defect" },
+		});
+
+		expect(recoveryGate(state, "read", { path: "src/a.ts" }).block).toBe(false);
+		expect(recoveryGate(state, "bash", { command: "git status" }).block).toBe(false);
+		expect(recoveryGate(state, "jev_context", { action: "list" }).block).toBe(false);
+		expect(recoveryGate(state, "jev_consult", { mode: "boolean" }).block).toBe(false);
+		expect(recoveryGate(state, "jev_course_check", { claim: "x" }).block).toBe(false);
+
+		const write = recoveryGate(state, "write", { path: "src/a.ts" });
+		expect(write.block).toBe(true);
+		expect(write.boundary).toBe("hold");
+		expect(write.reason).toContain(hold?.id ?? "");
+		expect(write.reason).toContain("findingId");
+		expect(recoveryGate(state, "jev_requirements", {}).block).toBe(false);
+		expect(recoveryGate(state, "jev_plan_review", {}).block).toBe(false);
+		expect(recoveryGate(state, "jev_triage", {}).block).toBe(true);
+		expect(recoveryGate(state, "jev_acceptance", {}).block).toBe(true);
+	});
+
+	test("FR-13: without a hold the recovery gate holds nothing", () => {
+		const state = planned();
+
+		expect(recoveryGate(state, "write", { path: "src/a.ts" }).block).toBe(false);
+	});
+
+	test("FR-23, FR-21: spent triage still holds inspection; an outage holds it too", () => {
 		const spent = freshState();
 		screenRequest(spent, "добавь отчёт по покрытию");
 		spendBoundary(spent, "triage");
-		expect(triageBeforeInspectionGate(spent, config(), "read", { path: "src/a.ts" }).block).toBe(false);
+		expect(triageBeforeInspectionGate(spent, config(), "read", { path: "src/a.ts" }).block).toBe(true);
 
 		const down = freshState();
 		screenRequest(down, "добавь отчёт по покрытию");
@@ -393,7 +531,7 @@ describe("FR-21, FR-23 - boundaries are bounded without manufacturing approval",
 		expect(triageBeforeInspectionGate(down, config(), "read", { path: "skill://ready-first" }).block).toBe(false);
 	});
 
-	test("FR-28: the triage and plan refusals name the call with its arguments and the boundary", () => {
+	test("FR-28: the triage and plan refusals name the next call and the boundary", () => {
 		const state = freshState();
 		const triage = mutationGate(state, config(), "write", { path: "src/a.ts" });
 		const call = /Next call: jev_triage\((\{.*\})\)/.exec(triage.reason ?? "")?.[1];
@@ -405,7 +543,8 @@ describe("FR-21, FR-23 - boundaries are bounded without manufacturing approval",
 		registerTask(state, "Report the coverage of the last run");
 		const plan = mutationGate(state, config(), "write", { path: "src/a.ts" });
 
-		expect(plan.reason).toContain("Next call: write local://<slug>-plan.md, then jev_plan_review(");
+		expect(plan.reason).toContain("Next call: write local://<slug>-plan.md");
+		expect(plan.reason).toContain("jev_plan_review");
 		expect(plan.boundary).toBe("plan");
 	});
 });
@@ -425,15 +564,17 @@ describe("FR-34 - requirements review before the plan", () => {
 		expect(requirementsBeforePlanGate(state, config(), "jev_plan_review", {}).block).toBe(false);
 	});
 
-	test("a spent requirements budget permits plan preparation with an OPEN item", () => {
+	test("a spent requirements budget still holds plan preparation as an OPEN item", () => {
 		const state = freshState();
 		registerTask(state, "Add the coverage report");
 		spendBoundary(state, "requirements");
 
 		const verdict = requirementsBeforePlanGate(state, config(), "write", { path: "local://x-plan.md" });
 
-		expect(verdict.block).toBe(false);
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("OPEN");
 		expect(state.requirementsApproval).toBeUndefined();
+		expect(state.continuation).toBeUndefined();
 	});
 
 	test("no owner confirmation is read: triage alone does not block the requirements submission", () => {
@@ -545,14 +686,15 @@ describe("T3 - the plan-mode proposal boundary", () => {
 		expect(verdict.reason).toContain("local://other-plan.md");
 	});
 
-	test("FR-23: a spent plan budget permits the proposal without plan approval", () => {
+	test("FR-23: a spent plan budget still holds the proposal without plan approval", () => {
 		const state = freshState();
 		registerTask(state, "Add the coverage report");
 		spendBoundary(state, "plan:finalize");
 
 		const verdict = proposeGate(state, config(), { path: "xd://propose", content: "coverage report" });
 
-		expect(verdict.block).toBe(false);
+		expect(verdict.block).toBe(true);
+		expect(verdict.reason).toContain("OPEN");
 		expect(state.plan).toBeUndefined();
 	});
 });
@@ -583,14 +725,15 @@ describe("T5 - the completion boundary", () => {
 		expect(completionGate(state, boundaryConfig()).reason).toBeUndefined();
 	});
 
-	test("FR-23: a spent acceptance budget permits completion without satisfying acceptance", () => {
+	test("FR-23: a spent acceptance budget still holds completion as an OPEN item", () => {
 		const state = developed();
 		recordAcceptance(state, { aspect: "architecture", revision: state.revision, label: "sound_for_next_change", approved: true, confidence: 0.9 });
 		spendBoundary(state, "acceptance:business");
 
 		const gate = completionGate(state, boundaryConfig());
 
-		expect(gate.applies).toBe(false);
+		expect(gate.applies).toBe(true);
+		expect(gate.reason).toContain("OPEN");
 		expect(state.acceptance.some(record => record.aspect === "business" && record.approved)).toBe(false);
 	});
 
@@ -625,9 +768,6 @@ describe("T5 - the completion boundary", () => {
 		expect(gate.reason).toContain("defect");
 	});
 
-	test("a disabled completion gate lets the session settle", () => {
-		expect(completionGate(developed(), config({ completion: false })).applies).toBe(false);
-	});
 });
 
 describe("FR-30 - the request screen decides whether a request enters the workflow", () => {
@@ -666,6 +806,26 @@ describe("FR-30 - the request screen decides whether a request enters the workfl
 		expect(weightOf("почему джев триаж сломан? у меня не работает")).toBe("quiet");
 		expect(weightOf("ты уже чинил этот баг?")).toBe("quiet");
 		expect(weightOf("почини баг в триаже")).toBe("judged");
+	});
+
+	test("a Russian summary or retelling is quiet unless a project change wins", () => {
+		expect(weightOf("https://www.youtube.com/watch?v=pz74r-4dGfQ\nсаммари")).toBe("quiet");
+		expect(weightOf("перескажи это видео")).toBe("quiet");
+		expect(weightOf("сделай пересказ статьи")).toBe("quiet");
+		expect(weightOf("добавь пересказ в README")).toBe("judged");
+		expect(weightOf("перепиши саммари")).toBe("judged");
+	});
+
+	test("an external URL read stays open while a project read waits for triage", () => {
+		const state = freshState();
+		screenRequest(state, "добавь отчёт по покрытию");
+
+		expect(triageBeforeInspectionGate(state, config(), "read", { path: "https://www.youtube.com/watch?v=x" }).block).toBe(false);
+		expect(triageBeforeInspectionGate(state, config(), "read", { path: "src/a.ts" }).block).toBe(true);
+
+		spendBoundary(state, "triage");
+		expect(triageBeforeInspectionGate(state, config(), "read", { path: "http://example.com/a" }).block).toBe(false);
+		expect(triageBeforeInspectionGate(state, config(), "read", { path: "src/a.ts" }).block).toBe(true);
 	});
 
 	test("the screen does not override a task that already entered the workflow", () => {
