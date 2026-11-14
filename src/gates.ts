@@ -1100,6 +1100,14 @@ export function recoveryGate(state: JevState, toolName: string, input: unknown):
 	if (state.hold === undefined || permittedRepair(state, toolName, input) !== undefined) return { block: false };
 	if (RECOVERY_PERMITTED_TOOLS[toolName] === true) return { block: false };
 	if (state.hold.boundary === toolName || (toolName === "jev_reaim" && state.directionPending !== undefined)) return { block: false };
+	// An inconclusive action preflight proved no defect and executed nothing. Its own refusal text
+	// tells the executor to resubmit a clearer invocation, and its revision-scoped boundary can never
+	// equal a tool name, so without this the finding is unremovable. The corrected call still faces
+	// the full action judgment below, and a fresh refusal holds it again.
+	const preflight = state.hold.boundary === "action" || state.hold.boundary?.startsWith("action:");
+	if (preflight && asRecord(state.hold.result)?.["kind"] === "unclear" && HELD_JUDGE_TOOLS[toolName] !== true) {
+		return { block: false };
+	}
 	if (HELD_JUDGE_TOOLS[toolName] === true) {
 		return { block: true, boundary: HOLD_BOUNDARY, reason: recoveryFeedback(state) };
 	}

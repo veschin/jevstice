@@ -489,7 +489,7 @@ async function submitToJudge(
 	boundary: string,
 	judged: unknown,
 	questions: readonly JudgeQuestion[],
-	identity: unknown = { material: judged, questions },
+	identity: unknown = { material: { ...asRecord(judged), heldFinding: undefined }, questions },
 ): Promise<{ ok: true; outcome: JudgeOutcome; digest: string } | { ok: false; text: string }> {
 	const digest = sha256(JSON.stringify(identity));
 	const ledger = submissionLedger(state, boundary, digest);
@@ -631,7 +631,7 @@ export async function consult(deps: ActivityDeps, state: JevState, params: unkno
 		return {
 			ok: usable,
 			text: `Consult (choice): ${label} - ${meaning} (confidence ${percent(answer.confidence)}).${usable ? "" : LOW_SCORE_RECOVERY}${diagnostic}`,
-			details: { mode, label, meaning, confidence: answer.confidence },
+			details: { mode, label, meaning, confidence: answer.confidence, submission: { boundary, digest: call.digest } },
 		};
 	}
 	if (mode === "score") {
@@ -642,7 +642,7 @@ export async function consult(deps: ActivityDeps, state: JevState, params: unkno
 		return {
 			ok: usable,
 			text: `Consult (score): ${value.toFixed(2)} - nearest rubric step ${level}: ${criteria[level] ?? ""} (confidence ${percent(answer.confidence)}).${usable ? "" : LOW_SCORE_RECOVERY}${diagnostic}`,
-			details: { mode, score: value, level, confidence: answer.confidence },
+			details: { mode, score: value, level, confidence: answer.confidence, submission: { boundary, digest: call.digest } },
 		};
 	}
 	const yes = probabilityOf(call.outcome, CONSULT_QUESTION) ?? 0;
@@ -652,7 +652,7 @@ export async function consult(deps: ActivityDeps, state: JevState, params: unkno
 	return {
 		ok: usable,
 		text: `Consult (boolean): ${verdict} - probability of yes ${percent(yes)}.${usable ? "" : LOW_SCORE_RECOVERY}${diagnostic}`,
-		details: { mode, probability: yes, verdict, confidence: yes },
+		details: { mode, probability: yes, verdict, confidence: yes, submission: { boundary, digest: call.digest } },
 	};
 }
 
@@ -1785,13 +1785,14 @@ export async function review(deps: ActivityDeps, state: JevState, params: unknow
 		};
 	}
 	recordRefusal(state, { boundary: REVIEW_BOUNDARY, digest: call.digest });
+	const defect = choseLabel(outcome, "review", REVIEW_DEFECT);
 	// The controller records the hold from an explicit approved:false, so the finding carries a real
 	// id, the exact material and the returned result instead of a legacy reason-only record.
 	return {
 		ok: false,
-		text: `developer review of ${kind} ${target}: ${label} (confidence ${percent(answer.confidence)}). Class: ${label === REVIEW_DEFECT ? "defect - the quoted change carries a defect that must be fixed" : "inconclusive - no defect is established"}. Consequential changes are held until one jev_consult names the resulting finding with a materially changed correction and evidence; this does not approve completion.`,
+		text: `developer review of ${kind} ${target}: ${label} (confidence ${percent(answer.confidence)}). Class: ${defect ? "defect - the quoted change carries a defect that must be fixed" : "inconclusive - no defect is established"}. Consequential changes are held until one jev_consult names the resulting finding with a materially changed correction and evidence; this does not approve completion.`,
 		details: {
-			kind: label === REVIEW_DEFECT ? "defect" : "unclear",
+			kind: defect ? "defect" : "unclear",
 			approved: false,
 			reviewKind: kind,
 			target,
@@ -2670,7 +2671,7 @@ export async function actionCheck(
 		recordRecovery(state, boundary, { action }, {
 			ok: true,
 			text: `the proposed invocation answered ${answer?.label ?? "no_answer"}`,
-			details: { kind: offCourse ? "defect" : "unclear", approved: false, label: answer?.label, confidence: answer?.confidence },
+			details: { kind: offCourse ? "defect" : "unclear", approved: false, label: answer?.label, confidence: answer?.confidence, submission: { boundary, digest: call.digest } },
 		});
 		// Only an above-floor off_course establishes a deviation; lower answers are uncertainty.
 		const label = answer?.label;
@@ -2822,12 +2823,12 @@ async function explicitCourseCheck(
 			details: { label, approved: true, confidence: answer.confidence, revision: state.revision },
 		};
 	}
+	const settled = choseLabel(outcome, "course", DIRECTION_OFF_COURSE);
 	const hold = recordRecovery(state, CHECK_BOUNDARY, { claim, nextAction: nextAction ?? null }, {
 		ok: true,
 		text: `course check answered ${label}`,
-		details: { kind: label === DIRECTION_OFF_COURSE ? "defect" : "unclear", approved: false, label, confidence: answer.confidence },
+		details: { kind: settled ? "defect" : "unclear", approved: false, label, confidence: answer.confidence },
 	});
-	const settled = label === DIRECTION_OFF_COURSE;
 	const confidenceNote = settled
 		? `Class: defect - the work departs from the approved task. Finding ${hold?.id ?? "(recorded by the host)"} holds consequential work until one bound jev_consult substitutes a correction.`
 		: label === DIRECTION_ON_COURSE
@@ -2896,7 +2897,7 @@ export async function courseCheck(deps: ActivityDeps, state: JevState, params?: 
 			details: { label: summary, approved: true, confidence: lowest, revision: state.revision },
 		};
 	}
-	const departed = answers.some(entry => entry.answer?.label === DIRECTION_OFF_COURSE);
+	const departed = answers.some(entry => choseLabel(outcome, entry.question.name, DIRECTION_OFF_COURSE));
 	const hold = recordRecovery(state, CHECK_BOUNDARY, { actions: state.actions }, {
 		ok: true,
 		text: `course check at revision ${state.revision} answered ${summary}`,
@@ -2984,6 +2985,8 @@ export async function completionCheck(
 		return unusable(problem);
 	}
 	const followsOk = choseLabel(outcome, FOLLOWS_QUESTION, FOLLOWS);
+	const defect = choseLabel(outcome, FOLLOWS_QUESTION, DEVIATES) ||
+		directions.some(question => choseLabel(outcome, question.name, DIRECTION_OFF_COURSE));
 	const failedTopics = directions.filter(question => !choseLabel(outcome, question.name, DIRECTION_ON_COURSE));
 	const approved = followsOk && failedTopics.length === 0;
 	const label = directions.length === 0 ? (follows.label ?? "no_answer") : `${follows.label ?? "no_answer"}/${failedTopics.length === 0 ? DIRECTION_ON_COURSE : failedTopics.map(question => question.name).join(" ")}`;
@@ -2992,7 +2995,7 @@ export async function completionCheck(
 		recordRecovery(state, "completion", { revision: state.revision }, {
 			ok: true,
 			text: `the completion check answered ${label}`,
-			details: { kind: followsOk ? "defect" : "unclear", approved: false, label, confidence: follows.confidence },
+			details: { kind: defect ? "defect" : "unclear", approved: false, label, confidence: follows.confidence },
 		});
 	}
 	return {
@@ -3000,7 +3003,7 @@ export async function completionCheck(
 		text: `completion check at revision ${state.revision}: ${label} (confidence ${percent(follows.confidence)}).${
 			approved
 				? ""
-				: ` The finished work is not approved for completion. Class: ${followsOk ? "defect - the work still departs from the registered requirements" : "inconclusive - the answer settles neither completion nor a deviation, so no defect is proven"}. Finding ${state.hold?.id ?? "(recorded by the host)"} holds further consequential work until one bound jev_consult corrects it.`
+				: ` The finished work is not approved for completion. Class: ${defect ? "defect - the work still departs from the registered requirements" : "inconclusive - the answer settles neither completion nor a deviation, so no defect is proven"}. Finding ${state.hold?.id ?? "(recorded by the host)"} holds further consequential work until one bound jev_consult corrects it.`
 		}`,
 		details: { label, approved, confidence: follows.confidence, revision: state.revision, follows: follows.label, directions: directionAnswers.map(answer => answer?.label) },
 	};

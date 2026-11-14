@@ -1775,6 +1775,55 @@ describe("FR-29 - owner follow-ups are classified, not automatically re-aimed", 
 });
 
 describe("FR-06 - the callable course check", () => {
+	test.each(["explicit", "interval"] as const)("FR-25: a below-floor off-course %s check remains uncertainty and still holds execution", async mode => {
+		const state = freshState();
+		const task = registerTask(state, "Report the coverage of the last run");
+		state.plan = { taskFingerprint: task.fingerprint, planUrl: PLAN_URL, planDigest: "d" };
+		state.planTopics = PLAN_TOPICS;
+		if (mode === "interval") recordAction(state, { tool: "write", target: "src/report.ts", excerpt: "Reads the recorded coverage" });
+		const { deps } = depsFor({
+			course: { label: "off_course", confidence: 0.56 },
+			"direction:1": { label: "off_course", confidence: 0.56 },
+		});
+		const outcome = await courseCheck(deps, state, mode === "explicit" ? { claim: "render the coverage report" } : undefined);
+		expect(outcome.details?.["approved"]).toBe(false);
+		expect(outcome.text).toContain("inconclusive");
+		expect(outcome.text).not.toContain("Class: defect");
+		expect(asRecord(state.hold?.result)?.["kind"]).toBe("unclear");
+		expect(mutationGate(state, boundaryConfig(), "write", { path: "src/report.ts" }).block).toBe(true);
+	});
+	test("an uncertain developer defect verdict does not establish a defect", async () => {
+		const state = freshState();
+		const { deps } = depsFor({ review: { label: "defect", confidence: 0.56 } });
+		const outcome = await review(deps, state, {
+			kind: "diff", target: "src/report.ts", claim: "The coverage reader guards empty input.",
+			evidence: [{ kind: "code", quote: "if (!report) return 0;" }],
+		});
+		expect(outcome.details?.["approved"]).toBe(false);
+		expect(outcome.details?.["kind"]).toBe("unclear");
+		expect(outcome.text).not.toContain("Class: defect");
+	});
+
+	test.each([
+		["follows", "off_course", 0.56, "unclear"],
+		["deviates", "on_course", 0.94, "defect"],
+	] as const)("completion classifies %s with direction %s at %s as %s", async (follows, direction, confidence, kind) => {
+		const state = freshState();
+		const task = registerTask(state, "Report the coverage of the last run");
+		state.plan = { taskFingerprint: task.fingerprint, planUrl: PLAN_URL, planDigest: "d" };
+		state.planTopics = PLAN_TOPICS;
+		recordAction(state, { tool: "write", target: "src/report.ts", excerpt: "Reads recorded coverage" });
+		const { deps } = depsFor({
+			follows_requirements: { label: follows, confidence: 0.94 },
+			"direction:1": { label: direction, confidence },
+		});
+		const outcome = await completionCheck(deps, state, { course: true });
+		expect(outcome.details?.["approved"]).toBe(false);
+		expect(asRecord(state.hold?.result)?.["kind"]).toBe(kind);
+		expect(outcome.text).toContain(kind === "defect" ? "Class: defect" : "Class: inconclusive");
+	});
+
+
 	test("without an approved plan it names the prerequisite instead of passing", async () => {
 		const state = freshState();
 		registerTask(state, "Build a coverage report");

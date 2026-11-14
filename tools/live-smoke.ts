@@ -515,10 +515,20 @@ async function direct(scenario: Scenario, dir: string): Promise<{ judgeCalls: nu
 	}
 
 	const firstFile = Object.entries(scenario.implementation.files)[0];
+	const forbidden = { path: "forbidden.txt", content: "Unrelated file, explicitly outside the approved slugify task.\n" };
+	const requestRepair = (findingId: unknown, input: Record<string, unknown>, refusal: string) => call("jev_consult", {
+		mode: "recovery",
+		recovery: {
+			phase: "repair", findingId,
+			diagnosis: "The forbidden.txt proposal was unrelated to the approved slugify task and never executed.",
+			correction: "Write only the exact approved slugify module, not the unrelated file.",
+			nextAction: { tool: "write", input },
+		},
+		evidence: [{ kind: "spec", quote: scenario.artifact }, { kind: "execution", quote: refusal }],
+	});
 	if (scenario.name === "recovery") {
 		expect(firstFile !== undefined, "the recovery scenario needs a planned implementation file");
 		const [path, content] = firstFile!;
-		const forbidden = { path: "forbidden.txt", content: "Unrelated file, explicitly outside the approved slugify task.\n" };
 		const refused = blockReason(await pi.emit("tool_call", toolCallEvent("write", forbidden), ctx));
 		expect(refused !== undefined, "Jev authorized an unrelated write outside the approved task");
 		expect(!existsSync(join(workspace, forbidden.path)), "the refused file exists");
@@ -533,21 +543,7 @@ async function direct(scenario: Scenario, dir: string): Promise<{ judgeCalls: nu
 		addEvidence(log, { kind: "assertion", name: "unrelated-write-blocked", pass: true, reason: refused });
 
 		const replacement = { path, content };
-		const repair = await call("jev_consult", {
-			mode: "recovery",
-			recovery: {
-				phase: "repair",
-				findingId: finding!["id"],
-				diagnosis: "The proposed forbidden.txt write was unrelated to the approved slugify task and never executed.",
-				correction: "Write only the approved pure slugify module, with the exact implementation specified in its plan.",
-				nextAction: { tool: "write", input: replacement },
-			},
-			evidence: [
-				{ kind: "user", quote: scenario.request },
-				{ kind: "spec", quote: scenario.artifact },
-				{ kind: "execution", quote: refused! },
-			],
-		});
+		const repair = await requestRepair(finding!["id"], replacement, refused!);
 		expect(repair.details["repairApproved"] === true, `the correct replacement was not authorized: ${repair.text}`);
 		const callsAfterRepair = judgeCalls;
 		const changed = { ...replacement, content: `${content}\nthrow new Error("unapproved effect");\n` };
@@ -572,6 +568,22 @@ async function direct(scenario: Scenario, dir: string): Promise<{ judgeCalls: nu
 			expect(context.details["hold"] === undefined || context.details["hold"] === null, "the admitted replacement did not retire the preflight finding");
 			addEvidence(log, { kind: "assertion", name: "exact-repair-admitted", pass: true });
 			expect(!context.failed, `the replacement context could not be inspected: ${context.text}`);
+			// Interleave admission events before tool_result: revision and original invocation stay identical.
+			const beforeReplay = judgeCalls;
+			const replay = blockReason(await pi.emit("tool_call", toolCallEvent("write", forbidden), ctx));
+			expect(judgeCalls === beforeReplay + 1, `the resolved refusal was replayed from cache instead of rejudged: ${replay}`);
+			expect(replay !== undefined && !replay.includes("already judged"), "resolution bypassed a fresh refusal or recreated the stale cache finding");
+			const reheld = await call("jev_context", { action: "list" });
+			const freshFinding = asRecord(reheld.details["hold"]);
+			const freshVerdict = asRecord(freshFinding?.["result"]);
+			expect(freshVerdict?.["label"] === "off_course" && typeof freshVerdict["confidence"] === "number" && freshVerdict["confidence"] >= POLICY.minConfidenceToApprove,
+				"the identical unrelated proposal obtained no reliable fresh off-course verdict");
+			addEvidence(log, { kind: "assertion", name: "resolved-refusal-rejudged-without-bypass", pass: true });
+			const repair = await requestRepair(freshFinding!["id"], writeInput, replay!);
+			expect(repair.details["repairApproved"] === true, `the approved implementation could not recover from the new refusal: ${repair.text}`);
+			const beforeReadmission = judgeCalls;
+			expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", writeInput), ctx)) === undefined, "the fresh exact repair was not admitted");
+			expect(judgeCalls === beforeReadmission, "the new exact repair was judged again");
 		}
 		const absolute = join(workspace, path);
 		mkdirSync(join(absolute, ".."), { recursive: true });

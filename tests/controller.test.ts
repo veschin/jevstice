@@ -1927,6 +1927,71 @@ describe("owner-controlled session mode", () => {
 });
 
 describe("executable finding recovery", () => {
+	test.each(["on_course", "off_course"] as const)("FR-67: resolution rejudges an identical refused action and respects the fresh %s answer", async label => {
+		const action = { label: "on_course", confidence: 0.55 };
+		const { pi, calls } = controllerFor({
+			needs_development: TRIAGE_DEEP, ...PLAN_APPROVED,
+			action, resolves_hold: { probability: 0.93 },
+		}, { mode: "completion" });
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
+		const input = { path: "src/a.ts", content: "the approved coverage report" };
+		expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", input), ctx))).toContain("inconclusive");
+		const finding = asRecord(toolDetails(await pi.callTool("jev_context", { action: "list" }, ctx))["hold"]);
+		const resolved = await pi.callTool("jev_consult", {
+			mode: "recovery",
+			recovery: {
+				phase: "resolve", findingId: finding?.["id"],
+				diagnosis: "The unexecuted preflight had insufficient authorization context, not an observed code defect.",
+				correction: "The approved plan and read-back establish that this exact report write serves the requirement.",
+			},
+			evidence: [{ kind: "spec", quote: "The approved plan requires writing the coverage report to src/a.ts." }],
+		}, ctx);
+		expect(toolFailed(resolved)).toBe(false);
+		action.label = label;
+		action.confidence = 0.94;
+		const before = calls.length;
+		const result = blockReason(await pi.emit("tool_call", toolCallEvent("write", input), ctx));
+		expect(calls).toHaveLength(before + 1);
+		if (label === "on_course") {
+			expect(result).toBeUndefined();
+			expect(toolDetails(await pi.callTool("jev_context", { action: "list" }, ctx))["hold"]).toBeUndefined();
+		} else {
+			expect(result).toContain("off_course");
+			expect(result).not.toContain("already judged");
+		}
+	});
+
+	test("FR-67: a resolved completion refusal is rechecked at the same work revision", async () => {
+		const completion = { label: "unsettled", confidence: 0.94 };
+		const { pi, calls } = controllerFor({
+			needs_development: TRIAGE_DEEP, ...PLAN_APPROVED,
+			follows_requirements: completion, "direction:1": ON_COURSE,
+			acceptance: approvingAcceptance, resolves_hold: { probability: 0.93 },
+		}, { mode: "completion" });
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
+		await triaged(pi, ctx);
+		await planned(pi, ctx);
+		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts" }, "Wrote the verified report"), ctx);
+		await accepted(pi, ctx);
+		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeDefined();
+		const finding = asRecord(toolDetails(await pi.callTool("jev_context", { action: "list" }, ctx))["hold"]);
+		expect(toolFailed(await pi.callTool("jev_consult", {
+			mode: "recovery",
+			recovery: {
+				phase: "resolve", findingId: finding?.["id"],
+				diagnosis: "Completion evidence was inconclusive despite the current accepted report.",
+				correction: "The observed report and both current acceptance records now settle the completion evidence.",
+			},
+			evidence: [{ kind: "execution", quote: "The coverage report matches the recorded run and both acceptance aspects passed." }],
+		}, ctx))).toBe(false);
+		completion.label = "follows";
+		const before = calls.length;
+		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
+		expect(calls).toHaveLength(before + 1);
+	});
+
 	test("an approved exact replacement executes once without a second resolution vote or an owner override", async () => {
 		const { pi, calls } = controllerFor({
 			needs_development: TRIAGE_DEEP, ...PLAN_APPROVED,

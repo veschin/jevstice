@@ -81,6 +81,8 @@ interface SubmissionRecord {
 	boundary: string;
 	/** SHA-256 of the material as submitted. */
 	digest: string;
+	/** A Jev-approved resolution retired this refusal; history remains, but it cannot refuse a fresh judgment. */
+	resolved?: true;
 }
 
 /** A boundary whose refusal budget is spent, kept as the OPEN item the owner has to settle (FR-23). */
@@ -437,6 +439,18 @@ export function permittedRepair(state: JevState, tool: string, input: unknown): 
 /** Clear the hold only when the consultation names its exact finding id. */
 export function clearResolvedHold(state: JevState, findingId: string): boolean {
 	if (state.hold === undefined || state.hold.id !== findingId) return false;
+	// FR-67: resolving a finding changes its authorization context, not the approval floor.
+	// Retire only the exact refused material named by this finding, not its whole tool boundary.
+	const boundary = state.hold.boundary;
+	const submission = asRecord(asRecord(state.hold.result)?.["submission"]);
+	state.submissions = state.submissions.map(entry =>
+		entry.boundary === submission?.["boundary"] && entry.digest === submission?.["digest"]
+			? { ...entry, resolved: true } : entry,
+	);
+	if (boundary === "completion" && state.completion?.approved === false) {
+		delete state.completion;
+		delete state.stop;
+	}
 	delete state.hold;
 	delete state.repair;
 	return true;
@@ -631,7 +645,7 @@ export function submissionLedger(
 	const judged = state.submissions.filter(entry => entry.boundary === boundary);
 	const attempts = judged.length;
 	return {
-		repeat: judged.some(entry => entry.digest === digest),
+		repeat: judged.some(entry => entry.digest === digest && entry.resolved !== true),
 		attempts,
 		exhausted: state.exhausted.includes(boundaryKey(boundary)) || attempts >= POLICY.maxRefusalsPerStage,
 	};
