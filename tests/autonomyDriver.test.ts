@@ -469,70 +469,93 @@ describe("T1 - explicit policy and CLI boundaries", () => {
 	});
 });
 
-describe("T2 - initial lifecycle decision gates the real scope launch", () => {
-	test("an initial wait decision launches nothing", async () => {
+describe("T2 - the lifecycle launch is deterministic while Jev remains diagnostic", () => {
+	test("an initial wait verdict is recorded and the scoped launch still happens", async () => {
 		const setupDir = await setup();
-		const result = await startAutonomyRun(
+		const controller = new AbortController();
+		const driving = startAutonomyRun(
 			{ store: setupDir.storePath, objectiveFile: setupDir.objectiveFile, policyFile: setupDir.policyFile, omp: setupDir.fixture },
-			{ judge: answer("wait") },
+			{ judge: answer("wait"), signal: controller.signal },
 		);
-		expect(result.exitCode).toBe(4);
-		expect(result.status).toBe("waiting");
-		const run = withStore(setupDir.storePath, store => store.read(result.runId));
-		expect(run.judgeCalls).toBe(1);
-		expect(run.waiting?.reason).toContain("Jev chose to wait");
-		expect(run.scope).toBeUndefined();
+		const running = await waitFor(async () =>
+			withStore(setupDir.storePath, store =>
+				store.list().find(candidate => candidate.status === "running" && candidate.child !== undefined),
+			),
+		);
+		track(setupDir.storePath, running.id);
+		expect(running.judgeCalls).toBe(1);
+		expect(await starts(setupDir)).toBe(1);
+		controller.abort("test observation complete");
+		const result = await driving;
+		expect(result.status).toBe("cancelled");
+		const run = withStore(setupDir.storePath, store => store.read(running.id));
 		expect(run.pending).toEqual({});
-		expect(await starts(setupDir)).toBe(0);
-	});
+		const events = withStore(setupDir.storePath, store => store.events(running.id));
+		const decision = asRecord(eventData(events.find(event => event.kind === "driver.recovery_decision") as AutonomyEvent)["outcome"]);
+		expect(asRecord(Array.isArray(decision?.["answers"]) ? (decision["answers"] as unknown[])[0] : undefined)?.["label"]).toBe("wait");
+		expect(events.some(event => event.kind === "driver.launch_intent")).toBe(true);
+	}, 20_000);
 
-	test("an unavailable lifecycle decision launches nothing", async () => {
+	test("an unavailable lifecycle verdict is recorded but does not block the launch", async () => {
 		const setupDir = await setup({ maxJudgeCalls: 1 });
-		const result = await startAutonomyRun(
+		const controller = new AbortController();
+		const driving = startAutonomyRun(
 			{ store: setupDir.storePath, objectiveFile: setupDir.objectiveFile, policyFile: setupDir.policyFile, omp: setupDir.fixture },
-			{ judge: unavailable() },
+			{ judge: unavailable(), signal: controller.signal },
 		);
-		expect(result.exitCode).toBe(4);
-		const run = withStore(setupDir.storePath, store => store.read(result.runId));
-		expect(run.status).toBe("waiting");
-		expect(run.judgeCalls).toBe(1);
-		expect(run.waiting?.kind).toBe("resource");
-		expect(await starts(setupDir)).toBe(0);
-		const events = withStore(setupDir.storePath, store => store.events(result.runId));
+		const running = await waitFor(async () =>
+			withStore(setupDir.storePath, store =>
+				store.list().find(candidate => candidate.status === "running" && candidate.child !== undefined),
+			),
+		);
+		track(setupDir.storePath, running.id);
+		expect(running.judgeCalls).toBe(1);
+		expect(await starts(setupDir)).toBe(1);
+		controller.abort("test observation complete");
+		const result = await driving;
+		expect(result.status).toBe("cancelled");
+		const events = withStore(setupDir.storePath, store => store.events(running.id));
 		const decision = events.find(event => event.kind === "driver.recovery_decision");
 		const outcome = asRecord(eventData(decision as AutonomyEvent)["outcome"]);
 		expect(outcome?.["ok"]).toBe(false);
 		expect(outcome?.["kind"]).toBe("unavailable");
-	});
+		expect(events.some(event => event.kind === "driver.launch_intent")).toBe(true);
+	}, 20_000);
 
-	test("a launch decision runs the real scoped RPC lifecycle and requires a bound bootstrap acknowledgment", async () => {
+	test("a launch verdict runs the real scoped RPC lifecycle and requires a bound bootstrap acknowledgment", async () => {
 		const setupDir = await setup();
 		process.env["JEVSTICE_TEST_BEHAVIOR"] = "exit-after-ready";
-		const result = await startAutonomyRun(
+		const driving = startAutonomyRun(
 			{ store: setupDir.storePath, objectiveFile: setupDir.objectiveFile, policyFile: setupDir.policyFile, omp: setupDir.fixture },
-			{ judge: sequenceJudge(answer("launch"), answer("wait")) },
+			{ judge: answer("launch") },
 		);
-		expect(result.exitCode).toBe(4);
-		track(setupDir.storePath, result.runId);
-		const run = withStore(setupDir.storePath, store => store.read(result.runId));
-		expect(run.status).toBe("waiting");
+		const running = await waitFor(async () =>
+			withStore(setupDir.storePath, store =>
+				store.list().find(candidate => candidate.status === "running" && candidate.session !== undefined),
+			),
+		);
+		track(setupDir.storePath, running.id);
+		const run = withStore(setupDir.storePath, store => store.read(running.id));
 		expect(run.scope?.bootId).toBe(autonomyBootId());
 		expect(run.scope?.controlGroup.endsWith(`/${run.scope?.unit}`)).toBe(true);
 		expect(run.child?.bootId).toBe(autonomyBootId());
 		expect(run.child?.group).toBe(run.child?.pid);
 		expect(run.session?.id.startsWith("session-")).toBe(true);
 		expect(run.session?.file.startsWith("/tmp/session-")).toBe(true);
-		expect(run.judgeCalls).toBe(2);
+		expect(run.judgeCalls).toBe(1);
 		expect(await starts(setupDir)).toBe(1);
-		expect(processIdentity(run.child?.pid ?? -1)).toBeNull();
 
-		const events = withStore(setupDir.storePath, store => store.events(result.runId));
+		const events = withStore(setupDir.storePath, store => store.events(running.id));
 		expect(events.some(event => event.kind === "driver.launch_intent")).toBe(true);
 		expect(events.some(event => event.kind === "scope-bound")).toBe(true);
 		expect(events.some(event => event.kind === "driver.bootstrap_ack")).toBe(true);
 		expect(events.some(event => event.kind === "driver.session_bound")).toBe(true);
-		expect(events.some(event => event.kind === "scope-fenced")).toBe(true);
-		expect(run.fences.length).toBeGreaterThanOrEqual(1);
+		await stopAutonomy({ store: setupDir.storePath, run: running.id, reason: "lifecycle observed" });
+		const result = await driving;
+		expect(result.exitCode).toBe(0);
+		const fenced = withStore(setupDir.storePath, store => store.read(running.id));
+		expect(fenced.fences.length).toBeGreaterThanOrEqual(1);
+		expect(processIdentity(run.child?.pid ?? -1)).toBeNull();
 	});
 
 	test("protocol v2 chunked get_state is reassembled before the session binds", async () => {
@@ -567,38 +590,54 @@ describe("T2 - initial lifecycle decision gates the real scope launch", () => {
 	test("ready and get_state without a bound runtime acknowledgment fail the launch and fence the scope", async () => {
 		const setupDir = await setup({ maxJudgeCalls: 2 });
 		process.env["JEVSTICE_TEST_BEHAVIOR"] = "no-ack";
-		const result = await startAutonomyRun(
+		const controller = new AbortController();
+		const driving = startAutonomyRun(
 			{ store: setupDir.storePath, objectiveFile: setupDir.objectiveFile, policyFile: setupDir.policyFile, omp: setupDir.fixture },
-			{ judge: sequenceJudge(answer("launch"), answer("wait")), startupAckTimeoutMs: 400 },
+			{ judge: answer("launch"), startupAckTimeoutMs: 400, signal: controller.signal },
 		);
-		track(setupDir.storePath, result.runId);
-		const run = withStore(setupDir.storePath, store => store.read(result.runId));
-		expect(run.status).toBe("waiting");
-		expect(run.scope).toBeDefined();
-		expect(run.child).toBeDefined();
-		expect(processIdentity(run.child?.pid ?? -1)).toBeNull();
-		const events = withStore(setupDir.storePath, store => store.events(result.runId));
+		const failedRun = await waitFor(async () =>
+			withStore(setupDir.storePath, store => {
+				const candidate = store.list()[0];
+				if (candidate === undefined) return undefined;
+				return store.events(candidate.id).some(event => event.kind === "driver.launch_failed") ? candidate : undefined;
+			}),
+		);
+		track(setupDir.storePath, failedRun.id);
+		expect(failedRun.scope).toBeDefined();
+		expect(failedRun.child).toBeDefined();
+		expect(processIdentity(failedRun.child?.pid ?? -1)).toBeNull();
+		controller.abort("test observation complete");
+		await driving;
+		const events = withStore(setupDir.storePath, store => store.events(failedRun.id));
 		const failed = events.find(event => event.kind === "driver.launch_failed");
 		expect(failed).toBeDefined();
 		expect(eventData(failed as AutonomyEvent)["stage"]).toBe("bootstrap_ack");
 		expect(eventData(failed as AutonomyEvent)["fenced"]).toBe(true);
 		expect(events.some(event => event.kind === "driver.bootstrap_ack")).toBe(false);
-	});
+	}, 20_000);
 
 	test("a committed acknowledgment is retained when the child exits before the next poll, without treating it as live", async () => {
 		const setupDir = await setup({ maxJudgeCalls: 2 });
 		process.env["JEVSTICE_TEST_BEHAVIOR"] = "ack-then-exit";
-		const result = await startAutonomyRun(
+		const controller = new AbortController();
+		const driving = startAutonomyRun(
 			{ store: setupDir.storePath, objectiveFile: setupDir.objectiveFile, policyFile: setupDir.policyFile, omp: setupDir.fixture },
-			{ judge: sequenceJudge(answer("launch"), answer("wait")) },
+			{ judge: answer("launch"), signal: controller.signal },
 		);
-		expect(result.exitCode).toBe(4);
-		track(setupDir.storePath, result.runId);
-		const run = withStore(setupDir.storePath, store => store.read(result.runId));
-		expect(run.status).toBe("waiting");
-		expect(run.session?.id.startsWith("session-")).toBe(true);
-		expect(processIdentity(run.child?.pid ?? -1)).toBeNull();
-		const events = withStore(setupDir.storePath, store => store.events(result.runId));
+		const observed = await waitFor(async () =>
+			withStore(setupDir.storePath, store => {
+				const candidate = store.list()[0];
+				if (candidate === undefined) return undefined;
+				const events = store.events(candidate.id);
+				const acked = events.some(event => event.kind === "driver.bootstrap_ack");
+				const failed = events.some(event => event.kind === "driver.launch_failed");
+				return acked && failed ? candidate : undefined;
+			}),
+		);
+		track(setupDir.storePath, observed.id);
+		controller.abort("test observation complete");
+		await driving;
+		const events = withStore(setupDir.storePath, store => store.events(observed.id));
 		expect(events.some(event => event.kind === "driver.bootstrap_ack")).toBe(true);
 		expect(events.some(event => event.kind === "driver.session_bound")).toBe(true);
 		expect(events.some(event => event.kind === "driver.ready")).toBe(false);
@@ -606,8 +645,8 @@ describe("T2 - initial lifecycle decision gates the real scope launch", () => {
 		expect(failed).toBeDefined();
 		expect(eventData(failed as AutonomyEvent)["stage"]).toBe("bootstrap_ack");
 		expect(eventData(failed as AutonomyEvent)["fenced"]).toBe(true);
-		expect(await starts(setupDir)).toBe(1);
-	});
+		expect(await starts(setupDir)).toBeGreaterThanOrEqual(1);
+	}, 20_000);
 
 	test("an honest completed or infeasible run with a live scope is fenced and exits 0", async () => {
 		for (const status of ["completed", "infeasible"] as const) {
@@ -650,74 +689,22 @@ describe("T2 - initial lifecycle decision gates the real scope launch", () => {
 		}
 	}, 30_000);
 
-	test("resume does not re-ask an unchanged decisive wait but judges fresh material", async () => {
+	test("a capability outage is a transport wait and a later resume still launches", async () => {
 		const setupDir = await setup({ maxJudgeCalls: 3 });
-		const first = await startAutonomyRun(
-			{ store: setupDir.storePath, objectiveFile: setupDir.objectiveFile, policyFile: setupDir.policyFile, omp: setupDir.fixture },
-			{ judge: answer("wait") },
-		);
-		track(setupDir.storePath, first.runId);
-		expect(first.exitCode).toBe(4);
-		let run = withStore(setupDir.storePath, store => store.read(first.runId));
-		expect(run.judgeCalls).toBe(1);
-		expect(run.waiting?.kind).toBe("judge");
-		expect(
-			withStore(setupDir.storePath, store =>
-				store.events(first.runId).some(event => event.kind === "driver.refusal_hold"),
-			),
-		).toBe(true);
-
-		let calls = 0;
-		const judge: Judge = async (context, questions) => {
-			calls += 1;
-			return answer("wait")(context, questions);
-		};
-		const repeated = await resumeAutonomyRun(
-			{ store: setupDir.storePath, run: first.runId, omp: setupDir.fixture },
-			{ judge },
-		);
-		expect(repeated.exitCode).toBe(4);
-		expect(calls).toBe(0);
-		run = withStore(setupDir.storePath, store => store.read(first.runId));
-		expect(run.judgeCalls).toBe(1);
-		expect(run.waiting?.kind).toBe("judge");
-		expect(run.waiting?.reason).toContain("Jev chose to wait");
-
-		withStore(setupDir.storePath, store =>
-			store.update(
-				first.runId,
-				{ epoch: run.epoch },
-				current => {
-					current.checkpoint.revision += 1;
-				},
-				[],
-			),
-		);
-		const fresh = await resumeAutonomyRun(
-			{ store: setupDir.storePath, run: first.runId, omp: setupDir.fixture },
-			{ judge },
-		);
-		expect(fresh.exitCode).toBe(4);
-		expect(calls).toBe(1);
-		run = withStore(setupDir.storePath, store => store.read(first.runId));
-		expect(run.judgeCalls).toBe(2);
-	}, 30_000);
-
-	test("a durable refusal survives an unrelated capability wait", async () => {
-		const setupDir = await setup({ maxJudgeCalls: 3 });
-		const first = await startAutonomyRun(
-			{ store: setupDir.storePath, objectiveFile: setupDir.objectiveFile, policyFile: setupDir.policyFile, omp: setupDir.fixture },
-			{ judge: answer("wait") },
-		);
-		track(setupDir.storePath, first.runId);
-		expect(first.exitCode).toBe(4);
+		const created = withStore(setupDir.storePath, store => {
+			const owner = processIdentity();
+			if (owner === null) throw new Error("test identity unavailable");
+			const run = store.create(OBJECTIVE, setupDir.policy);
+			return store.claim(run.id, owner);
+		});
+		track(setupDir.storePath, created.id);
 		let calls = 0;
 		const judge: Judge = async (context, questions) => {
 			calls += 1;
 			return answer("wait")(context, questions);
 		};
 		const blocked = await resumeAutonomyRun(
-			{ store: setupDir.storePath, run: first.runId, omp: setupDir.fixture },
+			{ store: setupDir.storePath, run: created.id, omp: setupDir.fixture },
 			{
 				judge,
 				scopeCapability: async () => {
@@ -726,19 +713,26 @@ describe("T2 - initial lifecycle decision gates the real scope launch", () => {
 			},
 		);
 		expect(blocked.exitCode).toBe(4);
-		let run = withStore(setupDir.storePath, store => store.read(first.runId));
+		let run = withStore(setupDir.storePath, store => store.read(created.id));
 		expect(run.waiting?.kind).toBe("capability");
 		expect(calls).toBe(0);
+		expect(await starts(setupDir)).toBe(0);
 
-		const repeated = await resumeAutonomyRun(
-			{ store: setupDir.storePath, run: first.runId, omp: setupDir.fixture },
-			{ judge },
+		const controller = new AbortController();
+		const driving = resumeAutonomyRun(
+			{ store: setupDir.storePath, run: created.id, omp: setupDir.fixture },
+			{ judge, signal: controller.signal },
 		);
-		expect(repeated.exitCode).toBe(4);
-		expect(calls).toBe(0);
-		run = withStore(setupDir.storePath, store => store.read(first.runId));
+		run = await waitFor(async () => {
+			const current = withStore(setupDir.storePath, store => store.read(created.id));
+			return current.status === "running" && current.child !== undefined ? current : undefined;
+		});
+		expect(calls).toBe(1);
 		expect(run.judgeCalls).toBe(1);
-		expect(run.waiting?.kind).toBe("judge");
+		expect(await starts(setupDir)).toBe(1);
+		controller.abort("test observation complete");
+		const result = await driving;
+		expect(result.status).toBe("cancelled");
 	}, 30_000);
 
 	test("the judged candidate argv pins a run-private session directory used by the actual spawn", async () => {
@@ -832,29 +826,37 @@ describe("T2 - initial lifecycle decision gates the real scope launch", () => {
 			seen = asRecord(context);
 			return answer("wait")(context, questions);
 		};
-		const result = await resumeAutonomyRun(
+		const driving = resumeAutonomyRun(
 			{ store: setupDir.storePath, run: created.id, omp: setupDir.fixture },
 			{ judge },
 		);
-		expect(result.exitCode).toBe(4);
-		expect(seen).toBeDefined();
-		const observations = asRecord(seen?.["observations"]);
-		const entries = observations?.["selectedPaths"];
-		expect(Array.isArray(entries)).toBe(true);
-		const list = entries as Array<Record<string, unknown>>;
-		const effect = list.find(entry => entry["path"] === "effect.txt");
-		expect(effect?.["content"]).toBe(effectText);
-		expect(effect?.["encoding"]).toBe("utf-8");
-		expect(effect?.["complete"]).toBe(true);
-		const note = list.find(entry => entry["path"] === "local://test-note.txt");
-		expect(note?.["content"]).toBe(noteText);
-		const missing = list.find(entry => entry["path"] === "missing.txt");
-		expect(missing?.["exists"]).toBe(false);
-		const candidate = asRecord(seen?.["candidate"]);
-		const effectPolicy = asRecord(candidate?.["effectPolicy"]);
-		expect(effectPolicy?.["mode"]).toBe("observation_and_reconciliation_only");
-		expect(effectPolicy?.["consequentialEffectsBlocked"]).toBe(true);
-	});
+		try {
+			await waitFor(async () => {
+				const run = withStore(setupDir.storePath, store => store.read(created.id));
+				return run.status === "running" && run.child !== undefined ? run : undefined;
+			});
+			expect(seen).toBeDefined();
+			const observations = asRecord(seen?.["observations"]);
+			const entries = observations?.["selectedPaths"];
+			expect(Array.isArray(entries)).toBe(true);
+			const list = entries as Array<Record<string, unknown>>;
+			const effect = list.find(entry => entry["path"] === "effect.txt");
+			expect(effect?.["content"]).toBe(effectText);
+			expect(effect?.["encoding"]).toBe("utf-8");
+			expect(effect?.["complete"]).toBe(true);
+			const note = list.find(entry => entry["path"] === "local://test-note.txt");
+			expect(note?.["content"]).toBe(noteText);
+			const missing = list.find(entry => entry["path"] === "missing.txt");
+			expect(missing?.["exists"]).toBe(false);
+			const candidate = asRecord(seen?.["candidate"]);
+			const effectPolicy = asRecord(candidate?.["effectPolicy"]);
+			expect(effectPolicy?.["mode"]).toBe("observation_and_reconciliation_only");
+			expect(effectPolicy?.["consequentialEffectsBlocked"]).toBe(true);
+		} finally {
+			await stopAutonomy({ store: setupDir.storePath, run: created.id, reason: "context evidence checked" });
+			await driving;
+		}
+	}, 30_000);
 
 	test("oversized selected material stays a durable context wait instead of a truncated body", async () => {
 		const setupDir = await setup();
@@ -896,22 +898,30 @@ describe("T2 - initial lifecycle decision gates the real scope launch", () => {
 	test("a forged bootstrap acknowledgment cannot authorize the launch", async () => {
 		const setupDir = await setup({ maxJudgeCalls: 2 });
 		process.env["JEVSTICE_TEST_BEHAVIOR"] = "forged-ack";
-		const result = await startAutonomyRun(
+		const controller = new AbortController();
+		const driving = startAutonomyRun(
 			{ store: setupDir.storePath, objectiveFile: setupDir.objectiveFile, policyFile: setupDir.policyFile, omp: setupDir.fixture },
-			{ judge: sequenceJudge(answer("launch"), answer("wait")), startupAckTimeoutMs: 400 },
+			{ judge: answer("launch"), startupAckTimeoutMs: 400, signal: controller.signal },
 		);
-		expect(result.exitCode).toBe(4);
-		track(setupDir.storePath, result.runId);
-		const run = withStore(setupDir.storePath, store => store.read(result.runId));
-		expect(run.status).toBe("waiting");
-		expect(await starts(setupDir)).toBe(1);
-		const events = withStore(setupDir.storePath, store => store.events(result.runId));
+		const failedRun = await waitFor(async () =>
+			withStore(setupDir.storePath, store => {
+				const candidate = store.list()[0];
+				if (candidate === undefined) return undefined;
+				return store.events(candidate.id).some(event => event.kind === "driver.launch_failed") ? candidate : undefined;
+			}),
+		);
+		track(setupDir.storePath, failedRun.id);
+		controller.abort("test observation complete");
+		const result = await driving;
+		expect(result.status).toBe("cancelled");
+		expect(await starts(setupDir)).toBeGreaterThanOrEqual(1);
+		const events = withStore(setupDir.storePath, store => store.events(failedRun.id));
 		const failed = events.find(event => event.kind === "driver.launch_failed");
 		expect(failed).toBeDefined();
 		expect(eventData(failed as AutonomyEvent)["stage"]).toBe("bootstrap_ack");
 		expect(eventData(failed as AutonomyEvent)["fenced"]).toBe(true);
 		expect(events.some(event => event.kind === "driver.bootstrap_ack")).toBe(false);
-	});
+	}, 20_000);
 });
 
 describe("T3 - whole-scope fencing, unknown intents and root races", () => {
@@ -945,22 +955,27 @@ describe("T3 - whole-scope fencing, unknown intents and root races", () => {
 		track(setupDir.storePath, state.runId);
 		expect(processIdentity(state.sleepPid)).not.toBeNull();
 
-		const result = await resumeAutonomyRun(
+		const controller = new AbortController();
+		const driving = resumeAutonomyRun(
 			{ store: setupDir.storePath, run: state.runId, omp: setupDir.fixture },
-			{ judge: answer("wait") },
+			{ judge: answer("wait"), signal: controller.signal },
 		);
-		expect(result.exitCode).toBe(4);
-		const run = withStore(setupDir.storePath, store => store.read(state.runId));
-		expect(run.pending["tool-1"]).toBeDefined();
-		expect(run.fences.length).toBe(1);
-		expect(run.fences[0]?.intentIds).toEqual(["tool-1"]);
-		expect(run.fences[0]?.scope.unit).toBe(state.unit);
+		const fencedRun = await waitFor(async () => {
+			const current = withStore(setupDir.storePath, store => store.read(state.runId));
+			return current.fences.length === 1 ? current : undefined;
+		});
+		expect(fencedRun.pending["tool-1"]).toBeDefined();
+		expect(fencedRun.fences[0]?.intentIds).toEqual(["tool-1"]);
+		expect(fencedRun.fences[0]?.scope.unit).toBe(state.unit);
 		expect(processIdentity(state.sleepPid)).toBeNull();
 		expect(processIdentity(state.child.pid)).toBeNull();
+		controller.abort("test observation complete");
+		const result = await driving;
+		expect(result.status).toBe("cancelled");
 		const events = withStore(setupDir.storePath, store => store.events(state.runId));
 		expect(events.some(event => event.kind === "scope-fenced")).toBe(true);
 		expect(events.some(event => event.kind === "driver.fence")).toBe(true);
-	});
+	}, 30_000);
 
 	test("a never-observed launch is proved quiet but recovery still requires an observed child identity", async () => {
 		const setupDir = await setup();
@@ -1465,53 +1480,38 @@ describe("T4 - budgets, unavailable capability and rotation", () => {
 		expect(await starts(setupDir)).toBe(0);
 	});
 
-	test("an unavailable judge is retried with backoff, then the exhausted budget preserves waiting", async () => {
+	test("an unavailable judge is recorded and does not block recovery", async () => {
 		const setupDir = await setup({ maxJudgeCalls: 2, maxRuntimeMs: 60_000 });
-		const created = withStore(setupDir.storePath, store => {
-			const owner = processIdentity();
-			if (owner === null) throw new Error("test identity unavailable");
-			const run = store.create(OBJECTIVE, setupDir.policy);
-			return store.claim(run.id, owner);
-		});
-		track(setupDir.storePath, created.id);
-		let clock = Date.now();
-		const sleeps: number[] = [];
+		const controller = new AbortController();
 		let calls = 0;
 		const judge: Judge = async () => {
 			calls += 1;
 			return { ok: false, kind: "unavailable", problem: "offline" };
 		};
-		const result = await resumeAutonomyRun(
-			{ store: setupDir.storePath, run: created.id, omp: setupDir.fixture },
-			{
-				judge,
-				now: () => clock,
-				sleep: async ms => {
-					sleeps.push(ms);
-					clock += ms;
-					return true;
-				},
-			},
+		const driving = startAutonomyRun(
+			{ store: setupDir.storePath, objectiveFile: setupDir.objectiveFile, policyFile: setupDir.policyFile, omp: setupDir.fixture },
+			{ judge, signal: controller.signal },
 		);
-		expect(result.exitCode).toBe(4);
-		expect(calls).toBe(2);
-		expect(sleeps.length).toBeGreaterThanOrEqual(1);
-		const run = withStore(setupDir.storePath, store => store.read(created.id));
-		expect(run.status).toBe("waiting");
-		expect(run.judgeCalls).toBe(2);
-		expect(run.waiting?.reason).toContain("judge call budget is exhausted");
-		expect(run.child).toBeUndefined();
-	});
+		const running = await waitFor(async () =>
+			withStore(setupDir.storePath, store =>
+				store.list().find(candidate => candidate.status === "running" && candidate.child !== undefined),
+			),
+		);
+		track(setupDir.storePath, running.id);
+		expect(calls).toBe(1);
+		expect(running.judgeCalls).toBe(1);
+		expect(await starts(setupDir)).toBe(1);
+		controller.abort("test observation complete");
+		const result = await driving;
+		expect(result.status).toBe("cancelled");
+		const events = withStore(setupDir.storePath, store => store.events(running.id));
+		const decision = events.find(event => event.kind === "driver.recovery_decision");
+		expect(asRecord(eventData(decision as AutonomyEvent)["outcome"])?.["kind"]).toBe("unavailable");
+	}, 20_000);
 
-	test("a below-floor lifecycle answer stays a disclosed durable wait and launches nothing", async () => {
+	test("a below-floor lifecycle answer launches and is recorded without a refusal hold", async () => {
 		const setupDir = await setup({ maxJudgeCalls: 2, maxRuntimeMs: 60_000 });
-		const created = withStore(setupDir.storePath, store => {
-			const owner = processIdentity();
-			if (owner === null) throw new Error("test identity unavailable");
-			const run = store.create(OBJECTIVE, setupDir.policy);
-			return store.claim(run.id, owner);
-		});
-		track(setupDir.storePath, created.id);
+		const controller = new AbortController();
 		let calls = 0;
 		const judge: Judge = async () => {
 			calls += 1;
@@ -1523,27 +1523,29 @@ describe("T4 - budgets, unavailable capability and rotation", () => {
 				],
 			};
 		};
-		const result = await resumeAutonomyRun(
-			{ store: setupDir.storePath, run: created.id, omp: setupDir.fixture },
-			{ judge },
+		const driving = startAutonomyRun(
+			{ store: setupDir.storePath, objectiveFile: setupDir.objectiveFile, policyFile: setupDir.policyFile, omp: setupDir.fixture },
+			{ judge, signal: controller.signal },
 		);
-		expect(result.exitCode).toBe(4);
-		// An inconclusive verdict is neither a defect nor approval: the run keeps its durable wait,
-		// spends no second judge call on unchanged material, and never launches a child.
+		const running = await waitFor(async () =>
+			withStore(setupDir.storePath, store =>
+				store.list().find(candidate => candidate.status === "running" && candidate.child !== undefined),
+			),
+		);
+		track(setupDir.storePath, running.id);
 		expect(calls).toBe(1);
-		const run = withStore(setupDir.storePath, store => store.read(created.id));
-		expect(run.status).toBe("waiting");
-		expect(run.judgeCalls).toBe(1);
-		expect(run.waiting?.kind).toBe("judge");
-		expect(run.waiting?.reason).toBe("Jev did not decisively approve the lifecycle transition");
-		expect(run.child).toBeUndefined();
-		expect(await starts(setupDir)).toBe(0);
-		const events = withStore(setupDir.storePath, store => store.events(created.id));
-		expect(events.some(event => event.kind === "driver.refusal_hold")).toBe(true);
-		expect(events.some(event => event.kind === "driver.launch_intent")).toBe(false);
-	});
+		expect(running.judgeCalls).toBe(1);
+		expect(running.child).toBeDefined();
+		expect(await starts(setupDir)).toBe(1);
+		controller.abort("test observation complete");
+		const result = await driving;
+		expect(result.status).toBe("cancelled");
+		const events = withStore(setupDir.storePath, store => store.events(running.id));
+		expect(events.some(event => event.kind === "driver.refusal_hold")).toBe(false);
+		expect(events.some(event => event.kind === "driver.launch_intent")).toBe(true);
+	}, 20_000);
 
-	test("an exhausted judge budget on resume fences the prior scope before refusing", async () => {
+	test("an exhausted judge budget on resume still fences and launches a replacement", async () => {
 		const setupDir = await setup({ maxJudgeCalls: 1 });
 		const stateFile = join(setupDir.dir, "budget.json");
 		const objective = await readFile(setupDir.objectiveFile, "utf8");
@@ -1574,31 +1576,30 @@ describe("T4 - budgets, unavailable capability and rotation", () => {
 		expect(processIdentity(state.child.pid)).not.toBeNull();
 		expect(processIdentity(state.sleepPid)).not.toBeNull();
 		let calls = 0;
+		const controller = new AbortController();
 		const judge: Judge = async (context, questions) => {
 			calls += 1;
 			return answer("launch")(context, questions);
 		};
-		const result = await resumeAutonomyRun(
+		const driving = resumeAutonomyRun(
 			{ store: setupDir.storePath, run: state.runId, omp: setupDir.fixture },
-			{ judge },
+			{ judge, signal: controller.signal },
 		);
-		expect(result.exitCode).toBe(4);
+		const replacement = await waitFor(async () => {
+			const run = withStore(setupDir.storePath, store => store.read(state.runId));
+			return run.status === "running" && run.child !== undefined && run.child.pid !== state.child.pid ? run : undefined;
+		});
 		expect(calls).toBe(0);
+		expect(replacement.judgeCalls).toBe(1);
 		expect(processIdentity(state.child.pid)).toBeNull();
 		expect(processIdentity(state.sleepPid)).toBeNull();
-		const run = withStore(setupDir.storePath, store => store.read(state.runId));
-		expect(run.status).toBe("waiting");
-		expect(run.waiting?.kind).toBe("resource");
-		expect(run.judgeCalls).toBe(1);
-		expect(run.fences.some(fence => fence.scope.unit === state.unit)).toBe(true);
-		expect(() =>
-			withStore(setupDir.storePath, store =>
-				store.create("A competing objective.\n", { ...setupDir.policy, roots: [setupDir.root] }),
-			),
-		).toThrow("overlapping authorized root");
+		expect(replacement.fences.some(fence => fence.scope.unit === state.unit)).toBe(true);
+		controller.abort("test observation complete");
+		const result = await driving;
+		expect(result.status).toBe("cancelled");
 	}, 30_000);
 
-	test("a persisted judge retry time survives resume without an early judge call", async () => {
+	test("a persisted judge retry time does not block the launch and is not treated as a new call", async () => {
 		const setupDir = await setup();
 		const created = withStore(setupDir.storePath, store => {
 			const owner = processIdentity();
@@ -1622,28 +1623,26 @@ describe("T4 - budgets, unavailable capability and rotation", () => {
 			);
 		});
 		track(setupDir.storePath, created.id);
-		let clock = Date.now();
-		const sleeps: number[] = [];
 		let calls = 0;
+		const controller = new AbortController();
 		const judge: Judge = async (context, questions) => {
 			calls += 1;
 			return answer("wait")(context, questions);
 		};
-		const result = await resumeAutonomyRun(
+		const driving = resumeAutonomyRun(
 			{ store: setupDir.storePath, run: created.id, omp: setupDir.fixture },
-			{
-				judge,
-				now: () => clock,
-				sleep: async ms => {
-					sleeps.push(ms);
-					clock += ms;
-					return true;
-				},
-			},
+			{ judge, signal: controller.signal },
 		);
-		expect(result.exitCode).toBe(4);
-		expect(sleeps[0]).toBeGreaterThanOrEqual(4_000);
-		expect(calls).toBe(1);
+		const running = await waitFor(async () => {
+			const run = withStore(setupDir.storePath, store => store.read(created.id));
+			return run.status === "running" && run.child !== undefined ? run : undefined;
+		});
+		expect(calls).toBe(0);
+		expect(running.judgeCalls).toBe(0);
+		expect(await starts(setupDir)).toBe(1);
+		controller.abort("test observation complete");
+		const result = await driving;
+		expect(result.status).toBe("cancelled");
 	}, 30_000);
 
 	test("an already exhausted runtime budget on resume fences the stored scope before the resource wait", async () => {
@@ -1789,9 +1788,10 @@ describe("T5 - status projection", () => {
 	});
 });
 
-test("FR-57: lifecycle launch approval cannot substitute for an unsettled deliverable audience", async () => {
+test("FR-57: an unclear audience falls back to internal and never blocks the launch", async () => {
 	const setupDir = await setup({ maxJudgeCalls: 1, maxRuntimeMs: 8_000 });
 	process.env["JEVSTICE_TEST_BEHAVIOR"] = "exit-after-ready";
+	const controller = new AbortController();
 	const judge: Judge = async () => ({
 		ok: true,
 		answers: [
@@ -1800,19 +1800,29 @@ test("FR-57: lifecycle launch approval cannot substitute for an unsettled delive
 		],
 	});
 
-	const result = await startAutonomyRun(
+	const driving = startAutonomyRun(
 		{ store: setupDir.storePath, objectiveFile: setupDir.objectiveFile, policyFile: setupDir.policyFile, omp: setupDir.fixture },
-		{ judge },
+		{ judge, signal: controller.signal },
 	);
-	track(setupDir.storePath, result.runId);
-
-	expect(result.status).toBe("waiting");
-	expect(await starts(setupDir)).toBe(0);
+	const running = await waitFor(async () =>
+		withStore(setupDir.storePath, store =>
+			store.list().find(candidate => candidate.status === "running" && candidate.child !== undefined),
+		),
+	);
+	track(setupDir.storePath, running.id);
+	expect(running.audience?.external).toBe(false);
+	const events = withStore(setupDir.storePath, store => store.events(running.id));
+	const decision = eventData(events.find(event => event.kind === "driver.recovery_decision") as AutonomyEvent);
+	expect(decision["audienceFallback"]).toBe("internal");
+	expect(await starts(setupDir)).toBe(1);
+	controller.abort("test observation complete");
+	await driving;
 }, 20_000);
 
 test("FR-58: a changed checkpoint while startup is judged cannot authorize a child", async () => {
 	const setupDir = await setup({ maxJudgeCalls: 1, maxRuntimeMs: 8_000 });
 	process.env["JEVSTICE_TEST_BEHAVIOR"] = "exit-after-ready";
+	const controller = new AbortController();
 	const judge: Judge = async () => {
 		withStore(setupDir.storePath, store => {
 			const run = store.list()[0];
@@ -1830,12 +1840,22 @@ test("FR-58: a changed checkpoint while startup is judged cannot authorize a chi
 		};
 	};
 
-	const result = await startAutonomyRun(
+	const driving = startAutonomyRun(
 		{ store: setupDir.storePath, objectiveFile: setupDir.objectiveFile, policyFile: setupDir.policyFile, omp: setupDir.fixture },
-		{ judge },
+		{ judge, signal: controller.signal },
 	);
-	track(setupDir.storePath, result.runId);
-
-	expect(result.status).toBe("waiting");
+	const stale = await waitFor(async () =>
+		withStore(setupDir.storePath, store => {
+			const candidate = store.list()[0];
+			if (candidate === undefined) return undefined;
+			return candidate.waiting?.kind === "stale" ? candidate : undefined;
+		}),
+	);
+	track(setupDir.storePath, stale.id);
+	// The stale candidate never launches: the real checkpoint drift prevents a child.
+	expect(await starts(setupDir)).toBe(0);
+	controller.abort("test observation complete");
+	const result = await driving;
+	expect(result.status).toBe("cancelled");
 	expect(await starts(setupDir)).toBe(0);
 }, 20_000);

@@ -18,13 +18,9 @@ export const POLICY = {
 	 */
 	minConfidenceToApprove: 0.6,
 	/**
-	 * Boolean probability floor for workflow decisions: triage depth, per-item requirement
-	 * support, review, acceptance, completion and both recovery phases. Calibrated 2026-10-08
-	 * on a ground-truth domain (evidence/jev-calibration-2026-10-08.md): no false claim was
-	 * ever approved at any threshold, while well-evidenced true claims measured 0.66-1.00.
-	 * Lowered from 0.8 to 0.7 on 2026-11-13 by owner decision: a recorded live recovery was
-	 * refused at 0.79 and honest requirement items at 0.7x, both inside the measured
-	 * true-claim band. The anti-slop floor stays at 0.8 because FR-47 through FR-52 fix it.
+	 * Boolean probability floor for recorded workflow decisions. Below-floor answers stay
+	 * inconclusive rather than approving a claim or proving a defect. These floors classify
+	 * evidence; they never authorize or prevent execution.
 	 */
 	minProbabilityToApprove: 0.7,
 	/** Requirement-list coverage floor; inferred implementation choices are reviewed against the objective. */
@@ -137,8 +133,8 @@ export interface TextRule {
 	scope?: "text" | "fragment";
 }
 
-/** How the external-artifact review is enforced (FR-55). */
-export type AntiSlopMode = "off" | "advisory" | "enforce";
+/** Whether the external-artifact diagnostic is enabled. */
+export type AntiSlopMode = "off" | "advisory";
 
 /** The source-strength ladder a claim's evidence is marked with (FR-48). */
 export type AntiSlopSourceClass =
@@ -240,32 +236,11 @@ export interface AntiSlopReviewRecord {
 	findings: AntiSlopFinding[];
 }
 
-/** An owner waiver for one finding id (FR-54). */
-export interface AntiSlopWaiver {
-	findingId: string;
-	reason: string;
-	/** The review part and task or request the waived finding belongs to. */
-	reviewPartDigest?: string;
-	taskFingerprint?: string;
-	request?: string;
-}
-
 /** The anti-slop configuration (FR-55). */
 interface AntiSlopConfig {
 	mode: AntiSlopMode;
 }
 
-/** How often implementation is checked against the task direction. */
-interface CourseCheckConfig {
-	mode: "interval" | "completion";
-	interval: number;
-}
-
-/** Which boundaries hold work. Both are on by default; turning one off stops that boundary. */
-interface GateConfig {
-	mutation: boolean;
-	completion: boolean;
-}
 
 /** Session spend and the owner's balance snapshot; the public API exposes no balance endpoint. */
 export interface BillingConfig {
@@ -275,15 +250,8 @@ export interface BillingConfig {
 	outputCostPerMillion: number;
 }
 
-/**
- * Effective extension configuration plus the problems found while reading it. `gates` and
- * `courseCheck` tune one workflow and there is deliberately no mode: what a request is judged for is
- * read from the request itself (`screen.ts`) and the judge - not the configuration - decides how
- * deep it goes. Turning both gates off is how an owner asks for it to hold nothing.
- */
+/** Effective diagnostic preferences and problems found while reading them. */
 export interface JevConfig {
-	gates: GateConfig;
-	courseCheck: CourseCheckConfig;
 	antiSlop: AntiSlopConfig;
 	billing: BillingConfig;
 	problems: readonly string[];

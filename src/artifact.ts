@@ -8,6 +8,8 @@
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
+const artifactDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
 /** The session surface the artifact path is derived from. */
 interface ArtifactHost {
 	getArtifactsDir?(): string | null;
@@ -25,12 +27,12 @@ function localArtifactPath(host: ArtifactHost, name: string): string | null {
 	return join(tmpdir(), "omp-local", safe, name);
 }
 
-/** Read one artifact as UTF-8 text; null when it does not exist or cannot be read. */
+/** Read exact UTF-8 bytes as text; reject invalid encoding instead of normalizing the plan. */
 export async function readLocalArtifact(host: ArtifactHost, name: string): Promise<string | null> {
 	const path = localArtifactPath(host, name);
 	if (path === null) return null;
 	try {
-		return await Bun.file(path).text();
+		return artifactDecoder.decode(await Bun.file(path).arrayBuffer());
 	} catch {
 		return null;
 	}

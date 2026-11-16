@@ -15,6 +15,20 @@ describe("T3 - reading a session artifact (FR-07)", () => {
 		expect(await readLocalArtifact(host, "missing.md")).toBeNull();
 	});
 
+	test("plan approval sees a UTF-8 byte-order mark rather than silently changing the bytes", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "jev-artifact-bom-"));
+		await mkdir(join(dir, "local"), { recursive: true });
+		await writeFile(join(dir, "local", "plan.md"), "\uFEFF# plan\n", "utf8");
+		expect(await readLocalArtifact({ getArtifactsDir: () => dir }, "plan.md")).toBe("\uFEFF# plan\n");
+	});
+
+	test("invalid UTF-8 cannot be reviewed as a replacement-character plan", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "jev-artifact-invalid-"));
+		await mkdir(join(dir, "local"), { recursive: true });
+		await writeFile(join(dir, "local", "plan.md"), new Uint8Array([0xff, 0x23, 0x20]));
+		expect(await readLocalArtifact({ getArtifactsDir: () => dir }, "plan.md")).toBeNull();
+	});
+
 	test("a name that would escape the artifact root is refused", async () => {
 		const host = { getArtifactsDir: () => "/nowhere", getSessionId: () => "session-1" };
 

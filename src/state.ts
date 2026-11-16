@@ -5,13 +5,11 @@
  * Strict autonomous runs restore only validated ledger checkpoints and exact artifact bindings.
  */
 import { createHash } from "node:crypto";
-import { isDeepStrictEqual } from "node:util";
 import {
 	PLAN_BOUNDARY,
 	POLICY,
 	type AntiSlopFinding,
 	type AntiSlopReviewRecord,
-	type AntiSlopWaiver,
 	type Aspect,
 	type PlanOutlineStep,
 	type PlanTopic,
@@ -119,14 +117,6 @@ export interface RecoveryHold {
 	result?: unknown;
 }
 
-/** One Jev-approved corrective invocation; it grants no permission to any other payload. */
-export interface RepairPermit {
-	findingId: string;
-	tool: string;
-	input: Record<string, unknown>;
-	probability: number;
-	binding: string;
-}
 
 /** The source provenance the controller resolves before an activity reads its evidence. */
 export interface TrustedContext {
@@ -151,13 +141,57 @@ export interface ActivityCount {
 	fail: number;
 }
 
-/** Everything the gates read and write for one session. */
+export type DiagnosticKind = "passed" | "failed" | "inconclusive" | "unavailable" | "not_checked";
+export type DiagnosticCounts = Record<DiagnosticKind, number>;
+export interface SessionDiagnostics {
+	checks: DiagnosticCounts;
+	work: DiagnosticCounts;
+}
+
+const diagnosticCounts = (): DiagnosticCounts => ({
+	passed: 0, failed: 0, inconclusive: 0, unavailable: 0, not_checked: 0,
+});
+
+/** A check result is evidence, never execution permission. */
+export function recordDiagnostic(state: JevState, outcome: ToolOutcome, work = false): DiagnosticKind {
+	const details = asRecord(outcome.details);
+	const named = details?.["kind"];
+	const confidence = details?.["confidence"];
+	const unsettled = details?.["unsettled"];
+	const kind: DiagnosticKind =
+		details?.["skipped"] === true || details?.["prerequisite"] !== undefined ||
+		named === "invalid" || named === "stale" ? "not_checked" :
+		named === "unavailable" ? "unavailable" :
+		named === "unclear" || named === "unusable" || details?.["verdict"] === "unclear" ||
+		(Array.isArray(unsettled) && unsettled.length > 0) ||
+		(details?.["approved"] === false && typeof confidence === "number" && confidence < POLICY.minConfidenceToApprove) ? "inconclusive" :
+		!outcome.ok || details?.["approved"] === false || details?.["verdict"] === "revise" ||
+		details?.["blocked"] === true || (typeof details?.["blockers"] === "number" && details["blockers"] > 0) ? "failed" : "passed";
+	const diagnostics = state.diagnostics ??= { checks: diagnosticCounts(), work: diagnosticCounts() };
+	diagnostics.checks[kind] += 1;
+	if (work) diagnostics.work[kind] += 1;
+	return kind;
+}
+
+export function diagnosticSummary(state: JevState): string {
+	const render = (counts: DiagnosticCounts): string => {
+		const total = Object.values(counts).reduce((sum, count) => sum + count, 0);
+		return `${total} total; ${counts.passed} passed; ${counts.failed} failed; ${counts.inconclusive} inconclusive; ${counts.unavailable} unavailable; ${counts.not_checked} not checked`;
+	};
+	const diagnostics = state.diagnostics ?? { checks: diagnosticCounts(), work: diagnosticCounts() };
+	const accepted = (["business", "architecture"] as const).filter(aspect => acceptanceAt(state, aspect)?.approved === true);
+	return `Jev diagnostics, not execution permission. Work: ${render(diagnostics.work)}. Checks: ${render(diagnostics.checks)}. Current-revision acceptance: ${accepted.join(", ") || "none"}. Passed action checks do not prove a successful implementation. Findings never block continued work or completion.`;
+}
+
+/** Session workflow evidence and diagnostic history. */
 export interface JevState {
-	/** Strict autonomous policy never substitutes continuation permission for approval (FR-57). */
+	/** This session is supervised by the strict runtime's deterministic safety policy. */
 	autonomous?: true;
 	task?: TaskIdentity;
 	/** The approved obligations of the registered task. */
 	requirementsApproval?: { taskFingerprint: string; items: string[] };
+	/** FR-42: unaffected obligations remain accepted, but the amended set needs review. */
+	requirementsRetained?: { taskFingerprint: string; items: string[] };
 	/** The request triage confirmed simple: read-only work needs no deeper workflow, nothing more. */
 	simple?: TaskIdentity;
 	/**
@@ -177,10 +211,10 @@ export interface JevState {
 	actionsSinceCheck: number;
 	/** A course check is in flight; consequential changes wait for its verdict. */
 	checkPending?: PendingCheck;
-	/** A finding that holds consequential changes until a supported correction resolves it. */
+	/** First unresolved diagnostic; it never controls work permission. */
 	hold?: RecoveryHold;
-	/** A single corrective invocation approved while the rest of the finding remains held. */
-	repair?: RepairPermit;
+	/** Exact distinct failed-check records, retained for the session. */
+	findings?: RecoveryHold[];
 	/** Every authentic owner message of this session, in chronological order. */
 	ownerMessages: string[];
 	/** Complete owner messages not yet classified against the active task. */
@@ -217,18 +251,16 @@ export interface JevState {
 	completion?: CompletionRecord;
 	acceptance: AcceptanceRecord[];
 	stop?: StopRecord;
-	/** The owner's explicit, current-request permission to continue; never set by a count or a Jev approval. */
-	continuation?: { taskFingerprint?: string; request: string; reason: string };
 	/** Recorded external-artifact review parts, newest last (FR-45..FR-56). */
 	antiSlopReviews: AntiSlopReviewRecord[];
-	/** Owner waivers for individual anti-slop findings (FR-54). */
-	antiSlopWaivers: AntiSlopWaiver[];
 	/** The advisory anti-slop disclosure already sent for this revision and finding set. */
 	antiSlopNotice?: string;
 	/** Session-wide judge calls and token usage; it survives a task change. */
 	usage: SessionUsage;
 	/** Session-wide activity outcomes, keyed by tool name. */
 	stats: Record<string, ActivityCount>;
+	/** Session-wide diagnostic coverage, retained across task changes. */
+	diagnostics?: SessionDiagnostics;
 }
 
 export function freshState(): JevState {
@@ -244,22 +276,13 @@ export function freshState(): JevState {
 		refusedCalls: new Map(),
 		judgeFailures: 0,
 		antiSlopReviews: [],
-		antiSlopWaivers: [],
 		usage: { judgeCalls: 0, inputTokens: 0, outputTokens: 0 },
 		stats: {},
+		diagnostics: { checks: diagnosticCounts(), work: diagnosticCounts() },
+		findings: [],
 	};
 }
 
-export function allowContinuation(state: JevState, reason: string): void {
-	if (state.autonomous === true) return;
-	state.continuation = { taskFingerprint: state.task?.fingerprint, request: state.request?.text ?? "", reason };
-}
-
-export function continuationAllowed(state: JevState): boolean {
-	return state.autonomous !== true && state.continuation !== undefined &&
-		state.continuation.taskFingerprint === state.task?.fingerprint &&
-		state.continuation.request === (state.request?.text ?? "");
-}
 
 const RECOVERY_KINDS: Record<string, true> = {
 	refusal: true,
@@ -344,6 +367,7 @@ export function recordRecovery(
 		JSON.stringify({
 			task: state.task?.fingerprint ?? state.request?.text ?? null,
 			boundary: boundaryKey(boundary),
+			revision: state.revision,
 			material,
 		}),
 	);
@@ -351,6 +375,11 @@ export function recordRecovery(
 	// The exact returned text is the observable failure; the details stay alongside it so neither
 	// the validation/transport message nor the structured class is lost from the finding.
 	const result = { ...(details ?? {}), kind, text: outcome.text };
+	const finding: RecoveryHold = {
+		reason: summarizeRecovery(boundary, outcome), id, boundary, revision: state.revision, material, result,
+	};
+	const findings = state.findings ??= [];
+	if (!findings.some(entry => entry.id === id)) findings.push(finding);
 	if (state.hold !== undefined) {
 		if (state.hold.boundary === undefined || boundaryKey(state.hold.boundary) === boundaryKey(boundary)) {
 			state.hold = {
@@ -364,14 +393,7 @@ export function recordRecovery(
 		}
 		return state.hold;
 	}
-	state.hold = {
-		reason: summarizeRecovery(boundary, outcome),
-		id,
-		boundary,
-		revision: state.revision,
-		material,
-		result,
-	};
+	state.hold = finding;
 	return state.hold;
 }
 
@@ -380,60 +402,12 @@ export function recoveryHoldId(state: JevState): string | undefined {
 	return state.hold?.id;
 }
 
-/** What each recorded class establishes, so uncertainty is never read as a proven defect. */
-const RECOVERY_CLASS_GLOSS: Record<RecoveryKind, string> = {
-	refusal: "the judge answered and refused this material; the finding stands until it is materially corrected",
-	invalid: "the submission was malformed, so this is a local input problem and no judgment exists",
-	unavailable: "no judgment was obtained, so an outage establishes no defect and approves nothing",
-	unclear: "the answer settled neither side, so this is uncertainty, not a proven deviation",
-	defect: "a defect was established and stands until the material is corrected",
-	stale: "the answer was discarded as stale, so it is no finding and no current decision",
-};
-
-/**
- * The concise decisive feedback for the standing hold: the finding's identity and class, the
- * observable reason it was recorded, where its exact material remains readable, and one next step.
- * The exact refused submission and the returned result stay in the hold and in the jev_context list,
- * so they are never repeated here as a payload wall.
- */
+/** Original finding context remains inspectable without controlling execution. */
 export function recoveryFeedback(state: JevState): string {
-	const hold = state.hold;
-	if (hold === undefined) return "";
-	const recorded = asRecord(hold.result)?.["kind"];
-	const kind: RecoveryKind =
-		typeof recorded === "string" && RECOVERY_KINDS[recorded] === true ? (recorded as RecoveryKind) : "refusal";
-	const finding = hold.id ?? "(legacy finding without an id)";
-	const repair = state.repair === undefined ? undefined : permittedRepair(state, state.repair.tool, state.repair.input);
-	return [
-		`Finding ${finding} holds consequential work at boundary ${boundaryKey(hold.boundary ?? "hold")} (work revision ${hold.revision ?? state.revision}).`,
-		`Class: ${kind} - ${RECOVERY_CLASS_GLOSS[kind]}. Observable reason: ${hold.reason}.`,
-		`The exact refused submission and the returned result stay in this finding's structured details and in jev_context({"action":"list"}) under hold; read them there instead of repeating them.`,
-		"Evidence reads, diagnostic consultations, requirement/plan repairs and re-submission to the failed review remain open. A score alone does not explain a defect; do not invent its cause.",
-		repair === undefined
-			? `Next: inspect this finding and the approved plan. Use jev_consult with mode "recovery" and recovery.findingId "${finding}": phase "repair" authorizes one exact corrective {tool,input}, phase "resolve" clears the finding from observed proof. Neither phase needs a separate question.`
-			: `Next: execute exactly the approved repair ${repair.tool} with recovery.nextAction.input once. Any different payload still waits; the repair is not proof that the whole task is complete.`,
-		"Rewording the same proposal is not new evidence. An approved corrective invocation can run without an owner override; unresolved findings remain held.",
-		...(state.autonomous === true
-			? []
-			: ["The owner may permit continuation with /jev-continue or an explicit approval message; that permission is the owner's override, not Jev approval."]),
-	].join("\n");
-}
-
-/** Bind repair authority to the actual workflow, excluding transient source selections and counters. */
-export function repairBinding(state: JevState): string {
-	return sha256(JSON.stringify([
-		state.request, state.task, state.simple, state.revision, state.requirementsApproval,
-		state.plan, state.planTopics, state.planDraft, state.ownerMessages, state.pendingOwnerMessages,
-		state.actions, state.hold,
-	]));
-}
-
-/** A repair opens only its exact invocation, while the finding and governing state still match. */
-export function permittedRepair(state: JevState, tool: string, input: unknown): RepairPermit | undefined {
-	const repair = state.repair;
-	if (repair === undefined || repair.findingId !== state.hold?.id || repair.tool !== tool ||
-		!isDeepStrictEqual(repair.input, input) || repair.binding !== repairBinding(state)) return undefined;
-	return repair;
+	const finding = state.hold;
+	if (finding === undefined) return "";
+	const kind = asRecord(finding.result)?.["kind"] ?? "inconclusive";
+	return `Diagnostic finding ${finding.id ?? "(legacy)"} at ${finding.boundary ?? "check"}: ${kind}. ${finding.reason}. The original submission and result remain available through jev_context. Continue useful work; this finding grants no approval and blocks no action or completion.`;
 }
 
 /** Clear the hold only when the consultation names its exact finding id. */
@@ -452,7 +426,6 @@ export function clearResolvedHold(state: JevState, findingId: string): boolean {
 		delete state.stop;
 	}
 	delete state.hold;
-	delete state.repair;
 	return true;
 }
 
@@ -483,10 +456,10 @@ function clearWork(state: JevState): void {
 	delete state.task;
 	delete state.simple;
 	delete state.requirementsApproval;
+	delete state.requirementsRetained;
 	delete state.planDraft;
 	delete state.plan;
 	delete state.hold;
-	delete state.repair;
 	delete state.directionPending;
 	state.pendingOwnerMessages = [];
 	delete state.openItem;
@@ -495,7 +468,6 @@ function clearWork(state: JevState): void {
 	delete state.deviation;
 	delete state.completion;
 	delete state.stop;
-	delete state.continuation;
 	state.acceptance = [];
 	state.actions = [];
 	state.submissions = [];
@@ -503,7 +475,6 @@ function clearWork(state: JevState): void {
 	state.planTopics = [];
 	state.refusedCalls = new Map();
 	state.antiSlopReviews = [];
-	state.antiSlopWaivers = [];
 	delete state.antiSlopNotice;
 	state.revision = 0;
 	state.actionsSinceCheck = 0;
@@ -744,11 +715,6 @@ export function antiSlopScope(state: JevState): AntiSlopScope | undefined {
 	return undefined;
 }
 
-/** Whether the owner waived one finding id (FR-54). */
-export function antiSlopWaived(state: JevState, findingId: string): boolean {
-	return state.antiSlopWaivers.some(waiver => waiver.findingId === findingId);
-}
-
 /** Record one review part, replacing an earlier version of the same part. */
 export function recordAntiSlopReview(state: JevState, review: AntiSlopReviewRecord): void {
 	const samePart = (existing: AntiSlopReviewRecord): boolean =>
@@ -759,12 +725,6 @@ export function recordAntiSlopReview(state: JevState, review: AntiSlopReviewReco
 		-POLICY.maxAntiSlopReviews,
 	);
 	delete state.antiSlopNotice;
-}
-
-/** Record an owner waiver; a repeated waiver is one record. */
-export function recordAntiSlopWaiver(state: JevState, waiver: AntiSlopWaiver): void {
-	if (antiSlopWaived(state, waiver.findingId)) return;
-	state.antiSlopWaivers = [...state.antiSlopWaivers, waiver];
 }
 
 /** Find one recorded finding and the review part that carries it. */
@@ -805,9 +765,7 @@ export function antiSlopStatus(state: JevState, scope: AntiSlopScope): AntiSlopS
 		if (!byIndex.has(index)) missing.push(index);
 	}
 	const ordered = [...byIndex.values()].sort((left, right) => left.part.index - right.part.index);
-	const blockers = ordered.flatMap(review =>
-		review.findings.filter(finding => finding.severity === "blocker" && !antiSlopWaived(state, finding.id)),
-	);
+	const blockers = ordered.flatMap(review => review.findings.filter(finding => finding.severity === "blocker"));
 	const inconsistent = ordered.some(
 		review =>
 			review.language !== latest?.language ||

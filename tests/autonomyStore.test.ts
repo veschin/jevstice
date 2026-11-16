@@ -652,6 +652,10 @@ describe("create and restore", () => {
 					draft.status = "running";
 					draft.checkpoint.refusedCalls.set("plan", 2);
 					draft.checkpoint.actions.push({ tool: "write", target: "src/a.ts", excerpt: "changed" });
+					draft.checkpoint.diagnostics = {
+						checks: { passed: 1, failed: 2, inconclusive: 3, unavailable: 4, not_checked: 5 },
+						work: { passed: 6, failed: 7, inconclusive: 8, unavailable: 9, not_checked: 10 },
+					};
 				},
 				[{ kind: "progress", data: { step: 1 } }],
 				{ "local://a.txt": bytes },
@@ -666,9 +670,53 @@ describe("create and restore", () => {
 				expect(restored.sequence).toBe(updated.sequence);
 				expect(restored.checkpoint.refusedCalls).toBeInstanceOf(Map);
 				expect(restored.checkpoint.refusedCalls.get("plan")).toBe(2);
+				expect(restored.checkpoint.diagnostics?.work.not_checked).toBe(10);
+				expect(restored.checkpoint.diagnostics?.checks.unavailable).toBe(4);
 				expect(restored.artifacts["local://a.txt"]).toBe(digest);
 				expect([...(reopened.artifact(run.id, "local://a.txt") ?? [])]).toEqual([...bytes]);
 				expect(reopened.artifact(run.id, "local://missing.txt")).toBeNull();
+			} finally {
+				reopened.close();
+			}
+		});
+	});
+
+	test("the checkpoint preserves every independent recovery finding and refuses a malformed one", async () => {
+		await inFixture(async fixture => {
+			const run = create(fixture);
+			const claimed = claim(fixture.store, run.id);
+			const planFinding = {
+				reason: "the plan review did not approve the current bytes",
+				id: "finding-aaaaaaaaaaaa",
+				boundary: "jev_plan_review",
+				revision: 3,
+				material: "{\"phase\":\"finalize\"}",
+				result: { kind: "unclear", text: "the finalize section is not reviewable" },
+			};
+			const acceptanceFinding = {
+				reason: "the business acceptance was unavailable",
+				id: "finding-bbbbbbbbbbbb",
+				boundary: "jev_acceptance",
+				revision: 4,
+				material: "{\"aspect\":\"business\"}",
+				result: { kind: "unavailable", text: "the judge transport failed" },
+			};
+			fixture.store.update(run.id, { epoch: claimed.epoch }, draft => {
+				draft.checkpoint.findings = [planFinding, acceptanceFinding];
+				draft.checkpoint.hold = planFinding;
+			}, []);
+			fixture.store.close();
+
+			const reopened = openAutonomyStore(fixture.file);
+			try {
+				const restored = reopened.read(run.id);
+				// Both independent findings survive close/reopen; the first unresolved advisory stays
+				// the hold, and neither record is collapsed into the other.
+				expect(restored.checkpoint.findings).toEqual([planFinding, acceptanceFinding]);
+				expect(restored.checkpoint.hold).toEqual(planFinding);
+				expect(() => reopened.update(run.id, { epoch: claimed.epoch }, draft => {
+					draft.checkpoint.findings = [{ reason: 7 } as unknown as typeof planFinding];
+				}, [])).toThrow("checkpoint.findings[0].reason must be a string");
 			} finally {
 				reopened.close();
 			}
@@ -1527,25 +1575,25 @@ describe("transactional updates and artifacts", () => {
 });
 
 describe("completion proof", () => {
-	test("completion is refused until current business, architecture and completion approvals exist", async () => {
+	test("completion requires settled effects and actual state, not Jev verdicts", async () => {
 		await inFixture(async fixture => {
 			const run = create(fixture);
 			const claimed = claim(fixture.store, run.id);
 
+			// A pending effect is the actual completion boundary.
 			expect(() =>
 				fixture.store.update(run.id, { epoch: claimed.epoch }, draft => {
+					draft.pending["call-1"] = {
+						id: "call-1", kind: "tool", payload: { tool: "write" }, revision: 0, createdAt: Date.now(),
+					};
 					draft.status = "completed";
 				}),
-			).toThrow(/completion is not proved/);
+			).toThrow(/completion is not proved|pending effects/);
 			expect(fixture.store.read(run.id).status).toBe("ready");
 
 			const completed = fixture.store.update(run.id, { epoch: claimed.epoch }, draft => {
+				// No requirements, plan, acceptance or completion verdict exists: Jev is diagnostic.
 				draft.checkpoint.revision = 2;
-				draft.checkpoint.completion = { revision: 2, label: "follows", approved: true, confidence: 0.9 };
-				draft.checkpoint.acceptance = [
-					{ aspect: "business", revision: 2, label: "serves", approved: true, confidence: 0.9 },
-					{ aspect: "architecture", revision: 2, label: "fits", approved: true, confidence: 0.9 },
-				];
 				draft.status = "completed";
 			});
 			expect(completed.status).toBe("completed");
@@ -1561,7 +1609,7 @@ describe("completion proof", () => {
 		});
 	});
 
-	test("a hand-forged completed row is rejected on read", async () => {
+	test("a hand-forged completed row with a pending effect is rejected on read", async () => {
 		await inFixture(async fixture => {
 			const run = create(fixture);
 			const raw = new Database(fixture.file, { strict: true });
@@ -1570,6 +1618,7 @@ describe("completion proof", () => {
 				if (row === null) throw new Error("run row missing");
 				const body: Record<string, unknown> = JSON.parse(row.body);
 				body.status = "completed";
+				body.pending = { "call-1": { id: "call-1", kind: "tool", payload: {}, revision: 0, createdAt: Date.now() } };
 				const forged = JSON.stringify(body);
 				raw.query("UPDATE runs SET body = ?, digest = ?, status = 'completed' WHERE id = ?").run(forged, sha256(forged), run.id);
 			} finally {

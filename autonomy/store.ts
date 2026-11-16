@@ -22,7 +22,7 @@ import {
 	statSync,
 } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
-import { acceptanceAt, antiSlopScope, antiSlopStatus, freshState, sha256, type JevState } from "../src/state.js";
+import { freshState, sha256, type JevState } from "../src/state.js";
 import { asRecord } from "../src/types.js";
 import {
 	assertAutonomyScope,
@@ -651,13 +651,14 @@ function validateAntiSlopReview(value: unknown, what: string): void {
 	);
 }
 
-function validateWaiver(value: unknown, what: string): void {
-	const waiver = record(value, what);
-	text(waiver.findingId, `${what}.findingId`);
-	text(waiver.reason, `${what}.reason`);
-	if (waiver.reviewPartDigest !== undefined) text(waiver.reviewPartDigest, `${what}.reviewPartDigest`);
-	if (waiver.taskFingerprint !== undefined) text(waiver.taskFingerprint, `${what}.taskFingerprint`);
-	if (waiver.request !== undefined) text(waiver.request, `${what}.request`);
+const DIAGNOSTIC_KINDS = ["passed", "failed", "inconclusive", "unavailable", "not_checked"] as const;
+
+function validateDiagnostics(value: unknown, what: string): void {
+	const diagnostics = record(value, what);
+	for (const group of ["checks", "work"] as const) {
+		const counts = record(diagnostics[group], `${what}.${group}`);
+		for (const kind of DIAGNOSTIC_KINDS) integer(counts[kind], `${what}.${group}.${kind}`);
+	}
 }
 
 function validateStats(value: unknown): Record<string, { ok: number; fail: number }> {
@@ -672,6 +673,20 @@ function validateStats(value: unknown): Record<string, { ok: number; fail: numbe
 		};
 	}
 	return result;
+}
+
+/**
+ * One recovery finding. The legacy `{reason}` shape and the identity-bearing record are both
+ * readable; `result` is the exact returned details object, so its inner shape is not re-invented
+ * here (the checkpoint encoding already requires JSON-representable data).
+ */
+function validateRecoveryHold(value: unknown, what: string): void {
+	const hold = record(value, what);
+	text(hold.reason, `${what}.reason`);
+	if (hold.id !== undefined) text(hold.id, `${what}.id`);
+	if (hold.boundary !== undefined) text(hold.boundary, `${what}.boundary`);
+	if (hold.revision !== undefined) integer(hold.revision, `${what}.revision`);
+	if (hold.material !== undefined) text(hold.material, `${what}.material`);
 }
 
 /**
@@ -722,7 +737,12 @@ function decodeCheckpoint(value: unknown): JevState {
 	array(state.planTopics, "checkpoint.planTopics").forEach((topic, index) =>
 		validatePlanTopic(topic, `checkpoint.planTopics[${index}]`),
 	);
-	if (state.hold !== undefined) text(record(state.hold, "checkpoint.hold").reason, "checkpoint.hold.reason");
+	if (state.hold !== undefined) validateRecoveryHold(state.hold, "checkpoint.hold");
+	if (state.findings !== undefined) {
+		array(state.findings, "checkpoint.findings").forEach((finding, index) =>
+			validateRecoveryHold(finding, `checkpoint.findings[${index}]`),
+		);
+	}
 	if (state.directionPending !== undefined) {
 		text(record(state.directionPending, "checkpoint.directionPending").text, "checkpoint.directionPending.text");
 	}
@@ -759,19 +779,8 @@ function decodeCheckpoint(value: unknown): JevState {
 		text(stop.signature, "checkpoint.stop.signature");
 		integer(stop.blocks, "checkpoint.stop.blocks");
 	}
-	if (state.continuation !== undefined) {
-		const continuation = record(state.continuation, "checkpoint.continuation");
-		if (continuation.taskFingerprint !== undefined) {
-			text(continuation.taskFingerprint, "checkpoint.continuation.taskFingerprint");
-		}
-		text(continuation.request, "checkpoint.continuation.request");
-		text(continuation.reason, "checkpoint.continuation.reason");
-	}
 	array(state.antiSlopReviews, "checkpoint.antiSlopReviews").forEach((review, index) =>
 		validateAntiSlopReview(review, `checkpoint.antiSlopReviews[${index}]`),
-	);
-	array(state.antiSlopWaivers, "checkpoint.antiSlopWaivers").forEach((waiver, index) =>
-		validateWaiver(waiver, `checkpoint.antiSlopWaivers[${index}]`),
 	);
 	if (state.antiSlopNotice !== undefined) text(state.antiSlopNotice, "checkpoint.antiSlopNotice");
 	const usage = record(state.usage, "checkpoint.usage");
@@ -779,6 +788,7 @@ function decodeCheckpoint(value: unknown): JevState {
 	integer(usage.inputTokens, "checkpoint.usage.inputTokens");
 	integer(usage.outputTokens, "checkpoint.usage.outputTokens");
 	const stats = validateStats(state.stats);
+	if (state.diagnostics !== undefined) validateDiagnostics(state.diagnostics, "checkpoint.diagnostics");
 	const decoded: Record<string, unknown> = { ...state, refusedCalls: refusedCallsOf(state.refusedCalls), stats };
 	delete decoded.checkPending;
 	return decoded as unknown as JevState;
@@ -1080,29 +1090,17 @@ function validateRun(value: unknown): AutonomyRun {
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * Why a completed status is not proved, or undefined when it is. The proof is the current recorded
- * completion verdict, both acceptance aspects at the current revision and, for an external
- * deliverable, a complete review of the current bytes. A flag alone never completes a run.
+ * Why a completed status is not proved, or undefined when it is. Completion is an actual-state
+ * invariant: every committed effect must have been observed or reconciled, no wake may still be
+ * queued, and the checkpoint must belong to an autonomous run. Jev verdicts (requirements, plan,
+ * acceptance, anti-slop, completion judgment) are diagnostics recorded elsewhere; they are never
+ * completion proof and never block a model's terminal completion.
  */
 function completionProblem(run: AutonomyRun): string | undefined {
 	if (Object.keys(run.pending).length > 0) return "pending effects have no observed result";
 	if (run.wake !== undefined) return "a queued wake remains";
 	const state = run.checkpoint;
-	if (state.judgeUnavailable === true) return "judgment is unavailable";
-	if (state.hold !== undefined) return "an open finding still holds the run";
-	if (state.directionPending !== undefined) return "the task direction is unreviewed";
-	const completion = state.completion;
-	if (completion === undefined || completion.approved !== true || completion.revision !== state.revision) {
-		return "the completion check did not approve the current revision";
-	}
-	const missing = (["business", "architecture"] as const).filter(
-		aspect => acceptanceAt(state, aspect)?.approved !== true,
-	);
-	if (missing.length > 0) return `acceptance has not passed for ${missing.join(" and ")}`;
-	const scope = antiSlopScope(state);
-	if (scope !== undefined && !scope.quiet) {
-		if (!antiSlopStatus(state, scope).complete) return "the external deliverable review is incomplete";
-	}
+	if (state.autonomous !== true) return "the checkpoint does not belong to an autonomous run";
 	return undefined;
 }
 

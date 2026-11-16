@@ -1,13 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { actionCheck, antiSlop, triage } from "../src/activities.js";
-import { completionGate } from "../src/gates.js";
 import {
 	antiSlopStatus,
 	freshState,
 	recordAcceptance,
 	recordAction,
 	recordAntiSlopReview,
-	recordAntiSlopWaiver,
 	registerSimple,
 	registerTask,
 	type JevState,
@@ -29,11 +27,11 @@ const ARTIFACT = [
 	"The supplier is therefore liable for delay.",
 ].join(" ");
 
-function config(mode: "off" | "advisory" | "enforce" = "advisory"): JevConfig {
+function config(mode: "off" | "advisory" = "advisory"): JevConfig {
 	return { ...boundaryConfig(), antiSlop: { mode } };
 }
 
-function depsFor(table: Record<string, FakeAnswerSource>, mode: "off" | "advisory" | "enforce" = "advisory") {
+function depsFor(table: Record<string, FakeAnswerSource>, mode: "off" | "advisory" = "advisory") {
 	const fake = answeringJudge(table);
 	return { deps: { judge: fake.judge, config: config(mode) }, calls: fake.calls };
 }
@@ -316,7 +314,7 @@ describe("FR-56 - fail-closed and part coverage", () => {
 
 	test("a judge failure records no review and no trusted mark", async () => {
 		const state = externalState();
-		const deps = { judge: failingJudge("offline"), config: config("enforce") };
+		const deps = { judge: failingJudge("offline"), config: config("advisory") };
 		const outcome = await antiSlop(deps, state, params());
 
 		expect(outcome.ok).toBe(false);
@@ -334,7 +332,6 @@ describe("FR-56 - fail-closed and part coverage", () => {
 			language: "en",
 			register: "formal",
 			rulesDigest: "r",
-			mode: "enforce" as const,
 			claims: [],
 			inferences: [],
 			findings: [],
@@ -386,7 +383,7 @@ describe("FR-20, FR-21, FR-46, FR-53 - judgment recovery and review freshness", 
 			attempts += 1;
 			return offline ? { ok: false, kind: "unavailable", problem: "offline" } : fake.judge(material, questions);
 		};
-		const deps = { judge, config: config("enforce") };
+		const deps = { judge, config: config("advisory") };
 		const input = params();
 
 		const first = await antiSlop(deps, state, input);
@@ -410,7 +407,7 @@ describe("FR-20, FR-21, FR-46, FR-53 - judgment recovery and review freshness", 
 				inference_1: { label: "follows", confidence: 0.95 },
 				...CLEAN_FRAGMENT,
 			},
-			"enforce",
+			"advisory",
 		);
 		expect((await antiSlop(clean.deps, state, params({ part: { index: 1, total: 2 } }))).ok).toBe(true);
 		expect((await antiSlop(clean.deps, state, params({ part: { index: 2, total: 2 } }))).ok).toBe(true);
@@ -434,7 +431,7 @@ describe("FR-20, FR-21, FR-46, FR-53 - judgment recovery and review freshness", 
 		expect(antiSlopStatus(state, scope).complete).toBe(true);
 
 		const changed = `${ARTIFACT} The supplier also insures the shipment.`;
-		const failing = { judge: failingJudge("offline"), config: config("enforce") };
+		const failing = { judge: failingJudge("offline"), config: config("advisory") };
 		const failed = await antiSlop(failing, state, params({ artifact: changed, part: { index: 1, total: 2 } }));
 		expect(failed.ok).toBe(false);
 
@@ -457,7 +454,7 @@ describe("FR-20, FR-21, FR-46, FR-53 - judgment recovery and review freshness", 
 				claim_2: { label: "refuted", confidence: 0.95 },
 				...CLEAN_FRAGMENT,
 			},
-			"enforce",
+			"advisory",
 		);
 		const first = await antiSlop(deps, state, params({ claims: [CLAIM_1, CLAIM_2], inferences: [] }));
 		if (!first.ok) throw new Error(first.text);
@@ -504,7 +501,7 @@ describe("FR-20, FR-21, FR-46, FR-53 - judgment recovery and review freshness", 
 		};
 		const { deps, calls } = depsFor(
 			{ claim_1: { label: "supported", confidence: 0.95 }, ...CLEAN_FRAGMENT },
-			"enforce",
+			"advisory",
 		);
 
 		const outcome = await antiSlop(deps, state, params({ claims: [selfClaim], inferences: [] }));
@@ -524,7 +521,15 @@ describe("FR-20, FR-21, FR-46, FR-53 - judgment recovery and review freshness", 
 	});
 });
 
-describe("FR-55 - enforcement, waiver and advisory default", () => {
+describe("FR-55 - review status and advisory default", () => {
+	function scopeOf(state: JevState) {
+		return {
+			taskFingerprint: state.task?.fingerprint ?? state.simple?.fingerprint,
+			request: REQUEST,
+			revision: state.revision,
+			quiet: false,
+		};
+	}
 	function acceptedState(): JevState {
 		const state = externalState();
 		recordAction(state, { tool: "write", target: "memo.md", excerpt: "memo" });
@@ -545,18 +550,17 @@ describe("FR-55 - enforcement, waiver and advisory default", () => {
 		return state;
 	}
 
-	test("enforce holds completion without a review, and a blocker holds it until the owner waives it", async () => {
+	test("advisory records an incomplete review and keeps a blocker recorded as a diagnostic", async () => {
 		const state = acceptedState();
-		const missing = completionGate(state, config("enforce"));
-		expect(missing.applies).toBe(true);
-		expect(missing.reason).toContain("anti-slop");
+		const missing = antiSlopStatus(state, scopeOf(state));
+		expect(missing.complete).toBe(false);
 
 		const { deps } = depsFor(
 			{
 				claim_1: { label: "refuted", confidence: 0.95 },
 				...CLEAN_FRAGMENT,
 			},
-			"enforce",
+			"advisory",
 		);
 		const outcome = await antiSlop(
 			deps,
@@ -573,22 +577,19 @@ describe("FR-55 - enforcement, waiver and advisory default", () => {
 		const findingId = finding?.["id"];
 		expect(typeof findingId).toBe("string");
 
-		const blocked = completionGate(state, config("enforce"));
-		expect(blocked.reason).toContain(String(findingId));
+		const blocked = antiSlopStatus(state, scopeOf(state));
+		expect(blocked.blockers.map(entry => entry.id)).toContain(String(findingId));
 
-		recordAntiSlopWaiver(state, { findingId: String(findingId), reason: "owner accepted the risk" });
-		const waived = completionGate(state, config("enforce"));
-		expect(waived.reason ?? "").not.toContain("anti-slop");
+		const stillRecorded = antiSlopStatus(state, scopeOf(state));
+		expect(stillRecorded.blockers.map(entry => entry.id)).toContain(String(findingId));
 	});
 
-	test("enforce holds a simple external completion until the review exists", () => {
+	test("a simple external deliverable has no complete review until one is recorded", () => {
 		const state = freshState();
 		state.request = { text: REQUEST, weight: "judged" };
 		registerSimple(state, REQUEST, true);
 
-		const missing = completionGate(state, config("enforce"));
-		expect(missing.applies).toBe(true);
-		expect(missing.reason).toContain("anti-slop");
+		expect(antiSlopStatus(state, scopeOf(state)).complete).toBe(false);
 
 		recordAntiSlopReview(state, {
 			taskFingerprint: state.simple?.fingerprint,
@@ -601,10 +602,10 @@ describe("FR-55 - enforcement, waiver and advisory default", () => {
 			rulesDigest: "r",
 			findings: [],
 		});
-		expect(completionGate(state, config("enforce")).applies).toBe(false);
+		expect(antiSlopStatus(state, scopeOf(state)).complete).toBe(true);
 	});
 
-	test("advisory reports the finding without holding completion", async () => {
+	test("advisory reports the finding without touching completion", async () => {
 		const state = acceptedState();
 		const { deps } = depsFor({
 			claim_1: { label: "refuted", confidence: 0.95 },
@@ -613,8 +614,8 @@ describe("FR-55 - enforcement, waiver and advisory default", () => {
 		const outcome = await antiSlop(deps, state, params({ claims: [CLAIM_2], inferences: [] }));
 		if (!outcome.ok) throw new Error(outcome.text);
 
-		const gate = completionGate(state, config("advisory"));
-		expect(gate.reason ?? "").not.toContain("anti-slop");
+		expect(outcome.details["blocked"]).toBe(true);
+		expect(state.completion).toBeUndefined();
 	});
 });
 
@@ -640,7 +641,7 @@ describe("FR-55 - an external delivery waits for a complete review", () => {
 				action: { label: "on_course", confidence: 0.95 },
 				external_delivery: { label: "delivers", confidence: 0.95 },
 			},
-			"enforce",
+			"advisory",
 		);
 
 		const withoutReview = await actionCheck(deps, state, {
@@ -657,7 +658,7 @@ describe("FR-55 - an external delivery waits for a complete review", () => {
 				action: { label: "on_course", confidence: 0.95 },
 				external_delivery: { label: "does_not_deliver", confidence: 0.95 },
 			},
-			"enforce",
+			"advisory",
 		);
 		const localWrite = await actionCheck(local.deps, state, {
 			tool: "write",
@@ -724,7 +725,7 @@ describe("FR-63 - strict delivery preserves the reviewed content", () => {
 			state.autonomous = true;
 			state.plan = { taskFingerprint: state.task?.fingerprint ?? "", planUrl: "local://plan.md", planDigest: "bound" };
 			state.planTopics = [{ id: "deliver", section: "# Deliver the reviewed memo", paths: ["memo.md"], requirement: REQUEST }];
-			const review = depsFor({ ...CLEAN_FRAGMENT, claim_1: { label: "supported", confidence: 0.99 } }, "enforce");
+			const review = depsFor({ ...CLEAN_FRAGMENT, claim_1: { label: "supported", confidence: 0.99 } }, "advisory");
 			const reviewed = await antiSlop(review.deps, state, params({ claims: [CLAIM_1], inferences: [] }));
 			if (!reviewed.ok) throw new Error(reviewed.text);
 			const action = depsFor({
@@ -732,7 +733,7 @@ describe("FR-63 - strict delivery preserves the reviewed content", () => {
 				within_authority: { probability: 0.99 },
 				external_delivery: { label: "delivers", confidence: 0.99 },
 				reviewed_delivery: { probability: scenario.matches },
-			}, "enforce");
+			}, "advisory");
 			const deps = {
 				...action.deps,
 				judge: async (material: unknown, questions: Parameters<Judge>[1]) => {

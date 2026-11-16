@@ -8,8 +8,10 @@
  * workspace, and reads the committed run, journal and artifacts back through the real
  * `openAutonomyStore`. Every scenario asserts status, ledger, bytes, process and admission facts;
  * nothing is faked, and a missing real host/provider is a stated prerequisite (exit 78), never a
- * pass. The deterministic storage/driver/coordinator behavior lives in the unit tests; this file
- * only exercises what needs a real omp, a real judge and real processes.
+ * pass. Jev verdicts are diagnostics: a scenario never requires an approval, and a negative or
+ * unavailable judge answer must not stop the work it observes. The deterministic storage/driver/
+ * coordinator behavior lives in the unit tests; this file only exercises what needs a real omp, a
+ * real judge and real processes.
  *
  *   bun tools/autonomy-smoke.ts [--scenario all|list|name,...] [--model ID] [--omp PATH]
  *                               [--deadline SECONDS] [--out DIR] [--keep] [--list]
@@ -69,6 +71,8 @@ const CRASH_EFFECT_BYTES = "jev-autonomy-crash-effect-v1\n";
 const NOTES_BYTES = "startup-context-ok\n";
 const CANCEL_BYTES = "jev-autonomy-cancel-v1\n";
 const ASYNC_BYTES = "jev-autonomy-async-v1\n";
+const DIAGNOSTICS_BYTES = "jev-autonomy-diagnostics-v1\n";
+const KEEPALIVE_BYTES = "jev-autonomy-admission-v1\n";
 
 const DEFAULT_DEADLINE_SECONDS = 1200;
 const MAX_EVIDENCE_STRING = 8000;
@@ -684,8 +688,8 @@ function completionObjective(): string {
 		`Verify it with the command \`sha256sum autonomy-smoke.txt\` and record the output as execution evidence. The expected SHA-256 is ${sha256Hex(COMPLETION_BYTES)}.`,
 		`Also run \`wc -c autonomy-smoke.txt\`; it must report ${Buffer.byteLength(COMPLETION_BYTES, "utf8")} bytes.`,
 		"Write a small Bun script verify-autonomy-smoke.ts that reads autonomy-smoke.txt and exits non-zero unless its bytes are exactly the expected ones, then run it with `bun run verify-autonomy-smoke.ts`.",
-		"Keep project-file changes inside this workspace; use local:// for the private Jev plan and required workflow artifacts. Do not publish anything or install a service.",
-		"Work autonomously with the normal Jev requirements, plan review and acceptance workflow: there is no human to answer questions, and this run must finish on its own.",
+		"Keep project-file changes inside this workspace. Do not publish anything or install a service.",
+		"Work autonomously and finish on your own: there is no human to answer questions. Jev requirements, plan review and acceptance are optional diagnostics; a missing or negative Jev answer never blocks safe work or completion, so never wait for one.",
 	].join("\n");
 }
 
@@ -693,39 +697,53 @@ function startupObjective(): string {
 	return [
 		`Read the file notes.txt in the current workspace and confirm its only line is ${show(NOTES_BYTES)}.`,
 		"Do not modify any project file and do not publish anything.",
-		"Work autonomously with the normal Jev workflow; there is no human to answer questions.",
+		"Work autonomously; Jev diagnostics are optional and there is no human to answer questions.",
 	].join("\n");
 }
 
 function cancelObjective(): string {
 	return [
 		`Create the file autonomy-cancel.txt in the current workspace with exactly these bytes (UTF-8): ${show(CANCEL_BYTES)}.`,
-		"After the ordinary Jev plan approval, run exactly this shell command in the current workspace, in the foreground, without background jobs:",
+		"Run exactly this shell command in the current workspace, in the foreground, without background jobs:",
 		"sh cancel-effect.sh",
 		"The workspace already contains cancel-effect.sh; do not rewrite or modify it. It writes autonomy-cancel.txt and then keeps running a long native effect.",
 		`After it finishes, verify autonomy-cancel.txt contains exactly ${show(CANCEL_BYTES)}.`,
-		"Keep project-file changes inside this workspace; use local:// for private Jev workflow artifacts. Do not publish anything.",
-		"Work autonomously with the normal Jev workflow; there is no human to answer questions.",
+		"Keep project-file changes inside this workspace. Do not publish anything.",
+		"Work autonomously; Jev diagnostics are optional, need no approval, and there is no human to answer questions.",
 	].join("\n");
 }
 
 function crashObjective(): string {
 	return [
-		`First create the session artifact local://crash-marker.txt with the \`write\` tool (path exactly local://crash-marker.txt) and exactly these bytes (UTF-8) and nothing else: ${show(CRASH_MARKER_BYTES)}. Checkpoint it through the ordinary Jev workflow and never rewrite it.`,
+		`First create the session artifact local://crash-marker.txt with the \`write\` tool (path exactly local://crash-marker.txt) and exactly these bytes (UTF-8) and nothing else: ${show(CRASH_MARKER_BYTES)}. Never rewrite it.`,
 		"Then run exactly this shell command in the current workspace, in the foreground, without background jobs:",
 		"sh crash-effect.sh",
 		"The workspace already contains crash-effect.sh; do not rewrite or modify it. It writes crash-effect.txt and then keeps running a long native effect.",
 		`After it finishes, verify crash-effect.txt contains exactly ${show(CRASH_EFFECT_BYTES)} and verify local://crash-marker.txt still has its exact bytes.`,
-		"Then finish the task with the normal Jev requirements, plan review, acceptance and completion workflow.",
-		"Keep project-file changes inside this workspace; use local:// for private Jev workflow artifacts. Do not publish anything or install a service. Work autonomously: there is no human to answer questions.",
+		"Keep project-file changes inside this workspace. Do not publish anything or install a service.",
+		"Work autonomously: Jev requirements, plan review, acceptance and completion checks are optional diagnostics that never gate safe work or completion, and there is no human to answer questions.",
+	].join("\n");
+}
+
+function diagnosticsObjective(): string {
+	return [
+		`Create the file diag-report.txt in the current workspace with exactly these bytes (UTF-8) and nothing else: ${show(DIAGNOSTICS_BYTES)}.`,
+		"Then call the jev_requirements tool exactly once for this objective. Treat its answer strictly as a diagnostic for the owner: do not wait for it, do not treat a negative or unavailable answer as a blocker, and do not redo correct work because of it.",
+		`Verify the file with \`sha256sum diag-report.txt\` and finish. The expected SHA-256 is ${sha256Hex(DIAGNOSTICS_BYTES)}.`,
+		"Keep project-file changes inside this workspace. Do not publish anything.",
+		"Work autonomously; there is no human to answer questions and Jev results never gate safe work or completion.",
 	].join("\n");
 }
 
 function admissionObjective(): string {
 	return [
-		`Read the file notes.txt in the current workspace and report its only line ${show(NOTES_BYTES)}.`,
-		"Do not modify any file and do not publish anything.",
-		"Work autonomously with the normal Jev workflow; there is no human to answer questions.",
+		`Create the file admission-keepalive.txt in the current workspace with exactly these bytes (UTF-8): ${show(KEEPALIVE_BYTES)}.`,
+		"Run exactly this shell command in the current workspace, in the foreground, without background jobs:",
+		"sh admission-keepalive.sh",
+		"The workspace already contains admission-keepalive.sh; do not rewrite or modify it. It writes admission-keepalive.txt and then keeps running a long native effect, so the run stays active while the operator checks root admission.",
+		`After it finishes, verify admission-keepalive.txt contains exactly ${show(KEEPALIVE_BYTES)}.`,
+		"Do not publish anything.",
+		"Work autonomously; Jev diagnostics are optional and there is no human to answer questions.",
 	].join("\n");
 }
 
@@ -739,13 +757,13 @@ function asyncObjective(delivery: AsyncDelivery): string {
 	return [
 		`Create the file async-effect.txt in the current workspace with exactly these bytes (UTF-8) and nothing else: ${show(ASYNC_BYTES)}.`,
 		"The workspace already contains async-effect.sh; do not rewrite or modify it. It writes async-effect.txt, then runs a real native /usr/bin/sleep 70, then verifies its own bytes.",
-		"After the ordinary Jev plan approval, run exactly this shell command in the current workspace, in the foreground, by calling the bash tool with the timeout parameter set to 120 and without backgrounding it yourself:",
+		"Run exactly this shell command in the current workspace, in the foreground, by calling the bash tool with the timeout parameter set to 120 and without backgrounding it yourself:",
 		"sh async-effect.sh",
 		"If the bash tool reports that the command was backgrounded as a job, do not claim completion. Immediately attempt exactly one probe call with the bash tool, `sh async-extra.sh`, and never retry it; the runtime must refuse that effect while the first one is unobserved. Apart from that single probe attempt, do not run any other consequential command until the native terminal result arrives.",
 		settlement,
 		`After the background result arrives, verify async-effect.txt contains exactly ${show(ASYNC_BYTES)} with \`sha256sum async-effect.txt\` and record the digest. The expected SHA-256 is ${sha256Hex(ASYNC_BYTES)}.`,
-		"Keep project-file changes inside this workspace; use local:// for private Jev workflow artifacts. Do not publish anything.",
-		"Work autonomously with the normal Jev workflow; there is no human to answer questions.",
+		"Keep project-file changes inside this workspace. Do not publish anything.",
+		"Work autonomously; Jev diagnostics are optional, need no approval, and there is no human to answer questions.",
 	].join("\n");
 }
 
@@ -755,7 +773,7 @@ function writeAsyncExtra(ctx: ScenarioContext): void {
 }
 
 /**
- * Write the executable fixture inside the authorized workspace. The objective's judged shell
+ * Write the executable fixture inside the authorized workspace. The objective's recorded shell
  * command names only this relative script, so the policy can bound it to the root; the inspected
  * script bytes are what exec the real /usr/bin/sleep as a native detached descendant.
  */
@@ -946,7 +964,7 @@ export default function (pi) {
 			}
 		});
 		const text = JSON.stringify(payload ?? null);
-		if (!armed && text.includes("Workflow: the plan is approved at ")) armed = true;
+		if (!armed && text.includes("Jevstice autonomous runtime context. This is runtime data")) armed = true;
 		record({ kind: "before_provider_request", index: requests, armed, afterCompact: compacted, contexts, asyncJobs });
 	});
 	pi.on("context", event => {
@@ -960,7 +978,7 @@ export default function (pi) {
 				const content = typeof message.content === "string" ? message.content : "";
 				injected += 1;
 				contexts.push(content);
-				if (!armed && content.includes("Workflow: the plan is approved at ")) armed = true;
+				if (!armed && content.includes("Jevstice autonomous runtime context. This is runtime data")) armed = true;
 			}
 		}
 		record({ kind: "context", messages: messages.length, afterCompact: compacted, injected, contexts });
@@ -1523,13 +1541,17 @@ async function scenarioStartup(ctx: ScenarioContext): Promise<void> {
 		? decisionAnswers.map(entry => asRecord(entry)).find(answer => answer?.["name"] === typedAudience?.["name"])
 		: undefined;
 	const audienceLabel = audienceAnswer?.["label"];
+	const audienceFallback = decisionData?.["audienceFallback"];
+	const decisive = (audienceLabel === "external" || audienceLabel === "internal") && (audienceLabel === "external") === receipt?.external;
+	// A decisive typed classification and the deterministic internal fallback are both honest
+	// outcomes: an unavailable or unclear diagnostic must never strand the run, and neither one is
+	// an approval. Only a fabricated mismatch between the receipt and the journal is a failure.
+	const fallbackUsed = audienceFallback === "internal" && receipt?.external === false;
 	check(
 		ctx,
-		"the journaled initial batch carries a decisive typed external/internal audience choice",
-		typedAudience !== undefined &&
-			(audienceLabel === "external" || audienceLabel === "internal") &&
-			(audienceLabel === "external") === receipt?.external,
-		show({ question: typedAudience ?? null, answer: audienceAnswer ?? null, receipt: receipt ?? null }),
+		"the journaled initial batch carries either a decisive typed audience choice or the recorded deterministic fallback",
+		typedAudience !== undefined && (decisive || fallbackUsed),
+		show({ question: typedAudience ?? null, answer: audienceAnswer ?? null, fallback: audienceFallback ?? null, receipt: receipt ?? null }),
 	);
 	const decisionDigest = decisionData === undefined ? undefined : sha256Hex(JSON.stringify({
 		purpose: decisionData["purpose"],
@@ -1582,8 +1604,15 @@ async function scenarioStartup(ctx: ScenarioContext): Promise<void> {
 		typeof wakeDeadline === "number" && wakeDeadline > wakeCommit.run.createdAt,
 		show(commitData),
 	);
-	check(ctx, "wake.send followed the committed wake", lastEvent(wakeCommit.events, "wake.send") !== undefined);
-	const sendData = eventData(lastEvent(wakeCommit.events, "wake.send"));
+	const sent = await pollSnapshot(
+		ctx,
+		runId,
+		"wake.send for the committed wake",
+		Math.min(ctx.deadlineMs, 120_000),
+		snapshot => eventData(lastEvent(snapshot.events, "wake.send"))?.["wakeId"] === wakeId,
+	);
+	const sendData = eventData(lastEvent(sent.events, "wake.send"));
+	check(ctx, "wake.send followed the committed wake", sendData !== undefined, show(sendData ?? null));
 	check(
 		ctx,
 		"wake.send carries the same wake, epoch, generation and session",
@@ -1616,51 +1645,76 @@ async function scenarioStartup(ctx: ScenarioContext): Promise<void> {
 	const worked = await pollSnapshot(
 		ctx,
 		runId,
-		"real executor work after the acknowledged wake",
+		"real executor tool work after the acknowledged wake",
 		Math.min(ctx.deadlineMs, 600_000),
-		snapshot => {
-			const after = eventsAfter(snapshot.events, wakeSequence);
-			return after.some(event => event.kind === "judge.result");
-		},
+		snapshot => eventsAfter(snapshot.events, wakeSequence).some(event => {
+			const data = eventData(event);
+			return event.kind === "result.recorded" && data?.["source"] === "tool_result" && data?.["completed"] === true;
+		}),
 	);
+	const workEvent = eventsAfter(worked.events, wakeSequence).find(event => {
+		const data = eventData(event);
+		return event.kind === "result.recorded" && data?.["source"] === "tool_result" && data?.["completed"] === true;
+	});
+	const workData = eventData(workEvent);
 	check(
 		ctx,
-		"a post-wake executor decision actually reached Jev and returned",
-		worked.run.judgeCalls > running.run.judgeCalls,
-		`before ${running.run.judgeCalls}, after ${worked.run.judgeCalls}`,
+		"the acknowledged wake produced an actual durable executor tool result",
+		workEvent !== undefined && typeof workData?.["tool"] === "string",
+		show(workData ?? null),
 	);
 	// getSessionFile allocates a path before the native host materializes its lazy transcript.
 	// A completed assistant turn, not the initial get_state reply, establishes file persistence.
-	check(ctx, "the actual executor turn persisted its native session transcript", sessionFileExists(worked.run), worked.run.session?.file ?? "missing");
+	const persisted = await pollSnapshot(
+		ctx,
+		runId,
+		"native session transcript materialized",
+		Math.min(ctx.deadlineMs, 180_000),
+		snapshot => sessionFileExists(snapshot.run),
+	);
+	check(ctx, "the actual executor turn persisted its native session transcript", sessionFileExists(persisted.run), persisted.run.session?.file ?? "missing");
 	const judgeResult = eventData(lastEvent(worked.events, "judge.result"));
-	const judgeRequest = worked.events.find(event =>
-		event.kind === "judge.request" && eventData(event)?.["requestDigest"] === judgeResult?.["requestDigest"],
-	);
-	const requestData = eventData(judgeRequest);
-	const selectedInput = asRecord(requestData?.["request"]);
-	check(
-		ctx, "the durable judge request retains the exact selected input after the network call",
-		selectedInput !== undefined && sha256Hex(JSON.stringify(selectedInput)) === requestData?.["requestDigest"],
-		show({ requestSequence: judgeRequest?.sequence ?? null, requestDigest: requestData?.["requestDigest"] ?? null }),
-	);
-	const typedQuestions = requestData?.["questions"];
-	check(
-		ctx, "the durable judge request retains question meanings rather than names alone",
-		Array.isArray(typedQuestions) && typedQuestions.length > 0 &&
-			typedQuestions.every(question => {
-				const record = asRecord(question);
-				return typeof record?.["name"] === "string" && typeof record["mode"] === "string" &&
-					typeof record["instructions"] === "string";
-			}),
-	);
-	const typedOutcome = asRecord(judgeResult?.["outcome"]);
-	check(
-		ctx, "the durable result retains the actual typed judge outcome",
-		typedOutcome?.["ok"] === true && Array.isArray(typedOutcome["answers"]) &&
-			typedOutcome["answers"].length > 0,
-	);
+	if (judgeResult !== undefined) {
+		const judgeRequest = worked.events.find(event =>
+			event.kind === "judge.request" && eventData(event)?.["requestDigest"] === judgeResult?.["requestDigest"],
+		);
+		const requestData = eventData(judgeRequest);
+		const selectedInput = asRecord(requestData?.["request"]);
+		check(
+			ctx, "the durable judge request retains the exact selected input after the network call",
+			selectedInput !== undefined && sha256Hex(JSON.stringify(selectedInput)) === requestData?.["requestDigest"],
+			show({ requestSequence: judgeRequest?.sequence ?? null, requestDigest: requestData?.["requestDigest"] ?? null }),
+		);
+		const typedQuestions = requestData?.["questions"];
+		check(
+			ctx, "the durable judge request retains question meanings rather than names alone",
+			Array.isArray(typedQuestions) && typedQuestions.length > 0 &&
+				typedQuestions.every(question => {
+					const record = asRecord(question);
+					return typeof record?.["name"] === "string" && typeof record["mode"] === "string" &&
+						typeof record["instructions"] === "string";
+				}),
+		);
+		const typedOutcome = asRecord(judgeResult?.["outcome"]);
+		check(
+			ctx, "the durable result retains the actual typed judge outcome",
+			typedOutcome?.["ok"] === true && Array.isArray(typedOutcome["answers"]) &&
+				typedOutcome["answers"].length > 0,
+		);
+	}
 
-	await stopRun(ctx, runId, supervisor);
+	// The read-only objective can finish in its first turn. Completion is recorded by the runtime
+	// itself when no committed effect is unobserved, so the supervisor exits without an operator
+	// stop and without any Jev approval.
+	const settled = await waitForSupervisor(ctx, supervisor, runId, ctx.deadlineMs);
+	const cli = parseCliResult(settled);
+	check(ctx, "the supervisor exited 0 after the executor's turn", settled.exitCode === 0 && !settled.timedOut, `exit ${settled.exitCode}: ${settled.stderr.trim()}`);
+	check(ctx, "the startup run completed without a Jev approval", cli["status"] === "completed", show(cli));
+	const ended = snapshotOf(ctx.storePath, runId);
+	check(ctx, "store status is completed", ended.run.status === "completed", `${ended.run.status}: ${ended.run.waiting?.reason ?? ""}`);
+	check(ctx, "completed run has no pending effect", Object.keys(ended.run.pending).length === 0, show(Object.keys(ended.run.pending)));
+	check(ctx, "completed run retains no wake", ended.run.wake === undefined, show(ended.run.wake));
+	checkAuthority(ctx, ended.run);
 }
 
 async function scenarioCompletion(ctx: ScenarioContext): Promise<void> {
@@ -1679,25 +1733,40 @@ async function scenarioCompletion(ctx: ScenarioContext): Promise<void> {
 	check(ctx, "completed run retains no wake", run.wake === undefined, show(run.wake));
 	const business = acceptanceAt(run.checkpoint, "business");
 	const architecture = acceptanceAt(run.checkpoint, "architecture");
-	check(ctx, "business acceptance is approved at the current revision", business?.approved === true && business.revision === run.checkpoint.revision, show(business));
+	// Requirements, plan, acceptance, anti-slop and completion checks are diagnostics for the owner.
+	// Completion is proved by the actual bytes, the durable terminal status and the absence of
+	// unobserved effects, not by a Jev verdict. A retained verdict must still belong to the current
+	// revision, so a stale approval is never presented as current evidence.
 	check(
 		ctx,
-		"architecture acceptance is approved at the current revision",
-		architecture?.approved === true && architecture.revision === run.checkpoint.revision,
-		show(architecture),
+		"any retained acceptance verdict belongs to the current work revision",
+		(business === undefined || business.revision === run.checkpoint.revision) &&
+			(architecture === undefined || architecture.revision === run.checkpoint.revision),
+		show({ business: business ?? null, architecture: architecture ?? null, revision: run.checkpoint.revision }),
 	);
 	check(
 		ctx,
-		"completion approved the current revision",
-		run.checkpoint.completion?.approved === true && run.checkpoint.completion.revision === run.checkpoint.revision,
-		show(run.checkpoint.completion),
+		"any retained completion verdict belongs to the current work revision",
+		run.checkpoint.completion === undefined || run.checkpoint.completion.revision === run.checkpoint.revision,
+		show(run.checkpoint.completion ?? null),
 	);
 	const completedEvent = eventData(lastEvent(final.events, "completed"));
 	check(
 		ctx,
-		"the completed event binds the accepted revision and confidence",
-		completedEvent?.["revision"] === run.checkpoint.revision && typeof completedEvent?.["confidence"] === "number",
+		"the completed event binds the current work revision",
+		completedEvent?.["revision"] === run.checkpoint.revision,
 		show(completedEvent),
+	);
+	const completedDiagnostics = asRecord(completedEvent?.["diagnostics"]);
+	check(
+		ctx,
+		"the completed event records the Jev diagnostics as information for the owner",
+		completedDiagnostics !== undefined &&
+			typeof completedDiagnostics["note"] === "string" &&
+			typeof completedDiagnostics["requirementsCurrent"] === "boolean" &&
+			typeof completedDiagnostics["planCurrent"] === "boolean" &&
+			asRecord(completedDiagnostics["acceptance"]) !== undefined,
+		show(completedDiagnostics ?? null),
 	);
 
 	const filePath = join(ctx.workspace, "autonomy-smoke.txt");
@@ -1737,17 +1806,26 @@ async function scenarioCompletion(ctx: ScenarioContext): Promise<void> {
 	const recordedActions = run.checkpoint.actions ?? [];
 	check(
 		ctx,
-		"a consequential code action is recorded for completion",
-		recordedActions.some(action => action.tool === "write" || action.tool === "edit" || action.tool === "ast_edit"),
+		"the checkpoint records the consequential action that created the current bytes",
+		recordedActions.some(action =>
+			action.tool === "write" || action.tool === "edit" || action.tool === "ast_edit" || action.tool === "bash",
+		),
 		show(recordedActions.map(action => ({ tool: action.tool, target: action.target }))),
 	);
 	check(
 		ctx,
-		"a consequential execution action is recorded for completion",
+		"a consequential execution action is recorded for the requested verification run",
 		recordedActions.some(action => action.tool === "bash" && action.target.includes("bun run verify-autonomy-smoke.ts")),
 		show(recordedActions.map(action => ({ tool: action.tool, target: action.target }))),
 	);
-	check(ctx, "judge calls happened", run.judgeCalls > 0, String(run.judgeCalls));
+	const judgeRequests = final.events.filter(event => event.kind === "judge.request").length;
+	const judgeAttempts = final.events.filter(event => event.kind === "driver.judge_attempt").length;
+	check(
+		ctx,
+		"each counted judge call has exactly one durable request or lifecycle attempt",
+		run.judgeCalls === judgeRequests + judgeAttempts,
+		show({ judgeCalls: run.judgeCalls, judgeRequests, judgeAttempts }),
+	);
 	check(ctx, "executor budget was not exceeded", run.executorCalls <= run.policy.maxExecutorCalls, `${run.executorCalls}/${run.policy.maxExecutorCalls}`);
 	check(ctx, "judge budget was not exceeded", run.judgeCalls <= run.policy.maxJudgeCalls, `${run.judgeCalls}/${run.policy.maxJudgeCalls}`);
 	checkAuthority(ctx, run);
@@ -1761,6 +1839,72 @@ async function scenarioCompletion(ctx: ScenarioContext): Promise<void> {
 	check(ctx, "status and store agree on the executor count", row?.["executorCalls"] === run.executorCalls, `${String(row?.["executorCalls"])} vs ${run.executorCalls}`);
 	check(ctx, "status and store agree on the judge count", row?.["judgeCalls"] === run.judgeCalls, `${String(row?.["judgeCalls"])} vs ${run.judgeCalls}`);
 	writeFileSync(join(ctx.dir, "observed-bytes.txt"), readFileSync(filePath));
+}
+
+async function scenarioDiagnostics(ctx: ScenarioContext): Promise<void> {
+	const objective = readFileSync(ctx.objectiveFile, "utf8");
+	const supervisor = spawnSupervisor(ctx, "start", startArgsOf(ctx), ctx.deadlineMs + 120_000);
+	const runId = await waitForRunId(ctx, 60_000);
+	const result = await waitForSupervisor(ctx, supervisor, runId, ctx.deadlineMs);
+	const cli = parseCliResult(result);
+	check(ctx, "start exited 0", result.exitCode === 0 && !result.timedOut, `exit ${result.exitCode}: ${result.stderr.trim()}`);
+	check(ctx, "driver result reports completed", cli["status"] === "completed", show(cli));
+	const final = snapshotOf(ctx.storePath, runId);
+	const run = final.run;
+	check(ctx, "store status is completed", run.status === "completed", `${run.status}: ${run.waiting?.reason ?? ""}`);
+	check(ctx, "completed run has no pending effect", Object.keys(run.pending).length === 0, show(Object.keys(run.pending)));
+	checkAuthority(ctx, run);
+	const filePath = join(ctx.workspace, "diag-report.txt");
+	check(ctx, "the requested file exists", existsSync(filePath));
+	check(ctx, "the requested file has exactly the fixture bytes", fileHex(filePath) === sha256Hex(DIAGNOSTICS_BYTES), fileHex(filePath) ?? "unreadable");
+	const requests = final.events.filter(event => event.kind === "judge.request");
+	const results = final.events.filter(event => event.kind === "judge.result");
+	check(ctx, "the executor's diagnostic reached the judge through a durable request", requests.length > 0, String(requests.length));
+	check(
+		ctx,
+		"every durable judge request retains an actual request digest",
+		requests.every(event => {
+			const digest = eventData(event)?.["requestDigest"];
+			return typeof digest === "string" && /^[0-9a-f]{64}$/.test(digest);
+		}),
+		show(requests.map(event => eventData(event)?.["requestDigest"] ?? null)),
+	);
+	check(
+		ctx,
+		"every recorded judge result pairs with its retained request",
+		results.length > 0 && results.every(resultEvent =>
+			requests.some(requestEvent => eventData(requestEvent)?.["requestDigest"] === eventData(resultEvent)?.["requestDigest"]),
+		),
+		show({ results: results.map(event => eventData(event)?.["requestDigest"] ?? null) }),
+	);
+	const outcomes = results.map(event => asRecord(eventData(event)?.["outcome"]));
+	check(
+		ctx,
+		"each diagnostic outcome is a typed judge outcome, including a recorded outage",
+		outcomes.length > 0 && outcomes.every(outcome =>
+			outcome !== undefined &&
+			typeof outcome["ok"] === "boolean" &&
+			(outcome["ok"] === true || typeof outcome["kind"] === "string"),
+		),
+		show(outcomes),
+	);
+	const judgeAttempts = final.events.filter(event => event.kind === "driver.judge_attempt").length;
+	check(
+		ctx,
+		"each counted judge call has exactly one durable request or lifecycle attempt",
+		run.judgeCalls === requests.length + judgeAttempts,
+		show({ judgeCalls: run.judgeCalls, requests: requests.length, judgeAttempts }),
+	);
+	// The negative or unavailable answer above must not have delayed or vetoed the work: the exact
+	// bytes exist and the run reached its own terminal status.
+	check(
+		ctx,
+		"the diagnostic verdict did not gate safe work or completion",
+		lastEvent(final.events, "completed") !== undefined && fileHex(filePath) === sha256Hex(DIAGNOSTICS_BYTES),
+		show(eventData(lastEvent(final.events, "completed")) ?? null),
+	);
+	check(ctx, "the completed run retains no Jev retry wait", run.waiting === undefined, show(run.waiting ?? null));
+	check(ctx, "the immutable objective is the exact fixture text", run.objective === objective);
 }
 
 async function scenarioAsync(ctx: ScenarioContext, delivery: AsyncDelivery): Promise<void> {
@@ -2127,7 +2271,15 @@ async function scenarioCompaction(ctx: ScenarioContext): Promise<void> {
 		show(run.policy),
 	);
 	const planUrl = run.checkpoint.plan?.planUrl;
-	check(ctx, "the approved plan survived the compaction", typeof planUrl === "string" && planUrl.length > 0, show(run.checkpoint.plan ?? null));
+	const planDigest = run.checkpoint.plan?.planDigest;
+	// Plan review is an optional diagnostic now: the compaction check must not require an approval
+	// the executor never made. When a plan is bound, its exact URL and digest must survive.
+	check(
+		ctx,
+		"a plan bound before the compaction is still the same recorded plan",
+		planUrl === undefined || (typeof planUrl === "string" && typeof planDigest === "string" && /^[0-9a-f]{64}$/.test(planDigest)),
+		show(run.checkpoint.plan ?? null),
+	);
 	const injects = final.events.filter(event => event.kind === "context.inject" && checkpointEvent !== undefined && event.sequence > checkpointEvent.sequence);
 	const contexts = Array.isArray(fresh?.["contexts"]) ? (fresh["contexts"] as unknown[]).filter((value): value is string => typeof value === "string") : [];
 	check(
@@ -2136,11 +2288,18 @@ async function scenarioCompaction(ctx: ScenarioContext): Promise<void> {
 		injects.length > 0 || contexts.length > 0,
 		show({ injects: injects.map(event => eventData(event) ?? null), fresh: fresh ?? null }),
 	);
+	const contextText = contexts.join("\n");
 	check(
 		ctx,
-		"the next provider request carries the exact objective and approved plan",
-		planUrl !== undefined && contexts.some(text => text.includes(`Objective (immutable): ${objective}`) && text.includes(planUrl)),
+		"the next provider request carries the exact immutable objective",
+		contextText.includes(`Objective (immutable): ${objective}`),
 		show(contexts.map(text => text.slice(0, 300))),
+	);
+	check(
+		ctx,
+		"the next provider request carries the bound plan when one was approved",
+		planUrl === undefined || contextText.includes(planUrl),
+		show({ planUrl: planUrl ?? null, contexts: contexts.map(text => text.slice(0, 300)) }),
 	);
 	const nativeCompaction = sessionEntries(run).find(entry => entry["type"] === "compaction");
 	const nativeSummary = nativeCompaction?.["summary"];
@@ -2499,7 +2658,7 @@ async function scenarioCrash(ctx: ScenarioContext): Promise<void> {
 	const recoveryDecision = eventData(lastEvent(recovered.events, "driver.recovery_decision"));
 	check(
 		ctx,
-		"recovery was judged with a committed context digest and typed outcome",
+		"recovery recorded a committed context digest and typed diagnostic outcome",
 		typeof recoveryDecision?.["contextDigest"] === "string" && asRecord(recoveryDecision?.["outcome"]) !== undefined,
 		show(recoveryDecision),
 	);
@@ -2536,7 +2695,7 @@ async function scenarioCrash(ctx: ScenarioContext): Promise<void> {
 	const reconciled = await pollSnapshot(
 		ctx,
 		runId,
-		"inherited effects observed and judged after the whole-scope fence",
+		"inherited effects observed and reconciled after the whole-scope fence",
 		Math.min(ctx.deadlineMs, 600_000),
 		snapshot =>
 			pendingIds.every(id => snapshot.run.pending[id] === undefined) &&
@@ -2552,7 +2711,7 @@ async function scenarioCrash(ctx: ScenarioContext): Promise<void> {
 			const data = eventData(event);
 			return event.kind === "reconcile" && data?.["intent"] === id;
 		});
-		check(ctx, `inherited intent '${id}' left pending only through a judged reconciliation`, events.length === 1, show(events.map(event => event.data)));
+		check(ctx, `inherited intent '${id}' left pending only through a recorded reconciliation`, events.length === 1, show(events.map(event => event.data)));
 		const data = eventData(events[0]);
 		check(
 			ctx,
@@ -2563,7 +2722,7 @@ async function scenarioCrash(ctx: ScenarioContext): Promise<void> {
 		const outcome = data?.["outcome"];
 		check(
 			ctx,
-			`the reconciliation of '${id}' carries an evidence-backed judged outcome`,
+			`the reconciliation of '${id}' carries an evidence-backed declared outcome`,
 			(outcome === "executed" || outcome === "not_executed") &&
 				typeof data?.["evidenceDigest"] === "string" &&
 				String(data["evidenceDigest"]).length === 64,
@@ -2602,7 +2761,7 @@ async function scenarioCrash(ctx: ScenarioContext): Promise<void> {
 }
 
 async function scenarioAdmission(ctx: ScenarioContext): Promise<void> {
-	writeFileSync(join(ctx.workspace, "notes.txt"), NOTES_BYTES, "utf8");
+	writeEffectScript(ctx, "admission-keepalive.sh", "admission-keepalive.txt", KEEPALIVE_BYTES, 90);
 	const supervisor = spawnSupervisor(ctx, "start", startArgsOf(ctx), ctx.deadlineMs + 120_000);
 	const runId = await waitForRunId(ctx, 60_000);
 	const active = await pollSnapshot(
@@ -2694,8 +2853,9 @@ async function scenarioAdmission(ctx: ScenarioContext): Promise<void> {
 }
 
 const SCENARIOS: ScenarioDefinition[] = [
-	{ name: "startup", purpose: "native ready/get_state, bootstrap, wake commit/send/start and real judged work", run: scenarioStartup },
+	{ name: "startup", purpose: "native ready/get_state, bootstrap, wake commit/send/start, real executor tool work and self-completion without a Jev approval", run: scenarioStartup },
 	{ name: "completion", purpose: "one objective reaches evidence-backed completed without later human input", run: scenarioCompletion },
+	{ name: "diagnostics", purpose: "a model-requested Jev diagnostic is durably recorded and never gates safe work or completion", run: scenarioDiagnostics },
 	{ name: "async", purpose: "real native bash auto-background: the pending intent survives until the native wait-tool delivery settles exactly one intent", run: ctx => scenarioAsync(ctx, "native-wait") },
 	{ name: "async-result", purpose: "real native bash auto-background: the pending intent survives until the automatic custom async-result follow-up settles exactly one intent", run: ctx => scenarioAsync(ctx, "async-result") },
 	{ name: "compaction", purpose: "real ctx.compact through a smoke-only probe extension: native compaction, pre-compaction checkpoint, preserved objective/plan and fresh provider context", run: scenarioCompaction },
@@ -2783,6 +2943,8 @@ function objectiveFor(name: string): string {
 			return crashObjective();
 		case "cancel":
 			return cancelObjective();
+		case "diagnostics":
+			return diagnosticsObjective();
 		case "startup":
 			return startupObjective();
 		default:

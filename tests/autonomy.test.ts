@@ -183,8 +183,14 @@ function defaultAnswer(question, state) {
   if (name === "within_authority") return { probability: 0.95, confidence: 0.95 };
   if (name === "acceptance") return { label: aspect === "architecture" ? "sound_for_next_change" : "serves_business_need", confidence: 0.95 };
   if (name === "follows_requirements") return { label: "follows", confidence: 0.95 };
+  if (name.endsWith("_execution") || name.endsWith("_code")) {
+    const options = question.options && typeof question.options === "object" ? question.options : {};
+    const key = Object.keys(options).find(candidate => candidate !== "none");
+    if (key !== undefined) return { label: key, confidence: 0.95 };
+  }
   if (name.indexOf("topic_") === 0) return { probability: 0.95, confidence: 0.95 };
   if (name === "coverage" || name.indexOf("item_") === 0) return { probability: 0.95, confidence: 0.95 };
+  if (name === "execution_evidence" || name === "code_evidence") return { probability: 0.95, confidence: 0.95 };
   if (name.indexOf("direction:") === 0) return { label: "on_course", confidence: 0.95 };
   if (name === "reconcile") return { label: "not_executed", confidence: 0.95 };
   if (name === "infeasible") return { probability: 0.95, confidence: 0.95 };
@@ -255,7 +261,7 @@ function summary(state) {
     acceptance: state.acceptance,
     completion: state.completion || null,
     exhausted: state.exhausted,
-    continuation: state.continuation || null,
+    diagnostics: state.diagnostics || null,
     hold: state.hold || null,
   };
 }
@@ -374,6 +380,18 @@ const commands = {
     const state = runtime.stateFor(ctx);
     recordAction(state, { tool: args.tool, target: args.target, excerpt: args.excerpt }, args.bumps !== false);
     return { revision: state.revision };
+  },
+  setHold: async function (args) {
+    const state = runtime.stateFor(ctx);
+    state.hold = { id: args.id || "finding-test", boundary: "action", reason: args.reason || "an unresolved diagnostic finding", revision: state.revision, material: "{}", result: { kind: "unclear" } };
+    await runtime.checkpoint(ctx, state, "test.hold");
+    return { ok: true, findingId: state.hold.id };
+  },
+  bumpState: async function () {
+    const state = runtime.stateFor(ctx);
+    state.revision += 1;
+    await runtime.checkpoint(ctx, state, "test.bump_state");
+    return { ok: true, revision: state.revision };
   },
   setSession: function (args) {
     if (args.id !== undefined) sessionId = args.id;
@@ -909,7 +927,7 @@ test("a restored task registered for another audience cannot restore approval", 
 	expect(env.store.read(env.runId).status).not.toBe("completed");
 });
 
-test("an external audience holds completion for the current review and still grants no publication effect", async () => {
+test("an external audience completes without a review and still grants no publication effect", async () => {
 	const env = createRun(OBJECTIVE, POLICY, audienceFor(OBJECTIVE, true));
 	const harness = await spawnRuntime(env);
 	const state = valueOf(await harness.rpc.send("state"));
@@ -925,12 +943,12 @@ test("an external audience holds completion for the current review and still gra
 	expect(publication["block"]).toBe(true);
 	expect(publication["boundary"]).toBe("publication");
 
-	const held = valueOf(await harness.rpc.send("stop"));
-	const reply = asRecord(held["decision"]);
-	expect(reply?.["decision"]).toBe("block");
-	expect(String(reply?.["reason"] ?? "")).toContain("anti-slop review");
-	expect(env.store.read(env.runId).status).not.toBe("completed");
-	expect(eventKinds(env)).not.toContain("completed");
+	const settled = valueOf(await harness.rpc.send("stop"));
+	expect(settled["decision"]).toBeNull();
+	expect(env.store.read(env.runId).status).toBe("completed");
+	const completed = eventsOf(env, "completed");
+	expect(asRecord(asRecord(completed[0]?.data)?.["diagnostics"])).toBeDefined();
+	expect(asRecord(asRecord(asRecord(completed[0]?.data)?.["diagnostics"])?.["review"])?.["complete"]).toBe(false);
 });
 
 test("a supplied history that drops the injected message is re-injected as compacted material and journaled", async () => {
@@ -962,17 +980,15 @@ test("a supplied history that drops the injected message is re-injected as compa
 	expect(eventsOf(env, "context.inject").map(event => asRecord(event.data)?.["reason"])).toContain("refresh");
 });
 
-test("only the external audience requires the current review for a policy-granted delivery", async () => {
+test("a policy-granted delivery does not require the external review", async () => {
 	const policy: AutonomyPolicy = { ...POLICY, effects: ["project", "publication"] };
 	const delivery = { type: "tool_call", toolCallId: "p1", toolName: "send_email", input: { to: "guest@example.test", body: "hello" } };
 
 	const externalEnv = createRun(OBJECTIVE, policy, audienceFor(OBJECTIVE, true));
 	const externalHarness = await spawnRuntime(externalEnv);
 	await externalHarness.rpc.send("state");
-	const external = valueOf(await externalHarness.rpc.send("before", { event: delivery }));
-	expect(external["block"]).toBe(true);
-	expect(external["boundary"]).toBe("publication");
-	expect(String(external["reason"])).toContain("anti-slop review");
+	const external = await externalHarness.rpc.send("before", { event: delivery });
+	expect(external).toBeNull();
 
 	const internalEnv = createRun(OBJECTIVE, policy, audienceFor(OBJECTIVE, false));
 	const internalHarness = await spawnRuntime(internalEnv);
@@ -991,6 +1007,165 @@ test("the context bound comes from the stored policy rather than an assumed comp
 	const data = asRecord(over[0]?.data);
 	expect(data?.["limit"]).toBe(1024);
 	expect(Number(data?.["bytes"])).toBeGreaterThan(1024);
+});
+
+test("an open diagnostic finding does not block a safely-scoped effect", async () => {
+	const env = createRun();
+	const harness = await spawnRuntime(env);
+	await harness.rpc.send("state");
+	const input = { path: join(env.root, "finding.txt"), content: "finding" };
+	const setup = valueOf(await harness.rpc.send("setHold", { id: "finding-open" }));
+	expect(setup["ok"]).toBe(true);
+	const verdict = await harness.rpc.send("before", {
+		event: { type: "tool_call", toolCallId: "finding-call", toolName: "write", input },
+	});
+	expect(verdict).toBeNull();
+	// No Jev action judgment is required at all: the deterministic envelope plus the durable
+	// intent admit the call, and the open finding stays a diagnostic record.
+	const admitted = valueOf(await harness.rpc.send("admit", {
+		event: { type: "tool_call", toolCallId: "finding-call", toolName: "write", input },
+	}));
+	expect(admitted["ok"]).toBe(true);
+	const run = env.store.read(env.runId);
+	expect(run.pending["finding-call"]).toBeDefined();
+	expect(run.checkpoint.hold?.id).toBe("finding-open");
+});
+
+test("a rejected Jev action result is a diagnostic, not an admission gate", async () => {
+	const env = createRun();
+	const harness = await spawnRuntime(env);
+	await harness.rpc.send("state");
+	const input = { path: join(env.root, "rejected.txt"), content: "still allowed" };
+	await harness.rpc.send("setJudge", { answers: { action: { label: "off_course", confidence: 0.99 }, within_authority: { probability: 0.01, confidence: 0.99 } } });
+	const judged = valueOf(await harness.rpc.send("judge", {
+		material: actionMaterial("write", String(input.path), input, "rejected-call"),
+		questions: ACTION_QUESTIONS,
+	}));
+	expect(outcomeOf(judged)["ok"]).toBe(true);
+	const admitted = valueOf(await harness.rpc.send("admit", {
+		event: { type: "tool_call", toolCallId: "rejected-call", toolName: "write", input },
+	}));
+	expect(admitted["ok"]).toBe(true);
+	const intent = asRecord(env.store.read(env.runId).pending["rejected-call"]?.payload);
+	const diagnostic = asRecord(intent?.["diagnosticDecision"]);
+	expect(diagnostic?.["accepted"]).toBe(false);
+	expect(diagnostic?.["action"]).toBe("off_course");
+});
+
+test("diagnostic findings do not block terminal completion", async () => {
+	const env = createRun();
+	const harness = await spawnRuntime(env);
+	await harness.rpc.send("state");
+	attachWorkflow(env);
+	await rebind(env, harness.rpc);
+	attachActions(env);
+	await harness.rpc.send("state");
+	ownerUpdate(env, next => {
+		const revision = next.checkpoint.revision;
+		next.checkpoint.completion = { revision, label: "not_approved", approved: false, confidence: 0.2 };
+		next.checkpoint.hold = {
+			id: "finding-held", boundary: "action", reason: "an unresolved diagnostic finding",
+			revision, material: "{}", result: { kind: "refusal" },
+		};
+		next.checkpoint.judgeUnavailable = true;
+	});
+	await rebind(env, harness.rpc);
+	await harness.rpc.send("state");
+	const settled = valueOf(await harness.rpc.send("stop"));
+	expect(settled["decision"]).toBeNull();
+	const run = env.store.read(env.runId);
+	expect(run.status).toBe("completed");
+	const completed = eventsOf(env, "completed");
+	expect(completed.length).toBe(1);
+	const diagnostics = asRecord(asRecord(completed[0]?.data)?.["diagnostics"]);
+	expect(asRecord(diagnostics?.["hold"])?.["id"]).toBe("finding-held");
+	expect(diagnostics?.["judgeUnavailable"]).toBe(true);
+});
+
+test("executed reconciliation rebinds dependencies in its settlement", async () => {
+	const env = createRun();
+	const harness = await spawnRuntime(env);
+	await harness.rpc.send("state");
+	attachWorkflow(env);
+	const path = join(env.root, "out.txt");
+	writeFileSync(path, "initial");
+	ownerUpdate(env, next => { next.manifest[path] = sha256("initial"); });
+	await rebind(env, harness.rpc);
+	await harness.rpc.send("state");
+	const input = { path, content: "reconciled" };
+	await harness.rpc.send("judge", { material: actionMaterial("write", path, input, "write-call"), questions: ACTION_QUESTIONS });
+	expect(valueOf(await harness.rpc.send("admit", {
+		event: { type: "tool_call", toolCallId: "write-call", toolName: "write", input },
+	}))["ok"]).toBe(true);
+	await harness.rpc.send("result", {
+		event: { type: "tool_result", toolCallId: "write-call", toolName: "write", input, content: [{ type: "text", text: "write interrupted" }], isError: true },
+	});
+	writeFileSync(path, "reconciled");
+	expect(env.store.read(env.runId).manifest[path]).toBe(sha256("initial"));
+	await harness.rpc.send("setJudge", { answers: { reconcile: { label: "executed", confidence: 0.95 } } });
+	const reconciled = valueOf(await harness.rpc.send("control", {
+		params: { action: "reconcile", intent: "write-call", observed: "executed", evidence: "a later read shows the complete reconciled bytes on disk", observations: [path] },
+	}));
+	expect(reconciled["isError"]).toBe(false);
+	const run = env.store.read(env.runId);
+	expect(run.pending["write-call"]).toBeUndefined();
+	expect(run.manifest[path]).toBe(sha256("reconciled"));
+	const next = { path: join(env.root, "next.txt"), content: "next" };
+	const judged = valueOf(await harness.rpc.send("judge", {
+		material: actionMaterial("write", String(next.path), next, "after-reconcile"),
+		questions: ACTION_QUESTIONS,
+	}));
+	expect(outcomeOf(judged)["ok"]).toBe(true);
+});
+
+test("an artifact above the policy bound is not retained but does not close admission or strand completion", async () => {
+	const env = createRun(OBJECTIVE, { ...POLICY, maxArtifactBytes: 16 });
+	const harness = await spawnRuntime(env);
+	await harness.rpc.send("state");
+	const workflow = attachWorkflow(env);
+	expect(readFileSync(workflow.path).byteLength).toBeGreaterThan(16);
+	const held = valueOf(await harness.rpc.send("checkpoint", { reason: "agent_end" }));
+	expect(held["ok"]).toBe(true);
+	const run = env.store.read(env.runId);
+	expect(run.status).not.toBe("completed");
+	// The policy bound is hard: no oversized bytes are stored. The dependency digest still tracks
+	// the actual current file, and the refusal is a durable, recoverable journal fact rather than a
+	// permanent admission closure that would strand the run.
+	expect(run.artifacts["local://plan.md"]).toBeUndefined();
+	expect(env.store.artifact(env.runId, "local://plan.md")).toBeNull();
+	const oversized = asRecord(eventsOf(env, "artifact.oversized")[0]?.data);
+	expect(oversized?.["url"]).toBe("local://plan.md");
+	expect(oversized?.["digest"]).toBe(workflow.digest);
+	expect(oversized?.["limit"]).toBe(16);
+	expect(oversized?.["bytes"]).toBeGreaterThan(16);
+	expect(run.manifest["local://plan.md"]).toBe(workflow.digest);
+	expect(env.store.read(env.runId).waiting).toBeUndefined();
+	// Admission stays usable for safe work, and completion is still recorded from actual state.
+	expect(await harness.rpc.send("before", {
+		event: { type: "tool_call", toolCallId: "after-overflow", toolName: "write", input: { path: join(env.root, "x.txt"), content: "x" } },
+	})).toBeNull();
+	const stopped = valueOf(await harness.rpc.send("stop"));
+	expect(stopped["decision"]).toBeNull();
+	expect(env.store.read(env.runId).status).toBe("completed");
+});
+
+test("strict safe devices admit context and course check", async () => {
+	const env = createRun();
+	const harness = await spawnRuntime(env);
+	await harness.rpc.send("state");
+	const context = await harness.rpc.send("before", {
+		event: { type: "tool_call", toolCallId: "context-route", toolName: "write", input: { path: "xd://jev_context", content: "{\"action\":\"list\"}" } },
+	});
+	expect(context).toBeNull();
+	const course = await harness.rpc.send("before", {
+		event: { type: "tool_call", toolCallId: "course-route", toolName: "write", input: { path: "xd://jev_course_check", content: "{\"claim\":\"x\"}" } },
+	});
+	expect(course).toBeNull();
+	const unknown = valueOf(await harness.rpc.send("before", {
+		event: { type: "tool_call", toolCallId: "unknown-route", toolName: "write", input: { path: "xd://jev_unknown", content: "{}" } },
+	}));
+	expect(unknown["block"]).toBe(true);
+	expect(unknown["boundary"]).toBe("capability");
 });
 
 test("a changed checkpoint objective fails closed instead of becoming owner approval", async () => {
@@ -1014,7 +1189,7 @@ test("a changed checkpoint objective fails closed instead of becoming owner appr
 	expect(env.store.read(env.runId).status).not.toBe("completed");
 });
 
-test("a per-call judgment is consumed only by its own callId with the exact payload", async () => {
+test("a diagnostic judgment is bound to its callId while admission stays deterministic", async () => {
 	const env = createRun();
 	const harness = await spawnRuntime(env);
 	await harness.rpc.send("state");
@@ -1027,23 +1202,38 @@ test("a per-call judgment is consumed only by its own callId with the exact payl
 	const admitted = valueOf(await harness.rpc.send("admit", { event: { type: "tool_call", toolCallId: "call-A", toolName: "write", input } }));
 	expect(admitted["ok"]).toBe(true);
 	expect(Object.keys(env.store.read(env.runId).pending)).toEqual(["call-A"]);
+	const payload = asRecord(env.store.read(env.runId).pending["call-A"]?.payload);
+	expect(asRecord(payload?.["diagnosticDecision"])?.["accepted"]).toBe(true);
 	expect(eventsOf(env, "intent.admit")).toHaveLength(1);
 	writeFileSync(input.path, input.content);
 	await harness.rpc.send("result", {
 		event: { type: "tool_result", toolCallId: "call-A", toolName: "write", input, content: [{ type: "text", text: "written" }], isError: false },
 	});
 
-	const stolen = valueOf(await harness.rpc.send("admit", { event: { type: "tool_call", toolCallId: "call-B", toolName: "write", input } }));
-	expect(stolen["ok"]).toBe(false);
+	// A distinct callId is a distinct durable intent and needs no judgment.
+	const second = valueOf(await harness.rpc.send("admit", { event: { type: "tool_call", toolCallId: "call-B", toolName: "write", input } }));
+	expect(second["ok"]).toBe(true);
+	writeFileSync(input.path, input.content);
+	await harness.rpc.send("result", {
+		event: { type: "tool_result", toolCallId: "call-B", toolName: "write", input, content: [{ type: "text", text: "written" }], isError: false },
+	});
+	// A settled id is never re-admitted: one id is one durable intent.
 	const replayed = valueOf(await harness.rpc.send("admit", { event: { type: "tool_call", toolCallId: "call-A", toolName: "write", input } }));
 	expect(replayed["ok"]).toBe(false);
 	expect(env.store.read(env.runId).pending).toEqual({});
 
 	const weak = valueOf(await harness.rpc.send("setJudge", { answers: { within_authority: { probability: 0.2 } } }));
 	expect(weak["ok"]).toBe(true);
-	await harness.rpc.send("judge", { material: actionMaterial("write", String(input.path), input, "call-C"), questions: ACTION_QUESTIONS });
-	const refused = valueOf(await harness.rpc.send("admit", { event: { type: "tool_call", toolCallId: "call-C", toolName: "write", input } }));
-	expect(refused["ok"]).toBe(false);
+	await harness.rpc.send("judge", { material: actionMaterial("write", join(env.root, "c.txt"), { path: join(env.root, "c.txt"), content: "c" }, "call-C"), questions: ACTION_QUESTIONS });
+	const c = { path: join(env.root, "c.txt"), content: "c" };
+	const refused = valueOf(await harness.rpc.send("admit", { event: { type: "tool_call", toolCallId: "call-C", toolName: "write", input: c } }));
+	expect(refused["ok"]).toBe(true);
+	const cPayload = asRecord(env.store.read(env.runId).pending["call-C"]?.payload);
+	expect(asRecord(cPayload?.["diagnosticDecision"])?.["accepted"]).toBe(false);
+	writeFileSync(c.path, c.content);
+	await harness.rpc.send("result", {
+		event: { type: "tool_result", toolCallId: "call-C", toolName: "write", input: c, content: [{ type: "text", text: "c" }], isError: false },
+	});
 
 	const outside = valueOf(await harness.rpc.send("before", {
 		event: { type: "tool_call", toolCallId: "c2", toolName: "write", input: { path: join(env.base, "outside.txt"), content: "x" } },
@@ -1095,7 +1285,7 @@ test("a per-call judgment is consumed only by its own callId with the exact payl
 	}
 });
 
-test("a decision bound to an older revision is rejected", async () => {
+test("a diagnostic decision bound to an older revision is recorded as stale, not used", async () => {
 	const env = createRun();
 	const harness = await spawnRuntime(env);
 	await harness.rpc.send("state");
@@ -1103,13 +1293,14 @@ test("a decision bound to an older revision is rejected", async () => {
 	await harness.rpc.send("judge", { material: actionMaterial("write", String(input.path), input, "call-A"), questions: ACTION_QUESTIONS });
 	const moved = valueOf(await harness.rpc.send("recordAction", { tool: "bash", target: "echo ok", excerpt: "ok" }));
 	expect(moved["revision"]).toBe(1);
-	const stale = valueOf(await harness.rpc.send("admit", { event: { type: "tool_call", toolCallId: "call-A", toolName: "write", input } }));
-	expect(stale["ok"]).toBe(false);
-	expect(String(stale["error"])).toContain("another revision");
-	expect(env.store.read(env.runId).pending).toEqual({});
+	const admitted = valueOf(await harness.rpc.send("admit", { event: { type: "tool_call", toolCallId: "call-A", toolName: "write", input } }));
+	expect(admitted["ok"]).toBe(true);
+	const payload = asRecord(env.store.read(env.runId).pending["call-A"]?.payload);
+	expect(payload?.["diagnosticDecision"]).toBeUndefined();
+	expect(eventsOf(env, "admission.decision_stale")).toHaveLength(1);
 });
 
-test("an artifact changed during the network call discards the answer", async () => {
+test("an artifact changed during the network call discards the answer and still blocks on the tracked change", async () => {
 	const env = createRun();
 	const harness = await spawnRuntime(env);
 	await harness.rpc.send("state");
@@ -1124,9 +1315,13 @@ test("an artifact changed during the network call discards the answer", async ()
 	expect(String(outcome["problem"])).toContain("changed during judgment");
 	expect(eventKinds(env)).toContain("judge.stale");
 	expect(readFileSync(plan.path, "utf8")).toContain("changed during judgment");
+	// The stale answer is discarded. The changed plan is a tracked dependency, so admission still
+	// refuses until the observed change is checkpointed: that is actual dependency accounting, not
+	// a Jev judgment.
 	const admitted = valueOf(await harness.rpc.send("admit", { event: { type: "tool_call", toolCallId: "call-A", toolName: "write", input } }));
 	expect(admitted["ok"]).toBe(false);
-	expect(String(admitted["error"])).toContain("no unused judgment");
+	expect(String(admitted["error"])).toContain("tracked dependencies changed");
+	expect(env.store.read(env.runId).pending).toEqual({});
 });
 
 test("a tracked dependency changed during judgment cannot authorize another invocation", async () => {
@@ -1234,7 +1429,7 @@ test("reappearing planned output cannot inherit acceptance for its recorded abse
 	}))["ok"]).toBe(false);
 });
 
-test("an errored effect stays unknown, blocks work, and only a judged reconciliation clears it", async () => {
+test("an errored effect stays unknown, blocks work, and reconciliation settles it", async () => {
 	const env = createRun();
 	const harness = await spawnRuntime(env);
 	await harness.rpc.send("state");
@@ -1403,9 +1598,11 @@ test("evidence-bound stop records both aspects and commits completion atomically
 	const run = env.store.read(env.runId);
 	expect(run.status).toBe("completed");
 	expect(run.wake).toBeUndefined();
-	expect(run.checkpoint.completion?.approved).toBe(true);
-	expect(run.checkpoint.acceptance.map(record => record.aspect).sort()).toEqual(["architecture", "business"]);
+	// Completion is recorded as the model's terminal state; Jev verdicts stay diagnostics.
 	expect(eventKinds(env)).toContain("completed");
+	const diagnostics = asRecord(asRecord(eventsOf(env, "completed")[0]?.data)?.["diagnostics"]);
+	expect(asRecord(diagnostics?.["acceptance"])).toBeDefined();
+	expect(diagnostics?.["hold"]).toBeNull();
 	const again = valueOf(await harness.rpc.send("stop"));
 	expect(again["decision"]).toBeNull();
 });
@@ -1475,11 +1672,11 @@ test("a restarted executor cannot complete using execution observations from its
 	}));
 	expect(asRecord(stale["details"])?.["approved"]).not.toBe(true);
 	const settled = valueOf(await harness.rpc.send("stop"));
-	expect(asRecord(settled["decision"])?.["decision"]).toBe("block");
-	expect(env.store.read(env.runId).status).not.toBe("completed");
+	expect(settled["decision"]).toBeNull();
+	expect(env.store.read(env.runId).status).toBe("completed");
 });
 
-test("checkpointing external dependency changes cannot reuse the previous execution evidence", async () => {
+test("a changed dependency is checkpointed and does not block completion", async () => {
 	const env = createRun();
 	const harness = await spawnRuntime(env);
 	await harness.rpc.send("state");
@@ -1493,15 +1690,15 @@ test("checkpointing external dependency changes cannot reuse the previous execut
 	writeFileSync(path, "unverified replacement");
 	await harness.rpc.send("checkpoint", { reason: "agent_end" });
 	const settled = valueOf(await harness.rpc.send("stop"));
-	expect(asRecord(settled["decision"])?.["decision"]).toBe("block");
-	expect(env.store.read(env.runId).status).not.toBe("completed");
+	expect(settled["decision"]).toBeNull();
+	expect(env.store.read(env.runId).status).toBe("completed");
+	expect(eventKinds(env)).toContain("completed");
 });
 
-test("stop without actual execution and code evidence holds the turn instead of completing", async () => {
+test("stop completes without requirements, acceptance or a judge call", async () => {
 	const env = createRun();
 	const harness = await spawnRuntime(env);
 	await harness.rpc.send("state");
-	attachWorkflow(env);
 	ownerUpdate(env, next => {
 		next.checkpoint.actions = [{ tool: "bash", target: "bun test", excerpt: "1 pass, 0 fail" }];
 		next.checkpoint.revision = 1;
@@ -1510,36 +1707,27 @@ test("stop without actual execution and code evidence holds the turn instead of 
 	await harness.rpc.send("state");
 	const before = valueOf(await harness.rpc.send("judgeCalls"));
 	expect(before["count"]).toBe(0);
-	const held = valueOf(await harness.rpc.send("stop"));
-	const reply = asRecord(held["decision"]);
-	expect(reply?.["decision"]).toBe("block");
-	expect(String(reply?.["reason"] ?? "")).toContain("execution and code evidence");
-	expect(env.store.read(env.runId).status).not.toBe("completed");
-	expect(eventKinds(env)).toContain("checkpoint");
+	const settled = valueOf(await harness.rpc.send("stop"));
+	expect(settled["decision"]).toBeNull();
+	expect(env.store.read(env.runId).status).toBe("completed");
 	const after = valueOf(await harness.rpc.send("judgeCalls"));
 	expect(after["count"]).toBe(0);
 });
 
-test("exhausted refusals and a stored continuation grant still authorize no effect", async () => {
+test("exhausted boundary diagnostics do not block a safely-scoped effect", async () => {
 	const env = createRun();
 	const harness = await spawnRuntime(env);
 	await harness.rpc.send("state");
-	const run = env.store.read(env.runId);
-	const task = run.checkpoint.task;
-	if (task === undefined) throw new Error("missing bootstrap task");
 	ownerUpdate(env, next => {
 		next.checkpoint.exhausted = ["action"];
-		next.checkpoint.continuation = { taskFingerprint: task.fingerprint, request: OBJECTIVE, reason: "the owner permitted continuation" };
 	});
 	await rebind(env, harness.rpc);
 	const state = valueOf(await harness.rpc.send("state"));
-	expect(state["continuation"]).toBeNull();
 	expect(state["exhausted"]).toEqual(["action"]);
 	const input = { path: join(env.root, "a.txt"), content: "hello" };
 	const admitted = valueOf(await harness.rpc.send("admit", { event: { type: "tool_call", toolCallId: "call-A", toolName: "write", input } }));
-	expect(admitted["ok"]).toBe(false);
-	expect(String(admitted["error"])).toContain("no unused judgment");
-	expect(env.store.read(env.runId).pending).toEqual({});
+	expect(admitted["ok"]).toBe(true);
+	expect(env.store.read(env.runId).pending["call-A"]).toBeDefined();
 });
 
 test("an inherited effect is reconciled only by an exact durable whole-scope fence receipt", async () => {
@@ -1600,14 +1788,11 @@ test("a run with no observed execution scope admits no consequential call", () =
 	expect(env.store.read(env.runId).pending).toEqual({});
 });
 
-test("config forces the strict workflow and asides never start an uncommitted turn", () => {
+test("config keeps Jev diagnostic and asides never start an uncommitted turn", () => {
 	const env = createRun();
 	const runtime = createAutonomyRuntime({ storeFile: env.storeFile, runId: env.runId, judge: failingJudge("unused"), config: DEFAULT_CONFIG });
 	const config = runtime.config();
-	expect(config.gates.mutation).toBe(true);
-	expect(config.gates.completion).toBe(true);
-	expect(config.antiSlop.mode).toBe("enforce");
-	expect(config.courseCheck.mode).toBe("completion");
+	expect(config.antiSlop.mode).toBe("advisory");
 	expect(config.billing.inputCostPerMillion).toBe(DEFAULT_CONFIG.billing.inputCostPerMillion);
 
 	const sent: Array<{ payload: Record<string, unknown>; options?: { triggerTurn?: boolean; deliverAs?: string } }> = [];
@@ -1718,8 +1903,70 @@ test("a failed native background delivery remains unknown until judged reconcili
 	expect(await harness.rpc.send("before", { event: next })).toBeNull();
 });
 
+test("an idle stop while a native background effect is still running ends the turn without claiming completion", async () => {
+	const env = createRun();
+	const harness = await spawnRuntime(env);
+	await harness.rpc.send("state");
+	const input = { command: "sh worker.sh" };
+	await harness.rpc.send("admit", { event: { type: "tool_call", toolCallId: "long-call", toolName: "bash", input } });
+	await harness.rpc.send("result", {
+		event: {
+			type: "tool_result", toolCallId: "long-call", toolName: "bash", input,
+			content: [{ type: "text", text: "Backgrounded as job bg_1" }], isError: false,
+			details: { async: { state: "running", jobId: "bg_1", type: "bash" } },
+		},
+	});
+	// The native result is not delivered yet, so the executor has nothing to observe or reconcile.
+	// Blocking this idle stop would force another turn and repeat the same block until the delivery
+	// arrives. Ending the turn is not completion: the intent stays pending, the pre-stop nonterminal
+	// status is preserved, and no completed event is recorded, so the eventual delivery still
+	// decides the outcome.
+	const before = env.store.read(env.runId);
+	const idle = valueOf(await harness.rpc.send("stop"));
+	expect(idle["decision"]).toBeNull();
+	const waitingRun = env.store.read(env.runId);
+	expect(waitingRun.status).toBe(before.status);
+	expect(waitingRun.status).not.toBe("completed");
+	expect(waitingRun.status).not.toBe("cancelled");
+	expect(waitingRun.status).not.toBe("infeasible");
+	expect(waitingRun.pending["long-call"]).toBeDefined();
+	expect(waitingRun.waiting?.kind).toBe("pending_effects");
+	expect(eventsOf(env, "completed").length).toBe(0);
+
+	// A terminal failure is a different fact: the effect is unknown and only an observed
+	// reconciliation can settle it, so the stop still holds with that instruction.
+	const failure = {
+		role: "custom", customType: "async-result", timestamp: Date.now(), content: "worker failed before writing",
+		details: { jobs: [{ jobId: "bg_1", type: "bash", status: "failed" }] },
+	};
+	await harness.rpc.send("context", { messages: [failure] });
+	const held = valueOf(valueOf(await harness.rpc.send("stop"))["decision"]);
+	expect(held["decision"]).toBe("block");
+	expect(String(held["reason"])).toContain("reconcile");
+	expect(env.store.read(env.runId).pending["long-call"]).toBeDefined();
+});
+
+test("a stop after a rotation request ends the turn without recording completion", async () => {
+	const env = createRun();
+	const harness = await spawnRuntime(env);
+	await harness.rpc.send("state");
+	const rotated = valueOf(await harness.rpc.send("control", {
+		params: { action: "rotate", reason: "the executor requested a fresh session generation" },
+	}));
+	expect(rotated["isError"]).toBe(false);
+	expect(env.store.read(env.runId).waiting?.kind).toBe("rotation_requested");
+	// The supervisor rotates only while the run is non-terminal and the child is settled. Recording
+	// terminal completion here would retire the run instead of rotating it.
+	const stopped = valueOf(await harness.rpc.send("stop"));
+	expect(stopped["decision"]).toBeNull();
+	const run = env.store.read(env.runId);
+	expect(run.status).not.toBe("completed");
+	expect(run.waiting?.kind).toBe("rotation_requested");
+	expect(eventsOf(env, "completed").length).toBe(0);
+});
+
 for (const timing of ["during judgment", "before admission"] as const) {
-	test(`changed referenced script bytes ${timing} cannot use an unchanged command approval`, async () => {
+	test(`changed referenced script bytes ${timing} are recorded as stale diagnostics, not gates`, async () => {
 		const env = createRun();
 		const script = join(env.root, "worker.sh");
 		writeFileSync(script, "#!/bin/sh\necho original\n");
@@ -1737,11 +1984,18 @@ for (const timing of ["during judgment", "before admission"] as const) {
 			expect(outcomeOf(judged)["ok"]).toBe(true);
 			writeFileSync(script, "#!/bin/sh\necho changed\n");
 		}
+		// The script is inside the frozen roots and the actual invocation is admitted; a judgment
+		// that described other bytes is retained as a stale diagnostic rather than used.
 		const admitted = valueOf(await harness.rpc.send("admit", {
 			event: { type: "tool_call", toolCallId: "script-call", toolName: "bash", input },
 		}));
-		expect(admitted["ok"]).toBe(false);
-		expect(env.store.read(env.runId).pending).toEqual({});
+		expect(admitted["ok"]).toBe(true);
+		const payload = asRecord(env.store.read(env.runId).pending["script-call"]?.payload);
+		expect(payload?.["invocationDigest"]).toBe(sha256(JSON.stringify(input)));
+		if (timing === "before admission") {
+			expect(payload?.["diagnosticDecision"]).toBeUndefined();
+			expect(eventsOf(env, "admission.decision_stale")).toHaveLength(1);
+		}
 	});
 }
 
@@ -1853,7 +2107,7 @@ test("a remote Bash cwd is refused instead of being resolved as a local path", a
 	expect(held["boundary"]).toBe("capability");
 });
 
-test("referenced Bash bytes bind to the actual payload cwd rather than a same-named session file", async () => {
+test("changed referenced Bash bytes after judgment are a stale diagnostic, not a gate", async () => {
 	const env = createRun();
 	mkdirSync(join(env.root, "nested"));
 	writeFileSync(join(env.root, "worker.sh"), "#!/bin/sh\necho unrelated-session-file\n");
@@ -1870,7 +2124,10 @@ test("referenced Bash bytes bind to the actual payload cwd rather than a same-na
 	const admitted = valueOf(await harness.rpc.send("admit", {
 		event: { type: "tool_call", toolCallId: "cwd-call", toolName: "bash", input },
 	}));
-	expect(admitted["ok"]).toBe(false);
+	expect(admitted["ok"]).toBe(true);
+	const payload = asRecord(env.store.read(env.runId).pending["cwd-call"]?.payload);
+	expect(payload?.["diagnosticDecision"]).toBeUndefined();
+	expect(eventsOf(env, "admission.decision_stale")).toHaveLength(1);
 });
 
 test("historical native bg_N delivery cannot settle a newly admitted job with the same id", async () => {
@@ -1955,7 +2212,7 @@ test("a writable-root symlink cannot route a project write outside its actual au
 	expect(held["boundary"]).toBe("policy");
 });
 
-test("native leading-cd execution binds the actual nested script bytes", async () => {
+test("native leading-cd changed script bytes are a stale diagnostic, not a gate", async () => {
 	const env = createRun();
 	mkdirSync(join(env.root, "nested"));
 	writeFileSync(join(env.root, "worker.sh"), "#!/bin/sh\necho unrelated\n");
@@ -1972,7 +2229,8 @@ test("native leading-cd execution binds the actual nested script bytes", async (
 	const admitted = valueOf(await harness.rpc.send("admit", {
 		event: { type: "tool_call", toolCallId: "leading-cd", toolName: "bash", input },
 	}));
-	expect(admitted["ok"]).toBe(false);
+	expect(admitted["ok"]).toBe(true);
+	expect(eventsOf(env, "admission.decision_stale")).toHaveLength(1);
 });
 
 test("native leading-cd cannot enter a quoted symlink outside the frozen roots", async () => {
@@ -1989,7 +2247,7 @@ test("native leading-cd cannot enter a quoted symlink outside the frozen roots",
 	expect(held["boundary"]).toBe("policy");
 });
 
-test("native leading-cd with a quoted path binds the actual nested script bytes", async () => {
+test("native leading-cd with a quoted path treats changed script bytes as a stale diagnostic", async () => {
 	const env = createRun();
 	mkdirSync(join(env.root, "nested dir"));
 	writeFileSync(join(env.root, "worker.sh"), "#!/bin/sh\necho unrelated\n");
@@ -2006,7 +2264,8 @@ test("native leading-cd with a quoted path binds the actual nested script bytes"
 	const admitted = valueOf(await harness.rpc.send("admit", {
 		event: { type: "tool_call", toolCallId: "leading-cd-quoted", toolName: "bash", input },
 	}));
-	expect(admitted["ok"]).toBe(false);
+	expect(admitted["ok"]).toBe(true);
+	expect(eventsOf(env, "admission.decision_stale")).toHaveLength(1);
 });
 
 test("a second leading directory change is refused rather than bound to one cwd", async () => {
@@ -2092,7 +2351,7 @@ test("a multi-job native batch never attributes another job's output to the curr
 	expect(result.checkpoint.actions[0]?.excerpt).not.toContain("UNRELATED_CAPTURE");
 });
 
-test("a replaced reviewed artifact invalidates a delivery judgment before admission", async () => {
+test("a replaced reviewed artifact leaves the delivery judgment as a stale diagnostic", async () => {
 	const env = createRun(OBJECTIVE, { ...POLICY, effects: ["project", "publication"] }, audienceFor(OBJECTIVE, true));
 	const harness = await spawnRuntime(env);
 	await harness.rpc.send("state");
@@ -2125,11 +2384,13 @@ test("a replaced reviewed artifact invalidates a delivery judgment before admiss
 	const admitted = valueOf(await harness.rpc.send("admit", {
 		event: { type: "tool_call", toolCallId: "reviewed-call", toolName: "send_email", input },
 	}));
-	expect(admitted["ok"]).toBe(false);
-	expect(env.store.read(env.runId).pending["reviewed-call"]).toBeUndefined();
+	expect(admitted["ok"]).toBe(true);
+	const payload = asRecord(env.store.read(env.runId).pending["reviewed-call"]?.payload);
+	expect(payload?.["diagnosticDecision"]).toBeUndefined();
+	expect(eventsOf(env, "admission.decision_stale")).toHaveLength(1);
 });
 
-test("unchanged acceptance refusal settles into a durable nonterminal wait instead of repeating turns", async () => {
+test("completion does not repeat an unchanged acceptance judgment", async () => {
 	const env = createRun();
 	const harness = await spawnRuntime(env);
 	await harness.rpc.send("state");
@@ -2137,30 +2398,18 @@ test("unchanged acceptance refusal settles into a durable nonterminal wait inste
 	await rebind(env, harness.rpc);
 	attachActions(env);
 	await harness.rpc.send("state");
-	await harness.rpc.send("setJudge", { answers: { topic_1: { probability: 0.2 } } });
 	const first = valueOf(await harness.rpc.send("stop"));
-	expect(asRecord(first["decision"])?.["decision"]).toBe("block");
-	expect(env.store.read(env.runId).waiting).toBeDefined();
-	const calls = env.store.read(env.runId).judgeCalls;
-	await rebind(env, harness.rpc);
-	for (const _ of [1, 2, 3, 4]) {
-		expect(valueOf(await harness.rpc.send("stop"))["decision"]).toBeNull();
-	}
-	await harness.rpc.send("emit", { event: "agent_end", payload: { type: "agent_end", messages: [], willContinue: false } });
-	expect(sentMessages(harness.logFile)).toEqual([]);
-	expect(env.store.read(env.runId).judgeCalls).toBe(calls);
-	expect(env.store.read(env.runId).status).not.toBe("completed");
-	expect(env.store.read(env.runId).checkpoint.acceptance.some(record => record.approved)).toBe(false);
-	await harness.rpc.send("setJudge", {});
-	expect(valueOf(await harness.rpc.send("stop"))["decision"]).toBeNull();
-	expect(env.store.read(env.runId).status).not.toBe("completed");
-	await harness.rpc.send("recordAction", { tool: "bash", target: "bun verify-output.ts", excerpt: "The approved output bytes and size now match.", bumps: false });
-	expect(valueOf(await harness.rpc.send("stop"))["decision"]).toBeNull();
-	expect(env.store.read(env.runId).status).toBe("completed");
-	expect(env.store.read(env.runId).waiting).toBeUndefined();
+	expect(first["decision"]).toBeNull();
+	const completed = env.store.read(env.runId);
+	expect(completed.status).toBe("completed");
+	// Completion costs no judge call when Jev diagnostics are not consulted.
+	expect(completed.judgeCalls).toBe(0);
+	expect(completed.waiting).toBeUndefined();
+	const diagnostics = asRecord(asRecord(eventsOf(env, "completed")[0]?.data)?.["diagnostics"]);
+	expect(asRecord(diagnostics?.["acceptance"])?.["business"]).toBeNull();
 });
 
-test("inconclusive reconciliation durably preserves unknown effects without buying an unchanged retry", async () => {
+test("reconciliation settles from the declaration and records an inconclusive verdict", async () => {
 	const env = createRun();
 	const harness = await spawnRuntime(env);
 	await harness.rpc.send("state");
@@ -2172,21 +2421,14 @@ test("inconclusive reconciliation durably preserves unknown effects without buyi
 	});
 	await harness.rpc.send("setJudge", { answers: { reconcile: { label: "executed", confidence: 0.4 } } });
 	const params = { action: "reconcile", intent: "unknown-call", observed: "executed", evidence: "The attempted write returned an interrupted connection; its final file state is unknown." };
-	expect(valueOf(await harness.rpc.send("control", { params }))["isError"]).toBe(true);
-	const refused = env.store.read(env.runId);
-	expect(refused.waiting).toBeDefined();
-	expect(refused.pending["unknown-call"]).toBeDefined();
-	expect(refused.checkpoint.revision).toBe(0);
-	await harness.rpc.send("setJudge", { answers: { reconcile: { label: "executed", confidence: 0.99 } } });
-	expect(valueOf(await harness.rpc.send("control", { params }))["isError"]).toBe(true);
-	expect(env.store.read(env.runId).judgeCalls).toBe(refused.judgeCalls);
-	expect(env.store.read(env.runId).pending["unknown-call"]).toBeDefined();
-	writeFileSync(input.path, input.content);
-	const changed = { ...params, evidence: "A fresh read of partial.txt establishes its complete exact bytes: partial output.", observations: [input.path] };
-	expect(valueOf(await harness.rpc.send("control", { params: changed }))["isError"]).toBe(false);
-	expect(env.store.read(env.runId).pending).toEqual({});
-	expect(env.store.read(env.runId).checkpoint.revision).toBe(1);
-	expect(env.store.read(env.runId).waiting).toBeUndefined();
+	expect(valueOf(await harness.rpc.send("control", { params }))["isError"]).toBe(false);
+	const settled = env.store.read(env.runId);
+	expect(settled.pending).toEqual({});
+	expect(settled.waiting).toBeUndefined();
+	expect(settled.checkpoint.revision).toBe(1);
+	const data = asRecord(eventsOf(env, "reconcile")[0]?.data);
+	expect(asRecord(data?.["judgment"])?.["label"]).toBe("executed");
+	expect(asRecord(data?.["judgment"])?.["matchesDeclaration"]).toBe(true);
 });
 
 test("reconciliation cannot bind an authorized invocation to a different execution scope", async () => {
@@ -2212,7 +2454,7 @@ test("reconciliation cannot bind an authorized invocation to a different executi
 	expect(eventsOf(env, "reconcile")).toEqual([]);
 });
 
-test("a recovery observation changed during judgment cannot clear an unknown effect", async () => {
+test("a recovery observation changed during judgment is disclosed and still settles", async () => {
 	const env = createRun();
 	const harness = await spawnRuntime(env);
 	await harness.rpc.send("state");
@@ -2223,11 +2465,8 @@ test("a recovery observation changed during judgment cannot clear an unknown eff
 	await harness.rpc.send("result", { event: { type: "tool_result", toolCallId: "observation-call", toolName: "write", input, isError: true, content: [{ type: "text", text: "acknowledgment lost" }] } });
 	await harness.rpc.send("setJudge", { answers: { reconcile: { label: "executed", confidence: 0.99 } }, sideEffects: [{ path: input.path, write: "changed during judgment" }] });
 	const params = { action: "reconcile", intent: "observation-call", observed: "executed", evidence: "The output contains original bytes.", observations: [input.path] };
-	expect(valueOf(await harness.rpc.send("control", { params }))["isError"]).toBe(true);
-	expect(env.store.read(env.runId).pending["observation-call"]).toBeDefined();
-	expect(env.store.read(env.runId).checkpoint.revision).toBe(0);
-	await harness.rpc.send("setJudge", { answers: { reconcile: { label: "executed", confidence: 0.99 } } });
-	expect(valueOf(await harness.rpc.send("control", { params: { ...params, evidence: "Fresh observation establishes the changed bytes and all effects." } }))["isError"]).toBe(false);
+	expect(valueOf(await harness.rpc.send("control", { params }))["isError"]).toBe(false);
+	expect(eventsOf(env, "reconcile.observations_changed")).toHaveLength(1);
 	expect(env.store.read(env.runId).pending).toEqual({});
 	expect(env.store.read(env.runId).checkpoint.revision).toBe(1);
 });
@@ -2243,41 +2482,73 @@ test("recovery preserves decisive counterevidence beyond an ordinary quote bound
 	const counterevidence = "A final inspection contradicts the earlier success report: the output is incomplete.";
 	await harness.rpc.send("setJudge", { answers: { reconcile: { label: "executed", confidence: 0.99 } }, counterevidence });
 	const evidence = "An earlier partial log reported apparent success.\n".repeat(150) + counterevidence;
-	expect(valueOf(await harness.rpc.send("control", { params: { action: "reconcile", intent: "counterexample-call", observed: "executed", evidence } }))["isError"]).toBe(true);
-	expect(env.store.read(env.runId).pending["counterexample-call"]).toBeDefined();
-	expect(env.store.read(env.runId).checkpoint.revision).toBe(0);
+	expect(valueOf(await harness.rpc.send("control", { params: { action: "reconcile", intent: "counterexample-call", observed: "executed", evidence } }))["isError"]).toBe(false);
+	expect(env.store.read(env.runId).pending).toEqual({});
+	const data = asRecord(eventsOf(env, "reconcile")[0]?.data);
+	expect(asRecord(data?.["judgment"])?.["label"]).toBe("unclear");
+	expect(asRecord(data?.["judgment"])?.["matchesDeclaration"]).toBe(false);
 });
 
-test("infeasibility preserves counterevidence that safe progress remains possible", async () => {
+test("an infeasibility declaration settles from its retained evidence and records executor-declared unverified status", async () => {
 	const env = createRun();
 	const harness = await spawnRuntime(env);
 	await harness.rpc.send("state");
+	// The diagnostic service is unreachable and must not delay the terminal declaration.
+	await harness.rpc.send("setJudge", { fail: "the judge transport is unavailable" });
 	const counterevidence = "The latest verified observation establishes a safe remaining implementation path.";
-	await harness.rpc.send("setJudge", { counterevidence });
-	const evidence = "An earlier attempt reported an apparent blocker.\n".repeat(150) + counterevidence;
-	expect(valueOf(await harness.rpc.send("control", { params: { action: "infeasible", reason: "No implementation path remains.", evidence } }))["isError"]).toBe(true);
-	expect(env.store.read(env.runId).status).not.toBe("infeasible");
+	const evidence = `${counterevidence}\n${"An earlier attempt reported an apparent blocker.\n".repeat(150)}`;
+	const before = env.store.read(env.runId);
+	const settled = valueOf(await harness.rpc.send("control", {
+		params: { action: "infeasible", reason: "No implementation path remains.", evidence },
+	}));
+	expect(settled["isError"]).toBe(false);
+	const run = env.store.read(env.runId);
+	expect(run.status).toBe("infeasible");
+	// No judgment was requested, so a hanging or unavailable service cannot delay the declaration.
+	expect(run.judgeCalls).toBe(before.judgeCalls);
+	expect(eventsOf(env, "judge.request")).toEqual([]);
+	const data = asRecord(eventsOf(env, "infeasible")[0]?.data);
+	expect(data?.["declaredBy"]).toBe("executor");
+	expect(data?.["reason"]).toBe("No implementation path remains.");
+	// The full evidence is identified by its digest; the retained quote is bounded and says so.
+	expect(data?.["evidenceDigest"]).toBe(sha256(evidence));
+	expect(data?.["evidenceBytes"]).toBe(Buffer.byteLength(evidence, "utf8"));
+	expect(data?.["evidenceTruncated"]).toBe(true);
+	expect(String(data?.["evidence"])).toContain(counterevidence);
+	// The record never claims independent proof: it is an unverified executor declaration.
+	expect(data?.["verified"]).toBe(false);
+	expect(asRecord(data?.["judgment"])?.["kind"]).toBe("skipped");
+	expect(run.wake).toBeUndefined();
+	expect(run.waiting).toBeUndefined();
 });
 
-test("an inconclusive infeasibility decision stays durable without an unchanged paid retry", async () => {
+test("an infeasibility declaration without actual evidence is refused and settles only once", async () => {
 	const env = createRun();
 	const harness = await spawnRuntime(env);
 	await harness.rpc.send("state");
-	await harness.rpc.send("setJudge", { answers: { infeasible: { probability: 0.5 } } });
+	const before = env.store.read(env.runId);
+	expect(valueOf(await harness.rpc.send("control", {
+		params: { action: "infeasible", reason: "No implementation path remains.", evidence: "   " },
+	}))["isError"]).toBe(true);
+	expect(env.store.read(env.runId).status).not.toBe("infeasible");
+	expect(env.store.read(env.runId).judgeCalls).toBe(before.judgeCalls);
+
 	const params = { action: "infeasible", reason: "A required dependency may be unavailable.", evidence: "The dependency observation was inconclusive." };
-	expect(valueOf(await harness.rpc.send("control", { params }))["isError"]).toBe(true);
+	expect(valueOf(await harness.rpc.send("control", { params }))["isError"]).toBe(false);
 	const first = env.store.read(env.runId);
-	expect(first.waiting).toBeDefined();
-	expect(first.status).not.toBe("infeasible");
-	await harness.rpc.send("setJudge", { answers: { infeasible: { probability: 0.99 } } });
+	expect(first.status).toBe("infeasible");
+	const data = asRecord(eventsOf(env, "infeasible")[0]?.data);
+	expect(data?.["evidence"]).toBe(params.evidence);
+	expect(data?.["evidenceTruncated"]).toBe(false);
+	// The terminal declaration is settled once; a repeat cannot append another event or buy a call.
 	expect(valueOf(await harness.rpc.send("control", { params }))["isError"]).toBe(true);
+	expect(eventsOf(env, "infeasible")).toHaveLength(1);
 	expect(env.store.read(env.runId).judgeCalls).toBe(first.judgeCalls);
-	expect(valueOf(await harness.rpc.send("control", { params: { ...params, evidence: "A fresh authoritative dependency check proves it cannot be obtained within the frozen policy." } }))["isError"]).toBe(false);
 	expect(env.store.read(env.runId).status).toBe("infeasible");
 });
 
 for (const timing of ["during judgment", "before admission"] as const) {
-	test(`a project script absent at judgment cannot appear ${timing} and inherit authorization`, async () => {
+	test(`a project script absent at judgment can appear ${timing} and is admitted as a stale diagnostic`, async () => {
 		const env = createRun();
 		const harness = await spawnRuntime(env);
 		await harness.rpc.send("state");
@@ -2290,13 +2561,16 @@ for (const timing of ["during judgment", "before admission"] as const) {
 		}));
 		expect(outcomeOf(judged)["ok"]).toBe(timing !== "during judgment");
 		if (timing === "before admission") writeFileSync(path, content);
+		// The appearing script is inside the frozen roots, so the actual invocation is admitted.
 		const admitted = valueOf(await harness.rpc.send("admit", { event: { type: "tool_call", toolCallId: "appearing-call", toolName: "bash", input } }));
-		expect(admitted["ok"]).toBe(false);
-		expect(env.store.read(env.runId).pending).toEqual({});
+		expect(admitted["ok"]).toBe(true);
+		const payload = asRecord(env.store.read(env.runId).pending["appearing-call"]?.payload);
+		expect(payload?.["invocationDigest"]).toBe(sha256(JSON.stringify(input)));
+		if (timing === "before admission") expect(payload?.["diagnosticDecision"]).toBeUndefined();
 	});
 }
 
-test("an unchanged Bash payload cannot inherit judgment after its cwd symlink changes", async () => {
+test("a changed Bash cwd symlink is a stale diagnostic, not an admission gate", async () => {
 	const env = createRun();
 	const harness = await spawnRuntime(env);
 	await harness.rpc.send("state");
@@ -2315,6 +2589,8 @@ test("an unchanged Bash payload cannot inherit judgment after its cwd symlink ch
 	rmSync(link);
 	symlinkSync(second, link, "dir");
 	const admitted = valueOf(await harness.rpc.send("admit", { event: { type: "tool_call", toolCallId: "cwd-rebound-call", toolName: "bash", input } }));
-	expect(admitted["ok"]).toBe(false);
-	expect(env.store.read(env.runId).pending).toEqual({});
+	expect(admitted["ok"]).toBe(true);
+	const payload = asRecord(env.store.read(env.runId).pending["cwd-rebound-call"]?.payload);
+	expect(payload?.["diagnosticDecision"]).toBeUndefined();
+	expect(eventsOf(env, "admission.decision_stale")).toHaveLength(1);
 });

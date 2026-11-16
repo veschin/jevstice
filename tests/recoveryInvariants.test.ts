@@ -1,8 +1,9 @@
 import { expect, test } from "bun:test";
+import { actionCheck, courseCheck } from "../src/activities.js";
 import { createJevController } from "../src/controller.js";
-import { recoveryGate } from "../src/gates.js";
 import { clearResolvedHold, freshState, recordRecovery, recordRefusal, registerTask, submissionLedger } from "../src/state.js";
-import { answeringJudge, boundaryConfig, fakeCtx, fakePi, fakeZod, toolFailed } from "./helpers.js";
+import { asRecord } from "../src/types.js";
+import { answeringJudge, boundaryConfig, fakeCtx, fakePi, fakeZod, toolDetails } from "./helpers.js";
 
 test("FR-22: creating a finding does not buy another judgment for the identical diagnostic", async () => {
 	const fake = answeringJudge({ consult: { label: "left", confidence: 0.55 } });
@@ -14,8 +15,10 @@ test("FR-22: creating a finding does not buy another judgment for the identical 
 		context: "The implementation must produce the recorded coverage report.",
 		alternatives: [{ label: "left", meaning: "Read the recorded coverage." }, { label: "right", meaning: "Generate unrelated sample coverage." }],
 	};
-	expect(toolFailed(await pi.callTool("jev_consult", input, ctx))).toBe(true);
-	expect(toolFailed(await pi.callTool("jev_consult", input, ctx))).toBe(true);
+	const first = await pi.callTool("jev_consult", input, ctx);
+	const second = await pi.callTool("jev_consult", input, ctx);
+	expect(toolDetails(first)["approved"]).not.toBe(true);
+	expect(toolDetails(second)["approved"]).not.toBe(true);
 	expect(fake.calls).toHaveLength(1);
 });
 
@@ -35,30 +38,66 @@ test("FR-67: resolution retires its exact ledger record and preserves unrelated 
 	expect(submissionLedger(state, "search", "search-material").repeat).toBe(true);
 });
 
-test("FR-67: an inconclusive action finding admits the corrected invocation to fresh judgment", () => {
-	const call = { path: "src/a.ts", content: "the recorded report" };
-	const uncertain = freshState();
-	registerTask(uncertain, "Repair the recorded report.");
-	recordRecovery(uncertain, "action:4", { action: { tool: "write" } }, {
-		ok: true, text: "the proposed invocation answered on_course",
+test("FR-67: an arbitrary held diagnostic never prevents a new substantive check", async () => {
+	const state = freshState();
+	const task = registerTask(state, "Repair the recorded report.");
+	state.planTopics = [{ id: "report", section: "## Report", paths: ["src/report.ts"], requirement: "repair the recorded report" }];
+	state.plan = { taskFingerprint: task.fingerprint, planUrl: "local://report-plan.md", planDigest: "bound" };
+	recordRecovery(state, "review", { target: "report.ts" }, {
+		ok: false,
+		text: "the developer review found an unrelated parser defect",
+		details: { kind: "defect", approved: false, label: "defect" },
+	});
+	expect(state.hold?.id).toBeDefined();
+
+	const judge = answeringJudge({ action: { label: "on_course", confidence: 0.95 } });
+	const outcome = await actionCheck(
+		{ judge: judge.judge, config: boundaryConfig() },
+		state,
+		{ tool: "write", target: "src/report.ts", change: JSON.stringify({ path: "src/report.ts", content: "the report" }) },
+		{ path: "src/report.ts", content: "the report" },
+	);
+
+	expect(outcome.ok).toBe(true);
+	expect(outcome.details?.["approved"]).toBe(true);
+	expect(judge.calls).toHaveLength(1);
+	expect(state.hold?.id).toBeDefined();
+});
+
+test("FR-67: an inconclusive action finding still lets the corrected invocation be judged", async () => {
+	const state = freshState();
+	const task = registerTask(state, "Repair the recorded report.");
+	state.planTopics = [{ id: "report", section: "## Report", paths: ["src/report.ts"], requirement: "repair the recorded report" }];
+	state.plan = { taskFingerprint: task.fingerprint, planUrl: "local://report-plan.md", planDigest: "bound" };
+	recordRecovery(state, "action:4", { action: { tool: "write" } }, {
+		ok: true, text: "the proposed invocation answered unclear",
 		details: { kind: "unclear", approved: false, label: "on_course", confidence: 0.38 },
 	});
-	expect(recoveryGate(uncertain, "write", call).block).toBe(false);
-	// A held judge step is still a judge step: an open finding never admits one.
-	expect(recoveryGate(uncertain, "jev_acceptance", {}).block).toBe(true);
 
-	const defect = freshState();
-	registerTask(defect, "Repair the recorded report.");
-	recordRecovery(defect, "action:4", { action: { tool: "write" } }, {
-		ok: true, text: "the proposed invocation answered off_course",
-		details: { kind: "defect", approved: false, label: "off_course", confidence: 0.94 },
-	});
-	expect(recoveryGate(defect, "write", call).block).toBe(true);
+	const judge = answeringJudge({ action: { label: "on_course", confidence: 0.96 } });
+	const outcome = await actionCheck(
+		{ judge: judge.judge, config: boundaryConfig() },
+		state,
+		{ tool: "write", target: "src/report.ts", change: JSON.stringify({ path: "src/report.ts", content: "the corrected report" }) },
+	);
 
-	const review = freshState();
-	registerTask(review, "Repair the recorded report.");
-	recordRecovery(review, "review", { target: "a.ts" }, {
-		ok: false, text: "the review was inconclusive", details: { kind: "unclear", approved: false },
-	});
-	expect(recoveryGate(review, "write", call).block).toBe(true);
+	expect(outcome.details?.["approved"]).toBe(true);
+	expect(judge.calls).toHaveLength(1);
+	expect(asRecord(state.hold?.result)?.["kind"]).toBe("unclear");
+});
+
+test("diagnostics do not stop automatic checks after an unrelated finding", async () => {
+	const state = freshState();
+	const task = registerTask(state, "Report the coverage of the last run.");
+	state.plan = { taskFingerprint: task.fingerprint, planUrl: "local://coverage-plan.md", planDigest: "d" };
+	state.planTopics = [{ id: "collect", section: "## Collect", paths: ["src/report.ts"], requirement: "report the coverage of the last run" }];
+	state.actions = [{ tool: "write", target: "src/report.ts", excerpt: "reads the recorded coverage" }];
+	recordRecovery(state, "review", { target: "a.ts" }, { ok: false, text: "a defect", details: { kind: "defect", approved: false } });
+
+	const judge = answeringJudge({ "direction:1": { label: "on_course", confidence: 0.93 } });
+	const outcome = await courseCheck({ judge: judge.judge, config: boundaryConfig() }, state);
+
+	expect(outcome.ok).toBe(true);
+	expect(outcome.details?.["approved"]).toBe(true);
+	expect(judge.calls).toHaveLength(1);
 });

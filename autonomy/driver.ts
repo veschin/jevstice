@@ -70,8 +70,9 @@ const FENCE_RECEIPT_RETRY_MS = 50;
 /** A transient scope may release its cgroup while systemd still reports it loaded; bound the retry. */
 const FENCE_PROOF_TIMEOUT_MS = 5_000;
 const FENCE_PROOF_POLL_MS = 50;
-/** Decoder shared by the complete selected bodies; the aggregate JSON still obeys owner policy. */
+/** Decoder for selected bodies that must be represented exactly or not at all. */
 const exactUtf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+/** Injectable seams. Production uses the real judge, clock and timers; tests may observe them. */
 /** The typed choice the supervisor lifecycle decision uses. */
 export const AUTONOMY_RECOVERY_QUESTION = "supervisor_recovery";
 
@@ -1495,7 +1496,7 @@ function recoveryQuestion(): JudgeQuestion {
 		name: AUTONOMY_RECOVERY_QUESTION,
 		mode: "choice",
 		instructions:
-			"Decide the supervisor's next developmental transition for this autonomous run, including the exact precommitted systemd scope launch and its complete child invocation. Choose launch only when any recorded prior execution is positively fenced and any pending unknown effects can be handled by the replacement without blindly repeating an external effect. When pendingUnknownEffects is non-empty the replacement runtime is observation-and-reconciliation-only: consequential effects stay blocked, so launch may only gather read-only evidence and submit typed reconciliation decisions. Choose wait when evidence is insufficient or the previous material must change. Choose infeasible only when the run cannot safely continue within the frozen policy.",
+			"Record an assessment of the supervisor's next developmental transition for this autonomous run, including the exact precommitted systemd scope launch and its complete child invocation. This answer is diagnostic for the owner: the supervisor acts on deterministic safety facts (fencing receipts, budgets, observed scope and pending effects), so a launch, wait or infeasible choice neither authorizes nor blocks the launch. Report any material safety concern in the answer; uncertainty is not needed to stop the run.",
 		options: {
 			launch:
 				"Launch the exact replacement candidate in the precommitted scope. Native detached work inside that scope is proven empty. With pending intents, the replacement is observation-and-reconciliation-only: consequential effects remain blocked, it gathers read-only evidence and submits typed reconciliation decisions, and nothing is replayed.",
@@ -1532,12 +1533,12 @@ function recordDecision(
 	now: number,
 ): { run: AutonomyRun; stale: boolean; decisionId: string } {
 	const decisionId = sha256Text(JSON.stringify({ purpose, context, questions, outcome }));
-	const data = { decisionId, purpose, context, questions, contextDigest, outcome, at: now, stale: false };
+	const data: Record<string, unknown> = { decisionId, purpose, context, questions, contextDigest, outcome, at: now, stale: false };
 	const audience = answerOf(outcome, "deliverable_audience");
 	const updated = updateRun(store, run, current => {
 		data.stale = current.sequence !== run.sequence;
+		if (data.stale || current.audience !== undefined) return;
 		if (
-			!data.stale && current.audience === undefined &&
 			audience?.mode === "choice" && audience.confidence >= POLICY.minConfidenceToApprove &&
 			(audience.label === "external" || audience.label === "internal")
 		) {
@@ -1546,9 +1547,18 @@ function recordDecision(
 				objectiveDigest: sha256Text(current.objective),
 				decisionId,
 			};
+			return;
 		}
+		// No decisive classification is not permission to strand the run: the non-publishing
+		// internal default is recorded as a deterministic fallback, never as a Jev verdict.
+		current.audience = {
+			external: false,
+			objectiveDigest: sha256Text(current.objective),
+			decisionId,
+		};
+		data.audienceFallback = "internal";
 	}, [{ kind: "driver.recovery_decision", data }]);
-	return { run: updated, stale: data.stale, decisionId };
+	return { run: updated, stale: data.stale === true, decisionId };
 }
 
 function identityValue(value: unknown): ProcessIdentity | undefined {
@@ -2214,101 +2224,6 @@ async function launchChild(
 	}
 }
 
-/**
- * The decision material that a refusal actually consumed. It deliberately excludes the fresh
- * candidate scope unit, epoch, attempt and volatile status so a new random launch never re-asks the
- * same refusal, while changed checkpoint, artifact, pending or fencing evidence still does.
- */
-function refusalMaterialDigest(
-	store: AutonomyStore,
-	run: AutonomyRun,
-	fencing: { scope: AutonomyScope | undefined; intentIds: string[]; prior: ProcessIdentity | undefined },
-	observations: LifecycleObservations,
-): string {
-	const plan = run.checkpoint.plan;
-	const planBytes = plan === undefined ? null : store.artifact(run.id, plan.planUrl);
-	return sha256Text(
-		JSON.stringify({
-			objective: run.objective,
-			policy: run.policy,
-			policyDigest: run.policyDigest,
-			audience: run.audience ?? null,
-			checkpoint: { ...run.checkpoint, refusedCalls: Array.from(run.checkpoint.refusedCalls) },
-			artifacts: run.artifacts,
-			manifest: run.manifest,
-			topicManifests: run.topicManifests,
-			approvedPlan:
-				plan === undefined
-					? null
-					: {
-							...plan,
-							content:
-								planBytes === null ? null : exactUtf8.decode(planBytes),
-						},
-			fencing: {
-				scope: fencing.scope ?? null,
-				intentIds: fencing.intentIds,
-				prior: fencing.prior ?? null,
-			},
-			pending: Object.values(run.pending),
-			observations: observations.entries.map(entry => ({
-				path: entry.path,
-				source: entry.source,
-				exists: entry.exists,
-				kind: entry.kind ?? null,
-				size: entry.size ?? null,
-				digest: entry.digest ?? null,
-				encoding: entry.encoding ?? null,
-				content: entry.content ?? null,
-				complete: entry.complete,
-				required: entry.required ?? false,
-				note: entry.note ?? null,
-			})),
-			pendingObservations: observations.pending,
-		}),
-	);
-}
-
-/**
- * The latest durable refusal and whether a later actual decision superseded it. Waiting.kind is
- * ephemeral: a capability or fencing wait may overwrite it without changing the refused material.
- */
-function refusalHoldState(
-	store: AutonomyStore,
-	runId: string,
-): { hold?: Record<string, unknown>; active: boolean } {
-	let hold: Record<string, unknown> | undefined;
-	let active = false;
-	for (const event of store.events(runId)) {
-		if (event.kind === "driver.refusal_hold") {
-			const data = asRecord(event.data);
-			if (data !== undefined) {
-				hold = data;
-				active = true;
-			}
-			continue;
-		}
-		if (event.kind === "driver.recovery_decision") active = false;
-	}
-	return { hold, active };
-}
-
-function recordRefusalHold(
-	store: AutonomyStore,
-	run: AutonomyRun,
-	materialDigest: string,
-	reason: string,
-	decisionId: string,
-	now: number,
-): AutonomyRun {
-	return updateRun(
-		store,
-		run,
-		() => {},
-		[{ kind: "driver.refusal_hold", data: { materialDigest, reason, decisionId, at: now } }],
-	);
-}
-
 async function recoverRun(
 	store: AutonomyStore,
 	run: AutonomyRun,
@@ -2372,7 +2287,6 @@ async function recoverRun(
 	if (signal.aborted) return { kind: "stopped", run: current };
 	const remaining = lifecycleLaunches(current);
 	const priorChild = current.child ?? remaining.find(entry => entry.child !== undefined)?.child;
-	const heldWait = current.waiting;
 	if (remaining.some(entry => entry.child === undefined)) {
 		const waiting = markWaiting(
 			store,
@@ -2384,21 +2298,6 @@ async function recoverRun(
 			now,
 		);
 		return { kind: "blocked", run: waiting, reason: waiting.waiting?.reason ?? "orphan launch intent" };
-	}
-	if (heldWait?.kind === "judge" && heldWait.retryAt !== undefined && heldWait.retryAt > config.now()) {
-		return { kind: "wait", run: current, attempts: heldWait.attempts, retryAt: heldWait.retryAt };
-	}
-	if (current.judgeCalls >= current.policy.maxJudgeCalls) {
-		const waiting = markWaiting(
-			store,
-			current,
-			"resource",
-			"the judge call budget is exhausted; no developmental transition may be attempted",
-			attempts,
-			undefined,
-			now,
-		);
-		return { kind: "blocked", run: waiting, reason: waiting.waiting?.reason ?? "judge budget exhausted" };
 	}
 	if (current.executorCalls >= current.policy.maxExecutorCalls) {
 		const waiting = markWaiting(
@@ -2437,23 +2336,9 @@ async function recoverRun(
 	// The committed receipts that cover the intents still pending are decision material for the
 	// lifecycle decision: they are what a replacement's reconciliation is authorized by.
 	const receipts = current.fences.filter(fence => fence.intentIds.some(id => current.pending[id] !== undefined));
-	// A refusal is material, not a random launch identity. The same durable material must not buy a
-	// new judge call through resume; changed checkpoint, artifact, pending or observed body may.
-	const refusal = refusalHoldState(store, current.id);
-	if (
-		refusal.active &&
-		refusal.hold !== undefined &&
-		refusal.hold["materialDigest"] ===
-			refusalMaterialDigest(store, current, { scope: fencingScope, intentIds, prior: priorChild }, observations)
-	) {
-		const reason = typeof refusal.hold["reason"] === "string" ? refusal.hold["reason"] : "Jev chose to wait";
-		const heldAttempts = heldWait?.kind === "judge" ? heldWait.attempts : attempts;
-		const waiting = markWaiting(store, current, "judge", reason, heldAttempts, undefined, config.now());
-		return { kind: "blocked", run: waiting, reason: waiting.waiting?.reason ?? reason };
-	}
 
 	const launch = makeAutonomyScopeLaunch(current.id, current.epoch);
-	// The session directory is part of the exact judged argv, so approval covers the actual spawn.
+	// The run-private session directory is part of the exact launch argv.
 	const sessionDirectory = launchSessionDirectory(config.storePath, current.id, launch);
 	const launchTarget: ChildTarget = {
 		...target,
@@ -2490,36 +2375,36 @@ async function recoverRun(
 	}
 	const contextDigest = sha256Text(serialized);
 	const questions = current.audience === undefined ? [recoveryQuestion(), audienceQuestion()] : [recoveryQuestion()];
-	let judged: AutonomyRun;
-	try {
-		judged = recordJudgeAttempt(store, current, `supervisor ${reason}`, context, questions, contextDigest, attempts + 1, config.now());
-	} catch {
-		return { kind: "wait", run: current, attempts: attempts + 1, retryAt: config.now() + backoffMs(attempts + 1) };
+	// Jev is diagnostic here. A missing judgment budget or an in-force retry wait skips the network
+	// call (and the attempt record) entirely; it never blocks the deterministic launch when actual
+	// safety checks have passed.
+	const nowDecision = config.now();
+	const waitUntil = current.waiting?.kind === "judge" ? current.waiting.retryAt : undefined;
+	const judgmentAvailable =
+		current.judgeCalls < current.policy.maxJudgeCalls &&
+		(waitUntil === undefined || waitUntil <= nowDecision);
+	let judged: AutonomyRun = current;
+	let outcome: JudgeOutcome;
+	if (judgmentAvailable) {
+		try {
+			judged = recordJudgeAttempt(store, current, `supervisor ${reason}`, context, questions, contextDigest, attempts + 1, nowDecision);
+		} catch {
+			return { kind: "wait", run: current, attempts: attempts + 1, retryAt: config.now() + backoffMs(attempts + 1) };
+		}
+		const decided = await judgeOutcome(config.judge, context, questions, signal);
+		if (decided === "stopped") return { kind: "stopped", run: judged };
+		outcome = decided;
+	} else {
+		outcome = { ok: false, kind: "unavailable", problem: "the judge budget or transport wait skips the diagnostic lifecycle judgment" };
 	}
-	if (judged.judgeCalls === current.judgeCalls) {
-		const waiting = markWaiting(
-			store,
-			judged,
-			"resource",
-			"the judge call budget is exhausted; no developmental transition may be attempted",
-			attempts,
-			undefined,
-			config.now(),
-		);
-		return { kind: "blocked", run: waiting, reason: waiting.waiting?.reason ?? "judge budget exhausted" };
-	}
-	const outcome = await judgeOutcome(config.judge, context, questions, signal);
-	if (outcome === "stopped") return { kind: "stopped", run: judged };
-	let decided: AutonomyRun;
-	let decisionId = "";
+	let latestDecision: AutonomyRun;
 	try {
 		const recorded = recordDecision(store, judged, `supervisor ${reason}`, context, questions, contextDigest, outcome, config.now());
-		decided = recorded.run;
-		decisionId = recorded.decisionId;
+		latestDecision = recorded.run;
 		if (recorded.stale) {
 			const retryAt = config.now() + backoffMs(attempts + 1);
 			const waiting = markWaiting(
-				store, decided, "stale",
+				store, latestDecision, "stale",
 				"the persisted run changed while its lifecycle decision was in flight; a fresh decision is required",
 				attempts + 1, retryAt, config.now(),
 			);
@@ -2528,105 +2413,65 @@ async function recoverRun(
 	} catch {
 		return { kind: "wait", run: judged, attempts: attempts + 1, retryAt: config.now() + backoffMs(attempts + 1) };
 	}
-	if (!outcome.ok) {
-		const nextAttempt = attempts + 1;
-		const retryAt = config.now() + backoffMs(nextAttempt);
+	// The transition is attempted deterministically. The recorded Jev answer, when any, is material
+	// for the owner and for later inspection; it neither authorizes nor blocks this launch.
+	const latest = store.read(current.id);
+	if (isTerminal(latest.status)) return { kind: "terminal", run: latest };
+	if (latest.epoch !== current.epoch) {
+		try {
+			updateRun(store, latest, () => {}, [
+				{ kind: "driver.decision_stale", data: { contextDigest, epoch: latest.epoch, at: config.now() } },
+			]);
+		} catch {
+			// The supervisor will stop on the next read or storage error.
+		}
+		return { kind: "lost", run: latest };
+	}
+	if (latest.generation !== current.generation) {
 		const waiting = markWaiting(
 			store,
-			decided,
-			"judge",
-			`the lifecycle decision was unavailable (${outcome.kind}): ${outcome.problem}`,
-			nextAttempt,
+			latest,
+			"stale",
+			"the lifecycle decision was taken for a different session generation; a fresh decision is required",
+			attempts + 1,
+			config.now() + backoffMs(attempts + 1),
+			config.now(),
+		);
+		return { kind: "wait", run: waiting, attempts: attempts + 1, retryAt: waiting.waiting?.retryAt ?? 0 };
+	}
+	// Actual envelope drift: the checkpoint, pending effects or tracked bytes changed after the
+	// launch candidate was prepared. The stale candidate is never launched; a fresh one is needed.
+	if (
+		latest.checkpoint.revision !== current.checkpoint.revision ||
+		JSON.stringify(latest.pending) !== JSON.stringify(current.pending) ||
+		JSON.stringify(latest.manifest) !== JSON.stringify(current.manifest)
+	) {
+		const retryAt = config.now() + backoffMs(attempts + 1);
+		const waiting = markWaiting(
+			store,
+			latest,
+			"stale",
+			"the run's checkpoint, pending effects or tracked bytes changed after the launch candidate was prepared; a fresh candidate is required",
+			attempts + 1,
 			retryAt,
 			config.now(),
 		);
-		return { kind: "wait", run: waiting, attempts: nextAttempt, retryAt };
+		return { kind: "wait", run: waiting, attempts: attempts + 1, retryAt };
 	}
-	const answer = answerOf(outcome, AUTONOMY_RECOVERY_QUESTION);
-	const label = answer?.mode === "choice" ? answer.label : undefined;
-	const confidence = answer?.mode === "choice" ? answer.confidence : 0;
-	const decisive = confidence >= POLICY.minConfidenceToApprove;
-	if (label === "launch" && decisive) {
-		if (decided.audience === undefined) {
-			const retryAt = config.now() + backoffMs(attempts + 1);
-			const waiting = markWaiting(
-				store, decided, "audience",
-				"the objective's deliverable audience is unsettled; launch approval does not replace its required decision",
-				attempts + 1, retryAt, config.now(),
-			);
-			return { kind: "wait", run: waiting, attempts: attempts + 1, retryAt };
-		}
-		const latest = store.read(current.id);
-		if (isTerminal(latest.status)) return { kind: "terminal", run: latest };
-		if (latest.epoch !== current.epoch) {
-			try {
-				updateRun(store, latest, () => {}, [
-					{ kind: "driver.decision_stale", data: { contextDigest, epoch: latest.epoch, at: config.now() } },
-				]);
-			} catch {
-				// The supervisor will stop on the next read or storage error.
-			}
-			return { kind: "lost", run: latest };
-		}
-		if (latest.generation !== current.generation) {
-			const waiting = markWaiting(
-				store,
-				latest,
-				"stale",
-				"the lifecycle decision was taken for a different session generation; a fresh decision is required",
-				attempts + 1,
-				config.now() + backoffMs(attempts + 1),
-				config.now(),
-			);
-			return { kind: "wait", run: waiting, attempts: attempts + 1, retryAt: waiting.waiting?.retryAt ?? 0 };
-		}
-		const launched = await launchChild(store, latest, launchTarget, launch, command, config, signal, capability);
-		if (launched.ok) return { kind: "launched", run: launched.run, child: launched.child };
-		const nextAttempt = attempts + 1;
-		const retryAt = config.now() + backoffMs(nextAttempt);
-		const waiting = markWaiting(
-			store,
-			launched.run,
-			"launch",
-			`replacement launch failed: ${launched.error}`,
-			nextAttempt,
-			retryAt,
-			config.now(),
-		);
-		return { kind: "wait", run: waiting, attempts: nextAttempt, retryAt };
-	}
-	if (label === "infeasible" && decisive) {
-		const terminal = updateRun(
-			store,
-			decided,
-			r => {
-				r.status = "infeasible";
-				delete r.waiting;
-				delete r.wake;
-			},
-			[{ kind: "driver.infeasible", data: { contextDigest, confidence, outcome, at: config.now() } }],
-		);
-		return { kind: "terminal", run: terminal };
-	}
-	const reasonText =
-		label === "wait" && decisive
-			? "Jev chose to wait; the same lifecycle material must not be resent"
-			: "Jev did not decisively approve the lifecycle transition";
-	const waiting = markWaiting(store, decided, "judge", reasonText, attempts + 1, undefined, config.now());
-	try {
-		const held = recordRefusalHold(
-			store,
-			waiting,
-			refusalMaterialDigest(store, waiting, { scope: fencingScope, intentIds, prior: priorChild }, observations),
-			reasonText,
-			decisionId,
-			config.now(),
-		);
-		return { kind: "blocked", run: held, reason: reasonText };
-	} catch {
-		// The refusal itself is durable; without a hold event a later resume may ask again.
-		return { kind: "blocked", run: waiting, reason: reasonText };
-	}
+	const launched = await launchChild(store, latest, launchTarget, launch, command, config, signal, capability);
+	if (launched.ok) return { kind: "launched", run: launched.run, child: launched.child };
+	const nextAttempt = attempts + 1;
+	const retryAt = config.now() + backoffMs(nextAttempt);
+	const waiting = markWaiting(
+		store,
+		launched.run,
+		"launch",
+		`replacement launch failed: ${launched.error}`,
+		nextAttempt,
+		retryAt,
+		config.now(),
+	);
+	return { kind: "wait", run: waiting, attempts: nextAttempt, retryAt };
 }
 
 async function waitForChild(

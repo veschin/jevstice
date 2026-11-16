@@ -9,95 +9,44 @@ function reader(files: Record<string, string>) {
 	return (path: string): string | null => files[path] ?? null;
 }
 
-describe("T4 - configuration of the gates and the course check", () => {
-	test("the shipped default holds work at both boundaries and defers the course question", () => {
+describe("T4 - diagnostic configuration", () => {
+	test("diagnostics are advisory and expose no execution gates or schedule", () => {
 		const config = loadJevConfig({ cwd: "/work", home: "/home/owner", read: reader({}) });
-
 		expect(config).toEqual(DEFAULT_CONFIG);
-		expect(config.gates.mutation).toBe(true);
-		expect(config.gates.completion).toBe(true);
-		expect(config.courseCheck.mode).toBe("completion");
+		expect(config.antiSlop.mode).toBe("advisory");
+		expect(Object.hasOwn(config, "gates")).toBe(false);
+		expect(Object.hasOwn(config, "courseCheck")).toBe(false);
 	});
 
-	test("the project file overrides the user file and unknown keys are ignored", () => {
+	test("obsolete gate and schedule keys cannot restore blocking", () => {
 		const config = loadJevConfig({
-			cwd: "/work",
-			home: "/home/owner",
+			cwd: "/work", home: "/home/owner",
 			read: reader({
-				[USER_FILE]: JSON.stringify({ gates: { mutation: true }, courseCheck: { mode: "completion", interval: 5 } }),
-				[PROJECT_FILE]: JSON.stringify({
-					gates: { completion: true },
-					courseCheck: { interval: 2 },
-					// A file written for the old shape must still load: its other keys are ignored.
-					routing: { skills: [{ id: "test-driven-development" }] },
-				}),
+				[USER_FILE]: JSON.stringify({ gates: { mutation: true, completion: true } }),
+				[PROJECT_FILE]: JSON.stringify({ gates: ["invalid"], courseCheck: { mode: "interval", interval: 0 }, routing: {} }),
 			}),
 		});
+		expect(config).toEqual(DEFAULT_CONFIG);
+	});
 
-		expect(config.gates).toEqual({ mutation: true, completion: true });
-		expect(config.courseCheck).toEqual({ mode: "completion", interval: 2 });
+	test("the project file overrides inherited diagnostic preferences", () => {
+		const config = loadJevConfig({
+			cwd: "/work", home: "/home/owner",
+			read: reader({
+				[USER_FILE]: JSON.stringify({ antiSlop: { mode: "off" } }),
+				[PROJECT_FILE]: JSON.stringify({ antiSlop: { mode: "advisory" } }),
+			}),
+		});
+		expect(config.antiSlop.mode).toBe("advisory");
 		expect(config.problems).toEqual([]);
 	});
 
-	test("a gate can only be turned off explicitly", () => {
+	test("empty diagnostic sections retain the defaults", () => {
 		const config = loadJevConfig({
-			cwd: "/work",
-			home: "/home/owner",
-			read: reader({ [PROJECT_FILE]: JSON.stringify({ gates: { mutation: false, completion: false } }) }),
+			cwd: "/work", home: "/home/owner",
+			read: reader({ [PROJECT_FILE]: JSON.stringify({ antiSlop: {}, billing: {} }) }),
 		});
-
-		expect(config.gates).toEqual({ mutation: false, completion: false });
-	});
-
-	test("an invalid value keeps the fail-closed default and names the file and the key", () => {
-		const config = loadJevConfig({
-			cwd: "/work",
-			home: "/home/owner",
-			read: reader({
-				[PROJECT_FILE]: JSON.stringify({
-					gates: { mutation: "yes", completion: 1 },
-					courseCheck: { mode: "sometimes", interval: 0 },
-				}),
-			}),
-		});
-
-		expect(config.gates).toEqual({ mutation: true, completion: true });
-		expect(config.courseCheck).toEqual({ mode: "completion", interval: 3 });
-		expect(config.problems).toHaveLength(4);
-		expect(config.problems.join(" ")).toContain(PROJECT_FILE);
-		expect(config.problems.join(" ")).toContain("gates.mutation");
-		expect(config.problems.join(" ")).toContain("courseCheck.interval");
-	});
-
-	test("a gates or courseCheck value that is not an object names the file and the key", () => {
-		const config = loadJevConfig({
-			cwd: "/work",
-			home: "/home/owner",
-			read: reader({
-				[USER_FILE]: JSON.stringify({ gates: ["mutation"] }),
-				[PROJECT_FILE]: JSON.stringify({ courseCheck: "interval" }),
-			}),
-		});
-
-		expect(config.gates).toEqual({ mutation: true, completion: true });
-		expect(config.courseCheck).toEqual({ mode: "completion", interval: 3 });
-		expect(config.problems).toHaveLength(2);
-		const [userProblem = "", projectProblem = ""] = config.problems;
-		expect(userProblem).toContain(USER_FILE);
-		expect(userProblem).toContain("gates");
-		expect(projectProblem).toContain(PROJECT_FILE);
-		expect(projectProblem).toContain("courseCheck");
-	});
-
-	test("an empty object for a section keeps the defaults and reports nothing", () => {
-		const config = loadJevConfig({
-			cwd: "/work",
-			home: "/home/owner",
-			read: reader({ [PROJECT_FILE]: JSON.stringify({ gates: {}, courseCheck: {} }) }),
-		});
-
 		expect(config).toEqual(DEFAULT_CONFIG);
-		expect(config.problems).toEqual([]);
 	});
 
 	test("a file that is not JSON keeps every default in force", () => {
@@ -117,20 +66,14 @@ describe("T4 - configuration of the gates and the course check", () => {
 		expect(configPaths({ cwd: "/work", home: "/home/owner" })).toEqual([USER_FILE, PROJECT_FILE]);
 	});
 
-	test("anti-slop ships advisory and the project file can enforce it", () => {
-		const shipped = loadJevConfig({ cwd: "/work", home: "/home/owner", read: reader({}) });
-		expect(shipped.antiSlop).toEqual({ mode: "advisory" });
-
-		const enforced = loadJevConfig({
-			cwd: "/work",
-			home: "/home/owner",
-			read: reader({
-				[USER_FILE]: JSON.stringify({ antiSlop: { mode: "advisory" } }),
-				[PROJECT_FILE]: JSON.stringify({ antiSlop: { mode: "enforce" } }),
-			}),
+	test("the removed enforce mode is diagnosed rather than restored", () => {
+		const config = loadJevConfig({
+			cwd: "/work", home: "/home/owner",
+			read: reader({ [PROJECT_FILE]: JSON.stringify({ antiSlop: { mode: "enforce" } }) }),
 		});
-		expect(enforced.antiSlop).toEqual({ mode: "enforce" });
-		expect(enforced.problems).toEqual([]);
+		expect(config.antiSlop.mode).toBe("advisory");
+		expect(config.problems).toHaveLength(1);
+		expect(config.problems[0]).toContain(`${PROJECT_FILE}: antiSlop.mode`);
 	});
 
 	test("an invalid anti-slop mode keeps the default and names the file and key", () => {
@@ -194,36 +137,24 @@ describe("T4 - configuration of the gates and the course check", () => {
 			home: "/home/owner",
 			read: reader({
 				[USER_FILE]: JSON.stringify({
-					gates: { mutation: false },
-					courseCheck: { mode: "interval", interval: 5 },
-					antiSlop: { mode: "enforce" },
+					antiSlop: { mode: "off" },
 					billing: { balance: 7 },
 				}),
 				[PROJECT_FILE]: JSON.stringify({
-					gates: ["mutation"],
-					courseCheck: "interval",
 					antiSlop: 42,
 					billing: "later",
 				}),
 			}),
 		});
 
-		expect(config.gates).toEqual({ mutation: false, completion: true });
-		expect(config.courseCheck).toEqual({ mode: "interval", interval: 5 });
-		expect(config.antiSlop).toEqual({ mode: "enforce" });
+		expect(config.antiSlop).toEqual({ mode: "off" });
 		expect(config.billing.balance).toBe(7);
-		expect(config.problems).toHaveLength(4);
+		expect(config.problems).toHaveLength(2);
 		const text = config.problems.join(" ");
 		for (const problem of config.problems) expect(problem).toContain(PROJECT_FILE);
-		expect(text).toContain("gates.mutation");
-		expect(text).toContain("courseCheck.mode");
 		expect(text).toContain("antiSlop.mode");
 		expect(text).toContain("billing.balance");
-		expect(text).toContain("false");
-		expect(text).toContain("true");
-		expect(text).toContain("interval");
-		expect(text).toContain("5");
-		expect(text).toContain("enforce");
+		expect(text).toContain("off");
 		expect(text).toContain("7");
 	});
 
@@ -232,30 +163,30 @@ describe("T4 - configuration of the gates and the course check", () => {
 			cwd: "/work",
 			home: "/home/owner",
 			read: reader({
-				[USER_FILE]: JSON.stringify({ gates: { mutation: false }, billing: { balance: 7 } }),
-				[PROJECT_FILE]: JSON.stringify({ gates: { mutation: "yes" }, billing: { balance: -1 } }),
+				[USER_FILE]: JSON.stringify({ antiSlop: { mode: "off" }, billing: { balance: 7 } }),
+				[PROJECT_FILE]: JSON.stringify({ antiSlop: { mode: "invalid" }, billing: { balance: -1 } }),
 			}),
 		});
 
-		expect(scalar.gates.mutation).toBe(false);
+		expect(scalar.antiSlop.mode).toBe("off");
 		expect(scalar.billing.balance).toBe(7);
 		const scalarText = scalar.problems.join(" ");
 		for (const problem of scalar.problems) expect(problem).toContain(PROJECT_FILE);
-		expect(scalarText).toContain("gates.mutation");
+		expect(scalarText).toContain("antiSlop.mode");
 		expect(scalarText).toContain("billing.balance");
-		expect(scalarText).toContain("false");
+		expect(scalarText).toContain("off");
 		expect(scalarText).toContain("7");
 
 		const broken = loadJevConfig({
 			cwd: "/work",
 			home: "/home/owner",
 			read: reader({
-				[USER_FILE]: JSON.stringify({ gates: { mutation: false }, billing: { balance: 7 } }),
+				[USER_FILE]: JSON.stringify({ antiSlop: { mode: "off" }, billing: { balance: 7 } }),
 				[PROJECT_FILE]: "{oops",
 			}),
 		});
 
-		expect(broken.gates.mutation).toBe(false);
+		expect(broken.antiSlop.mode).toBe("off");
 		expect(broken.billing.balance).toBe(7);
 		const brokenText = broken.problems.join(" ");
 		expect(broken.problems).toHaveLength(1);

@@ -1,0 +1,220 @@
+{
+  "reviews": [
+    {
+      "file": "jev_triage.feature",
+      "id": "jev_triage_01",
+      "title": "A quiet request needs no triage call",
+      "digest": "1e02c92df420f2dfa2f33290303b23c4964c0fca7a405f3b066bed0c689777e2",
+      "requirementIds": [
+        "FR-01",
+        "FR-02",
+        "FR-10",
+        "FR-30",
+        "FR-45",
+        "FR-72",
+        "FR-73"
+      ],
+      "approved": false,
+      "probability": 0.72,
+      "at": "2026-11-15T15:21:32.483Z"
+    },
+    {
+      "file": "jev_triage.feature",
+      "id": "jev_triage_02",
+      "title": "A judged development request registers the exact objective",
+      "digest": "b11a6e324f5fb1970aa7680a12d81db6ef5b1fb9dd766b17764c80b6f7398962",
+      "requirementIds": [
+        "FR-01",
+        "FR-02",
+        "FR-10",
+        "FR-30",
+        "FR-45",
+        "FR-72",
+        "FR-73"
+      ],
+      "approved": false,
+      "probability": 0.33,
+      "at": "2026-11-15T15:21:32.727Z"
+    },
+    {
+      "file": "jev_triage.feature",
+      "id": "jev_triage_03",
+      "title": "A simple request names the skipped stages",
+      "digest": "5c744cdbc51d7298efb929ccafa2b3be176198dfdc6a2df1075709a65bad6ad0",
+      "requirementIds": [
+        "FR-01",
+        "FR-02",
+        "FR-10",
+        "FR-30",
+        "FR-45",
+        "FR-72",
+        "FR-73"
+      ],
+      "approved": false,
+      "probability": 0.83,
+      "at": "2026-11-15T15:21:32.994Z"
+    },
+    {
+      "file": "jev_triage.feature",
+      "id": "jev_triage_04",
+      "title": "Only concrete requested expertise topics are retained",
+      "digest": "c2edf7db67fc326c730418dec29c35c7b19a486b76c39c81c9e0cac05f9b8c41",
+      "requirementIds": [
+        "FR-01",
+        "FR-02",
+        "FR-10",
+        "FR-30",
+        "FR-45",
+        "FR-72",
+        "FR-73"
+      ],
+      "approved": false,
+      "probability": 0.24,
+      "at": "2026-11-15T15:21:33.248Z"
+    },
+    {
+      "file": "jev_triage.feature",
+      "id": "jev_triage_05",
+      "title": "No generic catalog is attached to every prompt",
+      "digest": "30a69a6eeb18f04c420077b294e81802f7f827d4f945d08c32a1185ef1d6e1c3",
+      "requirementIds": [
+        "FR-01",
+        "FR-02",
+        "FR-10",
+        "FR-30",
+        "FR-45",
+        "FR-72",
+        "FR-73"
+      ],
+      "approved": true,
+      "probability": 0.89,
+      "at": "2026-11-15T15:21:33.521Z"
+    },
+    {
+      "file": "jev_triage.feature",
+      "id": "jev_triage_06",
+      "title": "Triage records whether the deliverable is external",
+      "digest": "6d747c58092b87e4475583945afca4842e82c01e47460a0bd620dfc3f8f645d5",
+      "requirementIds": [
+        "FR-01",
+        "FR-02",
+        "FR-10",
+        "FR-30",
+        "FR-45",
+        "FR-72",
+        "FR-73"
+      ],
+      "approved": false,
+      "probability": 0.89,
+      "at": "2026-11-15T15:21:33.766Z"
+    },
+    {
+      "file": "jev_triage.feature",
+      "id": "jev_triage_07",
+      "title": "Uncertain external scope is not silently treated as internal",
+      "digest": "ac0b40d55b4e68782a956d6102e4b269e37222e8f4a1f189cfc89caa315df4a9",
+      "requirementIds": [
+        "FR-01",
+        "FR-02",
+        "FR-10",
+        "FR-30",
+        "FR-45",
+        "FR-72",
+        "FR-73"
+      ],
+      "approved": false,
+      "probability": 0.47,
+      "at": "2026-11-15T15:21:34.029Z"
+    },
+    {
+      "file": "jev_triage.feature",
+      "id": "jev_triage_08",
+      "title": "Unsettled triage registers nothing and is recorded as uncertainty",
+      "digest": "1206d5f5ce3ed78395dc70f0e53a924698971e5ca2ede86f5ec71b21571973a0",
+      "requirementIds": [
+        "FR-01",
+        "FR-02",
+        "FR-10",
+        "FR-30",
+        "FR-45",
+        "FR-72",
+        "FR-73"
+      ],
+      "approved": false,
+      "probability": 0.8,
+      "at": "2026-11-15T15:21:34.257Z"
+    },
+    {
+      "file": "jev_triage.feature",
+      "id": "jev_triage_09",
+      "title": "A mismatched request is refused locally with the current words",
+      "digest": "83390efdf3b754ceb5cf77a2afb40ef6ed5768776d4d19b5a1544548572b50e3",
+      "requirementIds": [
+        "FR-01",
+        "FR-02",
+        "FR-10",
+        "FR-30",
+        "FR-45",
+        "FR-72",
+        "FR-73"
+      ],
+      "approved": false,
+      "probability": 0.37,
+      "at": "2026-11-15T15:21:34.534Z"
+    },
+    {
+      "file": "jev_triage.feature",
+      "id": "jev_triage_10",
+      "title": "Triage is registered once per request",
+      "digest": "240dda3918a38a59415520023d6300be18fffdd8057204982fd6c46dfdfa0bfd",
+      "requirementIds": [
+        "FR-01",
+        "FR-02",
+        "FR-10",
+        "FR-30",
+        "FR-45",
+        "FR-72",
+        "FR-73"
+      ],
+      "approved": false,
+      "probability": 0.53,
+      "at": "2026-11-15T15:21:34.791Z"
+    },
+    {
+      "file": "jev_triage.feature",
+      "id": "jev_triage_11",
+      "title": "Missing triage does not block project work",
+      "digest": "5cfd2b987b060e50a09fe5b9cb3f6eee3d34b834785b92f4152c1d359ea8245d",
+      "requirementIds": [
+        "FR-01",
+        "FR-02",
+        "FR-10",
+        "FR-30",
+        "FR-45",
+        "FR-72",
+        "FR-73"
+      ],
+      "approved": true,
+      "probability": 0.64,
+      "at": "2026-11-15T15:21:35.066Z"
+    },
+    {
+      "file": "jev_triage.feature",
+      "id": "jev_triage_12",
+      "title": "A judge outage registers no task and does not stop work",
+      "digest": "a0a140eb242e2db30bae9b666de175768ed18e07c592025b09ab508c5c05c90a",
+      "requirementIds": [
+        "FR-01",
+        "FR-02",
+        "FR-10",
+        "FR-30",
+        "FR-45",
+        "FR-72",
+        "FR-73"
+      ],
+      "approved": false,
+      "probability": 0.33,
+      "at": "2026-11-15T15:21:35.384Z"
+    }
+  ]
+}

@@ -4,7 +4,7 @@ import {
 	boundaryExhausted,
 	clearFinishedTask,
 	clearResolvedHold,
-	continuationAllowed,
+	diagnosticSummary,
 	exhaustBoundary,
 	freshState,
 	permitAfterIgnoredCalls,
@@ -15,6 +15,7 @@ import {
 	recordAcceptance,
 	recordAction,
 	recordActivityOutcome,
+	recordDiagnostic,
 	recordFailedAction,
 	recordJudgeCall,
 	recordRecovery,
@@ -25,10 +26,15 @@ import {
 	sha256,
 	submissionLedger,
 	takePendingOwnerMessages,
+	type DiagnosticKind,
 	type JevState,
 } from "../src/state.js";
 import { asRecord, type ToolOutcome } from "../src/types.js";
 import { POLICY } from "../src/types.js";
+
+function emptyCounts(): Record<DiagnosticKind, number> {
+	return { passed: 0, failed: 0, inconclusive: 0, unavailable: 0, not_checked: 0 };
+}
 
 /** A task with one approved plan, one accepted aspect and every task-bound marker set. */
 function workedTask(): JevState {
@@ -161,8 +167,8 @@ describe("T5 - acceptance is bound to the work revision", () => {
 	});
 });
 
-describe("T5 - a blocked stop never settles the session", () => {
-	test("the same reason is counted past the bound and stays an OPEN item", () => {
+describe("stop-block counting stays informational", () => {
+	test("the same reason is counted past the bound and remains a count", () => {
 		const state = freshState();
 		const reason = sha256("acceptance missing");
 
@@ -229,7 +235,7 @@ describe("FR-22, FR-23 - the refusal ledger and the OPEN item", () => {
 	});
 });
 
-describe("FR-23 - a refusal records a recoverable finding, never authority", () => {
+describe("FR-23 - a refusal records a finding, never authority", () => {
 	const refusalOutcome: ToolOutcome = {
 		ok: false,
 		text: "the judge selected defect (confidence 0.91)",
@@ -249,11 +255,22 @@ describe("FR-23 - a refusal records a recoverable finding, never authority", () 
 		expect(hold?.result).toMatchObject(refusalOutcome.details ?? {});
 		expect(asRecord(hold?.result)?.["text"]).toBe(refusalOutcome.text);
 		expect(recoveryFeedback(state)).toContain(hold?.id ?? "");
-		expect(recoveryFeedback(state)).toContain("findingId");
-		expect(continuationAllowed(state)).toBe(false);
 	});
 
-	test("the recovery feedback names the class and where the original finding stays, not its payload", () => {
+	test("independent failed checks retain their own exact findings without replacing the first", () => {
+		const state = freshState();
+		const first = recordRecovery(state, "review", { target: "a.ts" }, refusalOutcome);
+		recordRecovery(state, "course-check", { claim: "the parser handles empty input" }, {
+			ok: false, text: "The evidence is inconclusive.", details: { kind: "unclear", approved: false },
+		});
+		expect(state.hold).toBe(first);
+		expect(state.findings).toHaveLength(2);
+		expect(state.findings?.[0]?.material).toBe(JSON.stringify({ target: "a.ts" }));
+		expect(state.findings?.[1]?.material).toContain("empty input");
+		expect(asRecord(state.findings?.[1]?.result)?.["text"]).toBe("The evidence is inconclusive.");
+	});
+
+	test("the recovery feedback is an advisory summary, not a stop or override instruction", () => {
 		const state = freshState();
 		registerTask(state, "Repair the parser");
 		const hold = recordRecovery(state, "review", { kind: "diff", target: "a.ts" }, refusalOutcome);
@@ -261,12 +278,17 @@ describe("FR-23 - a refusal records a recoverable finding, never authority", () 
 		const feedback = recoveryFeedback(state);
 
 		expect(feedback).toContain(hold?.id ?? "");
-		expect(feedback).toContain("Class: defect");
-		expect(feedback).toContain('jev_context({"action":"list"})');
+		expect(feedback).toContain("defect");
+		expect(feedback.toLowerCase()).toContain("diagnostic");
+		expect(feedback).toContain("blocks no action or completion");
 		// The exact returned text stays in the finding; the feedback points at it instead of pasting it.
 		expect(asRecord(hold?.result)?.["text"]).toBe(refusalOutcome.text);
 		expect(feedback).not.toContain(refusalOutcome.text);
 		expect(hold?.material).toBe(JSON.stringify({ kind: "diff", target: "a.ts" }));
+		// No removed authority or blocking instruction survives in the advisory wording.
+		expect(feedback).not.toContain("/jev-continue");
+		expect(feedback).not.toContain("phase \"repair\"");
+		expect(feedback).not.toContain("do not claim completion");
 	});
 
 	test("an inconclusive finding is reported as uncertainty, not a proven deviation", () => {
@@ -280,10 +302,9 @@ describe("FR-23 - a refusal records a recoverable finding, never authority", () 
 
 		const feedback = recoveryFeedback(state);
 
-		expect(feedback).toContain("Class: unclear");
-		expect(feedback).toContain("not a proven deviation");
-		expect(feedback).toContain("/jev-continue");
-		expect(continuationAllowed(state)).toBe(false);
+		expect(feedback).toContain("unclear");
+		expect(feedback).toContain("blocks no action or completion");
+		expect(feedback).not.toContain("proven deviation");
 	});
 
 	test("an ordinary well-formed answer and a skipped check record no finding", () => {
@@ -312,15 +333,15 @@ describe("FR-23 - a refusal records a recoverable finding, never authority", () 
 		expect(state.hold).toBeUndefined();
 	});
 
-	test("a spent budget records the boundary OPEN without continuation permission", () => {
+	test("a spent budget records the boundary OPEN with no continuation authority in state", () => {
 		const state = freshState();
 		registerTask(state, "task");
 		for (const digest of ["a", "b", "c"]) recordRefusal(state, { boundary: "plan:outline", digest });
 
 		expect(state.exhausted).toEqual(["plan"]);
 		expect(state.openItem).toEqual({ boundary: "plan:outline", attempts: 3 });
-		expect(continuationAllowed(state)).toBe(false);
-		expect(state.continuation).toBeUndefined();
+		expect(Object.hasOwn(state, "continuation")).toBe(false);
+		expect(Object.hasOwn(state, "repair")).toBe(false);
 	});
 
 	test("owner messages keep chronological history and a takeable queue", () => {
@@ -357,6 +378,7 @@ describe("FR-29 - re-aiming and finishing a task", () => {
 		expect(state.directionPending).toBeUndefined();
 		expect(state.exhausted).toEqual([]);
 		expect(state.openItem).toBeUndefined();
+		expect(Object.hasOwn(state, "continuation")).toBe(false);
 	});
 
 	test("a finished task is dropped for the next prompt; an unfinished one is kept", () => {
@@ -376,29 +398,17 @@ describe("FR-29 - re-aiming and finishing a task", () => {
 		expect(state.revision).toBe(0);
 		expect(state.completion).toBeUndefined();
 	});
-
-	test("a finding holds a finished task open", () => {
-		const state = freshState();
-		registerTask(state, "task");
-		recordAction(state, { tool: "write", target: "src/a.ts", excerpt: "x" });
-		state.completion = { revision: state.revision, label: "follows", approved: true, confidence: 0.9 };
-		state.hold = { reason: "a defect" };
-
-		expect(clearFinishedTask(state)).toBe(false);
-		expect(state.task).toBeDefined();
-	});
 });
 
-describe("session accounting and ignored-call continuation", () => {
-	test("ignored gate calls record an OPEN item and authorize no continuation", () => {
+describe("session accounting and ignored-call records", () => {
+	test("ignored gate calls record an OPEN item and authorize nothing", () => {
 		const state = freshState();
 
 		permitAfterIgnoredCalls(state, "triage", 3);
 
 		expect(state.openItem).toEqual({ boundary: "triage", attempts: 3 });
 		expect(boundaryExhausted(state, "triage")).toBe(false);
-		expect(continuationAllowed(state)).toBe(false);
-		expect(state.continuation).toBeUndefined();
+		expect(Object.hasOwn(state, "continuation")).toBe(false);
 	});
 
 	test("activity outcomes and judge usage survive a task change", () => {
@@ -415,18 +425,100 @@ describe("session accounting and ignored-call continuation", () => {
 	});
 });
 
-describe("FR-57 - strict autonomous authorization", () => {
-	test("an exhausted boundary remains OPEN without authorizing autonomous continuation", () => {
-		const state = Object.assign(freshState(), { autonomous: true as const });
+describe("diagnostic state API", () => {
+	test("fresh state starts with zeroed check and work diagnostic counts", () => {
+		const state = freshState();
+
+		expect(state.diagnostics?.checks).toEqual(emptyCounts());
+		expect(state.diagnostics?.work).toEqual(emptyCounts());
+	});
+
+	test.each([
+		["a passed verdict", { ok: true, text: "approved", details: { approved: true } } as ToolOutcome, "passed"],
+		["a settled diagnostic consult", { ok: true, text: "yes", details: { verdict: "yes" } } as ToolOutcome, "passed"],
+		["an explicit refusal", { ok: false, text: "no", details: { approved: false } } as ToolOutcome, "failed"],
+		["a revise verdict", { ok: false, text: "revise", details: { verdict: "revise" } } as ToolOutcome, "failed"],
+		["an unavailable check", { ok: false, text: "offline", details: { kind: "unavailable" } } as ToolOutcome, "unavailable"],
+		["an unclear verdict", { ok: false, text: "unclear", details: { kind: "unclear" } } as ToolOutcome, "inconclusive"],
+		["an unusable answer", { ok: false, text: "unusable", details: { kind: "unusable" } } as ToolOutcome, "inconclusive"],
+		["an untyped uncertain answer", { ok: false, text: "unsettled", details: { verdict: "unclear" } } as ToolOutcome, "inconclusive"],
+		["a skipped check", { ok: false, text: "skipped", details: { skipped: true } } as ToolOutcome, "not_checked"],
+		["a missing prerequisite", { ok: false, text: "no plan", details: { prerequisite: "approved plan" } } as ToolOutcome, "not_checked"],
+		["an invalid submission", { ok: false, text: "bad input", details: { kind: "invalid" } } as ToolOutcome, "not_checked"],
+		["a stale answer", { ok: false, text: "stale", details: { kind: "stale" } } as ToolOutcome, "not_checked"],
+		["an external review with blockers", { ok: true, text: "reviewed", details: { blocked: true, blockers: 1 } } as ToolOutcome, "failed"],
+		["an unsettled fragment check", { ok: false, text: "unsettled", details: { approved: false, unsettled: [{ fragment: "claim" }] } } as ToolOutcome, "inconclusive"],
+	] as const)("records %s as %s", (_label, outcome, expected) => {
+		const state = freshState();
+
+		expect(recordDiagnostic(state, outcome)).toBe(expected);
+		expect(state.diagnostics?.checks[expected]).toBe(1);
+		expect(state.diagnostics?.work[expected]).toBe(0);
+	});
+
+	test("an explicit approved:false fails even when the call itself succeeded", () => {
+		const state = freshState();
+
+		expect(recordDiagnostic(state, { ok: true, text: "rejected", details: { approved: false } })).toBe("failed");
+		expect(state.diagnostics?.checks.failed).toBe(1);
+	});
+
+	test("work diagnostics count on both ledgers, explicit ones only as checks", () => {
+		const state = freshState();
+		const passed: ToolOutcome = { ok: true, text: "on course", details: { approved: true } };
+		const unavailable: ToolOutcome = { ok: false, text: "offline", details: { kind: "unavailable" } };
+
+		recordDiagnostic(state, passed);
+		recordDiagnostic(state, passed);
+		recordDiagnostic(state, unavailable, true);
+		recordDiagnostic(state, passed, true);
+
+		expect(state.diagnostics?.checks).toEqual({ ...emptyCounts(), passed: 3, unavailable: 1 });
+		expect(state.diagnostics?.work).toEqual({ ...emptyCounts(), passed: 1, unavailable: 1 });
+	});
+
+	test("the summary reports diagnostic counts and total without claiming acceptance", () => {
+		const state = freshState();
+		recordDiagnostic(state, { ok: true, text: "approved", details: { approved: true } });
+		recordDiagnostic(state, { ok: false, text: "offline", details: { kind: "unavailable" } }, true);
+
+		const summary = diagnosticSummary(state);
+
+		expect(summary).toContain("passed");
+		expect(summary).toContain("unavailable");
+		expect(summary).toMatch(/total/i);
+		expect(summary).toMatch(/diagnostic/i);
+		// Counts are evidence, never an acceptance or permission claim.
+		expect(summary).not.toMatch(/acceptance (?:passed|approved)|is approved|approval granted/i);
+	});
+
+	test("an empty session summarizes zero diagnostics", () => {
+		const state = freshState();
+
+		const summary = diagnosticSummary(state);
+
+		expect(summary).toMatch(/diagnostic/i);
+		expect(summary).toMatch(/0/);
+	});
+
+	test("continuation and repair authority are not part of the state surface", async () => {
+		const state = freshState();
+		Object.assign(state, { autonomous: true as const });
 		registerTask(state, "Implement the bound autonomous objective");
 		for (const digest of ["first", "second", "third"]) {
 			recordRefusal(state, { boundary: "action", digest });
 		}
-
 		exhaustBoundary(state, "action");
 
 		expect(state.openItem).toEqual({ boundary: "action", attempts: 3 });
-		expect(continuationAllowed(state)).toBe(false);
-		expect(state.continuation).toBeUndefined();
+		expect(Object.hasOwn(state, "continuation")).toBe(false);
+		expect(Object.hasOwn(state, "repair")).toBe(false);
+
+		// Runtime import on purpose: naming a removed export in a static import would fail the build
+		// before the test could demonstrate that the authority API is gone.
+		const stateModule = await import("../src/state.js");
+		for (const removed of ["allowContinuation", "continuationAllowed", "repairBinding", "permittedRepair"]) {
+			expect(Object.hasOwn(stateModule, removed), `${removed} must be removed with the authority contract`).toBe(false);
+		}
 	});
 });

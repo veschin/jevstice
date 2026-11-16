@@ -1,4 +1,143 @@
-# Jevstice handoff — 2026-11-14
+# Jevstice handoff — 2026-11-15
+
+## Current contract
+
+Jevstice records diagnostic judgment at visible OMP tool boundaries. It does not grant or withhold
+execution permission. A failed check stays failed; an inconclusive answer establishes neither a
+defect nor an approval; an unavailable or stale answer establishes nothing; a local argument error is
+not checked because no judgment ran. Findings are disclosed with their original boundary, work
+revision, exact submitted material and returned result. Ordinary effects and model completion
+proceed independently from check acceptance.
+
+The host owns tool execution and completion. The optional strict supervisor keeps its own
+owner-authorized roots, resource limits, effect identity, durable ledger and pending-effect
+reconciliation; Jev verdicts are evidence inside that runtime, not authority.
+
+## Superseded features and unfinished claims
+
+- **Obsolete:** the two-phase `jev_consult mode: "recovery"` (`repair` authorizes one exact action,
+  `resolve` clears a finding), repair permits, refusal holds that block consequential work, and the
+  duplicate/replay machinery built around them. Definitions may still exist in source coordinates
+  until the owning code change lands; the public contract no longer exposes or promises them.
+- **Removed:** `/jev-continue`, `/jev-waive`, approval-message overrides such as `аппрув`, and
+  instructions to wait for an owner override or for checks to pass.
+- **Unfinished:** the earlier release demos and whole-task acceptance are not current passing
+  results. The 2026-11-14 two-phase recovery probe and the earlier below-floor recovery are prior
+  contracts, retained only as history. The 2.1.0 release carried an optional autonomy module whose
+  full acceptance was open then and remains open now. Do not describe any of these runs as evidence
+  for the diagnostic contract, release readiness or full autonomy acceptance.
+
+## Current public interface
+
+- Twelve ordinary tools: `jev_triage`, `jev_search_relevance`, `jev_requirements`,
+  `jev_plan_review`, `jev_consult` (choice/score/boolean only), `jev_context`, `jev_course_check`,
+  `jev_acceptance`, `jev_review`, `jev_reaim`, `jev_text_review`, `jev_anti_slop`.
+- Owner commands: `/jev` (report, `off`, `on`), `/jev-status`. The session switch changes checks
+  only, writes no configuration, and changes no host permission.
+- Every Jev tool result carries `details.diagnostics` with `checks` and `work`, each carrying
+  `passed`, `failed`, `inconclusive`, `unavailable` and `not_checked`. A consequential tool result
+  starts as `not_checked`; an asynchronous effect still pending remains `not_checked`. The status
+  summary reports both groups and the current-revision business and architecture acceptance
+  separately.
+- Configuration: `antiSlop.mode` (`off`, `advisory`) and `billing.*`. Older `gates.*`,
+  `courseCheck.*` and `antiSlop.mode: "enforce"` keys are obsolete: unknown keys are ignored, and an
+  `enforce` value falls back to `advisory` with a named problem.
+
+## Observed verification — 2026-11-15
+
+- `bun test`: **530 passed, 0 failed, 2352 assertions, 20 files**, after the acceptance
+  evidence-basis change and the diagnostic result contract.
+- Twelve per-tool recordings exist under `demos/tools/` (GIF, tape, frames, raw event stream, model
+  identity, outcome); `jev_reaim` is recorded through a two-message RPC session. Long recordings skip
+  idle frames; the evidence keeps the real timeline.
+- `bun run typecheck --noUnusedLocals --noUnusedParameters`: passed on the current source.
+- `code-guard --deep src autonomy tests tools`: clean TypeScript analysis; formatter and linter
+  channels skipped because no corresponding configuration exists.
+- Acceptance now requires literal basis evidence: `execution_evidence` and `code_evidence` at the
+  plan level, plus a selected execution and code evidence item per plan topic, with a missing or
+  below-floor basis reported as `unresolved` instead of inferred. The four FR-26 regressions failed
+  before the change and pass after it.
+- A negative diagnostic is a normal tool result carrying a "diagnostic only" note; only a malformed
+  local submission is a tool error. The recorded outcomes, counts and any hold are unchanged.
+- A follow-up that adds work retains the unaffected approved requirements without re-judging them,
+  filters the plan draft to them and reopens review; `jev_reaim` refuses a phrase that merely occurs
+  inside an older owner message before any judge call.
+- The normative Gherkin files live in `scenarios/`. `tests/scenarios/` parses them and turns every
+  scenario into a test: a scenario whose steps are all defined runs against production code, and any
+  other scenario is reported as `todo`, never as a pass. Steps are feature-scoped, so the same
+  sentence may mean different things in two files. Executable so far: `jev_reaim` 11/11,
+  `jev_triage` 14/14 (this file found a real defect: `inspect …` was read as judged, now quiet),
+  `jev_consult` 18/18, `jev_context` 18/18, `jev_search_relevance` 11/11, `jev_review` 14/14,
+  `jev_text_review` 15/15, `jev_requirements` 11/11, `jev_plan_review` 17/18 (the host plan-mode
+  hook does not exist), `jev_course_check` 11/11, `jev_acceptance` 21/21, `jev_diagnostics` 25/25,
+  `jev_session_mode` 12/12, `jev_configuration` 25/25, `jev_anti_slop` 28/28, `jev_autonomy` 27/27.
+  The full suite is 825 pass, 0 fail, 2 todo, 5354 assertions.
+- FR-42 retention is now implemented: an amendment keeps an already-accepted outline step and section
+  for every unaffected requirement and drops only the dependent ones (`src/activities.ts` amend
+  branch); its scenario runs (owner follow-up 15 pass, 1 todo) and the regression failed before the
+  change.
+- The autonomy scenarios now run for real: the supervisor and strict runtime are exercised under
+  observed systemd user scopes, with bounded waits and cleanup (0 leftover scopes or processes).
+- Two `todo` scenarios remain, both real gaps: one owner-follow-up scenario needs durable session
+  restore (ordinary state is a per-session in-memory map), and one plan-review scenario needs a host
+  plan-mode boundary — the installed OMP extension event union exposes no plan-mode event. The second
+  is a host capability gap, not a test stub.
+- `tools/review-scenarios.ts` asks the judge about one scenario at a time, with the cited requirement
+  and an implementation excerpt, and records the verdict in `scenarios/reviews.json`; unchanged
+  scenarios are not paid for twice. The triage verdicts so far are mixed (3 approved, the rest
+  flagged), so per-scenario judge agreement is not claimed.
+- Ordinary controller regressions cover an approved plan followed by a negative course check,
+  missing planning context, judge outages, an unresolved judge promise, independent context reads,
+  continued project calls and completion, and truthful diagnostic counts.
+
+- Strict targeted coverage preserves root/ownership/manifest checks, out-of-root script-symlink
+  rejection, intent identity and pending-effect reconciliation while removing Jev vetoes.
+- Deterministic negative/outage smoke passed at `/tmp/jev-live-smoke-BuklYu`: two failed checks
+  remained failed, outages remained unavailable, and subsequent writes and completion proceeded.
+- Production-judge direct workflow passed at `/tmp/jev-live-smoke-cFesXK`: 12 judge calls and
+  both acceptance aspects passed for the disposable slug example, not for this whole project.
+- Native OMP 18.20.2 with `deepseek/deepseek-flash` passed the workflow smoke at
+  `/tmp/jev-live-smoke-a763ON`, exit 0, with native calls and typed diagnostic records.
+- Native command inspection found `/jev` and `/jev-status`, no continuation/waiver command,
+  and accepted the status command locally with zero model turns and no extension errors
+  (`/tmp/jev-native-diagnostics-lMUR9G.jsonl`).
+
+The background-finding race is fixed: an unrelated diagnostic finding no longer participates in
+the task/approval staleness comparison. Its regression failed before the correction and passed
+afterward; the smoke deliberately overlaps background and foreground checks without a wait or retry.
+Genuine task, revision, owner input, approval and artifact changes still invalidate stale answers.
+
+Evidence paths above are local machine artifacts, not portable release assets.
+
+## Remaining scope
+
+- Full revised strict-supervisor real-host startup/completion/cancellation/crash coverage remains
+  unproved. Deterministic tests do not replace those deployment scenarios.
+- The matched 3D-game comparison was rebuilt with a style-pinned prompt and a 15-minute cap:
+  both runs exited 0 (397 s without the addon, 613 s with it), both artifacts passed the browser
+  checks, and the addon's ship matched the requested cone while the baseline drew a disc. The UI
+  comparison retains its earlier 300-second pair. Neither is a benchmark.
+- All twelve tools have a rendered GIF under `demos/tools/` plus the tape, three frames, the sanitized
+  event stream, the exact model identity and the outcome. `jev_reaim` is recorded through a
+  two-message RPC session; the driver sends the second owner message as `steer` and waits for the real
+  turn boundaries.
+- `docs/presale-reddit.md` and `docs/presale-twitter.md` are the release drafts. They are English,
+  cite the observed results above and claim no measured advantage.
+- No current Jev whole-project acceptance, commit, tag or publication is claimed.
+- Existing loaded hosts need a restart to load changed hooks, tool schemas and injected guidance.
+  Old global/user-authored instructions may still prescribe the superseded workflow; Jev findings
+  themselves are diagnostic, not a reason to ask for continuation.
+
+---
+
+# Historical record — 2026-11-14 (superseded, retained)
+
+> The record below describes the earlier blocking-recovery contract and the state observed then. It
+> is retained for audit history. It is not current behavior, not a current verification result, and
+> not evidence that the diagnostic contract passed. Its repair-permit feature is obsolete and the
+> release demos it mentions remain unfinished.
+
+## 2026-11-14 session record
 
 ## Final state of this session
 
@@ -13,7 +152,7 @@
 
 The owner ended the session because time ran out and requested this written record. Do not treat this handoff as implementation acceptance or permission to bypass Jev.
 
-The requested outcome is a reliable addon: a passed check enables its promised next transition; a failed check permits substantive diagnosis and correction until approval, without stale-refusal deadlocks, unsafe overrides, lower approval floors or repeated identical paid judgments. The owner additionally requested one parallel Sol agent per tool, English normative Gherkin scenarios in `сценарии`, followed by code/logic audits, especially for mistakes by inexpensive executor models.
+The requested outcome is a reliable addon: a passed check enables its promised next transition; a failed check permits substantive diagnosis and correction until approval, without stale-refusal deadlocks, unsafe overrides, lower approval floors or repeated identical paid judgments. The owner additionally requested one parallel Sol agent per tool, English normative Gherkin scenarios in `scenarios`, followed by code/logic audits, especially for mistakes by inexpensive executor models.
 
 ## Results actually obtained
 
@@ -49,7 +188,7 @@ Thirteen Sol agents were launched in parallel, one for each ordinary Jev tool pl
 
 At the stop snapshot there were **13 files and 332 Scenario/Scenario Outline definitions**; Examples rows are not counted separately:
 
-| File under `сценарии/` | Definitions | Agent audit handoff |
+| File under `scenarios/` | Definitions | Agent audit handoff |
 |---|---:|---|
 | `jev_triage.feature` | 23 | Completed |
 | `jev_requirements.feature` | 26 | Cancelled at owner stop; finish/reconcile audit |
@@ -107,7 +246,7 @@ The following are open static findings unless explicitly identified as fixed abo
 ### 5. Close confidence, evidence and exact-content gaps
 
 - Triage can treat uncertain external classification as internal and omit uncertain topics (`src/activities.ts:901,911`); enforced external checks can therefore be skipped. Validate raw topic/candidate input rather than silently dropping malformed entries.
-- Anti-slop below-floor required checks can yield a nominally complete review without proof; result prose can contradict advisory mode or overstate delivery permission. Enforced review at revision zero and uncertain external-delivery classification also need regressions. See `сценарии/jev_anti_slop.feature`.
+- Anti-slop below-floor required checks can yield a nominally complete review without proof; result prose can contradict advisory mode or overstate delivery permission. Enforced review at revision zero and uncertain external-delivery classification also need regressions. See `scenarios/jev_anti_slop.feature`.
 - Text review/anti-slop/search use trimming helpers on material whose contract promises verbatim preservation. Verify intended exact-content semantics and preserve original submitted text/rules/reasons where required. Text review also lacks the documented artifact-size bound.
 - Review/acceptance evidence checks may validate labels rather than required changed-code and observed-command-output content. Do not invent judge explanations: the SDK returns typed answers, not free prose. Treat fabricated-evidence resistance and prompt injection as unverified until exercised.
 - Ordinary consultations/acceptance/course checks need post-answer approved-artifact byte freshness checks, not only pre-judge readback. Malformed UTF-8/BOM normalization versus literal-byte approval also needs a precisely bounded contract/reproduction, not an assumed defect claim.

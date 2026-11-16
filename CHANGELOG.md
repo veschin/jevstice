@@ -1,6 +1,47 @@
 # Changelog
 
-## Unreleased
+## 2.2.0 - diagnostic contract (2026-11-15)
+
+### Changed
+
+- Jev results are diagnostic. A failed, inconclusive, unavailable or not-checked result is recorded truthfully and never becomes an execution error, a repair permit, an owner approval or a completion hold. Ordinary tool calls and model completion proceed independently from check acceptance.
+- `jev_consult` accepts only `choice`, `score` and `boolean`. Every mode answers one question and grants no authority; the recovery mode's `repair` and `resolve` phases are obsolete.
+- The native `/jev` command now switches diagnostic checks only, and `/jev-status` reports diagnostic coverage. The session switch changes no host permission and writes no configuration.
+- Every Jev tool result while diagnostics are on carries `details.diagnostics` with `checks` and `work`, each holding `passed`, `failed`, `inconclusive`, `unavailable` and `not_checked`. Work coverage counts consequential tool results, and an asynchronous effect still running remains `not_checked`. The status summary reports current-revision business and architecture acceptance separately.
+- Configuration is cut over to the diagnostic surface: only `antiSlop.mode` (`off` or `advisory`) and `billing.*` remain. Obsolete `gates.*` and `courseCheck.*` keys are ignored, and `antiSlop.mode: "enforce"` is invalid and falls back to `advisory` with a named problem.
+- README, the live-smoke guide, the autonomy reference, the PRD and the handoff now describe the diagnostic contract. Earlier recovery, continuation and repair entries are retained as clearly labeled history.
+
+### Acceptance and owner follow-up
+
+- `jev_acceptance` requires literal basis evidence: a command with its observed output for execution, and an actual diff, diagnostic or measurement for code. It asks for both at the plan level and, per plan topic, for the submitted evidence that establishes the execution and the code claim. A selected `none`, a missing answer or a below-floor answer blocks approval and is reported as `unresolved`; a basis is never inferred. An oversized batch is reported as not checked without dropping a question silently.
+- A negative diagnostic returns as a normal tool result with an explicit "diagnostic only, do not repeat this check to obtain approval" note; only a malformed local submission stays a tool error. Recorded outcomes and counts are unchanged.
+- A follow-up that adds work amends the accumulated objective and retains the unaffected approved requirements without re-judging them; the plan draft is filtered to the retained requirements and reopened for review, and affected approvals are invalidated.
+- `jev_reaim` accepts only the classified owner wording, the current request or the latest owner message; a phrase that merely occurs inside an older message is refused before any judge call.
+- The normative Gherkin files live in `scenarios/` (renamed from the earlier non-English directory).
+
+### Removed
+
+- `/jev-continue` and `/jev-waive`; continuation and waiver are not permission mechanisms.
+- The anti-slop waiver storage and its validators. Nothing wrote a waiver once the command was removed, so findings are now always reported exactly as recorded, and a review stays incomplete while a blocker stands.
+- `jev_consult mode: "recovery"` and its repair/resolve machinery.
+- The live `recovery` scenario and its repair assertions. Direct diagnostics coverage now verifies continued work after a negative verdict and an outage, and that the recorded diagnostic stays truthful.
+
+### Fixed
+
+- A background finding no longer invalidates an unrelated in-flight review. Genuine task,
+  work-revision, owner-input, approval and artifact changes still discard stale answers.
+
+### Documentation
+
+- The PRD records the 2026-11-15 owner contract as superseding the earlier hold, continuation and repair requirements rather than restating them as current behavior.
+- The live smoke no longer requires a gate hold or a repair permit. Host mode verifies that native calls actually executed, that typed diagnostics were attached, and that any observed negative verdict was recorded as negative.
+
+## Earlier unreleased work (historical, superseded)
+
+> The entries in this section record earlier contracts and the verification observed at that time:
+> automatic release, a blocking refusal hold, `jev_consult mode: "recovery"` repair/resolve, owner
+> continuation and owner waivers. They are not current behavior and are not evidence that the
+> diagnostic contract passed. Retained for audit history.
 
 ### Added
 

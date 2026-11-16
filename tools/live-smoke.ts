@@ -1,14 +1,17 @@
 #!/usr/bin/env bun
 /**
- * One live smoke entry for the current Jevstice workflow.
+ * Live smoke for the diagnostic Jevstice contract.
  *
- * `direct` builds the real controller over `createTypeSafeJudge`, drives the registered tools and
- * gate events through the same fake-host seams the tests use, and records every judge question,
- * answer, tool outcome and plan artifact. `host` launches the real omp CLI with the extension
- * loaded (`-e src/index.ts`) and verifies the tool calls it produced.
+ * `direct` builds the real controller over the production judge (or an injected deterministic judge
+ * for the `diagnostics` scenario), drives the registered tools and host events through the same
+ * seams the tests use, and records every judge question, typed answer, tool outcome and diagnostic
+ * snapshot. `host` launches the real omp CLI with the extension loaded (`-e src/index.ts`) and
+ * verifies the native calls it produced.
  *
- * Neither mode retries a refused stage: a refusal is evidence, not a pass. The old measurement and
- * review harnesses imported deleted modules; this is the live verification that replaced them.
+ * No mode treats a Jev verdict as execution permission. A negative verdict is recorded as a failed
+ * diagnostic and later work still executes; an outage is recorded as unavailable and later work
+ * still executes. A run fails when the record hides an observed outcome, when an expected native
+ * call or write never happened, or when the diagnostic shape is missing.
  */
 import { spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -18,25 +21,31 @@ import { memoizedApiKeyResolver } from "../src/apikey.js";
 import { loadJevConfig } from "../src/config.js";
 import { createJevController } from "../src/controller.js";
 import { createTypeSafeJudge, type Judge } from "../src/judge.js";
-import { asRecord, POLICY, type Evidence } from "../src/types.js";
+import { asRecord, type Evidence } from "../src/types.js";
 import {
+	answeringJudge,
 	blockReason,
 	fakeCtx,
+	type FakeAnswerSource,
+	type FakePi,
 	fakePi,
 	fakeZod,
+	failingJudge,
 	stopDecision,
 	toolCallEvent,
 	toolDetails,
 	toolFailed,
 	toolResultEvent,
 	toolText,
-	until,
 } from "../tests/helpers.js";
 
 const WORKFLOW_REQUEST =
 	"Add src/slug.ts exporting slugify(input: string): string that lowercases ASCII letters, replaces each run of non-alphanumeric characters with one hyphen, and trims leading and trailing hyphens. Add tests/slug.test.ts with bun tests for slugify(\"Hello World\") === \"hello-world\" and slugify(\"  A  B  \") === \"a-b\".";
 
 const FACTORIO_REQUEST = "Напиши Factorio в этом каталоге.";
+
+const DIAGNOSTIC_KEYS = ["passed", "failed", "inconclusive", "unavailable", "not_checked"] as const;
+type DiagnosticKey = (typeof DIAGNOSTIC_KEYS)[number];
 
 interface RequirementSpec {
 	text: string;
@@ -51,7 +60,7 @@ interface StepSpec {
 }
 
 interface Scenario {
-	name: "workflow" | "recovery" | "factorio";
+	name: "workflow" | "factorio";
 	request: string;
 	topics: string[];
 	requirements: RequirementSpec[];
@@ -289,11 +298,10 @@ Observed check: a browser check builds and progresses a world, reloads the page,
 	};
 }
 
-function scenarioOf(name: string): Scenario {
+export function scenarioOf(name: string): Scenario {
 	if (name === "workflow") return workflowScenario();
-	if (name === "recovery") return { ...workflowScenario(), name: "recovery" };
 	if (name === "factorio") return factorioScenario();
-	throw new Error(`unknown scenario '${name}' (expected workflow, recovery or factorio)`);
+	throw new Error(`unknown scenario '${name}' (expected workflow, factorio or diagnostics)`);
 }
 
 function parseArgs(argv: string[]): { mode: string; scenario: string; out?: string; model?: string; maxTime: number } {
@@ -354,17 +362,284 @@ function addEvidence(log: EvidenceLog, entry: Record<string, unknown>): void {
 }
 
 interface ToolReply {
-	blocked?: string;
 	text: string;
 	details: Record<string, unknown>;
 	failed: boolean;
+}
+
+interface DiagnosticCounts {
+	checks: Record<DiagnosticKey, number>;
+	work: Record<DiagnosticKey, number>;
+}
+
+function countsOf(value: unknown): Record<DiagnosticKey, number> | undefined {
+	const record = asRecord(value);
+	if (record === undefined) return undefined;
+	const counts = {} as Record<DiagnosticKey, number>;
+	for (const key of DIAGNOSTIC_KEYS) {
+		const count = record[key];
+		if (typeof count !== "number" || !Number.isInteger(count) || count < 0) return undefined;
+		counts[key] = count;
+	}
+	return counts;
+}
+
+/** The five-key diagnostic snapshot attached to every ordinary Jev tool result, or undefined. */
+export function diagnosticsOf(details: unknown): DiagnosticCounts | undefined {
+	const record = asRecord(details);
+	if (record === undefined) return undefined;
+	const diagnostics = asRecord(record["diagnostics"]);
+	if (diagnostics === undefined) return undefined;
+	const checks = countsOf(diagnostics["checks"]);
+	const work = countsOf(diagnostics["work"]);
+	return checks === undefined || work === undefined ? undefined : { checks, work };
+}
+
+/** Problem statements for a result that does not carry the current diagnostic shape. */
+export function diagnosticProblems(label: string, details: unknown): string[] {
+	const record = asRecord(details);
+	if (record === undefined) return [`${label} returned no details object`];
+	const diagnostics = asRecord(record["diagnostics"]);
+	if (diagnostics === undefined) return [`${label} returned no details.diagnostics`];
+	const problems: string[] = [];
+	for (const group of ["checks", "work"] as const) {
+		const counts = asRecord(diagnostics[group]);
+		if (counts === undefined) {
+			problems.push(`${label} returned no details.diagnostics.${group}`);
+			continue;
+		}
+		for (const key of DIAGNOSTIC_KEYS) {
+			if (typeof counts[key] !== "number") problems.push(`${label} diagnostics.${group}.${key} is not a number`);
+		}
+	}
+	return problems;
+}
+
+function parseCount(summary: string, key: DiagnosticKey, section: "Checks" | "Work"): number | undefined {
+	const match = new RegExp(`${section}: [^.]*?(\\d+) ${key}`).exec(summary);
+	if (match === null) return undefined;
+	return Number.parseInt(match[1] ?? "", 10);
 }
 
 function planEvidence(scenario: Scenario, quote: string): Evidence[] {
 	return [{ kind: "documentation", quote, source: `local://${scenario.artifactName}` }];
 }
 
-async function direct(scenario: Scenario, dir: string): Promise<{ judgeCalls: number }> {
+function writeEvidenceFile(root: string, path: string, content: string): string {
+	const absolute = join(root, path);
+	mkdirSync(join(absolute, ".."), { recursive: true });
+	writeFileSync(absolute, content, "utf8");
+	return absolute;
+}
+
+async function callTool(pi: FakePi, ctx: unknown, name: string, params: unknown, log: EvidenceLog): Promise<ToolReply> {
+	const gate = await pi.emit("tool_call", toolCallEvent(name, params), ctx);
+	const blocked = blockReason(gate);
+	if (blocked !== undefined) {
+		addEvidence(log, { kind: "tool_call", name, params, blocked });
+		throw new Error(`the addon blocked the ${name} diagnostic call: ${blocked}`);
+	}
+	const result = await pi.callTool(name, params, ctx);
+	const text = toolText(result);
+	const details = toolDetails(result);
+	const failed = toolFailed(result);
+	addEvidence(log, { kind: "tool", name, params, text, details, failed });
+	return { text, details, failed };
+}
+
+/**
+ * Execute one consequential call the way the host does: the gate handler runs first, the effect is
+ * performed for real, then the terminal result is reported. The gate must not block: ordinary Jev
+ * diagnostics never hold execution.
+ */
+async function performWrite(
+	pi: FakePi,
+	ctx: unknown,
+	workspace: string,
+	input: { path: string; content: string },
+	log: EvidenceLog,
+): Promise<void> {
+	const gate = await pi.emit("tool_call", toolCallEvent("write", input), ctx);
+	const blocked = blockReason(gate);
+	if (blocked !== undefined) throw new Error(`the addon blocked the write to '${input.path}': ${blocked}`);
+	const absolute = writeEvidenceFile(workspace, input.path, input.content);
+	if (readFileSync(absolute, "utf8") !== input.content) throw new Error(`the executed write did not produce the approved bytes for ${input.path}`);
+	await pi.emit("tool_result", toolResultEvent("write", input, `wrote ${input.content.length} bytes`), ctx);
+	addEvidence(log, { kind: "effect", tool: "write", path: input.path, bytes: input.content.length });
+}
+
+async function runPlanning(
+	scenario: Scenario,
+	pi: FakePi,
+	ctx: unknown,
+	log: EvidenceLog,
+): Promise<void> {
+	const triage = await callTool(pi, ctx, "jev_triage", { request: scenario.request, topics: scenario.topics }, log);
+	if (triage.details["needsDevelopment"] !== true && !triage.text.includes("development task registered")) {
+		throw new Error(`triage did not register a development task: ${triage.text}`);
+	}
+	const requirements = await callTool(pi, ctx, "jev_requirements", {
+		request: scenario.request,
+		items: scenario.requirements,
+		candidateNeeds: [],
+	}, log);
+	if (requirements.failed || requirements.details["approved"] !== true) {
+		throw new Error(`requirements were not approved: ${requirements.text}`);
+	}
+	const outline = await callTool(pi, ctx, "jev_plan_review", {
+		phase: "outline",
+		steps: scenario.steps.map(step => ({ id: step.id, summary: step.summary, requirement: step.requirement })),
+		evidence: planEvidence(scenario, sectionOf(scenario.artifact, scenario.steps[0]?.id ?? "")),
+	}, log);
+	const outlineVerdict = outline.details["verdict"];
+	if (
+		outline.details["phase"] !== "detail" &&
+		outlineVerdict !== "serves" &&
+		!(typeof outlineVerdict === "string" && outlineVerdict !== "revise" && outlineVerdict !== "unsupported")
+	) {
+		throw new Error(`the outline was not approved: ${outline.text}`);
+	}
+	for (const step of scenario.steps) {
+		const section = sectionOf(scenario.artifact, step.id);
+		const detail = await callTool(pi, ctx, "jev_plan_review", {
+			phase: "detail",
+			plan: `local://${scenario.artifactName}`,
+			topic: { id: step.id, section, paths: step.paths, requirement: step.requirement },
+			evidence: planEvidence(scenario, section),
+		}, log);
+		const verdict = detail.details["verdict"];
+		if (
+			detail.failed ||
+			(typeof verdict === "string" &&
+				["revise", "missing_operation", "missing_check", "scope_expansion", "conflict", "unclear"].includes(verdict))
+		) {
+			throw new Error(`detail for '${step.id}' was not approved: ${detail.text}`);
+		}
+	}
+	const finalize = await callTool(pi, ctx, "jev_plan_review", {
+		phase: "finalize",
+		plan: `local://${scenario.artifactName}`,
+		evidence: planEvidence(scenario, scenario.artifact),
+	}, log);
+	if (typeof finalize.details["planDigest"] !== "string" && !finalize.text.includes("plan approved")) {
+		throw new Error(`the final plan was not approved: ${finalize.text}`);
+	}
+	addEvidence(log, { kind: "stage", name: "plan", status: "approved" });
+}
+
+async function runImplementationCommand(
+	scenario: Scenario,
+	pi: FakePi,
+	ctx: unknown,
+	workspace: string,
+	log: EvidenceLog,
+): Promise<string> {
+	const implementation = scenario.implementation;
+	if (implementation === undefined) throw new Error(`'${scenario.name}' has no implementation command`);
+	for (const [path, content] of Object.entries(implementation.files)) {
+		await performWrite(pi, ctx, workspace, { path, content }, log);
+	}
+	const command = implementation.command;
+	const commandText = command.join(" ");
+	const gate = await pi.emit("tool_call", toolCallEvent("bash", { command: commandText }), ctx);
+	const blocked = blockReason(gate);
+	if (blocked !== undefined) throw new Error(`the addon blocked the implementation command: ${blocked}`);
+	// The smoke executes exactly the reported command once; the smoke itself must not be a failure
+	// only because the implementation is wrong, but an exit code is recorded truthfully.
+	const run = spawnSync(command[0] ?? "bun", command.slice(1), { cwd: workspace, encoding: "utf8" });
+	const output = `${run.stdout ?? ""}${run.stderr ?? ""}`.replace(/\x1b\[[0-9;]*m/g, "").trim();
+	await pi.emit("tool_result", toolResultEvent("bash", { command: commandText }, output.slice(0, 4000), run.status !== 0), ctx);
+	addEvidence(log, { kind: "effect", tool: "bash", command: commandText, status: run.status, output });
+	if (run.status !== 0) throw new Error(`the implementation command failed (${String(run.status)}): ${output}`);
+	return output;
+}
+
+async function runAcceptance(
+	scenario: Scenario,
+	pi: FakePi,
+	ctx: unknown,
+	output: string,
+	log: EvidenceLog,
+): Promise<Record<string, unknown>> {
+	const implementation = scenario.implementation;
+	if (implementation === undefined) throw new Error(`'${scenario.name}' has no acceptance claims`);
+	const commandText = implementation.command.join(" ");
+	const codeQuote = Object.entries(implementation.files)
+		.map(([path, content]) => `${path}\n${content}`)
+		.join("\n\n");
+	const evidence: Evidence[] = [
+		{ kind: "execution", quote: `$ ${commandText}\n${output}`, source: "smoke workspace" },
+		{ kind: "code", quote: codeQuote, source: "written files" },
+	];
+	const verdicts: Record<string, unknown> = {};
+	for (const aspect of ["business", "architecture"] as const) {
+		const acceptance = await callTool(pi, ctx, "jev_acceptance", {
+			aspect,
+			claim: implementation.claims[aspect],
+			evidence,
+		}, log);
+		if (typeof acceptance.details["approved"] !== "boolean") {
+			throw new Error(`${aspect} acceptance returned no typed approved verdict: ${acceptance.text}`);
+		}
+		verdicts[aspect] = acceptance.details["approved"];
+		addEvidence(log, { kind: "stage", name: `acceptance:${aspect}`, approved: acceptance.details["approved"], confidence: acceptance.details["confidence"], revision: acceptance.details["revision"] });
+	}
+	return verdicts;
+}
+
+function expectDiagnosticShape(label: string, details: Record<string, unknown>): DiagnosticCounts {
+	const problems = diagnosticProblems(label, details);
+	if (problems.length > 0) throw new Error(problems.join("; "));
+	const snapshot = diagnosticsOf(details);
+	if (snapshot === undefined) throw new Error(`${label} returned no readable diagnostics`);
+	return snapshot;
+}
+
+function statusTextOf(pi: FakePi, ctx: unknown): string {
+	pi.callCommand("jev-status", "", ctx);
+	const message = pi.messages.filter(entry => entry.customType === "jev.status").at(-1);
+	if (message === undefined) throw new Error("/jev-status emitted no status message");
+	return message.content;
+}
+
+function assertStatusTruth(summary: string, label: string): void {
+	if (!summary.includes("Jev diagnostics, not execution permission.")) throw new Error(`${label} status does not state that diagnostics are not permission: ${summary}`);
+	if (!summary.includes("Findings never block continued work or completion.")) throw new Error(`${label} status denies continuation independence: ${summary}`);
+	if (!summary.includes("Current-revision acceptance:")) throw new Error(`${label} status omits current-revision acceptance: ${summary}`);
+	const shown: Record<DiagnosticKey, string> = {
+		passed: "passed",
+		failed: "failed",
+		inconclusive: "inconclusive",
+		unavailable: "unavailable",
+		not_checked: "not checked",
+	};
+	for (const key of DIAGNOSTIC_KEYS) {
+		if (!summary.includes(` ${shown[key]}`)) throw new Error(`${label} status omits the '${shown[key]}' count: ${summary}`);
+	}
+}
+
+function assertCommandSurface(pi: FakePi): void {
+	if (!pi.commands.has("jev")) throw new Error("/jev is not registered");
+	if (!pi.commands.has("jev-status")) throw new Error("/jev-status is not registered");
+	if (pi.commands.has("jev-continue")) throw new Error("/jev-continue is still registered");
+	if (pi.commands.has("jev-waive")) throw new Error("/jev-waive is still registered");
+}
+
+async function controllerFor(
+	judge: Judge,
+	workspace: string,
+	artifactsDir: string,
+	sessionId: string,
+): Promise<{ pi: FakePi; ctx: unknown }> {
+	const config = loadJevConfig({ cwd: workspace, home: join(workspace, "home") });
+	if (config.problems.length > 0) throw new Error(`the default configuration did not load cleanly: ${config.problems.join("; ")}`);
+	const pi = fakePi();
+	createJevController({ judge, config, zod: fakeZod() }).register(pi.api);
+	const ctx = fakeCtx({ artifactsDir, sessionId });
+	return { pi, ctx };
+}
+
+async function direct(scenario: Scenario, dir: string): Promise<{ judgeCalls: number; diagnostics: DiagnosticCounts; acceptance: Record<string, unknown> }> {
 	const workspace = mkdtempSync(join(tmpdir(), "jev-smoke-work-"));
 	const artifactsDir = mkdtempSync(join(tmpdir(), "jev-smoke-artifacts-"));
 	mkdirSync(join(artifactsDir, "local"), { recursive: true });
@@ -382,266 +657,180 @@ async function direct(scenario: Scenario, dir: string): Promise<{ judgeCalls: nu
 		addEvidence(judgeLog, { call: judgeCalls, questions, state, outcome });
 		return outcome;
 	};
-
-	mkdirSync(join(workspace, ".omp"), { recursive: true });
-	writeFileSync(
-		join(workspace, ".omp", "jev.config.json"),
-		readFileSync(join(import.meta.dir, "armed.jev.config.json"), "utf8"),
-		"utf8",
-	);
-	const tempHome = join(workspace, "home");
-	mkdirSync(tempHome, { recursive: true });
-	const config = loadJevConfig({ cwd: workspace, home: tempHome });
-	const expectConfig = config.problems.length === 0 && config.courseCheck.mode === "interval" && config.courseCheck.interval === 1;
-	if (!expectConfig) throw new Error(`the armed fixture did not load cleanly: ${config.problems.join("; ")}`);
-	const pi = fakePi();
-	createJevController({ judge, config, zod: fakeZod() }).register(pi.api);
-	const ctx = fakeCtx({ artifactsDir, sessionId: "live-smoke" });
-
-	const call = async (name: string, params: unknown): Promise<ToolReply> => {
-		const gate = await pi.emit("tool_call", toolCallEvent(name, params), ctx);
-		const blocked = blockReason(gate);
-		if (blocked !== undefined) {
-			addEvidence(log, { kind: "tool_call", name, params, blocked });
-			return { blocked, text: blocked, details: {}, failed: true };
-		}
-		const result = await pi.callTool(name, params, ctx);
-		const text = toolText(result);
-		const details = toolDetails(result);
-		const failed = toolFailed(result);
-		await pi.emit("tool_result", toolResultEvent(name, params, text, failed), ctx);
-		addEvidence(log, { kind: "tool", name, params, text, details, failed });
-		return { blocked: undefined, text, details, failed };
-	};
-
-	const expect = (condition: unknown, message: string): void => {
-		if (!condition) throw new Error(message);
-	};
-
-	const waitForCourseCheck = async (before: number, required: boolean): Promise<void> => {
-		const seen = await until(
-			() => pi.messages.slice(before).some(message => message.customType === "jev.course_check"),
-			20000,
-		);
-		expect(!required || seen, "the interval course check did not run");
-		// The check clears its in-flight flag after it sends the message.
-		await Bun.sleep(50);
-		for (const message of pi.messages.slice(before)) {
-			if (message.customType !== "jev.course_check") continue;
-			addEvidence(log, { kind: "course_check", text: message.content });
-			expect(
-				!message.content.includes("Consequential changes are held") && !message.content.includes("could not be answered"),
-				`the course check refused: ${message.content}`,
-			);
-		}
-	};
-
+	const { pi, ctx } = await controllerFor(judge, workspace, artifactsDir, "live-smoke");
 	await pi.emit("session_start", {}, ctx);
 	await pi.emit("before_agent_start", { prompt: scenario.request }, ctx);
+	assertCommandSurface(pi);
 
-	const probeInput = {
+	// A pre-triage write must actually execute: diagnostics are not an admission gate.
+	await performWrite(pi, ctx, workspace, {
 		path: scenario.probePath,
 		content: scenario.implementation?.files[scenario.probePath] ?? "probe\n",
-	};
-	const beforeTriage = await pi.emit("tool_call", toolCallEvent("write", probeInput), ctx);
-	const triageRefusal = blockReason(beforeTriage);
-	expect(triageRefusal !== undefined, "the mutation gate did not hold the first project write before triage");
-	addEvidence(log, { kind: "gate", stage: "before-triage", path: scenario.probePath, reason: triageRefusal });
+	}, log);
 
-	const triage = await call("jev_triage", { request: scenario.request, topics: scenario.topics });
-	expect(
-		triage.details["needsDevelopment"] === true || triage.text.includes("development task registered"),
-		`triage did not register a development task: ${triage.text}`,
-	);
-
-	const beforePlan = await pi.emit("tool_call", toolCallEvent("write", probeInput), ctx);
-	const planRefusal = blockReason(beforePlan);
-	expect(planRefusal !== undefined, "the mutation gate did not hold a project write after triage and before the plan approval");
-	addEvidence(log, { kind: "gate", stage: "before-plan", path: scenario.probePath, reason: planRefusal });
-
-	const requirements = await call("jev_requirements", {
-		request: scenario.request,
-		items: scenario.requirements,
-		candidateNeeds: [],
-	});
-	expect(requirements.details["approved"] === true, `requirements were not approved: ${requirements.text}`);
-
-	const outline = await call("jev_plan_review", {
-		phase: "outline",
-		steps: scenario.steps.map(step => ({ id: step.id, summary: step.summary, requirement: step.requirement })),
-		evidence: planEvidence(scenario, sectionOf(scenario.artifact, scenario.steps[0]?.id ?? "")),
-	});
-	const outlineVerdict = outline.details["verdict"];
-	expect(
-		outline.details["phase"] === "detail" ||
-			outlineVerdict === "serves" ||
-			(typeof outlineVerdict === "string" && outlineVerdict !== "revise" && outlineVerdict !== "unsupported"),
-		`the outline was not approved: ${outline.text}`,
-	);
-
-	for (const step of scenario.steps) {
-		const section = sectionOf(scenario.artifact, step.id);
-		const detail = await call("jev_plan_review", {
-			phase: "detail",
-			plan: `local://${scenario.artifactName}`,
-			topic: { id: step.id, section, paths: step.paths, requirement: step.requirement },
-			evidence: planEvidence(scenario, section),
-		});
-		const detailVerdict = detail.details["verdict"];
-		expect(
-			!detail.failed &&
-				(typeof detailVerdict !== "string" ||
-					!["revise", "missing_operation", "missing_check", "scope_expansion", "conflict", "unclear"].includes(detailVerdict)),
-			`detail for '${step.id}' was not approved: ${detail.text}`,
-		);
-	}
-
-	const finalize = await call("jev_plan_review", {
-		phase: "finalize",
-		plan: `local://${scenario.artifactName}`,
-		evidence: planEvidence(scenario, scenario.artifact),
-	});
-	expect(
-		typeof finalize.details["planDigest"] === "string" || finalize.text.includes("plan approved"),
-		`the final plan was not approved: ${finalize.text}`,
-	);
-	addEvidence(log, { kind: "stage", name: "plan", status: "approved" });
-
-	if (scenario.implementation === undefined) {
-		// Planning-only: the approved plan is the deliverable. No game file is written, no acceptance
-		// is claimed, and the probe ends without asserting completion.
+	await runPlanning(scenario, pi, ctx, log);
+	const implementation = scenario.implementation;
+	if (implementation === undefined) {
 		addEvidence(log, { kind: "stage", name: "planning", status: "plan approved; implementation intentionally not performed" });
-		return { judgeCalls };
+		const snapshot = expectDiagnosticShape("jev_context", (await callTool(pi, ctx, "jev_context", { action: "list" }, log)).details);
+		assertStatusTruth(statusTextOf(pi, ctx), "planning-only");
+		return { judgeCalls, diagnostics: snapshot, acceptance: {} };
 	}
 
-	const firstFile = Object.entries(scenario.implementation.files)[0];
-	const forbidden = { path: "forbidden.txt", content: "Unrelated file, explicitly outside the approved slugify task.\n" };
-	const requestRepair = (findingId: unknown, input: Record<string, unknown>, refusal: string) => call("jev_consult", {
-		mode: "recovery",
-		recovery: {
-			phase: "repair", findingId,
-			diagnosis: "The forbidden.txt proposal was unrelated to the approved slugify task and never executed.",
-			correction: "Write only the exact approved slugify module, not the unrelated file.",
-			nextAction: { tool: "write", input },
-		},
-		evidence: [{ kind: "spec", quote: scenario.artifact }, { kind: "execution", quote: refusal }],
-	});
-	if (scenario.name === "recovery") {
-		expect(firstFile !== undefined, "the recovery scenario needs a planned implementation file");
-		const [path, content] = firstFile!;
-		const refused = blockReason(await pi.emit("tool_call", toolCallEvent("write", forbidden), ctx));
-		expect(refused !== undefined, "Jev authorized an unrelated write outside the approved task");
-		expect(!existsSync(join(workspace, forbidden.path)), "the refused file exists");
-		const held = await call("jev_context", { action: "list" });
-		const finding = asRecord(held.details["hold"]);
-		expect(typeof finding?.["id"] === "string", "the real action refusal produced no recoverable finding");
-		const verdict = asRecord(finding?.["result"]);
-		expect(
-			verdict?.["label"] === "off_course" && typeof verdict["confidence"] === "number" && verdict["confidence"] >= POLICY.minConfidenceToApprove,
-			`the negative case obtained no reliable off-course judgment: ${refused}`,
-		);
-		addEvidence(log, { kind: "assertion", name: "unrelated-write-blocked", pass: true, reason: refused });
-
-		const replacement = { path, content };
-		const repair = await requestRepair(finding!["id"], replacement, refused!);
-		expect(repair.details["repairApproved"] === true, `the correct replacement was not authorized: ${repair.text}`);
-		const callsAfterRepair = judgeCalls;
-		const changed = { ...replacement, content: `${content}\nthrow new Error("unapproved effect");\n` };
-		expect(
-			blockReason(await pi.emit("tool_call", toolCallEvent("write", changed), ctx)) !== undefined,
-			"a repair permit authorized changed code",
-		);
-		expect(!existsSync(join(workspace, path)), "a mismatched repair created the module");
-		expect(judgeCalls === callsAfterRepair, "a mismatched repair spent another judge call");
-		addEvidence(log, { kind: "assertion", name: "changed-repair-blocked", pass: true });
-	}
-
-	for (const [path, content] of Object.entries(scenario.implementation.files)) {
-		const writeInput = { path, content };
-		const callsBeforeWrite = judgeCalls;
-		const gate = await pi.emit("tool_call", toolCallEvent("write", writeInput), ctx);
-		const blocked = blockReason(gate);
-		expect(blocked === undefined, `the approved plan did not release '${path}': ${blocked}`);
-		if (scenario.name === "recovery" && path === firstFile?.[0]) {
-			expect(judgeCalls === callsBeforeWrite, "the exact authorized repair was unnecessarily judged again");
-			const context = await call("jev_context", { action: "list" });
-			expect(context.details["hold"] === undefined || context.details["hold"] === null, "the admitted replacement did not retire the preflight finding");
-			addEvidence(log, { kind: "assertion", name: "exact-repair-admitted", pass: true });
-			expect(!context.failed, `the replacement context could not be inspected: ${context.text}`);
-			// Interleave admission events before tool_result: revision and original invocation stay identical.
-			const beforeReplay = judgeCalls;
-			const replay = blockReason(await pi.emit("tool_call", toolCallEvent("write", forbidden), ctx));
-			expect(judgeCalls === beforeReplay + 1, `the resolved refusal was replayed from cache instead of rejudged: ${replay}`);
-			expect(replay !== undefined && !replay.includes("already judged"), "resolution bypassed a fresh refusal or recreated the stale cache finding");
-			const reheld = await call("jev_context", { action: "list" });
-			const freshFinding = asRecord(reheld.details["hold"]);
-			const freshVerdict = asRecord(freshFinding?.["result"]);
-			expect(freshVerdict?.["label"] === "off_course" && typeof freshVerdict["confidence"] === "number" && freshVerdict["confidence"] >= POLICY.minConfidenceToApprove,
-				"the identical unrelated proposal obtained no reliable fresh off-course verdict");
-			addEvidence(log, { kind: "assertion", name: "resolved-refusal-rejudged-without-bypass", pass: true });
-			const repair = await requestRepair(freshFinding!["id"], writeInput, replay!);
-			expect(repair.details["repairApproved"] === true, `the approved implementation could not recover from the new refusal: ${repair.text}`);
-			const beforeReadmission = judgeCalls;
-			expect(blockReason(await pi.emit("tool_call", toolCallEvent("write", writeInput), ctx)) === undefined, "the fresh exact repair was not admitted");
-			expect(judgeCalls === beforeReadmission, "the new exact repair was judged again");
-		}
-		const absolute = join(workspace, path);
-		mkdirSync(join(absolute, ".."), { recursive: true });
-		writeFileSync(absolute, content, "utf8");
-		expect(readFileSync(absolute, "utf8") === content, `the executed write did not produce the approved bytes for ${path}`);
-		const before = pi.messages.length;
-		await pi.emit("tool_result", toolResultEvent("write", writeInput, `wrote ${content.length} bytes`), ctx);
-		await waitForCourseCheck(before, true);
-	}
-	if (scenario.name === "recovery") {
-		expect(!existsSync(join(workspace, "forbidden.txt")), "the forbidden file appeared during recovery");
-	}
-
-	const command = scenario.implementation.command;
-	const commandText = command.join(" ");
-	const commandGate = await pi.emit("tool_call", toolCallEvent("bash", { command: commandText }), ctx);
-	const commandBlocked = blockReason(commandGate);
-	expect(commandBlocked === undefined, `the approved plan did not release '${commandText}': ${commandBlocked}`);
-	const run = spawnSync(command[0] ?? "bun", command.slice(1), { cwd: workspace, encoding: "utf8" });
-	const output = `${run.stdout ?? ""}${run.stderr ?? ""}`.replace(/\x1b\[[0-9;]*m/g, "").trim();
-	expect(run.status === 0, `the implementation command failed (${String(run.status)}): ${output}`);
-	const beforeCommand = pi.messages.length;
-	await pi.emit("tool_result", toolResultEvent("bash", { command: commandText }, output.slice(0, 4000)), ctx);
-	await waitForCourseCheck(beforeCommand, false);
-
+	const output = await runImplementationCommand(scenario, pi, ctx, workspace, log);
 	mkdirSync(join(dir, "workspace"), { recursive: true });
-	for (const [path, content] of Object.entries(scenario.implementation.files)) {
-		const target = join(dir, "workspace", path);
-		mkdirSync(join(target, ".."), { recursive: true });
-		writeFileSync(target, content, "utf8");
-	}
+	for (const [path, content] of Object.entries(implementation.files)) writeEvidenceFile(join(dir, "workspace"), path, content);
 	writeFileSync(join(dir, "workspace", "command-output.txt"), output, "utf8");
 
-	const codeQuote = Object.entries(scenario.implementation.files)
-		.map(([path, content]) => `${path}\n${content}`)
-		.join("\n\n");
-	const evidence: Evidence[] = [
-		{ kind: "execution", quote: `$ ${commandText}\n${output}`, source: "smoke workspace" },
-		{ kind: "code", quote: codeQuote, source: "written files" },
-	];
-	for (const aspect of ["business", "architecture"] as const) {
-		const acceptance = await call("jev_acceptance", {
-			aspect,
-			claim: scenario.implementation.claims[aspect],
-			evidence,
-		});
-		expect(
-			acceptance.details["approved"] === true,
-			`${aspect} acceptance was not approved: ${acceptance.text}`,
-		);
-		addEvidence(log, { kind: "stage", name: `acceptance:${aspect}`, status: "approved" });
+	const afterWork = await callTool(pi, ctx, "jev_context", { action: "list" }, log);
+	expectDiagnosticShape("jev_context", afterWork.details);
+	const acceptance = await runAcceptance(scenario, pi, ctx, output, log);
+
+	// Completion is independent from the typed acceptance verdicts.
+	const stop = await pi.emit("session_stop", {}, ctx);
+	const held = stopDecision(stop);
+	if (held !== undefined) throw new Error(`the addon held ordinary completion: ${held}`);
+	addEvidence(log, { kind: "stage", name: "completion", status: "settled without a Jev hold" });
+	assertStatusTruth(statusTextOf(pi, ctx), scenario.name);
+	const final = expectDiagnosticShape(
+		"jev_context",
+		(await callTool(pi, ctx, "jev_context", { action: "list" }, log)).details,
+	);
+	return { judgeCalls, diagnostics: final, acceptance };
+}
+
+/**
+ * Deterministic continuation coverage: an injected judge produces a negative review and a negative
+ * acceptance, then a separate controller produces an outage. Both must be recorded truthfully while
+ * the real controller keeps executing and settles completion. This is not a production-judge result.
+ */
+async function diagnosticsScenario(dir: string): Promise<{ judgeCalls: number; negative: DiagnosticCounts; outage: DiagnosticCounts }> {
+	const scenario = workflowScenario();
+	const workspace = mkdtempSync(join(tmpdir(), "jev-smoke-diag-"));
+	const artifactsDir = mkdtempSync(join(tmpdir(), "jev-smoke-diag-artifacts-"));
+	mkdirSync(join(artifactsDir, "local"), { recursive: true });
+	writeFileSync(join(artifactsDir, "local", scenario.artifactName), scenario.artifact, "utf8");
+	mkdirSync(join(dir, "artifacts"), { recursive: true });
+	writeFileSync(join(dir, "artifacts", scenario.artifactName), scenario.artifact, "utf8");
+
+	const log = evidenceLog(join(dir, "transcript.jsonl"));
+	const judgeLog = evidenceLog(join(dir, "judge.jsonl"));
+	const table: Record<string, FakeAnswerSource> = {
+		needs_development: { probability: 0.95 },
+		external_deliverable: { probability: 0 },
+		topic_1: { probability: 0.95 },
+		topic_2: { probability: 0.95 },
+		coverage: { probability: 0.95 },
+		item_1: { probability: 0.95 },
+		item_2: { probability: 0.95 },
+		item_3: { probability: 0.95 },
+		outline_requirement_1: { probability: 0.95 },
+		outline_requirement_2: { probability: 0.95 },
+		outline_requirement_3: { probability: 0.95 },
+		outline_step_1: { probability: 0.95 },
+		outline_step_2: { probability: 0.95 },
+		outline_step_3: { probability: 0.95 },
+		detail: { label: "ready", confidence: 0.95 },
+		finalize_consistency: { probability: 0.95 },
+		finalize_scope: { probability: 0.95 },
+		topic_1: { probability: 0.95 },
+		topic_2: { probability: 0.95 },
+		topic_3: { probability: 0.95 },
+		execution_evidence: { probability: 0.95 },
+		code_evidence: { probability: 0.95 },
+		topic_1_execution: { label: "evidence_1", confidence: 0.95 },
+		topic_1_code: { label: "evidence_2", confidence: 0.95 },
+		topic_2_execution: { label: "evidence_1", confidence: 0.95 },
+		topic_2_code: { label: "evidence_2", confidence: 0.95 },
+		topic_3_execution: { label: "evidence_1", confidence: 0.95 },
+		topic_3_code: { label: "evidence_2", confidence: 0.95 },
+		review: { label: "defect", confidence: 0.9 },
+		acceptance: question => ({
+			label: question.options?.["business_gap"] === undefined ? "sound_for_next_change" : "business_gap",
+			confidence: 0.9,
+		}),
+	};
+	const fake = answeringJudge(table);
+	let judgeCalls = 0;
+	const judge: Judge = async (state, questions) => {
+		judgeCalls += 1;
+		const outcome = await fake.judge(state, questions);
+		addEvidence(judgeLog, { call: judgeCalls, questions, state, outcome, injected: true });
+		return outcome;
+	};
+	const { pi, ctx } = await controllerFor(judge, workspace, artifactsDir, "live-smoke-diagnostics");
+	await pi.emit("session_start", {}, ctx);
+	await pi.emit("before_agent_start", { prompt: scenario.request }, ctx);
+	assertCommandSurface(pi);
+
+	await runPlanning(scenario, pi, ctx, log);
+
+	const output = await runImplementationCommand(scenario, pi, ctx, workspace, log);
+
+	// Negative developer review: typed defect, recorded as a failed diagnostic. This deliberately
+	// starts while the last background action diagnostic may still be in flight, so a diagnostic
+	// finding must not invalidate this judgment; a stale result here is a source regression.
+	const review = await callTool(pi, ctx, "jev_review", {
+		kind: "diff",
+		target: "src/slug.ts",
+		claim: "The slug helper normalizes separators.",
+		evidence: [
+			{ kind: "code", quote: 'replace(/[^a-z0-9]+/g, "-")', source: "src/slug.ts" },
+			{ kind: "execution", quote: `$ ${scenario.implementation?.command.join(" ")}\n${output}`, source: "smoke workspace" },
+		],
+	}, log);
+	if (review.details["approved"] !== false || review.details["kind"] !== "defect") {
+		throw new Error(`the injected negative review was not recorded as a defect: ${review.text}`);
 	}
 
+	// Negative business acceptance: the call still returns and records approved:false.
+	const acceptance = await runAcceptance(scenario, pi, ctx, output, log);
+	if (acceptance["business"] !== false) throw new Error("the injected business gap was not recorded as not approved");
+
+	// A write after the negative verdict and acceptance must execute normally.
+	await performWrite(pi, ctx, workspace, { path: "src/after-negative.ts", content: "export const continued = true;\n" }, log);
+	if (!existsSync(join(workspace, "src/after-negative.ts"))) throw new Error("the write after a negative verdict did not execute");
+
 	const stop = await pi.emit("session_stop", {}, ctx);
-	const decision = stopDecision(stop);
-	expect(decision === undefined, `the completion boundary held the finished work: ${decision}`);
-	addEvidence(log, { kind: "stage", name: "completion", status: "settled" });
-	return { judgeCalls };
+	if (stopDecision(stop) !== undefined) throw new Error("the addon held completion after a negative verdict");
+	const status = statusTextOf(pi, ctx);
+	assertStatusTruth(status, "negative");
+	if ((parseCount(status, "failed", "Checks") ?? 0) < 2) throw new Error(`the negative diagnostics were not counted as failed: ${status}`);
+	const negative = expectDiagnosticShape("jev_context", (await callTool(pi, ctx, "jev_context", { action: "list" }, log)).details);
+
+	// A local recovery consultation is not a current mechanism and costs no judge call.
+	const beforeRecovery = judgeCalls;
+	const recovery = await callTool(pi, ctx, "jev_consult", {
+		mode: "recovery",
+		recovery: { phase: "repair", findingId: "f", diagnosis: "d", correction: "c", nextAction: { tool: "write", input: {} } },
+		evidence: [{ kind: "execution", quote: "observed", source: "smoke" }],
+	}, log);
+	if (!recovery.failed || judgeCalls !== beforeRecovery) throw new Error("a recovery consultation reached the judge or was not refused locally");
+	addEvidence(log, { kind: "assertion", name: "recovery-consultation-removed", pass: true });
+
+	// Outage path: a separate controller cannot reach the judge, yet work and completion continue.
+	const outageWorkspace = mkdtempSync(join(tmpdir(), "jev-smoke-outage-"));
+	const outageArtifacts = mkdtempSync(join(tmpdir(), "jev-smoke-outage-artifacts-"));
+	const outage = await controllerFor(failingJudge("injected judge outage", "unavailable"), outageWorkspace, outageArtifacts, "live-smoke-outage");
+	await outage.pi.emit("session_start", {}, outage.ctx);
+	const consult = await callTool(outage.pi, outage.ctx, "jev_consult", {
+		mode: "boolean",
+		question: "Does the submitted report match the observed coverage?",
+		context: "The report contains the coverage observed in the test run.",
+		trueMeaning: "The report matches the observation.",
+		falseMeaning: "The report does not match the observation.",
+	}, log);
+	if (!consult.failed) throw new Error("the injected outage did not produce an unavailable judgment");
+	await performWrite(outage.pi, outage.ctx, outageWorkspace, { path: "after-outage.ts", content: "export const continued = true;\n" }, log);
+	if (!existsSync(join(outageWorkspace, "after-outage.ts"))) throw new Error("the write after an outage did not execute");
+	if (stopDecision(await outage.pi.emit("session_stop", {}, outage.ctx)) !== undefined) throw new Error("the addon held completion after an outage");
+	const outageStatus = statusTextOf(outage.pi, outage.ctx);
+	assertStatusTruth(outageStatus, "outage");
+	if ((parseCount(outageStatus, "unavailable", "Checks") ?? 0) < 1) throw new Error(`the outage was not counted as unavailable: ${outageStatus}`);
+	const outageDiagnostics = expectDiagnosticShape("jev_context", (await callTool(outage.pi, outage.ctx, "jev_context", { action: "list" }, log)).details);
+	addEvidence(log, { kind: "assertion", name: "continued-work-after-negative-and-outage", pass: true });
+
+	return { judgeCalls, negative, outage: outageDiagnostics };
 }
 
 interface HostEvent {
@@ -690,11 +879,12 @@ function parseHostEvents(raw: string): HostEvent[] {
 	return events;
 }
 
-function hostPrompt(scenario: Scenario): string {
+/** The exact autonomous prompt; a pre-plan write is expected to execute, not to be refused. */
+export function hostPrompt(scenario: Scenario): string {
 	if (scenario.implementation === undefined) {
 		return `You are the executor in a Jevstice live smoke. There is no human: never ask for confirmation and never wait for a reply. Work autonomously in this empty project.
 
-1. First attempt to write the file '${scenario.probePath}' with content 'probe'. The extension must refuse it because no request has been triaged. Continue after reading the refusal.
+1. First write the file '${scenario.probePath}' with content 'probe'. The write is expected to execute; read the result and continue. Jev results are diagnostics, never permission.
 2. Call jev_triage with request ${JSON.stringify(scenario.request)} and topics ${JSON.stringify(scenario.topics)}.
 3. Call jev_requirements with the same request and these items: ${JSON.stringify(scenario.requirements)}. candidateNeeds may be [].
 4. Call jev_plan_review with phase "outline" and these steps: ${JSON.stringify(scenario.steps.map(step => ({ id: step.id, summary: step.summary, requirement: step.requirement })))}. Include evidence [{"kind":"spec","quote":${JSON.stringify(scenario.request)},"source":"smoke prompt"}].
@@ -702,7 +892,7 @@ function hostPrompt(scenario: Scenario): string {
 ${scenario.artifact}
 6. Call jev_plan_review once per step with phase "detail", plan "local://${scenario.artifactName}", topic {id, section, paths, requirement} where section is the exact artifact section for that id, plus the same spec evidence item.
 7. Call jev_plan_review with phase "finalize", plan "local://${scenario.artifactName}", and the same spec evidence item.
-8. Do not create or modify any project file, do not implement the game, and do not call acceptance. Stop immediately after the final plan approval.`;
+8. Do not create or modify any project file beyond the probe write in step 1, do not implement the game, and do not call acceptance. Stop immediately after the final plan review.`;
 	}
 	const firstPath = Object.keys(scenario.implementation.files)[0] ?? "";
 	const fileBlocks = Object.entries(scenario.implementation.files)
@@ -710,7 +900,7 @@ ${scenario.artifact}
 		.join("\n");
 	return `You are the executor in a Jevstice live smoke. There is no human: never ask for confirmation and never wait for a reply. Work autonomously in this empty project.
 
-1. First attempt to write the file '${scenario.probePath}' with content 'probe'. The extension must refuse it because no request has been triaged. Continue after reading the refusal.
+1. First write the file '${scenario.probePath}' with content 'probe'. The write is expected to execute; read the result and continue. Jev results are diagnostics, never permission.
 2. Call jev_triage with request ${JSON.stringify(scenario.request)} and topics ${JSON.stringify(scenario.topics)}.
 3. Call jev_requirements with the same request and these items: ${JSON.stringify(scenario.requirements)}. candidateNeeds may be [].
 4. Call jev_plan_review with phase "outline" and these steps: ${JSON.stringify(scenario.steps.map(step => ({ id: step.id, summary: step.summary, requirement: step.requirement })))}. Include evidence [{"kind":"spec","quote":${JSON.stringify(scenario.request)},"source":"smoke prompt"}].
@@ -718,7 +908,7 @@ ${scenario.artifact}
 ${scenario.artifact}
 6. Call jev_plan_review once per step with phase "detail", plan "local://${scenario.artifactName}", topic {id, section, paths, requirement} where section is the exact artifact section for that id, plus the same spec evidence item.
 7. Call jev_plan_review with phase "finalize", plan "local://${scenario.artifactName}", and the same spec evidence item.
-8. After the final approval, write these exact files:
+8. After the plan review calls, write these exact files:
 ${fileBlocks}
 Run '${scenario.implementation.command.join(" ")}' and read its output.
 9. Call jev_acceptance for aspect "business" with claim ${JSON.stringify(scenario.implementation.claims.business)} and for aspect "architecture" with claim ${JSON.stringify(scenario.implementation.claims.architecture)}. Each call's evidence must contain {"kind":"execution","quote":"$ ${scenario.implementation.command.join(" ")} and the command output"} and {"kind":"code","quote":"the contents of ${firstPath} shown above"}.
@@ -748,21 +938,11 @@ export function normalizeHostEvents(events: HostEvent[]): HostEvent[] {
 	return events.map(normalizeHostEvent);
 }
 
-function customOutcomeMessages(events: HostEvent[]): { customType: string; content: string }[] {
-	const outcomes: { customType: string; content: string }[] = [];
-	for (const event of events) {
-		if (event.type !== "message_end") continue;
-		const message = asRecord(event["message"]);
-		if (message?.["role"] !== "custom") continue;
-		outcomes.push({
-			customType: typeof message["customType"] === "string" ? message["customType"] : "",
-			content: typeof message["content"] === "string" ? message["content"] : "",
-		});
-	}
-	return outcomes;
-}
-
-function verifyHost(scenario: Scenario, rawEvents: HostEvent[]): { pass: boolean; problems: string[] } {
+/**
+ * Verify a saved host event stream against the diagnostic contract. Exported for offline checks
+ * and for the focused tests; it makes no network call.
+ */
+export function verifyHost(scenario: Scenario, rawEvents: HostEvent[]): { pass: boolean; problems: string[] } {
 	const events = normalizeHostEvents(rawEvents);
 	const problems: string[] = [];
 	const ends = events.filter(event => event.type === "tool_execution_end");
@@ -777,6 +957,7 @@ function verifyHost(scenario: Scenario, rawEvents: HostEvent[]): { pass: boolean
 		problems.push("no jev_* tool executed: the extension was not loaded or never exercised");
 		return { pass: false, problems };
 	}
+
 	const finalizeIndex = ends.findIndex(
 		event => event.toolName === "jev_plan_review" && eventDetails(event)["planDigest"] !== undefined,
 	);
@@ -784,36 +965,39 @@ function verifyHost(scenario: Scenario, rawEvents: HostEvent[]): { pass: boolean
 	if (planApprovedEnd === undefined) problems.push("jev_plan_review never returned details.planDigest");
 
 	const finalizeEventIndex = planApprovedEnd === undefined ? -1 : events.indexOf(planApprovedEnd);
-	const probeBlocked = ends.some(event => {
-		if (event.toolName !== "write" || event.isError !== true) return false;
-		if (argsOf(event)?.["path"] !== scenario.probePath) return false;
+	const probeWrite = ends.find(event => {
+		if (event.toolName !== "write" || argsOf(event)?.["path"] !== scenario.probePath) return false;
 		const index = events.indexOf(event);
 		return finalizeEventIndex < 0 || index < finalizeEventIndex;
 	});
-	if (!probeBlocked) {
-		problems.push(`the pre-plan write to '${scenario.probePath}' was not refused: the mutation gate was not exercised`);
+	if (probeWrite === undefined) {
+		problems.push(`the pre-plan write to '${scenario.probePath}' never executed`);
+	} else if (probeWrite.isError === true) {
+		problems.push(`the pre-plan write to '${scenario.probePath}' failed: ${eventText(probeWrite).slice(0, 300)}`);
 	}
 
 	const triageAttempts = ends.filter(event => event.toolName === "jev_triage");
-	if (triageAttempts.length === 0) problems.push("jev_triage did not run");
+	const lastTriage = triageAttempts.at(-1);
+	if (lastTriage === undefined) problems.push("jev_triage did not run");
 	else if (!triageAttempts.some(event => eventDetails(event)["needsDevelopment"] === true)) {
-		problems.push(`jev_triage details.needsDevelopment was never true: ${eventText(triageAttempts[triageAttempts.length - 1]).slice(0, 300)}`);
+		problems.push(`jev_triage details.needsDevelopment was never true: ${eventText(lastTriage).slice(0, 300)}`);
 	}
 
 	const requirementsAttempts = ends.filter(event => event.toolName === "jev_requirements");
 	if (requirementsAttempts.length === 0) problems.push("jev_requirements did not run");
-	else if (!requirementsAttempts.some(event => eventDetails(event)["approved"] === true)) {
-		problems.push(`jev_requirements details.approved was never true: ${eventText(requirementsAttempts[requirementsAttempts.length - 1]).slice(0, 300)}`);
-	}
 
-	const customs = customOutcomeMessages(events);
-	for (const message of customs) {
-		if (message.customType === "jev.open_item") {
-			problems.push(`the session released a boundary as OPEN: ${message.content.slice(0, 300)}`);
-		}
-		if (message.customType === "jev.course_check" && message.content.includes("Consequential changes are held")) {
-			problems.push(`a course check refused the course: ${message.content.slice(0, 300)}`);
-		}
+	for (const jevEnd of jevEnds) {
+		const label = `${String(jevEnd.toolName)} result`;
+		problems.push(...diagnosticProblems(label, eventDetails(jevEnd)));
+	}
+	const lastJev = jevEnds.at(-1);
+	const lastDiagnostics = lastJev === undefined ? undefined : diagnosticsOf(eventDetails(lastJev));
+	const negativeRecorded = jevEnds.some(event => {
+		const details = eventDetails(event);
+		return event.isError === true || details["approved"] === false || details["verdict"] === "revise" || details["kind"] === "defect";
+	});
+	if (negativeRecorded && (lastDiagnostics?.checks.failed ?? 0) < 1) {
+		problems.push("a negative Jev verdict was observed but the recorded checks.failed count stayed zero");
 	}
 
 	if (scenario.implementation === undefined) {
@@ -825,7 +1009,7 @@ function verifyHost(scenario: Scenario, rawEvents: HostEvent[]): { pass: boolean
 		);
 		for (const write of writes) {
 			const path = String(argsOf(write)?.["path"] ?? "");
-			if (!path.startsWith("local://") && !path.startsWith("xd://") && !path.startsWith("agent://") && !path.startsWith("proc://")) {
+			if (!path.startsWith("local://") && !path.startsWith("xd://") && !path.startsWith("agent://") && !path.startsWith("proc://") && path !== scenario.probePath) {
 				problems.push(`planning-only scenario wrote a project file: ${path}`);
 			}
 		}
@@ -834,9 +1018,10 @@ function verifyHost(scenario: Scenario, rawEvents: HostEvent[]): { pass: boolean
 			event =>
 				event.toolName === "write" &&
 				argsOf(event)?.["path"] === "src/slug.ts" &&
-				event.isError !== true,
+				event.isError !== true &&
+				(finalizeEventIndex < 0 || events.indexOf(event) > finalizeEventIndex),
 		);
-		if (wroteModule === undefined) problems.push("the workflow never wrote src/slug.ts after the plan approval");
+		if (wroteModule === undefined) problems.push("the workflow never wrote src/slug.ts after the plan review");
 		const testRun = ends.find(event => {
 			const command = argsOf(event)?.["command"];
 			return event.toolName === "bash" && typeof command === "string" && command.includes("bun test");
@@ -845,21 +1030,15 @@ function verifyHost(scenario: Scenario, rawEvents: HostEvent[]): { pass: boolean
 		else if (testRun.isError === true) problems.push("the bun test command failed");
 		const acceptedRevisions: number[] = [];
 		for (const aspect of ["business", "architecture"]) {
-			const attempts = ends.filter(
-				event => event.toolName === "jev_acceptance" && argsOf(event)?.["aspect"] === aspect,
-			);
+			const attempts = ends.filter(event => event.toolName === "jev_acceptance" && argsOf(event)?.["aspect"] === aspect);
 			const last = attempts[attempts.length - 1];
 			if (last === undefined) {
 				problems.push(`jev_acceptance did not run for ${aspect}`);
 				continue;
 			}
-			if (last.isError === true || eventDetails(last)["approved"] !== true) {
-				problems.push(`${aspect} was not accepted at its last submission: ${eventText(last).slice(0, 300)}`);
-				continue;
-			}
-			const revision = eventDetails(last)["revision"];
-			if (typeof revision !== "number") problems.push(`${aspect} acceptance reported no work revision`);
-			else acceptedRevisions.push(revision);
+			const details = eventDetails(last);
+			if (typeof details["approved"] !== "boolean") problems.push(`${aspect} acceptance returned no typed approved verdict: ${eventText(last).slice(0, 300)}`);
+			if (typeof details["revision"] === "number") acceptedRevisions.push(details["revision"]);
 		}
 		if (acceptedRevisions.length === 2 && acceptedRevisions[0] !== acceptedRevisions[1]) {
 			problems.push(`acceptance aspects were recorded at different revisions: ${acceptedRevisions.join(" and ")}`);
@@ -881,12 +1060,6 @@ export function verifyExistingHostRun(
 
 async function host(scenario: Scenario, dir: string, model: string | undefined, maxTime: number): Promise<void> {
 	const workspace = mkdtempSync(join(tmpdir(), "jev-smoke-host-"));
-	mkdirSync(join(workspace, ".omp"), { recursive: true });
-	writeFileSync(
-		join(workspace, ".omp", "jev.config.json"),
-		readFileSync(join(import.meta.dir, "armed.jev.config.json"), "utf8"),
-		"utf8",
-	);
 	const extension = join(import.meta.dir, "..", "src", "index.ts");
 	const args = [
 		"omp",
@@ -952,46 +1125,64 @@ async function host(scenario: Scenario, dir: string, model: string | undefined, 
 async function main(): Promise<void> {
 	const options = parseArgs(Bun.argv.slice(2));
 	if (options.mode !== "direct" && options.mode !== "host" && options.mode !== "verify-existing") {
-		throw new Error("usage: bun tools/live-smoke.ts <direct|host|verify-existing> [--scenario workflow|recovery|factorio] [--out DIR] [--model NAME] [--max-time SECONDS]");
+		throw new Error("usage: bun tools/live-smoke.ts <direct|host|verify-existing> [--scenario workflow|factorio|diagnostics] [--out DIR] [--model NAME] [--max-time SECONDS]");
 	}
-	if (options.scenario === "recovery" && options.mode !== "direct") {
-		throw new Error("the recovery scenario requires direct mode; host mode currently verifies workflow or factorio");
-	}
-	const scenario = scenarioOf(options.scenario);
-	if (options.mode === "verify-existing") {
-		if (options.out === undefined) throw new Error("usage: bun tools/live-smoke.ts verify-existing --out DIR [--scenario workflow|factorio]");
-		const result = verifyExistingHostRun(options.out, options.scenario);
-		console.log(JSON.stringify(result, null, 2));
-		process.exitCode = result.pass ? 0 : 1;
-		return;
+	if (options.scenario === "diagnostics" && options.mode !== "direct") {
+		throw new Error("the diagnostics scenario uses an injected judge and requires direct mode");
 	}
 	const dir = outputDir(options.out);
 	try {
+		if (options.mode === "verify-existing") {
+			if (options.out === undefined) throw new Error("usage: bun tools/live-smoke.ts verify-existing --out DIR [--scenario workflow|factorio]");
+			const result = verifyExistingHostRun(options.out, options.scenario);
+			console.log(JSON.stringify(result, null, 2));
+			process.exitCode = result.pass ? 0 : 1;
+			return;
+		}
 		if (options.mode === "direct") {
+			if (options.scenario === "diagnostics") {
+				const stats = await diagnosticsScenario(dir);
+				writeJson(join(dir, "summary.json"), {
+					mode: "direct",
+					scenario: "diagnostics",
+					judge: "injected",
+					pass: true,
+					judgeCalls: stats.judgeCalls,
+					diagnostics: { negative: stats.negative, outage: stats.outage },
+					evidence: dir,
+				});
+				console.log(`PASS direct diagnostics: negative verdict and outage stayed truthful while work continued. Evidence: ${dir}`);
+				return;
+			}
+			const scenario = scenarioOf(options.scenario);
 			const stats = await direct(scenario, dir);
 			writeJson(join(dir, "summary.json"), {
 				mode: "direct",
 				scenario: scenario.name,
+				judge: "production",
 				pass: true,
 				planningOnly: scenario.implementation === undefined,
 				judgeCalls: stats.judgeCalls,
+				diagnostics: stats.diagnostics,
+				acceptance: stats.acceptance,
 				evidence: dir,
 			});
-			console.log(`PASS direct ${scenario.name}: real Jev flow approved. Evidence: ${dir}`);
+			console.log(`PASS direct ${scenario.name}: typed results recorded; work and completion proceeded. Evidence: ${dir}`);
 			return;
 		}
+		const scenario = scenarioOf(options.scenario);
 		await host(scenario, dir, options.model, options.maxTime);
-		console.log(`PASS host ${scenario.name}: omp loaded and exercised the extension. Evidence: ${dir}`);
+		console.log(`PASS host ${scenario.name}: native calls executed and diagnostics were recorded. Evidence: ${dir}`);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		writeJson(join(dir, "summary.json"), {
 			mode: options.mode,
-			scenario: scenario.name,
+			scenario: options.scenario,
 			pass: false,
 			error: message,
 			evidence: dir,
 		});
-		console.error(`FAIL ${options.mode} ${scenario.name}: ${message}\nEvidence: ${dir}`);
+		console.error(`FAIL ${options.mode} ${options.scenario}: ${message}\nEvidence: ${dir}`);
 		process.exitCode = 1;
 	}
 }

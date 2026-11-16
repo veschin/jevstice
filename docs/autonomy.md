@@ -2,22 +2,22 @@
 
 This reference describes an optional module that is activated explicitly and is not part of the ordinary addon. The package manifest loads only `src/index.ts`; an ordinary session registers the ordinary controller, ignores stray `JEVSTICE_AUTONOMY_*` locators and imports nothing under `autonomy/`. The module has one activation path: `bun run autonomy` starts `autonomy/driver.ts`, which launches the supervised child with `autonomy/index.ts` as its explicit extension entry. The Linux, cgroup, systemd, SQLite and supervisor prerequisites below belong to that module alone.
 
-Implementation: the opt-in coordinator, private SQLite ledger, whole-executor scope containment and Bun supervisor are present. The module's files are `autonomy/index.ts` (strict-only entry, loaded by the supervisor rather than the manifest), `autonomy/runtime.ts` (coordinator, workflow and `jev_autonomy`), `autonomy/store.ts` (private SQLite authority), `autonomy/scope.ts` (Linux scope containment) and `autonomy/driver.ts` (supervisor CLI). Full acceptance remains open: post-compaction completion and inherited-effect reconciliation stayed unapproved in real trials. A complete simple objective passed, but those two nonterminal outcomes are not successful completion. Ordinary sessions retain the normal-mode continuation rules in the README. FR-57 through FR-66 in [PRD.md](../PRD.md) define the strict contract and remaining verification.
+The opt-in runtime, private SQLite ledger, whole-executor scope containment and supervisor are present. Jev verdicts are diagnostic in this module too; deterministic owner-authorized safety limits remain mandatory. FR-73 through FR-78 in [PRD.md](../PRD.md) supersede earlier judge-veto requirements. The earlier live autonomy trials do not establish acceptance of this revised contract; full current real-host autonomy verification remains open.
 
 ## 1. Introduction and goals
 
-The owner supplies an objective once. The executor develops the solution, while Jev decides every important choice exposed at the execution boundaries. Development continues without requiring the owner to approve requirements, plans, repairs or subsequent sessions. The owner can still stop or redirect the work. These goals come from PRD sources S33-S35 and S40-S41.
+The owner supplies an objective and an authority envelope once. The executor develops the solution and uses Jev to review decisions and evidence. A failed or unavailable review never requires owner continuation; the owner remains able to stop the run.
 
-"100%" means that no important visible decision executes without a usable, current Jev verdict. It does not mean perfect judgment, access to private reasoning, unlimited spending, or progress while the judge, executor or storage is unavailable. Continuous operation means automatic progress, recovery and scheduled retry when prerequisites permit it; otherwise the run preserves its state and waits.
+Diagnostic coverage is not a guarantee of correctness or unlimited progress. Execution still requires valid ownership, available executor/storage capabilities, remaining execution resources and reconciliation of unknown effects.
 
 ## 2. Constraints and invariants
 
-- Autonomous enforcement is an explicit opt-in through the module's own CLI and entry; the package manifest never loads it. Normal mode retains its existing bounded continuation and owner-override behavior.
-- In autonomous mode, refusal limits, judge outages, `/jev-continue` and approval-like text cannot substitute for Jev approval. The owner may explicitly stop autonomy and return to normal mode, but that transition does not retroactively approve work.
-- Requirements, plans, implementation choices, consequential invocations, recovery strategies, developmental session transitions and completion require decisions. Previously exempt publication, including a push, is consequential in this mode. Read-only evidence gathering and execution of an already approved deterministic transition do not create a new business decision. Safety cancellation is owner-authorized and never waits for Jev.
+- Autonomous enforcement is an explicit opt-in through the module's own CLI and entry; the package manifest never loads it. Ordinary mode records diagnostics and imposes no execution or completion hold; it has no continuation or owner-override mechanism.
+- Negative, inconclusive, stale, missing and unavailable Jev results never prevent admission, reconciliation, rotation or completion. They remain recorded as such, not approved by a retry count.
+- Requirements, plans, conformance, recovery proposals and completion evidence can be reviewed diagnostically. Publication still needs its pre-authorized effect class; Jev cannot add one. Safety cancellation never waits for Jev.
 - Unknown effects remain consequential. Every actual payload must fit the inspected bounds; references and truncated code cannot stand in for executed bytes.
 - Jev receives explicit context on every call. A digest identifies context but does not communicate its contents.
-- Only one executor may own a run or overlapping canonical writable project roots. No side effect starts before its approved intent is committed durably.
+- Only one executor may own a run or overlapping canonical writable project roots. No side effect starts before its deterministically admitted intent is committed durably.
 - A restart preserves records, not automatic permission to trust changed files or old execution acceptance.
 - Execution outside the bound strict context is refused, including delegation whose child effects cannot receive equivalent authorization. Inherited environment text, a child session or a fork does not independently grant ownership.
 - No new workflow framework, broker or database package is required. Bun is already the runtime; `bun:sqlite` is built in. [B1]
@@ -26,13 +26,13 @@ The owner supplies an objective once. The executor develops the solution, while 
 
 The module coordinates one owner-authorized objective within its canonical writable project roots. It uses the existing judge adapter and typed activities; it does not turn Jev into a command generator. The executor supplies evidence, alternatives and proposed invocations. Jev returns typed decisions, not invented explanatory prose.
 
-The extension enforces tool boundaries inside OMP. A small Bun supervisor owns process lifetime and session rotation through OMP RPC. A preconfigured process manager is required if the supervisor itself must restart after exit or machine reboot. Installing that service is a deployment action, not an implicit consequence of enabling the extension.
+The strict runtime enforces its own tool boundaries inside OMP while the supervised child runs. A small Bun supervisor owns process lifetime and session rotation through OMP RPC. A preconfigured process manager is required if the supervisor itself must restart after exit or machine reboot. Installing that service is a deployment action, not an implicit consequence of enabling the extension.
 
 This design does not provide distributed workers, an OS sandbox, authenticated evidence, arbitrary remote storage, or exactly-once external effects. Those guarantees do not follow from a local judge gate or a database transaction.
 
 ## 4. Solution strategy
 
-Keep normal-mode policy intact and add a strict autonomous policy around the existing boundaries. Use one local SQLite ledger as the authority for autonomous runs; preserve OMP custom entries as references into that ledger. Keep continuation inside live sessions separate from process supervision.
+Keep ordinary diagnostics separate and add a strict autonomous policy around the existing boundaries. Ordinary mode records diagnostic results and never becomes execution authority; the strict runtime decides admission itself. Use one local SQLite ledger as the authority for autonomous runs; preserve OMP custom entries as references into that ledger. Keep continuation inside live sessions separate from process supervision.
 
 The installed host documents native custom-entry reconstruction, but its extension API returns `void` from `appendEntry`. The installed implementation can suppress append failures, does not fsync completed entries, and does not expose a durable-write acknowledgment to extensions. Native journal entries alone therefore cannot prove that an autonomous intent was committed before execution. [H1, H2, O1]
 
@@ -43,10 +43,10 @@ This explicitly refines pending FR-41 for autonomous runs: the native journal id
 | Block | Responsibility |
 | --- | --- |
 | Existing controller and activities | Preserve current tools; bind autonomous judgments and invocations to the active run, task, revision and policy. |
-| Autonomous coordinator | Select the unmet stage, request executor proposals, assemble explicit judge context, enforce strict policy and choose the next transition only from approved outcomes. |
+| Autonomous coordinator | Supply task context, record diagnostic reviews, enforce actual safety policy and commit deterministic transitions. |
 | Run ledger | Commit state, decisions, artifact bytes, invocation intents/results, retry deadlines and executor ownership atomically. |
 | Existing OMP host | Execute tools, emit results, compact context and carry extension-origin messages during a live session. |
-| Bun supervisor | Launch and observe the bound child, recover interrupted runs, request approved lifecycle transitions and relaunch after process loss. |
+| Bun supervisor | Launch and observe the bound child, fence interrupted executors and relaunch only within the frozen authority/resource envelope. |
 
 The implementation reuses `judge.ts`, activity validation, artifact hashing and the host adapter. The supervisor exposes only its fixed lifecycle CLI and a restricted OMP RPC channel; it is not a generic RPC or shell proxy.
 
@@ -56,18 +56,18 @@ The implementation reuses `judge.ts`, activity validation, artifact hashing and 
 
 1. The supervisor validates the configured authorization envelope, storage and host capabilities, then commits a run with its objective and policy. It binds the child to the run identifier and executor epoch outside prompt text.
 2. At session startup, the extension loads that committed record and verifies the main-session/run/ownership binding. It registers the per-request autonomous context channel, commits a pending wake identifier and deadline, then requests an internal custom wake for the next unmet stage. A child cannot acquire ownership merely by inheriting the launch environment.
-3. The executor proposes requirements, a plan, an action or a recovery choice through the existing typed activities. The coordinator includes the actual relevant context and asks Jev.
-4. A current usable verdict is committed with its exact input digest and dependencies. Before a consequential invocation, the complete payload is checked again against current state and committed as an execution intent.
+3. The executor develops the objective and can submit requirements, plans, evidence or recovery proposals for diagnostic review.
+4. The runtime checks the actual invocation against the current ownership, roots, capabilities, dependencies and pending effects, then durably commits an intent. A matching Jev result can be attached as diagnostic evidence; it is not admission authority.
 5. OMP executes the invocation. Observed results, failed executions and file changes advance or invalidate the appropriate revision-bound evidence. A failure does not prove that no effect occurred.
-6. At a stop boundary, missing evidence directs observation; an established defect directs repair; completed stages advance through the approved workflow. Completion requires fresh business and architecture acceptance and a completion verdict. External delivery additionally requires the applicable current artifact review.
+6. At a stop boundary, pending effects still require observation. Otherwise the runtime can commit terminal completion without Jev approval. The event records missing or failed acceptance and review evidence; terminal completion is not a claim that those checks passed.
 
-The coordinator derives instructions from typed outcomes and unmet obligations. It cannot manufacture Jev explanations, select a different goal, or treat repeated rejection as approval. A stalled executor may propose a materially different evidence or repair strategy; Jev must approve it before consequential execution.
+Recorded findings guide correction without preventing useful work. The coordinator cannot invent Jev explanations, change the objective or treat repeated rejection as approval.
 
 ### Waiting and termination
 
-A retryable transport failure schedules a persisted retry with backoff. An identical substantive refusal is not resent until its material changes. Exhausted progress or resource limits preserve a waiting state and its reason; they do not release a boundary. The run terminates only as completed, cancelled, or an explicitly judged infeasible outcome, rather than declaring unfinished work complete. A requested wake is not a started turn: commit its run, epoch, main-session generation, identifier, pending status and deadline before calling the host. Confirm it from the matching `agent_start` or `turn_start`; when events carry no wake identifier, require exactly one pending wake in that bound idle session. A missed deadline persists a waiting reason and triggers host-activity reconciliation, not blind repeat. An unsolicited or late event cannot acknowledge another wake.
+Judge retry timing and judge-call budgets control diagnostic requests only; a skipped request is not a pass and does not park execution. Actual executor/runtime limits, unavailable capabilities and unresolved effects may preserve a waiting state. A requested wake is not a started turn: its run, epoch, generation, identifier and deadline are committed before dispatch and confirmed only by a matching bound start event. Missing acknowledgments require host reconciliation, not blind duplicate turns.
 
-A timeout cannot authorize a second wake in the same session generation until the previous request is proven unable to start. If its status stays uncertain, keep waiting or fence the old session before an approved generation change. A new generation prevents a late old start event from confirming a newer wake.
+A timeout cannot authorize a second wake in the same session generation until the previous request is proven unable to start. If its status stays uncertain, keep waiting or fence the old session before a deterministically admitted generation change. A new generation prevents a late old start event from confirming a newer wake.
 
 A stop received through the supervisor's operator-control channel immediately closes admission, cancels queued wakeups and requests abort of active work, without waiting for Jev. Commit cancellation before acknowledging it as durable; restart then preserves that state. If the commit fails, still abort and suppress automatic relaunch, report the storage failure and do not claim durable cancellation. Existing effects are still reconciled; stopping does not imply rollback or successful completion.
 
@@ -75,7 +75,7 @@ A stop received through the supervisor's operator-control channel immediately cl
 
 Before compaction, rotation or teardown, commit the checkpoint and exact artifact bytes. After startup, verify the database, project root, schema/policy compatibility, selected session branch, stored blob hashes and current file manifest. Preserve unaffected requirements and plan details; invalidate dependent decisions when their inputs changed. Prior execution acceptance and completion require fresh observation after restart.
 
-An invocation intent without a recorded result is **unknown**, not failed or unexecuted. Observe the working tree and, where applicable, the external provider. Jev chooses among supported recovery alternatives using that evidence. Retry an external effect only when its provider idempotency contract or observed state proves the retry safe. If the effect cannot be reconciled, preserve the blocked run; do not repeat it blindly.
+An intent without a recorded result is **unknown**, not failed or unexecuted. Observe the working tree and applicable external provider, record the declared outcome with actual selected facts and bytes, and reconcile under the current binding. Jev review is diagnostic, including an unavailable answer. Retry an external effect only when observed state or the provider's idempotency contract proves it safe; an irreconcilable effect remains a safety wait.
 
 Lease expiry is only a failure detector. It does not fence an already running process or remote effect. Before takeover, the supervisor must establish that the prior child cannot start further actions and reconcile outstanding effects. Every later commit and admission checks the new epoch; stale answers and old workers cannot authorize new work. Ownership admission also atomically rejects a second active run with the same or overlapping canonical writable project roots. Separate run identifiers are not isolation; disjoint worktrees can run independently only within their own authorized roots, with shared external effects still subject to reconciliation.
 
@@ -85,7 +85,7 @@ Use one user-local database for the module, defaulting to `~/.omp/agent/jevstice
 
 SQLite owns recovery of its rollback journal. Do not delete journal files or copy a live database as though its main file were a complete backup. Use a consistent SQLite backup or a fully closed store. Fail closed on storage errors, unsupported schema, missing/corrupt required blobs or incompatible host capabilities.
 
-The supervisor launches OMP in RPC mode with the checkout explicitly loaded and a committed run/epoch binding. Only a fixed read-only and lifecycle command subset is exposed. Developmental lifecycle commands carry a committed Jev decision; safety abort and stop do not. Raw RPC `bash`, arbitrary host-tool installation and unreviewed control commands are not forwarding routes. This driver does not assume that a deferring ACP bridge starts agent-initiated turns. The supervisor observes committed wake acknowledgments and RPC/process liveness rather than treating a void API return as successful scheduling. [H8]
+The supervisor launches OMP in RPC mode with the explicit strict entry and a committed run/epoch binding. Its fixed read-only and lifecycle command subset is not a raw RPC or shell proxy. Lifecycle judgments are recorded diagnostically; actual capability, ownership, scope-fencing, dependency and execution-resource checks govern launch. Committed wake acknowledgments and process observations establish liveness, not a void API return. [H8]
 
 Credentials remain in the existing resolver/environment path. Never serialize resolved keys or full secret-bearing environment/configuration objects into the ledger, native journal or continuation messages. The owner supplies credentials and the initial authorization envelope through deployment configuration; Jev cannot grant authority to spend money or perform external actions the owner has not authorized.
 
@@ -106,7 +106,7 @@ bun run autonomy stop --run RUN_ID --reason "operator stop"
 
 `--store` selects the private database; `start` and `resume` also accept `--omp` and `--model`. The supervisor runs in the invoking process. A separate operator command or an attached controlling terminal can stop it; executor output is not an operator channel. A preconfigured process manager is needed to relaunch the supervisor after its own death. Stop does not roll back effects and does not claim an unknown effect succeeded.
 
-The call limits count attempts and provider requests, not approvals or completed tasks. A transport failure consumes a judge attempt and schedules backoff while the initial envelope still permits another attempt; exhausted limits remain durable waits. Changing the policy file cannot expand an existing run's committed envelope.
+Call limits count actual attempts, not approvals. Exhausting the judge budget or reaching its retry deadline skips that diagnostic request; exhausting executor/runtime resources remains a durable safety wait. Changing the policy file cannot expand an existing committed envelope.
 
 ## 8. Crosscutting concepts
 
@@ -118,9 +118,9 @@ Persist the original objective and authoritative corrections; task version; requ
 
 Checkpointing compares tracked live bytes before replacing their recorded digests. A changed dependency advances the work revision and invalidates acceptance and completion; a changed plan also loses its plan approval. Planned files produced through a native Bash invocation enter the same manifest as direct writes. Recorded absence remains a dependency, so later appearance cannot silently inherit old evidence. A judgment compares live dependency observations before and after the network call. Reconciliation may judge an already-changed unknown effect, but its selected observations must remain unchanged during that judgment.
 
-Automatic acceptance supplements the recent-action window with hash-checked current project bytes from the existing immutable artifact store. Runtime-owned quotes carry actual bootstrap/wake observations, workflow checkpoint metadata and native tool-result counts. The counts describe the observed native stream, not OS-wide absence of activity, and workflow events do not replace project implementation or verification evidence.
+Current project bytes, bootstrap/wake observations and native tool results support diagnostic acceptance. Counts describe the observed native stream, not OS-wide absence of activity; workflow events never substitute for implementation or verification evidence.
 
-A new session or an unobserved dependency change clears old execution observations. Acceptance requires fresh execution in the current binding; current code bytes alone cannot satisfy it. A refused wait retains only the old action digest for comparison, not execution authority, so clearing a stale action window cannot itself wake or approve unchanged refused material. A genuinely new observed result can change that material without a project mutation.
+A new session or changed dependency invalidates stale execution observations. Diagnostic acceptance is revision-bound, but its absence or refusal does not prevent execution or terminal completion. A new result can supply materially different evidence without a project mutation.
 
 A native custom entry carries the run identifier, committed sequence and checkpoint digest. Missing or stale native references can be repaired from the ledger; they cannot overwrite newer committed state. A fork does not inherit execution ownership. Attaching another session requires a checked, committed ownership transition. Compaction summaries are executor context aids, not approval records. [H3, O1]
 
@@ -142,15 +142,15 @@ Use `session_stop` continuation only to wake a live main session, respecting the
 
 ### Permission, resources and review scope
 
-Freeze the owner-authorized roots, allowed effect classes and configured resource limits into the run policy. A policy expansion requires new owner authority; Jev chooses only within that envelope. The strict runtime forces mutation/completion gates on, completion-time course checking and enforced external review instead of inheriting weaker normal-mode switches. Unsupported storage or host capabilities refuse strict execution. A configured billing balance is a snapshot, not proof of current provider balance or a complete spending limit.
+Freeze the owner-authorized roots, allowed effects and resource limits into the run policy. Expansion requires new owner authority. The strict runtime preserves deterministic admission, ownership and reconciliation regardless of check mode. Unsupported storage or host capabilities refuse strict execution; a configured billing balance is only a snapshot.
 
-For external-facing work, require current review before delivery. A delivery authorization must bind the reviewed bytes and distinguish pure delivery from a call that also changes or regenerates content. Require modification and verification before a separate reviewed delivery; do not keep a review current merely because a mixed invocation also publishes. No owner waiver is a prerequisite for autonomous progress: repair a blocker or preserve the waiting state.
+External review reports the exact reviewed bytes and whether delivery regenerated them. An old review cannot establish review of changed content, but no review outcome grants or withholds publication authority. The owner's frozen effect policy and actual host permissions control that authority.
 
-## 9. Architectural decisions
+## 9. Historical architectural consultations
 
 | Decision | Selected approach | Rejected alternative and consequence |
 | --- | --- | --- |
-| Autonomous policy | Separate strict opt-in; Jev approved at 0.98. | Normal-mode bounded release would contradict mandatory Jev decisions. A global replacement would silently change existing behavior. |
+| Autonomous policy | Separate strict opt-in; Jev approved at 0.98. | Treating an ordinary diagnostic result as strict admission authority would contradict mandatory Jev decisions. A global replacement would silently change existing behavior. |
 | Durable authority | Built-in SQLite ledger; Jev approved at 0.97. | Native `appendEntry` has no extension-visible durable acknowledgment; requiring a host patch would block an otherwise local module. |
 | Continuation | Small supervised driver plus live-session custom messages; Jev approved at 1.00. | Timers cannot restart their dead process, and fabricated owner prompts corrupt provenance. |
 | Concrete binding/storage | Run/epoch startup binding, restricted RPC and DELETE/EXTRA; Jev approved at 1.00. | A broker/framework or competing state stores add machinery without solving a requirement here. |
@@ -160,7 +160,7 @@ For external-facing work, require current review before delivery. A delivery aut
 | Owner cancellation | Separate operator channel and immediate safety abort outside the Jev gate; Jev approved at 1.00. | Requiring a judge verdict before stopping would continue work during a judge outage. |
 | Execution context | Refuse unbound delegation; Jev approved at 1.00. | A parent instruction or inherited environment does not authorize unseen child effects. |
 
-These design consultations establish the selected mechanisms; they are separate from implementation acceptance. Normal-mode permission after an unresolved decision does not constitute autonomy approval, and strict runs have no such escape.
+These consultations record earlier design decisions, not current implementation acceptance. Any requirement for a Jev-positive execution or completion verdict is superseded by the diagnostic contract. The storage, containment, ownership and control-plane mechanisms remain safety requirements.
 
 ## 10. Quality requirements and acceptance scenarios
 
@@ -168,10 +168,10 @@ The rows below define the acceptance scenarios. `tests/autonomy.test.ts`, `tests
 
 | Scenario | Required observation | Requirement |
 | --- | --- | --- |
-| Consequential calls through ordinary tools, delegation, publication and supervisor control | Each executed payload has a matching current committed Jev authorization; unknown effects do not bypass it. | FR-57, FR-58 |
-| Three outages, refusals or blocked stops | State remains unapproved and recoverable; no autonomous mutation or completion is released. | FR-57, FR-62 |
+| Consequential calls, publication and supervisor control | Each effect has a current committed deterministic admission within the frozen envelope; a Jev verdict grants no authority. | FR-58, FR-73–FR-78 |
+| Negative, unavailable, missing or pending Jev checks | Useful scoped work and completion continue, with truthful diagnostic coverage and no owner continuation. | FR-73–FR-78 |
 | Crash before intent commit | No invocation executes. | FR-59, FR-61 |
-| Crash after effect, before result commit | Recovery records unknown effect, observes actual state and obtains a recovery decision; a non-idempotent effect is not repeated blindly. | FR-61 |
+| Crash after effect, before result commit | Recovery observes and records the unknown effect; an unavailable diagnostic does not prevent reconciliation and a non-idempotent effect is never blindly repeated. | FR-61, FR-73 |
 | Storage failure or unsupported pragma/capability | No new consequential invocation starts; the failure remains explicit. | FR-59, FR-66 |
 | Compaction, plan handoff, session rotation and process restart | Exact artifacts and authoritative objective survive; changed inputs invalidate only dependents; execution acceptance is refreshed. | FR-59, FR-60, FR-63 |
 | Competing supervisor, fork, two runs sharing writable roots, or expired lease with a live old worker | Only one admitted owner exists for the run and overlapping writable roots; expiry alone does not permit takeover or overlapping actions. | FR-61 |
@@ -179,19 +179,19 @@ The rows below define the acceptance scenarios. `tests/autonomy.test.ts`, `tests
 | Delegated or forked child inherits run environment without equivalent strict enforcement | The child gains no ownership and its effects are refused; a parent instruction is not authorization of unseen invocations. | FR-57, FR-58, FR-61, FR-66 |
 | Cold startup and compaction with no owner-authored turn | Every provider request receives the bound autonomous guidance/context; no reliance on `before_agent_start` firing. | FR-58, FR-60, FR-66 |
 | Declined or dropped wake, delayed start and unrelated activity | A pending wake is confirmed only for its bound session/generation; missed deadlines remain durable waits and never cause blind duplicate turns. | FR-60, FR-62 |
-| Changed payload/artifact while Jev is answering | The stale result cannot admit the changed work. | FR-58 |
-| Delivery that also regenerates content | The old artifact review cannot authorize the new bytes. | FR-63 |
+| Changed payload/artifact while Jev is answering | The old diagnostic is discarded; admission independently checks current bytes, roots, ownership and dependencies. | FR-58, FR-73 |
+| Delivery that also regenerates content | The old review does not become evidence for new bytes; publication still needs owner-authorized effects. | FR-73, FR-76 |
 | Stop during judge outage, followed by restart | Safety cancellation does not wait for Jev; committed cancellation suppresses wake/relaunch, and a failed commit is never acknowledged as durable. | FR-65 |
-| Objective completed without later owner input | Both acceptances and completion rest on current execution evidence; the run terminates once. | FR-63 |
+| Session completion without Jev approval | No effect is unobserved; terminal completion records any absent or failed acceptance instead of claiming it passed. | FR-73–FR-76 |
 | Missing external authority or exhausted configured limits | The run waits without expanding scope or inventing a current account balance. | FR-64 |
 
 ## 11. Risks and technical debt
 
-Normal-mode state remains in memory; its broader FR-39 through FR-43 work is separate. Strict runs implement durable checkpoints, automatic acceptance from available observed evidence, background-result settlement, whole-scope fencing and recovery through the autonomous runtime and supervisor. No autonomous approval is restored from a native journal entry alone.
+Ordinary diagnostic state remains session-local. Strict runs persist validated diagnostic counts, checkpoints, background-result observations and recovery evidence with whole-scope fencing. A native journal entry alone restores neither authority nor a passed review.
 
 Installed host lifecycle, RPC and attribution details require capability checks and real-host tests; upstream documentation is not proof of an installed version's behavior. Supervisor death requires deployment support. A local ledger cannot atomically commit a remote side effect, authenticate executor-supplied evidence, or defend against an unrestricted process directly tampering with storage. Hashes detect byte changes, not truthful evidence or authorized origin.
 
-A permanently unavailable provider, unresolvable external effect, missing credentials or insufficient authority may prevent progress without human intervention. Preserve that fact as a waiting or judged terminal outcome; do not describe it as successful nonstop development.
+An unavailable executor provider, irreconcilable external effect, missing execution credential or insufficient owner authority can still prevent progress. Report the actual safety or capability reason, never a Jev approval requirement. Neither such waiting nor terminal completion proves successful implementation.
 
 ## 12. Glossary and evidence
 
