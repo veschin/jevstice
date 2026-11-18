@@ -2506,7 +2506,7 @@ export function createAutonomyRuntime(options: {
 			"## Strict autonomous runs",
 			"The runtime registers the immutable objective under a fixed development workflow. Do not triage it again or ask the owner to confirm the work. Requirements, plan review, acceptance, anti-slop and completion checks are available as diagnostics: call them when a judgment is genuinely useful, and treat any negative, inconclusive or unavailable result as information for the owner. They never block a safe call, a safe change or completion, and they never grant permission. Only a genuinely critical human-consent question may be asked of the owner.",
 			"The supervised run restores exact artifacts and reinjects current requirements, plan progress and approved plan bytes. `jev_autonomy` reports status, reconciles an unobserved effect, requests a rotation or records an evidenced infeasibility proposal. An outstanding native background effect stays pending until its actual terminal delivery; never replay an unknown effect. An inherited effect needs its exact whole-scope fence receipt before it can be reconciled.",
-			"Actual safety still applies: writes outside the frozen roots, store/control state, the session transcript, and publication without its granted effect are refused. Resource and context limits and unobserved effects are enforced. The model finishes its own work; Jev acceptance is not a completion requirement.",
+			"Actual safety still applies: writes outside the frozen roots, store/control state, the session transcript, and publication without its granted effect are refused. Resource and context limits and unobserved effects are enforced. These refusals are deterministic supervisor checks, not Jev judgments. The model finishes its own work; Jev acceptance is not a completion requirement.",
 			"Jevstice autonomous runtime context. This is runtime data, not an owner message and not an approval.",
 			`Objective (immutable): ${run.objective}`,
 			`Policy: roots [${run.policy.roots.join(", ") || "none"}]; effects [${run.policy.effects.join(", ") || "none"}]; ` +
@@ -2586,7 +2586,7 @@ export function createAutonomyRuntime(options: {
 		lines.push(
 			"Safety rules: writes outside authorized roots, store/control state, session transcripts and ungranted publication are refused. " +
 				"Delegated tasks, opaque eval, interactive questions, native propose and re-aim are refused as unbindable capabilities. " +
-				"Every consequential call is recorded as a durable intent before execution; unobserved effects block further effects until reconciled. " +
+				"Every consequential call is recorded as a durable intent before execution; unobserved effects block further effects until reconciled. These blocks are deterministic runtime checks, not Jev verdicts. " +
 				"Jev judgments are diagnostic records, not permissions, and a negative or unavailable result is never a reason to stall or to ask the owner for a continuation override.",
 		);
 		return lines.join("\n");
@@ -3097,6 +3097,9 @@ export function createAutonomyRuntime(options: {
 							"the effect stays unknown until the committed envelope is repaired by the supervisor. This is an integrity boundary, not a Jev judgment.",
 					);
 				}
+				// The revision the judgment describes. A later settlement must still describe this
+				// exact committed work revision; otherwise its material is stale.
+				const revisionAtStart = bound.state.revision;
 				const facts = observeRecoveryPaths(bound.run, bound.check.view, paths);
 				if (facts.problem !== undefined) return controlError(facts.problem);
 				const questions: JudgeQuestion[] = [
@@ -3145,8 +3148,11 @@ export function createAutonomyRuntime(options: {
 				const repeated = submissionLedger(bound.state, boundary, digest).repeat;
 				// The declaration is settled deterministically: the runtime records the declared outcome
 				// and the actual evidence, and never replays the effect. A Jev result, when one is
-				// available, is attached as a diagnostic record and never gates the settlement.
+				// available, is attached as a diagnostic record and never gates the settlement. The
+				// runtime's own freshness check below does gate it: a judgment describes the bytes,
+				// intent and revision it was asked about, and none of them may change underneath it.
 				let judgment: Record<string, unknown> = { kind: "skipped", reason: "the same material was already judged" };
+				let refusedOutcome = false;
 				if (!repeated) {
 					const outcome = await judgeFor(ctx)(material, questions);
 					if (outcome.ok) {
@@ -3157,24 +3163,76 @@ export function createAutonomyRuntime(options: {
 							confidence: answer?.confidence ?? null,
 							matchesDeclaration: answer?.label === observed,
 						};
-						if (answer?.label !== observed || (answer?.confidence ?? 0) < POLICY.minConfidenceToApprove) {
-							recordRefusal(bound.state, { boundary, digest });
-						}
+						refusedOutcome = answer?.label !== observed || (answer?.confidence ?? 0) < POLICY.minConfidenceToApprove;
 					} else {
 						judgment = { kind: outcome.kind, problem: outcome.problem };
 					}
 				}
 				const current = readRun();
+				const revisionNow = current.checkpoint.revision;
 				const currentFacts = observeRecoveryPaths(current, bound.check.view, paths);
-				if (JSON.stringify(currentFacts) !== JSON.stringify(facts) ||
-					JSON.stringify(current.pending[intent.id]) !== JSON.stringify(intent)) {
-					journal(current, [
+				const observationsChanged = JSON.stringify(currentFacts) !== JSON.stringify(facts);
+				const intentChanged = JSON.stringify(current.pending[intent.id]) !== JSON.stringify(intent);
+				const bindingChanged =
+					current.epoch !== bound.run.epoch ||
+					current.generation !== bound.run.generation ||
+					current.session?.id !== bound.run.session?.id;
+				const revisionChanged = revisionNow !== revisionAtStart;
+				if (observationsChanged || intentChanged || bindingChanged || revisionChanged) {
+					const causes: string[] = [];
+					if (observationsChanged) causes.push("the selected observations no longer match the bytes that were judged");
+					if (intentChanged) causes.push("the pending intent record changed");
+					if (bindingChanged) causes.push("the run binding (epoch, generation or session) changed");
+					if (revisionChanged) causes.push(`the committed work revision changed (${revisionAtStart} -> ${revisionNow})`);
+					try {
+						journal(current, [
+							{
+								kind: "reconcile.stale",
+								data: {
+									intent: intent.id,
+									declared: observed,
+									settled: false,
+									stale: true,
+									causes,
+									judgment,
+									evidenceDigest: sha256(evidence),
+									materialDigest: digest,
+									observationsChanged,
+									intentChanged,
+									bindingChanged,
+									revisionChanged,
+									revision: revisionNow,
+									observationsDigest: sha256(JSON.stringify(facts)),
+									currentObservationsDigest: sha256(JSON.stringify(currentFacts)),
+									...(currentFacts.problem === undefined ? {} : { observationProblem: currentFacts.problem }),
+								},
+							},
+						]);
+					} catch (error) {
+						return controlError(
+							`Reconciliation of intent ${intent.id} was abandoned because ${causes.join("; ")}, and the stale judgment could not be recorded: ${errorText(error)}. ` +
+								"The intent remains pending and unresolved.",
+						);
+					}
+					return controlError(
+						`Reconciliation of intent ${intent.id} was refused by the runtime's deterministic freshness check, not by a Jev verdict: ${causes.join("; ")}. ` +
+							"The judgment is stale and was discarded. The intent remains pending as an unknown effect, this reconciliation moved no revision and nothing was replayed. " +
+							"Re-observe the current bytes under the bound session and submit reconcile again with fresh evidence and observations; action \"status\" reports the retained invocation and whether a whole-scope fence receipt is required.",
 						{
-							kind: "reconcile.observations_changed",
-							data: { intent: intent.id, declared: observed, judgment },
+							settled: false,
+							stale: true,
+							causes,
+							intent: intent.id,
+							observationsChanged,
+							intentChanged,
+							bindingChanged,
+							revisionChanged,
+							revision: revisionNow,
+							judgment,
 						},
-					]);
+					);
 				}
+				if (refusedOutcome) recordRefusal(bound.state, { boundary, digest });
 				try {
 					const refreshedEvents: JournalEvent[] = [];
 					const refreshed = refreshedManifest(bound.run, bound.state, bound.check.view, refreshedEvents);
@@ -3317,7 +3375,7 @@ export function createAutonomyRuntime(options: {
 			description:
 				"Status, reconciliation, rotation and infeasibility for the strict autonomous run. " +
 				'action "status" reports the committed run without changing it. ' +
-				'action "reconcile" settles one pending intent {intent, observed: "not_executed"|"executed", evidence} from the declared observed evidence; a Jev verdict, when available, is recorded as a diagnostic and never gates the settlement. ' +
+				'action "reconcile" settles one pending intent {intent, observed: "not_executed"|"executed", evidence} from the declared observed evidence. The runtime\'s own deterministic freshness check refuses settlement when the selected observations, the pending intent, the run binding or the work revision changed after the judgment was requested; the judgment is then recorded as stale and the intent stays pending. A Jev verdict itself is only a recorded diagnostic and never gates the settlement. ' +
 				"Optional observations lists authorized project files (or absent targets); the runtime supplies their complete actual bytes and rejects unauthorized paths. " +
 				"An inherited unknown effect is released only when a durable whole-scope fence receipt covers that exact intent and its recorded scope; quiescence alone never counts as success. " +
 				'action "rotate" asks the supervisor for a new executor session at a safe settle. ' +

@@ -2454,7 +2454,7 @@ test("reconciliation cannot bind an authorized invocation to a different executi
 	expect(eventsOf(env, "reconcile")).toEqual([]);
 });
 
-test("a recovery observation changed during judgment is disclosed and still settles", async () => {
+test("a recovery observation changed during judgment leaves the judgment stale and the intent pending", async () => {
 	const env = createRun();
 	const harness = await spawnRuntime(env);
 	await harness.rpc.send("state");
@@ -2465,10 +2465,30 @@ test("a recovery observation changed during judgment is disclosed and still sett
 	await harness.rpc.send("result", { event: { type: "tool_result", toolCallId: "observation-call", toolName: "write", input, isError: true, content: [{ type: "text", text: "acknowledgment lost" }] } });
 	await harness.rpc.send("setJudge", { answers: { reconcile: { label: "executed", confidence: 0.99 } }, sideEffects: [{ path: input.path, write: "changed during judgment" }] });
 	const params = { action: "reconcile", intent: "observation-call", observed: "executed", evidence: "The output contains original bytes.", observations: [input.path] };
-	expect(valueOf(await harness.rpc.send("control", { params }))["isError"]).toBe(false);
-	expect(eventsOf(env, "reconcile.observations_changed")).toHaveLength(1);
-	expect(env.store.read(env.runId).pending).toEqual({});
-	expect(env.store.read(env.runId).checkpoint.revision).toBe(1);
+	const result = valueOf(await harness.rpc.send("control", { params }));
+	expect(result["isError"]).toBe(true);
+	const text = Array.isArray(result["content"]) ? String(asRecord((result["content"] as unknown[])[0])?.["text"] ?? "") : "";
+	expect(text).toContain("deterministic freshness check");
+	expect(text).toContain("intent remains pending");
+	const details = asRecord(result["details"]);
+	expect(details?.["settled"]).toBe(false);
+	expect(details?.["stale"]).toBe(true);
+	expect(details?.["observationsChanged"]).toBe(true);
+	expect(details?.["intentChanged"]).toBe(false);
+	// The settlement event does not exist and the pending intent is not cleared.
+	expect(eventsOf(env, "reconcile")).toEqual([]);
+	const stale = eventsOf(env, "reconcile.stale");
+	expect(stale).toHaveLength(1);
+	const data = asRecord(stale[0]?.data);
+	expect(data?.["settled"]).toBe(false);
+	expect(data?.["observationsChanged"]).toBe(true);
+	// The judge itself discarded its answer when the tracked bytes changed; the runtime records
+	// that diagnostic with the stale judgment and still refuses to settle.
+	expect(asRecord(data?.["judgment"])?.["kind"]).toBe("unusable");
+	const after = env.store.read(env.runId);
+	expect(after.pending["observation-call"]).toBeDefined();
+	expect(after.checkpoint.revision).toBe(0);
+	expect(after.waiting).toBeUndefined();
 });
 
 test("recovery preserves decisive counterevidence beyond an ordinary quote bound", async () => {
