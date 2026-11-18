@@ -237,7 +237,7 @@ See [the autonomy reference](docs/autonomy.md) for the lifecycle, deployment lim
 
 ## Demos
 
-See the [demonstration site](https://veschin.github.io/jevstice/) for the [twelve tool recordings](https://veschin.github.io/jevstice/features/), [session controls and optional autonomy](https://veschin.github.io/jevstice/controls/), and [downloadable Reddit and Twitter materials](https://veschin.github.io/jevstice/press/).
+See the [demonstration site](https://veschin.github.io/jevstice/) for the [twelve tool recordings](https://veschin.github.io/jevstice/features/) and [session controls and optional autonomy](https://veschin.github.io/jevstice/controls/).
 
 The [game and dashboard comparisons](https://veschin.github.io/jevstice/archive/) use matched prompts, models and time limits. The game produced two different ship profiles; the dashboard passed the same 26 interaction checks in both runs. In a [separate editing trial](https://veschin.github.io/jevstice/comparison/), both drafts met all seven criteria. These are examples, not a benchmark.
 

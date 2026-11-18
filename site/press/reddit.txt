@@ -1,7 +1,0 @@
-I gave three coding models the same briefs with and without Jevstice. One butterfly declared itself complete with its wings piled on top of each other.
-
-Jevstice is my oh-my-pi plugin. It gives the agent a second opinion while it works. I tested it on a stained-glass game, a harbor dispatch desk and a family train-or-coach fare question. GLM 5.3 Flash max, GPT-6 Luna high and GPT-6.2 Sol medium each got three attempts per brief in each condition.
-
-The clip shows repeat three. Without Jevstice, Luna put all four wings in the same spot on its target. With Jevstice it produced a playable match. Sol went the other way: its version with the plugin put the target on top of the controls.
-
-The models wrote 23 of 27 requested files without the plugin and 19 of 27 with it before the deadline. The full comparison includes missing files, median examples, every score and the token and judge-call ledger: https://veschin.github.io/jevstice/
