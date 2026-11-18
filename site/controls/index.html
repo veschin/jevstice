@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Watch the Jevstice session commands in oh-my-pi and inspect evidence from a separate strict supervisor startup.">
+  <title>Controls and autonomy | Jevstice</title>
+  <link rel="stylesheet" href="../fonts.css">
+  <style>
+    :root{color-scheme:light;--ink:#181917;--paper:#fafaf8;--red:#972f22;--rule:#b4b5ad;background:var(--paper);color:var(--ink);font:1.25rem/1.45 'EB Garamond',Georgia,serif}
+    *{box-sizing:border-box}
+    body{max-width:52rem;margin:auto;padding:clamp(1rem,4vw,3rem)}
+    header{border-bottom:1px solid var(--rule);padding-bottom:1.5rem}
+    h1,h2{font-family:Fraunces,Georgia,serif;font-weight:650;line-height:1.06;letter-spacing:-.025em;text-wrap:balance}
+    h1{font-size:clamp(2.2rem,7vw,4.3rem);margin:1rem 0 .55rem}
+    h2{font-size:clamp(1.6rem,4vw,2.75rem);margin:0 0 .7rem}
+    p,dl{max-width:65ch;margin:.65rem 0}
+    section{padding:1.8rem 0;border-bottom:1px solid var(--rule)}
+    a{color:var(--red);text-underline-offset:.18em}
+    a:focus-visible{outline:2px solid var(--red);outline-offset:4px}
+    code{font: .78em ui-monospace,monospace;white-space:nowrap}
+    dt{font-weight:700}
+    dd{margin:0 0 .45rem}
+    figure{max-width:41rem;margin:1rem 0 0}
+    img{display:block;width:100%;height:auto;border-radius:.2rem}
+    figcaption,.links,.home{font:600 .78rem/1.5 system-ui,sans-serif}
+    figcaption{margin-top:.55rem}
+    .links{display:flex;flex-wrap:wrap;gap:.5rem 1rem;margin:.65rem 0 0}
+    footer{padding-top:1rem}
+  </style>
+</head>
+<body>
+  <header>
+    <a class="home" href="../">Jevstice home</a>
+    <h1>Controls and autonomy</h1>
+    <p>Jevstice's session switch changes diagnostic checks. The optional strict supervisor is a separate way to launch OMP.</p>
+  </header>
+  <main>
+    <section aria-labelledby="session">
+      <h2 id="session">Session controls</h2>
+      <dl>
+        <dt><code>/jev</code></dt><dd>Reports whether checks are on for the current session.</dd>
+        <dt><code>/jev off</code> and <code>/jev on</code></dt><dd>Turn checks off and back on for this session. Host permissions stay the same.</dd>
+        <dt><code>/jev-status</code></dt><dd>Reports the mode, diagnostic coverage and judge usage.</dd>
+      </dl>
+      <p>The live recording shows <code>/jev</code> reporting On, <code>/jev off</code> reporting Off, and <code>/jev on</code> reporting On again. The expanded status showed zero judge requests.</p>
+      <figure>
+        <img src="session-status.png" width="820" height="500" alt="Expanded OMP session status showing Jev On and zero judge requests.">
+        <figcaption>Live OMP capture in an isolated workspace.</figcaption>
+      </figure>
+      <p class="links"><a href="session.gif">Watch session controls (GIF)</a><a href="session-off.png">See Off state (PNG)</a><a href="session-status.png">See status (PNG)</a></p>
+    </section>
+    <section aria-labelledby="strict">
+      <h2 id="strict">Strict supervisor startup</h2>
+      <p>The startup scenario supplied a read-only objective for <code>notes.txt</code>. The replay shows the session binding, wake and recorded tool result. The supervisor exited with code 0; the status command returned <code>completed</code>.</p>
+      <figure>
+        <img src="strict-startup.png" width="820" height="740" loading="lazy" alt="Selected strict startup events in recorded order, followed by completed status, exit code 0, and 67 passed startup checks.">
+        <figcaption>Replay of selected events from a live startup run. The harness reported 67 passing checks and no failures for this one scenario.</figcaption>
+      </figure>
+      <p class="links"><a href="strict-startup.gif">Watch startup replay (GIF)</a><a href="strict-startup.png">See result (PNG)</a><a href="strict-startup.json">Read evidence excerpt (JSON)</a></p>
+    </section>
+  </main>
+  <footer>
+    <a href="https://github.com/veschin/jevstice/blob/main/docs/autonomy.md#running-the-supervisor">Supervisor commands and prerequisites</a>
+  </footer>
+</body>
+</html>

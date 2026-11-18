@@ -1,0 +1,15 @@
+jev_review
+Recorded OMP tool events, 2026-11-15.
+The GIF replays selected inputs and outputs. Timing is edited.
+Excerpt boundaries omit other arguments and output.
+
+CALL 1 · INPUT EXCERPTS
+Target: src/export.ts
+Kind: diff
+Tests: 2 pass
+ 0 fail
+
+TOOL OUTPUT EXCERPTS
+developer review of diff src/export.ts: sound (confidence 0.46). Class: inconclusive
+no defect is established.
+This does not approve completion.

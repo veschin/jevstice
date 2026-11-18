@@ -1,0 +1,25 @@
+jev_anti_slop
+Recorded OMP tool events, 2026-11-18.
+The GIF replays selected inputs and outputs. Timing is edited.
+Excerpt boundaries omit other arguments and output.
+
+CALL 1 · INPUT EXCERPTS
+Language: English
+Claim: The export command supports --dry-run as of version 2.2.
+
+TOOL OUTPUT EXCERPTS
+anti-slop review part 1/1 is inconclusive; no review is recorded:
+unsupported_claim c2 1.00
+Quote: "The export command supports --dry-run as of version 2.2."
+Repair: Supply independent evidence for this claim or remove it; do not invent support.
+Editing protocol (en):
+
+CALL 2 · INPUT EXCERPTS
+Artifact: The export command supports --dry-run as of version 2.2.
+
+TOOL OUTPUT EXCERPTS
+anti-slop review part 1/1 is inconclusive; no review is recorded:
+built-in wording answer is below the 0.8 floor
+
+The first excerpt comes from the submission with both claims.
+The second excerpt shows that the narrowed submission remained inconclusive.

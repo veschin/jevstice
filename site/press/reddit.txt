@@ -1,0 +1,7 @@
+I asked for a low-poly cone. Here are the ships my coding agent built with and without Jevstice.
+
+I built Jevstice for oh-my-pi so I could see which parts of an agent's work a second model could verify. For this comparison I gave DeepSeek Flash the same game brief twice. Both games ran. Without the extension, the ship looked like a disc; with it, the ship had the pointed profile I asked for. That run took 613 seconds instead of 397.
+
+The screenshots show a difference, but they don't tell us what caused it. On a separate editing task, both drafts met all seven criteria. Jevstice recorded that it couldn't judge the final outcome from the evidence it had.
+
+The paired screenshots, prompts and recordings are here: https://veschin.github.io/jevstice/

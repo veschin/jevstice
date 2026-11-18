@@ -1,0 +1,3 @@
+I asked DeepSeek Flash to build the same game with and without Jevstice, my oh-my-pi extension. The brief called for a cone. Both games ran; only the second ship looked the part. It took 216 seconds longer.
+
+Clips and matched runs: https://veschin.github.io/jevstice/

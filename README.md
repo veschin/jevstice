@@ -7,6 +7,7 @@
 <p align="center"><strong>Jev records diagnostic judgment at OMP tool boundaries. It never grants or withholds execution permission.</strong></p>
 
 <p align="center">
+  <a href="https://veschin.github.io/jevstice/">Watch the demos</a> ·
   <a href="#install">Install</a> ·
   <a href="#tools">Tools</a> ·
   <a href="#diagnostics">Diagnostics</a> ·
@@ -237,23 +238,9 @@ See [the autonomy reference](docs/autonomy.md) for the lifecycle, deployment lim
 
 ## Demos
 
-Two kinds of evidence ship with the repository. Both are recorded from real sessions; nothing is scripted after the fact.
+See the [demonstration site](https://veschin.github.io/jevstice/) for the [twelve tool recordings](https://veschin.github.io/jevstice/features/), [session controls and optional autonomy](https://veschin.github.io/jevstice/controls/), and [downloadable Reddit and Twitter materials](https://veschin.github.io/jevstice/press/).
 
-**Per-tool recordings.** `demos/tools/<tool>/` holds a terminal GIF, the `.tape` that produced it, and the sanitized event stream, prompt, exact model identity and outcome of the session it recorded. All twelve tools have one; `jev_reaim` needs two owner messages in one session, so its scenario drives OMP's RPC mode rather than a single prompt. Each recording runs `omp` with `-e src/index.ts` against the installed `deepseek/deepseek-flash` entry, which OMP displays as DeepSeek V4.1 Flash, in a disposable workspace with extension discovery, skills, rules and context files disabled. Regenerate one with:
-
-```sh
-bun tools/release-demos.ts run <tool> --save demos/tools/<tool>/evidence
-bun tools/release-demos.ts record <tool>
-```
-
-**Matched comparisons.** `demos/comparisons/{game,ui}/` holds the same prompt built twice — once without the addon, once with it — under the same model and a 300-second limit, with the original `index.html`, `run.json`, screenshots, verification results and a README stating the protocol and every observed defect.
-
-| Task | Prompt | Without Jevstice | With Jevstice |
-| --- | --- | --- | --- |
-| 3D game (15-minute cap) | `demos/comparisons/game-prompt.txt` | exit 0 at 397 s | exit 0 at 613 s |
-| UI dashboard (300-second cap) | `demos/comparisons/ui-prompt.txt` | exit 0 at 226 s | exit 1 at the 300 s cap |
-
-In the game pair both runs finished and both artifacts passed the browser checks; the addon spent 216 extra seconds and its ship matched the requested cone while the baseline drew a flat disc. In the UI pair both artifacts passed every interaction check, and the addon hit its cap while still reviewing. Neither pair shows a measured benefit, and one pair of runs is not a benchmark.
+The [game and dashboard comparisons](https://veschin.github.io/jevstice/archive/) use matched prompts, models and time limits. The game produced two different ship profiles; the dashboard passed the same 26 interaction checks in both runs. In a [separate editing trial](https://veschin.github.io/jevstice/comparison/), both drafts met all seven criteria. These are examples, not a benchmark.
 
 ## Development
 

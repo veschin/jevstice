@@ -1,0 +1,30 @@
+jev_plan_review
+Recorded OMP tool events, 2026-11-15.
+The GIF replays selected inputs and outputs. Timing is edited.
+Excerpt boundaries omit other arguments and output.
+
+CALL 1 · INPUT EXCERPTS
+Phase: outline
+
+TOOL OUTPUT EXCERPTS
+plan outline approved (2 steps, coverage 0.89).
+
+CALL 2 · INPUT EXCERPTS
+Phase: detail
+Step: s1
+
+TOOL OUTPUT EXCERPTS
+detail approved for 's1' (0.96);
+
+CALL 3 · INPUT EXCERPTS
+Phase: detail
+Step: s2
+
+TOOL OUTPUT EXCERPTS
+detail approved for 's2' (1.00);
+
+CALL 4 · INPUT EXCERPTS
+Phase: finalize
+
+TOOL OUTPUT EXCERPTS
+plan approved after outline, 2 step-detail reviews and whole-artifact review (0.96).

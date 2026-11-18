@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tool recordings | Jevstice</title>
+<meta name="description" content="Watch all twelve Jevstice tools in recorded oh-my-pi sessions and read the selected inputs and outputs.">
+<link rel="stylesheet" href="../fonts.css">
+<style>
+  :root { color-scheme: light; --ink: #181917; --stock: #fafaf8; --muted: #555650; --red: #922c21; --line: #b4b5ad; color: var(--ink); background: var(--stock); font-family: 'EB Garamond', Georgia, serif; }
+  * { box-sizing: border-box; }
+  body { max-width: 72rem; margin: auto; padding: clamp(1rem, 4vw, 3.75rem); }
+  a { color: inherit; text-underline-offset: .2em; }
+  a:hover { color: var(--red); }
+  a:focus-visible { outline: 3px solid var(--red); outline-offset: 3px; }
+  .skip { position: absolute; left: -100vw; }
+  .skip:focus { left: 1rem; background: var(--stock); }
+  .imprint, .links, figcaption { font: 600 .875rem/1.5 system-ui, sans-serif; }
+  .imprint { display: flex; justify-content: space-between; gap: 1rem; border-bottom: 1px solid var(--line); padding-bottom: .75rem; }
+  h1 { font: 600 clamp(2.5rem, 8vw, 5.5rem)/1 Fraunces, Georgia, serif; letter-spacing: -.035em; margin: 1.5rem 0 .75rem; }
+  h2 { font: 600 clamp(1.1rem, 2.6vw, 1.75rem)/1.2 Fraunces, Georgia, serif; margin: 0; }
+  h3 { font: 600 1rem/1.4 ui-monospace, monospace; margin: 0; overflow-wrap: anywhere; }
+  p { margin: 0; font-size: 1.3rem; line-height: 1.35; }
+  .lead { display: grid; grid-template-columns: 3fr 2fr; gap: clamp(1rem, 4vw, 3rem); align-items: start; margin: 1.5rem 0 2rem; }
+  .lead p + p { margin-top: .8rem; }
+  figure { margin: 0; }
+  figure img { display: block; width: 100%; height: auto; border: 1px solid var(--line); }
+  figcaption { color: var(--muted); margin-top: .4rem; }
+  section { border-top: 1px solid var(--line); padding-top: 1.25rem; margin-bottom: 2rem; }
+  .recordings { margin: .75rem 0 0; padding: 0; list-style: none; }
+  .recordings li { display: grid; grid-template-columns: minmax(14rem, 2fr) minmax(0, 3fr); gap: .25rem 1rem; align-items: baseline; padding: .8rem 0; border-top: 1px solid var(--line); }
+  .links { display: flex; flex-wrap: wrap; gap: .35rem 1.3rem; margin-top: .3rem; }
+  .links a { display: inline-flex; align-items: center; min-height: 1.75rem; }
+  @media (max-width: 44rem) { .lead, .recordings li { grid-template-columns: minmax(0, 1fr); } }
+</style>
+</head>
+<body>
+<a class="skip" href="#recordings">Skip to recordings</a>
+<header class="imprint"><a href="../">Jevstice home</a><span>Tool reference</span></header>
+<main>
+<h1>Twelve tools on record</h1>
+<div class="lead">
+  <div>
+    <p>These replays use selected inputs and outputs from recorded oh-my-pi sessions. The recordings shorten the wait between calls and omit unrelated events.</p>
+    <p>Each GIF loads only when you follow its link. Read the text extract for more context. Jev diagnostics do not grant or withhold execution permission.</p>
+  </div>
+  <figure>
+    <a href="anti_slop.png"><img src="anti_slop.png" width="840" height="700" alt="Anti-slop replay: Jev asks for evidence or removal of an unsupported claim. The overall check is inconclusive."></a>
+    <figcaption>Featured still: <code>jev_anti_slop</code>.</figcaption>
+  </figure>
+</div>
+<section aria-labelledby="recordings">
+<h2 id="recordings">Request and plan</h2>
+<ul class="recordings" role="list">
+  <li id="triage"><h3>jev_triage</h3><div><p>Triage identifies the dry-run flag and usage text as relevant topics.</p><div class="links"><a href="triage.gif" aria-label="Watch jev_triage replay (GIF)">Replay GIF</a><a href="triage.png" aria-label="Open jev_triage still (PNG)">Still PNG</a><a href="triage.txt" aria-label="Read jev_triage evidence">Evidence</a></div></div></li>
+  <li id="requirements"><h3>jev_requirements</h3><div><p>The first submission stays unapproved; the next drops the proposed exit-status requirement and passes.</p><div class="links"><a href="requirements.gif" aria-label="Watch jev_requirements replay (GIF)">Replay GIF</a><a href="requirements.png" aria-label="Open jev_requirements still (PNG)">Still PNG</a><a href="requirements.txt" aria-label="Read jev_requirements evidence">Evidence</a></div></div></li>
+  <li id="plan_review"><h3>jev_plan_review</h3><div><p>Jev reviews the outline, each of two steps and the assembled plan.</p><div class="links"><a href="plan_review.gif" aria-label="Watch jev_plan_review replay (GIF)">Replay GIF</a><a href="plan_review.png" aria-label="Open jev_plan_review still (PNG)">Still PNG</a><a href="plan_review.txt" aria-label="Read jev_plan_review evidence">Evidence</a></div></div></li>
+  <li id="reaim"><h3>jev_reaim</h3><div><p>A substring is rejected; the full owner message changes the objective.</p><div class="links"><a href="reaim.gif" aria-label="Watch jev_reaim replay (GIF)">Replay GIF</a><a href="reaim.png" aria-label="Open jev_reaim still (PNG)">Still PNG</a><a href="reaim.txt" aria-label="Read jev_reaim evidence">Evidence</a></div></div></li>
+</ul>
+</section>
+<section aria-labelledby="decisions">
+<h2 id="decisions">Decisions and sources</h2>
+<ul class="recordings" role="list">
+  <li id="consult"><h3>jev_consult</h3><div><p>The judge favors stdout at 0.54 confidence. The choice remains inconclusive.</p><div class="links"><a href="consult.gif" aria-label="Watch jev_consult replay (GIF)">Replay GIF</a><a href="consult.png" aria-label="Open jev_consult still (PNG)">Still PNG</a><a href="consult.txt" aria-label="Read jev_consult evidence">Evidence</a></div></div></li>
+  <li id="search_relevance"><h3>jev_search_relevance</h3><div><p>The judge selects a POSIX source. That selection does not verify Node.js behavior.</p><div class="links"><a href="search_relevance.gif" aria-label="Watch jev_search_relevance replay (GIF)">Replay GIF</a><a href="search_relevance.png" aria-label="Open jev_search_relevance still (PNG)">Still PNG</a><a href="search_relevance.txt" aria-label="Read jev_search_relevance evidence">Evidence</a></div></div></li>
+  <li id="context"><h3>jev_context</h3><div><p>The agent lists archived sources and reads the original owner prompt.</p><div class="links"><a href="context.gif" aria-label="Watch jev_context replay (GIF)">Replay GIF</a><a href="context.png" aria-label="Open jev_context still (PNG)">Still PNG</a><a href="context.txt" aria-label="Read jev_context evidence">Evidence</a></div></div></li>
+</ul>
+</section>
+<section aria-labelledby="work">
+<h2 id="work">Work and outcome</h2>
+<ul class="recordings" role="list">
+  <li id="course_check"><h3>jev_course_check</h3><div><p>The judge returns <code>on_course</code> below the reliability floor, so Jev grants no approval.</p><div class="links"><a href="course_check.gif" aria-label="Watch jev_course_check replay (GIF)">Replay GIF</a><a href="course_check.png" aria-label="Open jev_course_check still (PNG)">Still PNG</a><a href="course_check.txt" aria-label="Read jev_course_check evidence">Evidence</a></div></div></li>
+  <li id="review"><h3>jev_review</h3><div><p>Two tests pass, but the diff review remains inconclusive.</p><div class="links"><a href="review.gif" aria-label="Watch jev_review replay (GIF)">Replay GIF</a><a href="review.png" aria-label="Open jev_review still (PNG)">Still PNG</a><a href="review.txt" aria-label="Read jev_review evidence">Evidence</a></div></div></li>
+  <li id="acceptance"><h3>jev_acceptance</h3><div><p>Six tests pass. The outcome check still leaves four obligations unresolved.</p><div class="links"><a href="acceptance.gif" aria-label="Watch jev_acceptance replay (GIF)">Replay GIF</a><a href="acceptance.png" aria-label="Open jev_acceptance still (PNG)">Still PNG</a><a href="acceptance.txt" aria-label="Read jev_acceptance evidence">Evidence</a></div></div></li>
+</ul>
+</section>
+<section aria-labelledby="prose">
+<h2 id="prose">Prose and publication</h2>
+<ul class="recordings" role="list">
+  <li id="text_review"><h3>jev_text_review</h3><div><p>The reviewer quotes a passage that violates the submitted active-voice rule.</p><div class="links"><a href="text_review.gif" aria-label="Watch jev_text_review replay (GIF)">Replay GIF</a><a href="text_review.png" aria-label="Open jev_text_review still (PNG)">Still PNG</a><a href="text_review.txt" aria-label="Read jev_text_review evidence">Evidence</a></div></div></li>
+  <li id="anti_slop"><h3>jev_anti_slop</h3><div><p>Jev flags an unsupported claim and returns the English editing protocol. The overall review stays inconclusive.</p><div class="links"><a href="anti_slop.gif" aria-label="Watch jev_anti_slop replay (GIF)">Replay GIF</a><a href="anti_slop.png" aria-label="Open jev_anti_slop still (PNG)">Still PNG</a><a href="anti_slop.txt" aria-label="Read jev_anti_slop evidence">Evidence</a></div></div></li>
+</ul>
+</section>
+</main>
+</body>
+</html>

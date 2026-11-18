@@ -1,0 +1,13 @@
+jev_consult
+Recorded OMP tool events, 2026-11-15.
+The GIF replays selected inputs and outputs. Timing is edited.
+Excerpt boundaries omit other arguments and output.
+
+CALL 1 · INPUT EXCERPTS
+Mode: choice
+Options: stdout or stderr
+Code: process.stderr.write(progress)
+
+TOOL OUTPUT EXCERPTS
+Consult (choice): stdout
+(confidence 0.54). Class: inconclusive

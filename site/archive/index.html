@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Historical browser captures and results from the Orbit Runner game and Orbit Projects dashboard, each generated with and without Jevstice.">
+  <title>Matched runs | Jevstice</title>
+  <link rel="stylesheet" href="../fonts.css">
+  <style>
+    :root { color-scheme: light; --stock: #fafaf8; --ink: #181917; --muted: #555650; --red: #922c21; --line: #b4b5ad; }
+    * { box-sizing: border-box; }
+    body { max-width: 64rem; margin: auto; padding: clamp(1rem, 4vw, 3.75rem); background: var(--stock); color: var(--ink); font: 1.25rem/1.35 'EB Garamond', Georgia, serif; }
+    a { color: inherit; text-underline-offset: .2em; }
+    a:hover { color: var(--red); }
+    a:focus-visible { outline: 3px solid var(--red); outline-offset: 3px; }
+    .imprint, figcaption, footer { font: 600 .9rem/1.4 system-ui, sans-serif; }
+    .imprint { border-bottom: 1px solid var(--ink); padding-bottom: .55rem; }
+    h1, h2 { font-family: Fraunces, Georgia, serif; letter-spacing: -.036em; text-wrap: balance; }
+    h1 { font-size: clamp(2.75rem, 8vw, 5.5rem); font-weight: 650; line-height: 1; margin: .52em 0 .28em; }
+    h2 { font-size: clamp(1.9rem, 4vw, 3rem); font-weight: 540; line-height: 1.05; margin: 0 0 .35em; }
+    p { max-width: 63ch; margin: 0 0 .8em; text-wrap: pretty; }
+    .note { color: var(--muted); }
+    section { border-top: 1px solid var(--ink); margin-top: 2rem; padding-top: 1.5rem; }
+    .plates { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; margin: 1rem 0; }
+    figure { margin: 0; }
+    figcaption { display: flex; flex-wrap: wrap; gap: .2rem .75rem; align-items: baseline; justify-content: space-between; padding-bottom: .45rem; }
+    figcaption span { color: var(--muted); font-weight: 500; }
+    img { width: 100%; height: auto; display: block; }
+    .ui img { border: 1px solid var(--line); }
+    footer { border-top: 3px double var(--ink); margin-top: 2rem; padding-top: 1rem; }
+    @media (max-width: 40rem) { .plates { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="imprint"><a href="../">Jevstice home</a></div>
+    <h1>Matched runs</h1>
+    <p>The archived run reports record the same prompt, model (DeepSeek V4.1 Flash), low thinking and time limit within each pair. One oh-my-pi session in each pair loaded Jevstice.</p>
+    <p class="note">One pair per task is too small to establish whether Jevstice improves the output.</p>
+  </header>
+  <main>
+    <section id="game" aria-labelledby="game-title">
+      <h2 id="game-title">Orbit Runner</h2>
+      <p>The game brief called for a low-poly cone, cyan rails and a starfield. Both versions use a cone mesh. In play, the ship without Jevstice looks disc-like; the ship with it has a pointed silhouette.</p>
+      <div class="plates">
+        <figure>
+          <figcaption>Without Jevstice <span>Finished in 397 s</span></figcaption>
+          <img src="game-without.png" width="680" height="600" alt="A disc-like white ship between cyan rails, under a sparse starfield.">
+        </figure>
+        <figure>
+          <figcaption>With Jevstice <span>Finished in 613 s</span></figcaption>
+          <img src="game-with.png" width="680" height="600" alt="A pointed white ship between cyan rails, under a denser starfield.">
+        </figure>
+      </div>
+      <p>Both runs finished within the 15-minute cap. In Chromium, both games rendered with WebGL, redrew the scene and advanced the score. Steering and restart were not independently verified.</p>
+      <p class="note">Each image crops the same 680 × 600 pixel region from a desktop screenshot taken just after play started.</p>
+    </section>
+    <section class="ui" id="dashboard" aria-labelledby="dashboard-title">
+      <h2 id="dashboard-title">Orbit Projects</h2>
+      <p>Both dashboards passed 26 of 26 Chromium checks, including filtering, form validation, keyboard focus and persistence. The run with Jevstice reached the five-minute cap and emitted no final summary.</p>
+      <div class="plates">
+        <figure>
+          <figcaption>Without Jevstice <span>Finished in 226 s</span></figcaption>
+          <img src="ui-without.png" width="500" height="230" loading="lazy" alt="The empty search result offers a Clear filters button beneath its message.">
+        </figure>
+        <figure>
+          <figcaption>With Jevstice <span>Hit the cap at 300 s</span></figcaption>
+          <img src="ui-with.png" width="500" height="230" loading="lazy" alt="The empty search result suggests adjusting the search or status and has no Clear filters button.">
+        </figure>
+      </div>
+      <p>When a search returned no matches, the baseline offered a dedicated Clear filters button. The version with Jevstice offered instructions instead. It did add a labelled close button to the New project dialog; both dialogs supported Cancel and Escape.</p>
+    </section>
+  </main>
+  <footer><a href="../">Back to Jevstice home</a></footer>
+</body>
+</html>
