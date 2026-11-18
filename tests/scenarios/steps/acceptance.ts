@@ -662,11 +662,12 @@ then("the addon collects observed code and execution evidence", value => {
 	expect(judged).toContain("12 pass / 0 fail");
 });
 
-then("it submits the missing business and architecture acceptance automatically", value => {
+then("it submits the missing architecture acceptance automatically", value => {
 	const world = w(value);
 	const messages = world.autoMessages ?? [];
 	expect(messages).toHaveLength(1);
-	expect(messages[0]?.content).toContain("Automatic architecture acceptance");
+	expect(messages[0]?.content).toContain("Jev · Architecture");
+	expect(messages[0]?.content).toContain("architecture acceptance:");
 });
 
 then("it returns the unmet obligations without requiring manual acceptance calls", value => {
@@ -674,6 +675,8 @@ then("it returns the unmet obligations without requiring manual acceptance calls
 	const content = world.autoMessages?.[0]?.content ?? "";
 	expect(content).toContain("does not establish every plan topic");
 	expect(content).toContain("collect");
+	expect(content).toContain("approved verification section:");
+	expect(content).toContain("Read the run data and report the count.");
 	expect(content).toContain("observe the behavior");
 });
 

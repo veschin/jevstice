@@ -15,6 +15,7 @@ import {
 	answeringJudge,
 	blockReason,
 	boundaryConfig,
+	cleanProtocolAnswers,
 	fakeArtifacts,
 	fakeCtx,
 	fakePi,
@@ -1222,6 +1223,7 @@ then("it does not advance the project work revision", async value => {
 then("its own judgment is recorded on the checks ledger", async value => {
 	const world = setup(value);
 	Object.assign(world.table, {
+		...cleanProtocolAnswers(),
 		claim_1: { label: "supported", confidence: 0.95 },
 		language_1: { probability: 0.05 },
 		meta_1: { probability: 0.05 },

@@ -1,8 +1,8 @@
 # language: en
-# Requirements: PRD FR-68, FR-69; pending FR-41, FR-42; FR-73, FR-76.
+# Requirements: PRD FR-68, FR-69; FR-41 (journal restore remains unimplemented); FR-42; FR-73, FR-76.
 # Source contract: AGENTS.md owner contract and context archive; src/jev-skill.md section 6.
-# Normative business specification only; no step definitions or executable runner exist here.
-# Scenarios tagged @pending describe owner-promised behavior that is NOT implemented yet.
+# Executable: tests/scenarios/steps/owner_followup.ts; run by tests/scenarios/run.test.ts.
+# The only @pending scenario is the runner-allowlisted native-journal restore case.
 Feature: Owner follow-ups change the task only through authentic, classified evidence
   The owner's words are captured from authentic input, classified at a workflow boundary,
   and never converted into a continuation permission, waiver or silent replacement.
@@ -138,8 +138,8 @@ Feature: Owner follow-ups change the task only through authentic, classified evi
     And dependent decisions are reviewed again against the corrected objective
     And the executor is not required to discard the whole plan
 
-  # PENDING, FR-42; stale hold clause superseded by FR-73.
-  @pending @jev_owner_followup_14 @fr_42
+  # FR-42; implementation src/state.ts requirementsRetained, src/activities.ts ownerUpdate
+  @jev_owner_followup_14 @fr_42
   Scenario: A corrected requirement set is re-bound without an execution hold
     Given a judged owner correction changed one requirement
     When the corrected requirement set and dependent plan are submitted again

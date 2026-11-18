@@ -5,6 +5,7 @@ import { DEFAULT_CONFIG } from "../src/config.js";
 import { createContextArchive } from "../src/context.js";
 import { createJevController } from "../src/controller.js";
 import type { Judge } from "../src/judge.js";
+import type { MessagePresentationRenderer } from "../src/presentation.js";
 import { asRecord, type JevConfig } from "../src/types.js";
 import {
 	answeringJudge,
@@ -155,6 +156,87 @@ describe("T1 - the registered ordinary surface", () => {
 	});
 });
 
+describe("compact user presentation", () => {
+	const renderedText = (component: { render(width: number): readonly string[] } | undefined): string =>
+		component?.render(100).join("\n") ?? "";
+	const setup = () => {
+		const pi = fakePi();
+		const renderers = new Map<string, MessagePresentationRenderer>();
+		// The host injects Text; this seam exposes the exact text handed to it.
+		pi.api.pi = { Text: function (text = "") {
+			return { render: () => [text], invalidate: () => {} };
+		} as unknown as NonNullable<typeof pi.api.pi>["Text"] };
+		pi.api.registerMessageRenderer = (name, renderer) => { renderers.set(name, renderer); };
+		createJevController({ judge: answeringJudge({}).judge, config: config(), zod: fakeZod() }).register(pi.api);
+		return { pi, renderers };
+	};
+
+	test("every tool hides arguments and full diagnostics without changing model content", async () => {
+		const { pi } = setup();
+		const result = await pi.callTool("jev_context", { action: "list" }, fakeCtx());
+		for (const tool of pi.tools.values()) {
+			expect(tool.mergeCallAndResult).toBe(true);
+			const call = renderedText(tool.renderCall?.({ artifact: "PRIVATE LONG INPUT" }, { expanded: false }));
+			expect(call).not.toContain("PRIVATE");
+			expect(call.length).toBeLessThan(80);
+			const short = renderedText(tool.renderResult?.(result, { expanded: false }));
+			expect(short).toContain("Complete");
+			expect(short).not.toContain("Current objective:");
+			expect(short.length).toBeLessThanOrEqual(100);
+			expect(renderedText(tool.renderResult?.(result, { expanded: true }))).toBe(toolText(result));
+		}
+		expect(toolText(result)).toContain("Current objective:");
+		expect(toolDetails(result)["diagnostics"]).toBeDefined();
+	});
+
+	test("collapsed results distinguish failures, uncertainty and checks that never ran", () => {
+		const { pi } = setup();
+		const render = pi.tools.get("jev_review")!.renderResult!;
+		for (const [details, isError, label] of [
+			[{ kind: "unavailable" }, false, "Unavailable"],
+			[{ kind: "unclear" }, false, "Inconclusive"],
+			[{ approved: false }, false, "Findings"],
+			[{ prerequisite: true }, false, "Not checked"],
+			[{ kind: "stale" }, false, "Outdated"],
+			[{ kind: "invalid" }, true, "Invalid input"],
+			[{ kind: "invalid", prerequisite: true }, true, "Not checked"],
+			[{ enabled: false, skipped: true }, false, "Off"],
+		] as const) {
+			const result = { content: [{ type: "text", text: "FULL DIAGNOSTIC" }], details, isError };
+			expect(renderedText(render(result, { expanded: false }))).toContain(label);
+			expect(renderedText(render(result, { expanded: true }))).toBe("FULL DIAGNOSTIC");
+			const longText = "FULL DIAGNOSTIC\n".repeat(400);
+			expect(renderedText(render({ ...result, content: [{ type: "text", text: longText }] }, { expanded: true }))).toBe(longText);
+		}
+	});
+
+	test("administrative messages remain expandable but are absent from provider context", async () => {
+		const { pi, renderers } = setup();
+		expect([...renderers.keys()].sort()).toEqual(["jev.acceptance", "jev.config", "jev.diagnostic", "jev.mode", "jev.status"]);
+		const ctx = fakeCtx();
+		await pi.emit("session_stop", stopEvent(), ctx);
+		const status = pi.messages.filter(message => message.customType === "jev.status").at(-1)!;
+		const content = status.content;
+		const summary = asRecord(status.details)?.["summary"];
+		expect(summary).toContain("Work: none");
+		expect(summary).toContain("Checks: none");
+		expect(summary).toContain("Outcome: Not checked");
+		for (const renderer of renderers.values()) {
+			const message = { content, details: { summary } };
+			expect(renderedText(renderer(message, { expanded: false }))).toBe(summary as string);
+			expect(renderedText(renderer(message, { expanded: true }))).toBe(content);
+		}
+		expect(content).toContain("Passed action checks do not prove");
+		const ownerMessage = { role: "custom", ...status };
+		const userMessage = { role: "user", content: "Continue the work" };
+		expect(await pi.emit("context", { messages: [ownerMessage, userMessage] }, ctx)).toEqual([{ messages: [userMessage] }]);
+		pi.callCommand("jev", "off", fakeCtx());
+		expect(lastMessage(pi, "jev.mode")).toContain("supervisor safety limits");
+		const mode = pi.messages.filter(message => message.customType === "jev.mode").at(-1)!;
+		expect(renderedText(renderers.get("jev.mode")!(mode, { expanded: false }))).toBe("Jev · Off");
+	});
+});
+
 describe("T2 - read-only work spends no judgment", () => {
 	test("a plain web search and a read are neither gated nor judged", async () => {
 		const { pi, calls } = controllerFor({});
@@ -211,6 +293,37 @@ describe("diagnostic-only boundary: tool_call holds no ordinary work", () => {
 		if (admission !== undefined) expect(blockReason(admission)).toBeUndefined();
 	});
 
+	test("a late plan diagnostic stays historical after another write", async () => {
+		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const normal = answeringJudge({ needs_development: NEEDS_DEVELOPMENT, ...PLAN_APPROVED });
+		const outdated = answeringJudge({ action: { label: "off_course", confidence: 0.95 } });
+		const pi = fakePi();
+		const historical: unknown[] = [];
+		pi.api.appendEntry = (name, data) => { if (name === "jev.historical-diagnostic") historical.push(data); };
+		const delayed = { started: false };
+		const judge: Judge = async (material, questions) => {
+			if (questions[0]?.name !== "action" || delayed.started) {
+				return normal.judge(material, questions);
+			}
+			delayed.started = true;
+			entered.resolve();
+			await release.promise;
+			return outdated.judge(material, questions);
+		};
+		createJevController({ judge, config: config(), zod: fakeZod() }).register(pi.api);
+		await planned(pi, ctx);
+		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts", content: "first" }, "Wrote first revision"), ctx);
+		await entered.promise;
+		await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts", content: "second" }, "Wrote second revision"), ctx);
+		release.resolve();
+		expect(await until(() => historical.length > 0, 200)).toBe(true);
+		const context = toolDetails(await pi.callTool("jev_context", { action: "list" }, ctx));
+		expect(context["revision"]).toBe(2);
+		expect(context["findings"]).toEqual([]);
+	});
+
 	test("an advisory finding never turns tool_call or session_stop into a refusal", async () => {
 		// No consult answer: the judgment fails and leaves an advisory record.
 		const { pi } = controllerFor({});
@@ -254,20 +367,21 @@ describe("diagnostic-only boundary: tool_call holds no ordinary work", () => {
 });
 
 describe("startup guidance and authentic owner capture", () => {
-	test("before_agent_start supplies diagnostic guidance and preserves the host policy", async () => {
+	test("development startup preserves host policy and injects only the ordinary workflow", async () => {
 		const { pi } = controllerFor({});
 		const ctx = fakeCtx();
 
-		const result = await pi.emit("before_agent_start", { prompt: "Inspect the source", systemPrompt: ["Host policy"] }, ctx);
-		const prompt = promptOf(result);
+		const event = { reason: "prompt", prompt: "Implement a coverage dashboard", systemPrompt: ["Host policy"] };
+		const prompt = promptOf(await pi.emit("before_agent_start", event, ctx));
 
 		expect(prompt).toContain("Host policy");
 		const joined = prompt.join("\n");
-		for (const name of ORDINARY_TOOLS) expect(joined).toContain(name);
-		expect(joined).toContain("sourceId");
-		expect(joined.toLowerCase()).toContain("diagnostic");
+		expect(joined).toContain("jev_requirements");
+		expect(joined).toContain('"aspect":"outcome"');
+		expect(joined).not.toContain("jev_plan_review");
+		expect(joined.length).toBeLessThan(1200);
 
-		const again = await pi.emit("before_agent_start", { prompt: "Inspect the source", systemPrompt: prompt }, ctx);
+		const again = await pi.emit("before_agent_start", { ...event, systemPrompt: prompt }, ctx);
 		expect(promptOf(again)).toHaveLength(prompt.length);
 	});
 
@@ -505,9 +619,13 @@ describe("owner-controlled session mode", () => {
 		expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
 		expect(calls).toHaveLength(0);
 
+		const announcement = pi.messages.find(message => message.customType === "jev.mode")!;
+		expect(announcement.deliverAs).toBe("nextTurn");
+		expect(await pi.emit("context", { messages: [{ ...announcement, role: "custom" }] }, ctx)).toEqual([{
+			messages: [expect.objectContaining({ customType: "jev.mode-advisory", display: false, content: expect.stringContaining("checks off") })],
+		}]);
 		const offPrompt = await pi.emit("before_agent_start", { reason: "prompt", prompt: "Urgent work", systemPrompt: ["Host policy"] }, ctx);
 		expect(promptOf(offPrompt)).toEqual(["Host policy"]);
-		expect(pi.messages.some(message => message.customType === "jev.mode" && message.deliverAs === "steer")).toBe(true);
 	});
 
 	test("mode is isolated per session and reenabling restores guidance, not permission", async () => {
@@ -525,7 +643,7 @@ describe("owner-controlled session mode", () => {
 
 		pi.callCommand("jev", "on", first);
 		const onPrompt = await pi.emit("before_agent_start", { prompt: "Report the coverage", systemPrompt: ["Host policy"] }, first);
-		expect(promptOf(onPrompt).join("\n")).toContain("jev_consult");
+		expect(promptOf(onPrompt).join("\n")).toContain("jev_requirements");
 		pi.callCommand("jev", "on", first);
 		expect(lastMessage(pi, "jev.mode")).toMatch(/on/i);
 	});

@@ -1,7 +1,7 @@
 # language: en
 # Requirements: PRD FR-03, FR-20; FR-73.
 # Source contract: src/guidance.ts SEARCH_DESCRIPTION; tests/activities.test.ts FR-03.
-# Normative business specification only; no step definitions or executable runner exist here.
+# Executable: tests/scenarios/steps/search_relevance.ts; run by tests/scenarios/run.test.ts.
 Feature: Search relevance selects from submitted candidates without inventing prose
   The executor supplies candidates, their evidence and its own reason for each.
   Jev selects a candidate or none. The returned reason is the executor's submitted text,

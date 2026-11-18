@@ -1,9 +1,9 @@
 # language: en
 # Requirements: PRD FR-57 through FR-66; FR-73, FR-76.
 # Source contract: docs/autonomy.md; AGENTS.md optional strict module.
-# Normative business specification only; no step definitions or executable runner exist here.
+# Executable: tests/scenarios/steps/autonomy.ts; run by tests/scenarios/run.test.ts.
 # The strict module is optional, Linux/systemd-specific and not loaded by the package manifest.
-# Scenarios tagged @pending or @gap_* describe promises that are NOT fully verified or implemented.
+# Open real-host strict acceptance is recorded in HANDOFF.md, not by a pending scenario tag.
 Feature: Optional strict supervision preserves owner safety limits
   The owner authorizes one objective and an envelope once. The supervisor enforces roots,
   effect classes, resource limits, ownership and containment deterministically. Jev reviews

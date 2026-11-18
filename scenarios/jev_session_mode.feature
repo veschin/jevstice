@@ -1,7 +1,7 @@
 # language: en
 # Requirements: PRD FR-71 (session switch), FR-76, FR-77; owner decision 2026-11-15.
 # Source contract: AGENTS.md session mode section; src/jev-skill.md section 0.
-# Normative business specification only; no step definitions or executable runner exist here.
+# Executable: tests/scenarios/steps/session_mode.ts; run by tests/scenarios/run.test.ts.
 Feature: Owner controls diagnostic checks per session
   The owner can pause and resume Jev's checks without changing host permissions,
   configuration files or the safety limits of an optional strict supervisor.
@@ -86,12 +86,13 @@ Feature: Owner controls diagnostic checks per session
     Then the mode is unchanged
     And the owner sees that /jev, /jev on and /jev off are the accepted forms
 
-  # FR-77; implementation src/controller.ts sendMessage deliverAs steer
+  # FR-77; implementation src/controller.ts sendMessage deliverAs nextTurn
   @jev_session_mode_10 @fr_77
-  Scenario: Switching while the executor is busy steers the next action
+  Scenario: Switching while the executor is busy queues the next turn
     Given the executor is working in the session
     When the owner turns diagnostics on or off
-    Then the mode message is delivered immediately to the active executor
+    Then the mode message is queued for the next turn without steering the active batch
+    And the queued message carries only mode guidance, not a permission change
     And an idle session does not start a model turn merely to announce the mode
 
   # FR-77, FR-76; implementation src/controller.ts /jev handler, strict branch

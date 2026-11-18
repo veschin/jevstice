@@ -110,7 +110,7 @@ export function parseFeature(text: string, file: string): ParsedFeature {
 			finishScenario();
 			const outline = line.startsWith("Scenario Outline:");
 			const name = line.slice((outline ? "Scenario Outline:" : "Scenario:").length).trim();
-			const idTag = pendingTags.find(tag => /^[a-z][a-z0-9_]*_\d+$/.test(tag));
+			const idTag = pendingTags.find(tag => /^jev_[a-z0-9_]+_\d+[a-z]?$/.test(tag));
 			current = {
 				id: idTag ?? `line_${number}`,
 				name,

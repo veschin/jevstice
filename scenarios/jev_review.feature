@@ -1,7 +1,7 @@
 # language: en
 # Requirements: PRD FR-16, FR-20; FR-73.
 # Source contract: src/guidance.ts REVIEW_DESCRIPTION; src/jev-skill.md section 8.
-# Normative business specification only; no step definitions or executable runner exist here.
+# Executable: tests/scenarios/steps/review.ts; run by tests/scenarios/run.test.ts.
 Feature: Developer review judges the submitted change as a developer
   Checkpoint, commit and diff reviews answer whether quoted changed code is safe to keep.
   A sound review is evidence, not release or acceptance; a defect is recorded for correction.

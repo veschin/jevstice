@@ -35,7 +35,7 @@ import {
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { sha256 } from "../src/state.js";
 import { asRecord } from "../src/types.js";
-import { failingJudge } from "./helpers.js";
+import { failingJudge, fakePi, fakeZod } from "./helpers.js";
 
 const OBJECTIVE = "Implement a small fixed artifact writer in the project and verify it with a command";
 
@@ -1786,6 +1786,30 @@ test("a run with no observed execution scope admits no consequential call", () =
 	});
 	expect(verdict?.block).toBe(true);
 	expect(env.store.read(env.runId).pending).toEqual({});
+});
+
+test("strict controls keep full results behind the compact user view", () => {
+	const env = createRun();
+	const runtime = createAutonomyRuntime({ storeFile: env.storeFile, runId: env.runId, judge: failingJudge("unused"), config: DEFAULT_CONFIG });
+	const pi = fakePi();
+	pi.api.pi = { Text: function (text = "") {
+		return { render: () => [text], invalidate: () => {} };
+	} as unknown as NonNullable<typeof pi.api.pi>["Text"] };
+	const renderers = new Map<string, unknown>();
+	pi.api.registerMessageRenderer = (name, renderer) => { renderers.set(name, renderer); };
+	runtime.register(pi.api, fakeZod());
+	const tool = pi.tools.get("jev_autonomy")!;
+	const full = "The supervisor refused reconciliation.\n" + "FULL STRICT DETAIL ".repeat(20);
+	const result = { content: [{ type: "text", text: full }], isError: true, details: {} };
+	const compact = tool.renderResult?.(result, { expanded: false })?.render(80).join("") ?? "";
+	expect(compact).toContain("Jev autonomy");
+	expect(compact).toContain("Findings");
+	expect(compact).not.toContain("FULL STRICT DETAIL");
+	expect(tool.renderResult?.(result, { expanded: true })?.render(80).join("")).toBe(full);
+	expect(renderers.has("jev.autonomy.wake")).toBe(true);
+	const adapter = runtime.controllerApi(pi.api);
+	expect(adapter.pi).toBe(pi.api.pi);
+	expect(adapter.registerMessageRenderer).toBeDefined();
 });
 
 test("config keeps Jev diagnostic and asides never start an uncommitted turn", () => {

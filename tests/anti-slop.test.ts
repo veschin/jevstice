@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { actionCheck, antiSlop, triage } from "../src/activities.js";
+import { acceptance, actionCheck, antiSlop, courseCheck, observedOutcome, requirements, textReview, triage } from "../src/activities.js";
 import {
 	antiSlopStatus,
+	diagnosticKind,
 	freshState,
 	recordAcceptance,
 	recordAction,
@@ -11,10 +12,11 @@ import {
 	type JevState,
 } from "../src/state.js";
 import type { Judge } from "../src/judge.js";
-import { asRecord, type JevConfig } from "../src/types.js";
+import { asRecord, type Evidence, type JevConfig, type ToolOutcome } from "../src/types.js";
 import {
 	answeringJudge,
 	boundaryConfig,
+	cleanProtocolAnswers,
 	failingJudge,
 	toolDetails,
 	type FakeAnswerSource,
@@ -45,6 +47,7 @@ function externalState(): JevState {
 
 /** Fragment answers for one clean paragraph and one owner rule. */
 const CLEAN_FRAGMENT: Record<string, FakeAnswerSource> = {
+	...cleanProtocolAnswers(),
 	language_1: { probability: 0.05 },
 	meta_1: { probability: 0.05 },
 	relevance_1: { label: "serves", confidence: 0.95 },
@@ -86,6 +89,44 @@ function params(overrides: Record<string, unknown> = {}): Record<string, unknown
 		inferences: [INFERENCE],
 		...overrides,
 	};
+}
+
+interface SelectedProtocol {
+	language: string;
+	steps: string[];
+	checks: Array<{ class: string; rule: string; repair: string }>;
+}
+
+/** The selected protocol attached to a successful or inconclusive review result. */
+function selectedProtocol(outcome: ToolOutcome): SelectedProtocol {
+	const protocol = asRecord(outcome.details?.["protocol"]);
+	expect(protocol).toBeDefined();
+	const language = protocol?.["language"];
+	const steps = protocol?.["steps"];
+	const checks = protocol?.["checks"];
+	expect(language === "ru" || language === "en").toBe(true);
+	expect(Array.isArray(steps)).toBe(true);
+	expect(Array.isArray(checks)).toBe(true);
+	return {
+		language: language as string,
+		steps: steps as string[],
+		checks: checks as SelectedProtocol["checks"],
+	};
+}
+
+/** The caller sees the selected numbered steps in order, including preservation guidance. */
+function expectProtocolInText(outcome: ToolOutcome, protocol: SelectedProtocol): void {
+	expect(protocol.steps.length).toBeGreaterThan(0);
+	expect(
+		protocol.steps.some(step => /(preserv|meaning|fact|negation|сохран|смысл|факт|отриц)/iu.test(step)),
+	).toBe(true);
+	let lastIndex = -1;
+	for (const step of protocol.steps) {
+		const index = outcome.text.indexOf(step);
+		expect(index).toBeGreaterThan(-1);
+		expect(index).toBeGreaterThan(lastIndex);
+		lastIndex = index;
+	}
 }
 
 describe("FR-46 - validation happens before a judge call", () => {
@@ -139,6 +180,225 @@ describe("FR-46 - validation happens before a judge call", () => {
 	});
 });
 
+describe("FR-51 - the built-in style protocol", () => {
+	for (const [language, expected] of [
+		["English", "en"],
+		["Russian", "ru"],
+		["Английский", "en"],
+		["Русский", "ru"],
+		["en-GB", "en"],
+		["ru-RU", "ru"],
+	] as const) {
+		test(`${language} (${expected}) assertion-free artifact with no owner rules is accepted`, async () => {
+			const state = externalState();
+			const { deps, calls } = depsFor({
+				...cleanProtocolAnswers(),
+				language_1: { probability: 0.05 },
+				meta_1: { probability: 0.05 },
+				relevance_1: { label: "serves", confidence: 0.95 },
+			});
+
+			const outcome = await antiSlop(
+				deps,
+				state,
+				params({
+					artifact: expected === "ru" ? "Выберите файл, затем нажмите кнопку \"Проверить\"." : "Select the file, then press the \"Verify\" button.",
+					language, rules: [], claims: [], inferences: [],
+				}),
+			);
+			if (!outcome.ok) throw new Error(outcome.text);
+			const protocol = selectedProtocol(outcome);
+
+			expect(protocol.language).toBe(expected);
+			expect(protocol.checks.map(check => check.class)).toEqual([
+				"symbols",
+				"wording",
+				"syntax",
+				"coherence",
+			]);
+			expect(calls[0]?.questions.map(question => question.name)).toEqual(
+				expect.arrayContaining(["protocol_1_1", "protocol_1_2", "protocol_1_3", "protocol_1_4"]),
+			);
+			expect(outcome.details["findings"]).toEqual([]);
+			expect(outcome.details["claims"]).toEqual([]);
+			expect(outcome.details["inferences"]).toEqual([]);
+			expect(outcome.text).toMatch(/does not verify factual assertions/i);
+			expectProtocolInText(outcome, protocol);
+			expect(state.antiSlopReviews).toHaveLength(1);
+		});
+	}
+
+	test("a built-in style violation is a warning with the exact quote and repair", async () => {
+		const state = externalState();
+		const { deps, calls } = depsFor({
+			...CLEAN_FRAGMENT,
+			claim_1: { label: "supported", confidence: 0.95 },
+			protocol_1_1: { probability: 0.95 },
+		});
+
+		const outcome = await antiSlop(
+			deps,
+			state,
+			params({
+				rules: [{ class: "register", rule: "Avoid contractions." }],
+				claims: [CLAIM_1],
+				inferences: [],
+			}),
+		);
+		if (!outcome.ok) throw new Error(outcome.text);
+		const protocol = selectedProtocol(outcome);
+		const styleCheck = protocol.checks[0];
+		const fragment = (outcome.details["fragments"] as string[])[0];
+		const findings = outcome.details["findings"] as Array<Record<string, unknown>>;
+		const finding = findings.find(
+			entry => entry["kind"] === "register_violation" && entry["rule"] === styleCheck?.rule,
+		);
+
+		expect(styleCheck?.class).toBe("symbols");
+		expect(finding).toBeDefined();
+		expect(finding?.["severity"]).toBe("warning");
+		expect(finding?.["target"]).toBe("fragment-1");
+		expect(finding?.["quote"]).toBe(fragment);
+		expect(finding?.["repair"]).toBe(styleCheck?.repair);
+		expect(findings).toHaveLength(1);
+		expect(outcome.text).toContain(String(finding?.["quote"]));
+		expect(outcome.text).toContain(String(finding?.["repair"]));
+		const names = calls[0]?.questions.map(question => question.name) ?? [];
+		expect(names).toContain("protocol_1_1");
+		expect(names).toContain("rule_1_1");
+	});
+
+	test("a claim finding carries the quoted material and a concrete repair", async () => {
+		const state = externalState();
+		const { deps } = depsFor({
+			...CLEAN_FRAGMENT,
+			claim_1: { label: "refuted", confidence: 0.95 },
+		});
+
+		const outcome = await antiSlop(deps, state, params({ claims: [CLAIM_1], inferences: [] }));
+		if (!outcome.ok) throw new Error(outcome.text);
+		const findings = outcome.details["findings"] as Array<Record<string, unknown>>;
+		const finding = findings.find(entry => entry["kind"] === "contradicted_claim");
+
+		expect(finding).toBeDefined();
+		expect(finding?.["quote"]).toBe(CLAIM_1.text);
+		expect(String(finding?.["repair"]).length).toBeGreaterThan(0);
+		expect(outcome.text).toContain(String(finding?.["quote"]));
+		expect(outcome.text).toContain(String(finding?.["repair"]));
+	});
+
+	test("an uncertain built-in style answer is inconclusive and still exposes the protocol", async () => {
+		const state = externalState();
+		const { deps } = depsFor({
+			...CLEAN_FRAGMENT,
+			protocol_1_3: { probability: 0.5 },
+		});
+
+		const outcome = await antiSlop(
+			deps,
+			state,
+			params({ rules: [], claims: [], inferences: [] }),
+		);
+
+		expect(outcome.ok).toBe(false);
+		expect(asRecord(outcome.details)?.["kind"]).toBe("unclear");
+		expect(state.antiSlopReviews).toHaveLength(0);
+		expect(outcome.text).toContain("inconclusive");
+		expect(outcome.text).not.toContain("Outcome: clean");
+		const protocol = selectedProtocol(outcome);
+		expect(protocol.language).toBe("en");
+		expectProtocolInText(outcome, protocol);
+	});
+
+	test("a missing built-in style answer cannot produce a clean review", async () => {
+		const state = externalState();
+		const table: Record<string, FakeAnswerSource> = { ...CLEAN_FRAGMENT };
+		delete table["protocol_1_4"];
+		const { deps } = depsFor(table);
+
+		const outcome = await antiSlop(
+			deps,
+			state,
+			params({ rules: [], claims: [], inferences: [] }),
+		);
+
+		expect(outcome.ok).toBe(false);
+		expect(state.antiSlopReviews).toHaveLength(0);
+		expect(outcome.text).not.toContain("Outcome: clean");
+	});
+
+	test("an unavailable judge cannot produce a clean style review", async () => {
+		const state = externalState();
+		const deps = { judge: failingJudge("offline"), config: config("advisory") };
+
+		const outcome = await antiSlop(
+			deps,
+			state,
+			params({ rules: [], claims: [], inferences: [] }),
+		);
+
+		expect(outcome.ok).toBe(false);
+		expect(state.antiSlopReviews).toHaveLength(0);
+		expect(outcome.text).not.toContain("Outcome: clean");
+	});
+
+	test("an unsupported language needs owner rules and selects no protocol", async () => {
+		for (const language of ["French", "constructor", "__proto__"]) {
+			const state = externalState();
+			const withoutRules = depsFor({});
+			const refused = await antiSlop(
+				withoutRules.deps,
+				state,
+				params({ language, rules: [], claims: [], inferences: [] }),
+			);
+
+			expect(refused.ok).toBe(false);
+			expect(withoutRules.calls).toHaveLength(0);
+			expect(refused.text).toMatch(/rules?/i);
+		}
+
+		const acceptedState = externalState();
+		const accepted = depsFor({
+			language_1: { probability: 0.05 },
+			meta_1: { probability: 0.05 },
+			relevance_1: { label: "serves", confidence: 0.95 },
+			rule_1_1: { probability: 0.05 },
+		});
+		const outcome = await antiSlop(
+			accepted.deps,
+			acceptedState,
+			params({
+				language: "French",
+				rules: [{ class: "register", rule: "Écrire en français formel." }],
+				claims: [],
+				inferences: [],
+			}),
+		);
+		if (!outcome.ok) throw new Error(outcome.text);
+
+		expect(outcome.details["protocol"]).toBeNull();
+		const names = accepted.calls[0]?.questions.map(question => question.name) ?? [];
+		expect(names.some(name => name.startsWith("protocol_"))).toBe(false);
+		expect(acceptedState.antiSlopReviews).toHaveLength(1);
+	});
+
+	test("a malformed supplied rule is still refused for a supported language", async () => {
+		const state = externalState();
+		const { deps, calls } = depsFor({});
+
+		const outcome = await antiSlop(
+			deps,
+			state,
+			params({ rules: [{ class: "", rule: "Use formal legal English." }] }),
+		);
+
+		expect(outcome.ok).toBe(false);
+		expect(calls).toHaveLength(0);
+		expect(outcome.text).toMatch(/class and rule line/i);
+		expect(state.antiSlopReviews).toHaveLength(0);
+	});
+});
+
 describe("FR-47, FR-48 - claim verification and explicit trust marks", () => {
 	test("a supported claim is trusted and a refuted claim is a blocker finding", async () => {
 		const state = externalState();
@@ -174,6 +434,7 @@ describe("FR-51, FR-52 - language, register, meta-text and relevance findings", 
 	test("each fragment defect is named with its submitted rule and severity", async () => {
 		const state = externalState();
 		const { deps } = depsFor({
+			...cleanProtocolAnswers(),
 			claim_1: { label: "supported", confidence: 0.95 },
 			language_1: { probability: 0.95 },
 			meta_1: { probability: 0.95 },
@@ -752,4 +1013,301 @@ describe("FR-63 - strict delivery preserves the reviewed content", () => {
 			expect(result.ok && toolDetails(result)["approved"] === true).toBe(scenario.approved);
 		});
 	}
+});
+
+describe("diagnostic false-clean and accounting regressions", () => {
+	test("an explicit unclear relevance answer makes the anti-slop review inconclusive with an unresolved status", async () => {
+		const state = externalState();
+		const { deps } = depsFor({
+			...CLEAN_FRAGMENT,
+			relevance_1: { label: "unclear", confidence: 0.95 },
+			claim_1: { label: "supported", confidence: 0.95 },
+			inference_1: { label: "follows", confidence: 0.95 },
+		});
+		const outcome = await antiSlop(deps, state, params({ rules: [], claims: [CLAIM_1], inferences: [INFERENCE] }));
+		expect(outcome.ok).toBe(false);
+		expect(outcome.details?.["kind"]).toBe("unclear");
+		expect(String(outcome.details?.["uncertain"])).toContain("relevance");
+		const relevance = asRecord(outcome.details?.["relevance"] instanceof Array ? (outcome.details?.["relevance"] as unknown[])[0] : undefined);
+		expect(relevance?.["status"]).toBe("unresolved");
+		expect(state.antiSlopReviews).toHaveLength(0);
+	});
+
+	test("a below-floor relevance answer is not treated as a clean fragment", async () => {
+		const state = externalState();
+		const { deps } = depsFor({
+			...CLEAN_FRAGMENT,
+			relevance_1: { label: "repeats", confidence: 0.5 },
+			claim_1: { label: "supported", confidence: 0.95 },
+		});
+		const outcome = await antiSlop(deps, state, params({ rules: [], claims: [CLAIM_1], inferences: [] }));
+		expect(outcome.ok).toBe(false);
+		expect(String(outcome.details?.["uncertain"])).toContain("relevance");
+		expect(state.antiSlopReviews).toHaveLength(0);
+	});
+
+	test("an explicit unclear inference answer is inconclusive and carries an unresolved status", async () => {
+		const state = externalState();
+		const { deps } = depsFor({
+			...CLEAN_FRAGMENT,
+			claim_1: { label: "supported", confidence: 0.95 },
+			inference_1: { label: "unclear", confidence: 0.95 },
+		});
+		const outcome = await antiSlop(deps, state, params({ rules: [], claims: [CLAIM_1], inferences: [INFERENCE] }));
+		expect(outcome.ok).toBe(false);
+		expect(outcome.details?.["kind"]).toBe("unclear");
+		expect(String(outcome.details?.["uncertain"])).toContain("inference inf-1");
+		const inferences = outcome.details?.["inferences"];
+		expect(Array.isArray(inferences)).toBe(true);
+		expect(asRecord((inferences as unknown[])[0])?.["status"]).toBe("unresolved");
+		expect(asRecord((inferences as unknown[])[0])?.["verdict"]).toBe("unclear");
+		expect(state.antiSlopReviews).toHaveLength(0);
+	});
+
+	test("a text review over the 200-question batch limit is refused locally without a judge call", async () => {
+		const fragments = Array.from({ length: 12 }, (_, index) => `Paragraph number ${index + 1}.`).join("\n\n");
+		const rules = Array.from({ length: 17 }, (_, index) => ({
+			class: "style",
+			rule: `Rule number ${index + 1}.`,
+			scope: "fragment" as const,
+		}));
+		const { deps, calls } = depsFor({});
+		const outcome = await textReview(deps, freshState(), { text: fragments, rules });
+		expect(outcome.ok).toBe(false);
+		expect(calls).toHaveLength(0);
+		expect(outcome.text).toContain("204");
+		expect(outcome.text).toContain("200");
+		expect(outcome.details?.["kind"]).toBe("invalid");
+	});
+
+	test("an unchanged repeated text review is counted as not checked, not another failure", async () => {
+		const { deps, calls } = depsFor({ text_rule_1: { probability: 0.95 } });
+		const params = { text: "The report is ready.", rules: [{ class: "accuracy", rule: "Claims must follow the evidence." }] };
+		const first = await textReview(deps, freshState(), params);
+		const state = freshState();
+		await textReview(deps, state, params);
+		const repeat = await textReview(deps, state, params);
+		expect(first.ok).toBe(false);
+		expect(repeat.ok).toBe(false);
+		expect(repeat.details?.["skipped"]).toBe(true);
+		expect(diagnosticKind(repeat)).toBe("not_checked");
+		expect(calls).toHaveLength(2);
+	});
+
+	test("the course check reports the choice confidence floor it actually applies", async () => {
+		const state = freshState();
+		const task = registerTask(state, "Report the coverage of the last run");
+		state.plan = { taskFingerprint: task.fingerprint, planUrl: "local://plan.md", planDigest: "bound" };
+		state.planTopics = [{
+			id: "report",
+			section: "# Report\nReport the coverage of the last run.",
+			paths: ["src/report.ts"],
+			requirement: "Report the coverage of the last run",
+		}];
+		const { deps } = depsFor({ course: { label: "on_course", confidence: 0.56 } });
+		const outcome = await courseCheck(deps, state, { claim: "render the coverage report" });
+		expect(outcome.details?.["approved"]).toBe(false);
+		expect(outcome.text).toContain("below the 0.6 reliability floor");
+		expect(outcome.text).not.toContain("0.7 reliability floor");
+	});
+});
+
+describe("observedOutcome - one ordinary result check", () => {
+	const EXECUTION: Evidence = { kind: "execution", quote: "$ bun test\n3 pass, 0 fail", source: "bun test" };
+	const CODE: Evidence = { kind: "code", quote: "export function report(): string { return renderCoverage(); }", source: "src/report.ts" };
+	const OBSERVATIONS: Evidence[] = [EXECUTION, CODE];
+
+	function observedState(items: string[]): JevState {
+		const state = freshState();
+		const task = registerTask(state, "Build the coverage report");
+		state.requirementsApproval = { taskFingerprint: task.fingerprint, items };
+		return state;
+	}
+
+	function requirementAnswers(label: string, execution = "evidence_1", code = "evidence_2", confidence = 0.95): Record<string, FakeAnswerSource> {
+		return {
+			requirement_1: { label, confidence },
+			requirement_1_execution: { label: execution, confidence },
+			requirement_1_code: { label: code, confidence },
+		};
+	}
+
+	test("all approved requirements are met from retained code and execution evidence without a plan or acceptance record", async () => {
+		const state = observedState(["The report renders the coverage."]);
+		const { deps, calls } = depsFor(requirementAnswers("observed"));
+		const outcome = await observedOutcome(deps, state, OBSERVATIONS);
+		expect(outcome.ok).toBe(true);
+		expect(outcome.details?.["approved"]).toBe(true);
+		expect(outcome.details?.["met"]).toEqual(["The report renders the coverage."]);
+		expect(outcome.details?.["missing"]).toEqual([]);
+		expect(outcome.details?.["unresolved"]).toEqual([]);
+		expect(outcome.details?.["defects"]).toEqual([]);
+		expect(calls[0]?.questions.map(question => question.name)).toEqual([
+			"requirement_1", "requirement_1_execution", "requirement_1_code",
+		]);
+		expect(state.acceptance).toEqual([]);
+		expect(state.plan).toBeUndefined();
+	});
+
+	test("a successful test run can establish that the tests passed without a code quote", async () => {
+		const state = observedState(["The tests run and pass."]);
+		const { deps } = depsFor(requirementAnswers("observed", "evidence_1", "not_needed"));
+		const outcome = await observedOutcome(deps, state, OBSERVATIONS);
+		expect(outcome.details).toMatchObject({ approved: true, requirements: [{
+			status: "met", execution: { status: "selected", id: "evidence_1" }, code: { status: "not_needed" },
+		}] });
+	});
+
+	test("two not-needed bases cannot establish a requirement without a cited observation", async () => {
+		const state = observedState(["The tests run and pass."]);
+		const { deps } = depsFor(requirementAnswers("observed", "not_needed", "not_needed"));
+		const outcome = await observedOutcome(deps, state, OBSERVATIONS);
+		expect(outcome.details).toMatchObject({ approved: false, missing: ["The tests run and pass."] });
+	});
+
+	test("a selected none basis reports the requirement as missing with the unresolved/missing names", async () => {
+		const state = observedState(["The report renders the coverage."]);
+		const { deps } = depsFor(requirementAnswers("observed", "none"));
+		const outcome = await observedOutcome(deps, state, OBSERVATIONS);
+		expect(outcome.ok).toBe(true);
+		expect(outcome.details?.["approved"]).toBe(false);
+		expect(outcome.details?.["kind"]).toBe("unclear");
+		expect(outcome.details?.["missing"]).toEqual(["The report renders the coverage."]);
+		expect(outcome.details?.["met"]).toEqual([]);
+		expect(state.acceptance).toEqual([]);
+	});
+
+	test("an unresolved answer is reported by requirement name rather than as a pass", async () => {
+		const state = observedState(["The report renders the coverage."]);
+		const { deps } = depsFor(requirementAnswers("unclear"));
+		const outcome = await observedOutcome(deps, state, OBSERVATIONS);
+		expect(outcome.details?.["approved"]).toBe(false);
+		expect(outcome.details?.["unresolved"]).toEqual(["The report renders the coverage."]);
+		expect(outcome.text).toContain("inconclusive");
+	});
+
+	test("deviating evidence names the requirement as a defect", async () => {
+		const state = observedState(["The report renders the coverage."]);
+		const { deps } = depsFor(requirementAnswers("deviates"));
+		const outcome = await observedOutcome(deps, state, OBSERVATIONS);
+		expect(outcome.details?.["approved"]).toBe(false);
+		expect(outcome.details?.["kind"]).toBe("defect");
+		expect(outcome.details?.["defects"]).toEqual(["The report renders the coverage."]);
+		expect(outcome.text).toContain("defect");
+	});
+
+	test("missing code or execution evidence is a no-judge prerequisite", async () => {
+		const state = observedState(["The report renders the coverage."]);
+		const { deps, calls } = depsFor({});
+		const outcome = await observedOutcome(deps, state, [CODE]);
+		expect(outcome.ok).toBe(false);
+		expect(calls).toHaveLength(0);
+		expect(outcome.details?.["skipped"]).toBe(true);
+		expect(outcome.details?.["prerequisite"]).toBe("code and execution evidence");
+		expect(outcome.details?.["missingEvidence"]).toEqual(["execution"]);
+	});
+
+	test("no approved requirements is a prerequisite with no judge call", async () => {
+		const state = freshState();
+		registerTask(state, "Build the coverage report");
+		const { deps, calls } = depsFor({});
+		const outcome = await observedOutcome(deps, state, OBSERVATIONS);
+		expect(outcome.ok).toBe(false);
+		expect(calls).toHaveLength(0);
+		expect(outcome.details?.["prerequisite"]).toBeDefined();
+	});
+
+	test("a failed judge is unavailable and never an approval", async () => {
+		const state = observedState(["The report renders the coverage."]);
+		const outcome = await observedOutcome({ judge: failingJudge("socket reset"), config: boundaryConfig() }, state, OBSERVATIONS);
+		expect(outcome.ok).toBe(false);
+		expect(outcome.details?.["kind"]).toBe("unavailable");
+		expect(outcome.details?.["approved"]).not.toBe(true);
+	});
+
+	test("an unchanged repeated observation is not checked and costs no second judge call", async () => {
+		const state = observedState(["The report renders the coverage."]);
+		const { deps, calls } = depsFor(requirementAnswers("deviates"));
+		const first = await observedOutcome(deps, state, OBSERVATIONS);
+		const repeat = await observedOutcome(deps, state, OBSERVATIONS);
+		expect(first.details?.["approved"]).toBe(false);
+		expect(repeat.ok).toBe(false);
+		expect(repeat.details?.["skipped"]).toBe(true);
+		expect(diagnosticKind(repeat)).toBe("not_checked");
+		expect(calls).toHaveLength(1);
+	});
+
+	test("aspect outcome delegates to the ordinary check without recording acceptance", async () => {
+		const state = observedState(["The report renders the coverage."]);
+		const { deps } = depsFor(requirementAnswers("observed"));
+		const outcome = await acceptance(deps, state, { aspect: "outcome", evidence: OBSERVATIONS });
+		expect(outcome.ok).toBe(true);
+		expect(outcome.details?.["check"]).toBe("observed_outcome");
+		expect(outcome.details?.["approved"]).toBe(true);
+		expect(state.acceptance).toEqual([]);
+	});
+
+	test("an oversized requirement set is refused locally without a judge call", async () => {
+		const state = observedState(Array.from({ length: 67 }, (_, index) => `Requirement number ${index + 1}.`));
+		const { deps, calls } = depsFor({});
+		const outcome = await observedOutcome(deps, state, OBSERVATIONS);
+		expect(outcome.ok).toBe(false);
+		expect(calls).toHaveLength(0);
+		expect(outcome.text).toContain("201");
+		expect(outcome.text).toContain("200");
+	});
+});
+
+describe("direct requirements registration", () => {
+	test("a captured judged request registers the task before its requirements are judged", async () => {
+		const state = freshState();
+		state.request = { text: "Build a coverage dashboard", weight: "judged" };
+		const { deps, calls } = depsFor({ coverage: { probability: 0.95 }, item_1: { probability: 0.95 } });
+		const outcome = await requirements(deps, state, {
+			request: "Build a coverage dashboard",
+			items: [{ text: "the dashboard lists coverage", source: "Build a coverage dashboard" }],
+		});
+		expect(outcome.ok).toBe(true);
+		expect(outcome.details?.["approved"]).toBe(true);
+		expect(state.task?.request).toBe("Build a coverage dashboard");
+		expect(state.task?.external).not.toBe(true);
+		expect(calls).toHaveLength(1);
+	});
+
+	test("an explicit external artifact keeps the anti-slop classification", async () => {
+		const state = freshState();
+		state.request = { text: "Write the legal memo", weight: "judged" };
+		const { deps } = depsFor({ coverage: { probability: 0.95 }, item_1: { probability: 0.95 } });
+		const outcome = await requirements(deps, state, {
+			request: "Write the legal memo",
+			items: [{ text: "the memo states the deadline", source: "Write the legal memo" }],
+		});
+		expect(outcome.ok).toBe(true);
+		expect(state.task?.external).toBe(true);
+	});
+
+	test("without a captured request the original triage prerequisite remains", async () => {
+		const state = freshState();
+		const { deps, calls } = depsFor({});
+		const outcome = await requirements(deps, state, {
+			request: "Build a coverage report",
+			items: [{ text: "the report lists coverage", source: "Build a coverage report" }],
+		});
+		expect(outcome.ok).toBe(false);
+		expect(calls).toHaveLength(0);
+		expect(outcome.text).toContain("must be registered through jev_triage");
+	});
+
+	test("a quiet request does not register a development task from requirements", async () => {
+		const state = freshState();
+		state.request = { text: "Build a coverage dashboard", weight: "quiet" };
+		const { deps, calls } = depsFor({});
+		const outcome = await requirements(deps, state, {
+			request: "Build a coverage dashboard",
+			items: [{ text: "the dashboard lists coverage", source: "Build a coverage dashboard" }],
+		});
+		expect(outcome.ok).toBe(false);
+		expect(state.task).toBeUndefined();
+		expect(calls).toHaveLength(0);
+	});
 });

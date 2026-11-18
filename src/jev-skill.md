@@ -1,4 +1,4 @@
-# Jevstice operating manual
+# Jevstice supervised diagnostic reference
 
 This manual and the tool catalog below describe one diagnostic workflow for one request. They are guidance the addon injects, not an owner instruction and not an approval: the owner's latest message outranks them, and an owner mode command outranks both. The catalog is the only schema reference; read the matching entry before calling a tool and never call a tool to discover its parameters.
 
@@ -9,7 +9,7 @@ Invoke a Jev tool through `write`, with `path: "xd://<tool name>"` and `content`
 ## 0. Owner mode commands take precedence
 
 - `/jev`, `/jev off`, `/jev on` and `/jev-status` are native owner commands, not tools. No model text and no tool argument can invoke them or switch modes; only the owner can.
-- `/jev off` suspends this entire manual for the session: the catalog, workflow injection, automatic checks and source capture stop until the owner turns checks back on. The addon announces the current mode and steers an active executor before its next action; an idle command does not start a model turn. Never use cached instructions here as a reason to ignore an actual disable. A Jev tool called then returns an explicit skipped or disabled result, never an approval, and a judgment still in flight across the change is discarded.
+- `/jev off` suspends this manual for the session: workflow injection, automatic checks and source capture stop until the owner turns checks back on. OMP reports the mode to the owner and makes a short mode notice available at the next natural model step. The notice neither starts nor interrupts a turn. A disabled tool returns a skipped check; an in-flight judgment is discarded.
 - `/jev on` starts a fresh ephemeral workflow for the session. Earlier approvals and findings are not restored; archived sources and usage totals remain. Global configuration is unchanged, and new loaded sessions default to on.
 - The session mode is held in memory for that session. Repeating on or off is idempotent and changes nothing.
 - In a strict supervised run, switching checks off changes diagnostics only. The supervisor's actual safety limits remain in force.
@@ -20,7 +20,7 @@ Invoke a Jev tool through `write`, with `path: "xd://<tool name>"` and `content`
 - An ordinary read, search or summary task is answered directly with `read`, `grep`, `glob`, `find` or `web_search`. No Jev call, triage or tool ritual is required, and inventing one is a defect, not diligence.
 - Public HTTP(S) URL reads are external evidence. Project reads are never blocked; a judged change is simply not recorded as reviewed until triage.
 - Recognized literal read and search commands, including safe pipelines, are classified without judgment. Unknown wrappers, executable scripts, delegation and unsupported shell syntax are classified as consequential and judged on their actual payload when they run.
-- For a change, a build or any consequential action, start with one `jev_triage` carrying the owner's exact words. One triage per request; refine the material instead of re-triaging to escape a refusal.
+- In a supervised run, start a change with `jev_triage` carrying the owner's exact words. The ordinary project workflow instead calls `jev_requirements` directly and uses `jev_acceptance` with `{"aspect":"outcome"}` before delivery.
 - Triage records whether the deliverable is external-facing, which is what enables the anti-slop review later.
 
 ## 2. Requirements and the staged plan
@@ -77,6 +77,8 @@ A below-floor score or confidence is not approval. On a course check specificall
 
 - Submit business and architecture acceptance separately, at the current revision, with execution evidence quoting the command and observed output and code evidence such as a diff or diagnostic. A later consequential change invalidates the earlier record.
 - Submit `jev_review` for a checkpoint, commit or diff. It never replaces business or architecture acceptance.
-- Before delivering an external artifact, submit `jev_anti_slop` on the exact text and report every finding. Its findings are advisory and never prevent delivery.
+- Before delivering an external artifact, follow the Russian or English numbered editing protocol in `jev_anti_slop`'s catalog entry. Preserve meaning, uncertainty, names, quotations and technical notation; remove filler, decorative symbols and formulaic sentence structures from editable prose. The tool reviews the text; the executor performs the edits.
+- Submit the exact revised text and every factual claim that needs checking. Use `rules: []` when the built-in Russian or English checks cover the requested register; add the owner's specific rules when needed. Use `claims: []` only for text without factual assertions, not to evade evidence checks. Other languages require explicit rules.
+- Read each finding's quote and repair instruction, correct the affected text, and recheck changed material. Do not repeat unchanged submissions to seek a passing answer. An inconclusive or unavailable review is not clean; disclose it separately from the edits. Findings are advisory and never prevent delivery.
 - Report completion only for what the evidence establishes. A finding that remains OPEN is disclosed as open, never silently dropped, and no completion waits for it.
 - With checks off, this manual is suspended: describe the work as unjudged, and neither claim Jev approval nor wait for one.

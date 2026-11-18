@@ -443,11 +443,19 @@ when("the owner turns diagnostics on or off", value => {
 	expect(lastMessage(world, "jev.mode")).toContain("Jev diagnostics are off");
 });
 
-then("the mode message is delivered immediately to the active executor", value => {
+then("the mode message is queued for the next turn without steering the active batch", value => {
 	const world = setup(value);
 	const send = lastSend(world, "jev.mode");
 	expect(send).toBeDefined();
-	expect(send?.options?.deliverAs).toBe("steer");
+	expect(send?.options?.deliverAs).toBe("nextTurn");
+	expect(send?.options?.triggerTurn).not.toBe(true);
+});
+
+then("the queued message carries only mode guidance, not a permission change", value => {
+	const world = setup(value);
+	const content = lastMessage(world, "jev.mode");
+	expect(content).toContain("changes checks only");
+	expect(content).toContain("not host permissions or supervisor safety limits");
 });
 
 then("an idle session does not start a model turn merely to announce the mode", value => {
@@ -456,7 +464,7 @@ then("an idle session does not start a model turn merely to announce the mode", 
 	(idle["ui"] as Record<string, unknown>)["notify"] = () => {};
 	world.pi.callCommand("jev", "on", idle);
 	const send = lastSend(world, "jev.mode");
-	expect(send?.options?.deliverAs).toBeUndefined();
+	expect(send?.options?.deliverAs).toBe("nextTurn");
 	expect(send?.options?.triggerTurn).not.toBe(true);
 });
 

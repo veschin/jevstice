@@ -1,8 +1,7 @@
 # language: en
 # Requirements: PRD FR-73, FR-74, FR-75; FR-17 (not an ordinary gate), FR-25/FR-56 superseded clauses.
 # Source contract: AGENTS.md "Current owner contract"; src/jev-skill.md sections 4-5, 8.
-# Normative business specification only: no step definitions, runner or executable acceptance
-# suite exists in this repository. Step definitions are NOT claimed.
+# Executable: tests/scenarios/steps/diagnostics.ts; run by tests/scenarios/run.test.ts.
 Feature: Jev records diagnostic coverage and never decides execution or completion
   Every judgment is evidence for the owner and the executor. It is not permission.
   A failed, inconclusive, unavailable or not-checked result is disclosed truthfully and

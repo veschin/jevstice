@@ -7,6 +7,7 @@
  * apart. The module imports schema types only; it never imports controller runtime.
  */
 import type { SchemaBuilder } from "./controller.js";
+import { ANTI_SLOP_PROTOCOL_GUIDANCE } from "./antiSlopProtocol.js";
 
 /** One registered tool, before its executor is attached. */
 export interface ToolCatalogEntry {
@@ -30,13 +31,13 @@ const SEARCH_DESCRIPTION =
 	"Submit one search question with its candidates. Arguments: query (required); candidates (required: two or more {title?, url?, evidence (the exact excerpt), reason (why it answers the query, or why it does not)}). Jev selects a candidate or none; the reason is yours, not Jev's. A below-floor selection is unusable; resubmit only with different candidates or excerpts.";
 
 const REQUIREMENTS_DESCRIPTION =
-	"Derive the obligations the owner's request imposes and submit them once. Arguments: request (required: the same owner request); items (required: one {text: a checkable obligation you derived, source: the exact request line it comes from}); candidateNeeds (optional: suspected omissions you want checked, never owner instructions); evidence (optional: quoted {kind, quote, source?, sourceId?} items, with sourceId for recorded owner text). No owner confirmation step exists or is needed. A necessary implementation choice is your decision, not an obligation. Diagnostics report missing coverage and unsupported items; they block no other work, so add the missing obligation and submit it again rather than rephrasing the same list.";
+	"Check derived obligations against the owner's objective. In ordinary work omit request to use the exact captured objective; an explicit request must match it. Supervised work requires the exact request. Supply items (one {text: a checkable obligation, source: a short exact quote from the request}); candidateNeeds and evidence with optional sourceId are optional. A diagnostic does not block work; resubmit only when the list materially changes.";
 
 const PLAN_REVIEW_DESCRIPTION =
 	"Staged approval of one plan artifact. Arguments: phase (required: outline, detail or finalize); steps (required for outline: one {id, summary, requirement} per high-level step, each requirement exactly matching one approved obligation); plan (required for detail and finalize: the local:// artifact URL); topic (required for detail: {id, section (the exact heading or the complete section), paths, requirement}); evidence (required: quoted {kind, quote, source?, sourceId?} items - for detail, the step's complete artifact section verbatim). Order is outline, then one detail call per step, then finalize. Passing steps are retained while rejected steps are revised; the original request, approved requirements, full outline and earlier approved details are re-sent with every call. No project file change is blocked by this review; a change made before final approval is simply recorded as not yet reviewed, and a changed artifact reopens the affected steps.";
 
 const ACCEPTANCE_DESCRIPTION =
-	"Prove one acceptance aspect at the current revision. Arguments: aspect (required: business or architecture); claim (required: what the owner needed and what this revision achieves); evidence (required: execution evidence quoting the command and its observed output, and code evidence such as a diff, diagnostic or measurement; any item may carry sourceId). Submit business and architecture separately at the current revision; both are recorded, and a later consequential change invalidates the earlier record. A refusal names the failing aspect as a diagnostic finding; disclose it and correct the evidence or the implementation, while independent work continues.";
+	"Use {\"aspect\":\"outcome\"} before reporting ordinary project work. Jev compares approved requirements with recorded code changes and execution results; no plan, claim or evidence argument is needed. Optional detailed acceptance uses aspect business or architecture and requires claim and quoted execution and code evidence. Those separate records only describe the current revision. All checks are advisory.";
 
 const REVIEW_DESCRIPTION =
 	"Submit one developer review. Arguments: kind (required: checkpoint, commit or diff); target (required: the file or revision reviewed); claim (required: what the change does); evidence (required: changed-code evidence and verification output, each {kind, quote, source?, sourceId?}). A defect finding is a diagnostic record that blocks no work; disclose it and correct the quoted change. This review never replaces business or architecture acceptance.";
@@ -45,7 +46,8 @@ const TEXT_REVIEW_DESCRIPTION =
 	"Judge prose against explicit rules. Arguments: text (required: the exact text to judge); rules (required: {class, rule, scope?} items, where scope=text judges the whole text once and is the default, scope=fragment judges each prose fragment, and headings and table blocks are never fragments). Submit the exact rules; revise only the returned violating fragments. No returned defect means the text meets the submitted rules.";
 
 const ANTI_SLOP_DESCRIPTION =
-	"Use before delivering an external document, research output, legal or other external communication. Arguments: artifact (required: the exact text), language, register, purpose, audience (all required), rules (required: {class, rule, severity?: blocker|warning} items), claims (required: {id, text, kind: fact|hypothesis, evidence [{kind, quote, source?, sourceClass}], falsifier? - a hypothesis needs a falsifier}), inferences (optional: {id, premises, warrant, conclusion}), part (optional: {index, total} when a large artifact is split into numbered parts). Jev marks each claim trusted, low_trust, distrusted or unverified and returns findings; the shipped mode is advisory. Report every finding before reporting the deliverable complete. A finding is a diagnostic record: it never blocks execution or delivery, and there is no waiver command.";
+	"Use before delivering an external document, research output, legal or other external communication. Arguments: artifact (required: the exact text), language, register, purpose, audience (all required), rules (required array of {class, rule, severity?: blocker|warning}; use [] for built-in Russian or English checks alone; other languages need explicit rules), claims (required array of {id, text, kind: fact|hypothesis, evidence [{kind, quote, source?, sourceClass}], falsifier?}; use [] only for text without factual assertions; a hypothesis needs a falsifier), inferences (optional: {id, premises, warrant, conclusion}), part (optional: {index, total} for numbered parts). Russian and English automatically receive independent symbols, wording, syntax and coherence checks in addition to supplied rules. Jev returns claim trust marks and findings with the affected quote and a repair instruction; the executor edits the text, not the tool. Unlisted claims are not fact-checked. An inconclusive or unavailable result is not clean. Report findings and incomplete checks without repeating unchanged submissions to seek approval. All findings are diagnostic and never block execution or delivery.\n\n" +
+	ANTI_SLOP_PROTOCOL_GUIDANCE;
 
 const CONTEXT_DESCRIPTION =
 	"Read the project's trusted context archive. Arguments: action (required: list or read); sourceId (required for read, omitted for list). list returns stable identifiers with kind (owner, requirements or plan), origin, session and approval metadata, and the latest recorded finding's exact original submission and result - read the recorded material there instead of repeating it. read returns the exact stored content and its digest. The archive holds authentic owner messages and approved requirement and plan snapshots captured by the addon: provenance says where the text came from, not that its assertions are true. Cite stored text in any tool's evidence as {kind, quote, sourceId}, using kind user for owner text; owner is the archive's provenance kind, not an evidence kind. The controller resolves the identifier against the archive, checks the quote is present and rejects missing, changed or mismatched sources without a judge call. Reading never restores approval, permission or execution authority.";
@@ -84,7 +86,7 @@ export function createToolCatalog(z: SchemaBuilder): ToolCatalogEntry[] {
 			label: "Jev requirements",
 			description: REQUIREMENTS_DESCRIPTION,
 			parameters: z.object({
-				request: z.string(),
+				request: z.string().optional(),
 				items: z.array(z.object({ text: z.string(), source: z.string() })),
 				candidateNeeds: z.array(z.string()).optional(),
 				evidence: evidence.optional(),
@@ -193,9 +195,9 @@ export function createToolCatalog(z: SchemaBuilder): ToolCatalogEntry[] {
 			label: "Jev acceptance",
 			description: ACCEPTANCE_DESCRIPTION,
 			parameters: z.object({
-				aspect: z.enum(["business", "architecture"]),
-				claim: z.string(),
-				evidence,
+				aspect: z.enum(["outcome", "business", "architecture"]),
+				claim: z.string().optional(),
+				evidence: evidence.optional(),
 			}),
 			example: {
 				aspect: "business",

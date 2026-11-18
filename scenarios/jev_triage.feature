@@ -1,7 +1,7 @@
 # language: en
 # Requirements: PRD FR-01, FR-02, FR-10, FR-30, FR-45, FR-72, FR-73.
 # Source contract: src/guidance.ts TRIAGE_DESCRIPTION; src/jev-skill.md section 1.
-# Normative business specification only; no step definitions or executable runner exist here.
+# Executable: tests/scenarios/steps/triage.ts; run by tests/scenarios/run.test.ts.
 Feature: Triage records request depth and external scope without granting permission
   A request is read once, locally, and judged only when it needs deeper activity.
   Triage records the objective and narrow topics. It never blocks project reads,

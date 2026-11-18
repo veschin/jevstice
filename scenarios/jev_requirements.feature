@@ -1,7 +1,7 @@
 # language: en
 # Requirements: PRD FR-04, FR-05, FR-06, FR-33, FR-34, FR-35, FR-36; FR-73.
 # Source contract: src/guidance.ts REQUIREMENTS_DESCRIPTION; src/jev-skill.md section 2.
-# Normative business specification only; no step definitions or executable runner exist here.
+# Executable: tests/scenarios/steps/requirements.ts; run by tests/scenarios/run.test.ts.
 Feature: Requirements establish complete, supported obligations without an owner loop
   The executor derives checkable obligations from the owner's objective and submits them once.
   An approved set is context for planning, not permission to execute, and a refusal is

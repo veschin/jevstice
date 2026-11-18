@@ -1,7 +1,7 @@
 # language: en
 # Requirements: PRD FR-08, FR-09, FR-13, FR-19, FR-20, FR-22; FR-67 superseded.
 # Source contract: src/guidance.ts CONSULT_DESCRIPTION; src/jev-skill.md sections 4-5.
-# Normative business specification only; no step definitions or executable runner exist here.
+# Executable: tests/scenarios/steps/consult.ts; run by tests/scenarios/run.test.ts.
 Feature: Consult one decision with a typed diagnostic answer
   Choice, score and boolean consultations answer one question from submitted context.
   The answer informs the executor; it clears no finding and authorizes no effect.

@@ -152,13 +152,13 @@ const diagnosticCounts = (): DiagnosticCounts => ({
 	passed: 0, failed: 0, inconclusive: 0, unavailable: 0, not_checked: 0,
 });
 
-/** A check result is evidence, never execution permission. */
-export function recordDiagnostic(state: JevState, outcome: ToolOutcome, work = false): DiagnosticKind {
+/** Shared classification for diagnostic accounting and user presentation. */
+export function diagnosticKind(outcome: ToolOutcome): DiagnosticKind {
 	const details = asRecord(outcome.details);
 	const named = details?.["kind"];
 	const confidence = details?.["confidence"];
 	const unsettled = details?.["unsettled"];
-	const kind: DiagnosticKind =
+	return (
 		details?.["skipped"] === true || details?.["prerequisite"] !== undefined ||
 		named === "invalid" || named === "stale" ? "not_checked" :
 		named === "unavailable" ? "unavailable" :
@@ -166,7 +166,13 @@ export function recordDiagnostic(state: JevState, outcome: ToolOutcome, work = f
 		(Array.isArray(unsettled) && unsettled.length > 0) ||
 		(details?.["approved"] === false && typeof confidence === "number" && confidence < POLICY.minConfidenceToApprove) ? "inconclusive" :
 		!outcome.ok || details?.["approved"] === false || details?.["verdict"] === "revise" ||
-		details?.["blocked"] === true || (typeof details?.["blockers"] === "number" && details["blockers"] > 0) ? "failed" : "passed";
+		details?.["blocked"] === true || (typeof details?.["blockers"] === "number" && details["blockers"] > 0) ? "failed" : "passed"
+	);
+}
+
+/** A check result is evidence, never execution permission. */
+export function recordDiagnostic(state: JevState, outcome: ToolOutcome, work = false): DiagnosticKind {
+	const kind = diagnosticKind(outcome);
 	const diagnostics = state.diagnostics ??= { checks: diagnosticCounts(), work: diagnosticCounts() };
 	diagnostics.checks[kind] += 1;
 	if (work) diagnostics.work[kind] += 1;
@@ -478,6 +484,11 @@ function clearWork(state: JevState): void {
 	delete state.antiSlopNotice;
 	state.revision = 0;
 	state.actionsSinceCheck = 0;
+}
+
+/** Retire the settled ordinary objective without discarding the session's diagnostic history. */
+export function retireTask(state: JevState): void {
+	clearWork(state);
 }
 
 /**

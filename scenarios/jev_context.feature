@@ -1,7 +1,7 @@
 # language: en
 # Requirements: PRD FR-68, FR-74; FR-73.
 # Source contract: src/guidance.ts CONTEXT_DESCRIPTION; src/context.ts.
-# Normative business specification only; no step definitions or executable runner exist here.
+# Executable: tests/scenarios/steps/context.ts; run by tests/scenarios/run.test.ts.
 Feature: Trusted context exposes authentic sources and original findings
   The executor can read archived owner messages and approved requirement and plan snapshots
   without re-asking the owner. Provenance says where text came from; it is not truth and not permission.

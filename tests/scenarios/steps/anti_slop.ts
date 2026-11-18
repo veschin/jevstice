@@ -26,6 +26,7 @@ import {
 	answeringJudge,
 	blockReason,
 	boundaryConfig,
+	cleanProtocolAnswers,
 	failingJudge,
 	fakeCtx,
 	fakePi,
@@ -118,6 +119,7 @@ interface AntiSlopWorld {
 	outcome?: ToolOutcome;
 	outcomes: ToolOutcome[];
 	attempts: ToolOutcome[];
+	protocolQuestionNames: string[][];
 	triage?: ToolOutcome;
 	// per-scenario observations
 	defect?: string;
@@ -159,6 +161,7 @@ function setup(value: unknown): AntiSlopWorld {
 		w.params = {};
 		w.outcomes = [];
 		w.attempts = [];
+		w.protocolQuestionNames = [];
 		w.findingIds = [];
 		w.commandNames = [];
 		w.toolNames = [];
@@ -195,8 +198,9 @@ async function run(w: AntiSlopWorld, params: Record<string, unknown>): Promise<T
 	return w.outcome;
 }
 
-/** Clean answers for every fragment and rule, so only the intended defect produces a finding. */
+/** Clean answers for every fragment, built-in style check and rule, so only the intended defect produces a finding. */
 function quiet(w: AntiSlopWorld, fragments = 1, rules = 1): void {
+	Object.assign(w.table, cleanProtocolAnswers(fragments));
 	for (let fragment = 1; fragment <= fragments; fragment += 1) {
 		w.table[`language_${fragment}`] = { probability: 0.05 };
 		w.table[`meta_${fragment}`] = { probability: 0.05 };
@@ -449,10 +453,10 @@ when("the review is validated", async value => {
 						? { ...base, purpose: " " }
 						: defect === "audience"
 							? { ...base, audience: "" }
-							: defect === "owner-supplied rules"
-								? { ...base, rules: [] }
-								: defect === "at least one claim or inference"
-									? { ...base, claims: [], inferences: [] }
+							: defect === "malformed owner-supplied rules"
+								? { ...base, rules: [{ class: "", rule: RULE_LINE }] }
+								: defect === "empty rules for an unsupported language"
+									? { ...base, language: "French", rules: [] }
 									: defect === "a claim that does not occur in the artifact"
 										? { ...base, claims: [{ ...CLAIM, text: "A sentence absent from the artifact." }], inferences: [] }
 										: { ...base, claims: [{ ...CLAIM, evidence: [{ ...CLAIM.evidence[0], sourceClass: "blog" }] }], inferences: [] };
@@ -475,10 +479,10 @@ then("the result names the invalid field", value => {
 						? /purpose/
 						: defect === "audience"
 							? /audience/
-							: defect === "owner-supplied rules"
-								? /rules must list at least one/i
-								: defect === "at least one claim or inference"
-									? /claim/
+							: defect === "malformed owner-supplied rules"
+								? /class and rule line/i
+								: defect === "empty rules for an unsupported language"
+									? /rules?/i
 									: defect === "a claim that does not occur in the artifact"
 										? /does not occur verbatim/i
 										: /sourceClass/;
@@ -492,6 +496,76 @@ then("the artifact is not partially reviewed", value => {
 	expect(w.state.antiSlopReviews).toHaveLength(0);
 	expect(findingsOf(w.outcomes[0])).toHaveLength(0);
 	expect(w.outcomes[0]?.text).toContain("nothing was judged and no finding is recorded");
+});
+
+// Scenario 5b --------------------------------------------------------------
+
+given("an external deliverable has no owner rules and no factual claims", value => {
+	const w = setup(value);
+	external(w);
+	w.table = {
+		...cleanProtocolAnswers(),
+		language_1: { probability: 0.05 },
+		meta_1: { probability: 0.05 },
+		relevance_1: { label: "serves", confidence: 0.95 },
+	};
+	expect(w.state.task?.external).toBe(true);
+});
+
+when("the review is submitted in English and in Russian", async value => {
+	const w = setup(value);
+	for (const language of ["English", "Russian"]) {
+		external(w);
+		w.fake = undefined;
+		const outcome = await run(w, submission({ language, rules: [], claims: [], inferences: [] }));
+		w.outcomes.push(outcome);
+		w.protocolQuestionNames.push(questionNames(w));
+	}
+});
+
+then("the selected built-in protocol is recorded and asked for every fragment", value => {
+	const w = world(value);
+	expect(w.outcomes).toHaveLength(2);
+	for (const [index, expected] of ["en", "ru"].entries()) {
+		const outcome = w.outcomes[index];
+		if (outcome === undefined || !outcome.ok) throw new Error(outcome?.text ?? "missing review");
+		const protocol = asRecord(detailsOf(outcome)["protocol"]);
+		expect(protocol?.["language"]).toBe(expected);
+		expect(w.protocolQuestionNames[index]).toEqual(
+			expect.arrayContaining(["protocol_1_1", "protocol_1_2", "protocol_1_3", "protocol_1_4"]),
+		);
+	}
+});
+
+then("the normal result names its numbered steps and concrete repairs", value => {
+	const w = world(value);
+	for (const outcome of w.outcomes) {
+		if (outcome === undefined || !outcome.ok) throw new Error(outcome?.text ?? "missing review");
+		const protocol = asRecord(detailsOf(outcome)["protocol"]);
+		const steps = protocol?.["steps"];
+		const checks = protocol?.["checks"];
+		expect(Array.isArray(steps)).toBe(true);
+		expect(Array.isArray(checks)).toBe(true);
+		for (const step of steps as string[]) expect(outcome.text).toContain(step);
+		for (const check of checks as Array<Record<string, unknown>>) {
+			expect(String(check["repair"]).length).toBeGreaterThan(0);
+		}
+		expect(detailsOf(outcome)["findings"]).toEqual([]);
+	}
+});
+
+then("malformed supplied rules remain invalid", async value => {
+	const w = world(value);
+	const state = external(w);
+	const fake = answeringJudge({});
+	const outcome = await antiSlop(
+		{ judge: fake.judge, config: w.config },
+		state,
+		submission({ rules: [{ class: "", rule: RULE_LINE }] }),
+	);
+	expect(outcome.ok).toBe(false);
+	expect(fake.calls).toHaveLength(0);
+	expect(outcome.text).toMatch(/class and rule line/i);
 });
 
 // Scenario 6 ---------------------------------------------------------------
@@ -1028,7 +1102,10 @@ then("affected claims and inferences remain unverified", value => {
 		expect.arrayContaining([expect.stringContaining("inference inference-1")]),
 	);
 	expect(listOf(detailsOf(w.attempts[1]), "claims")).toHaveLength(0);
-	expect(listOf(detailsOf(w.attempts[1]), "inferences")).toHaveLength(0);
+	const inferences = listOf(detailsOf(w.attempts[1]), "inferences");
+	expect(inferences).toHaveLength(1);
+	expect(inferences[0]?.["trust"]).toBe("unverified");
+	expect(inferences[0]?.["status"]).toBe("unresolved");
 });
 
 then("no trusted mark is manufactured", value => {

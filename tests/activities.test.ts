@@ -27,7 +27,13 @@ import {
 	type JevState,
 } from "../src/state.js";
 import { asRecord, POLICY, type PlanTopic } from "../src/types.js";
-import { answeringJudge, boundaryConfig, failingJudge, type FakeAnswerSource } from "./helpers.js";
+import {
+	answeringJudge,
+	boundaryConfig,
+	cleanProtocolAnswers,
+	failingJudge,
+	type FakeAnswerSource,
+} from "./helpers.js";
 
 /** Activity dependencies over a fake judge table and an optional artifact reader. */
 function depsFor(table: Record<string, FakeAnswerSource>, readArtifact?: ActivityDeps["readArtifact"]) {
@@ -2197,6 +2203,7 @@ describe("stale answers, uncertain triage and exact submitted content", () => {
 	test("anti-slop below-floor fragment check leaves the review inconclusive", async () => {
 		const state = externalState();
 		const { deps } = depsFor({
+			...cleanProtocolAnswers(),
 			claim_1: { label: "supported", confidence: 0.95 },
 			language_1: { probability: 0.05 },
 			meta_1: { probability: 0.05 },
@@ -2215,6 +2222,7 @@ describe("stale answers, uncertain triage and exact submitted content", () => {
 	test("anti-slop below-floor inference answer leaves the review inconclusive", async () => {
 		const state = externalState();
 		const { deps } = depsFor({
+			...cleanProtocolAnswers(),
 			claim_1: { label: "supported", confidence: 0.95 },
 			inference_1: { label: "follows", confidence: 0.5 },
 			language_1: { probability: 0.05 },
@@ -2279,6 +2287,7 @@ describe("stale answers, uncertain triage and exact submitted content", () => {
 		const artifact = `  ${memo}  `;
 		const rule = "  Use formal legal English.  ";
 		const { deps, calls } = depsFor({
+			...cleanProtocolAnswers(),
 			claim_1: { label: "supported", confidence: 0.95 },
 			language_1: { probability: 0.05 },
 			meta_1: { probability: 0.05 },

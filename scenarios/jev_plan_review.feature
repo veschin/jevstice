@@ -1,7 +1,8 @@
 # language: en
 # Requirements: PRD FR-24, FR-34, FR-36, FR-37; FR-73.
 # Source contract: src/guidance.ts PLAN_REVIEW_DESCRIPTION; src/jev-skill.md section 2.
-# Normative business specification only; no step definitions or executable runner exist here.
+# Executable: tests/scenarios/steps/plan_review.ts; run by tests/scenarios/run.test.ts.
+# The only @pending scenario is the runner-allowlisted native host plan-mode case.
 Feature: Staged plan review binds approvals to the exact plan artifact
   Outline, one detail per step and final assembly are separate judgments.
   Passing steps remain accepted while rejected steps are revised. An approved plan is

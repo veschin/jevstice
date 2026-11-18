@@ -6,6 +6,7 @@ import {
 	antiSlop,
 	consult,
 	courseCheck,
+	observedOutcome,
 	ownerUpdate,
 	reaim,
 	planReview,
@@ -21,13 +22,16 @@ import { createToolCatalog, toolInstructions } from "./guidance.js";
 import { readLocalArtifact } from "./artifact.js";
 import { isConsequentialMutation, type GateVerdict } from "./gates.js";
 import type { Judge } from "./judge.js";
+import { messagePresentation, outcomeSummary, toolPresentation, type MessagePresentationRenderer, type PresentationApi, type ToolPresentation } from "./presentation.js";
 import {
 	freshState, recordAction, recordFailedAction, recordActivityOutcome, recordDiagnostic,
-	diagnosticSummary, recordRecovery, recoveryFeedback, queueOwnerMessage, screenRequest, sha256,
-	acceptanceAt, recordAcceptance,
+	diagnosticKind, diagnosticSummary, recordRecovery, recoveryFeedback, queueOwnerMessage, screenRequest, sha256,
+	acceptanceAt, recordAcceptance, retireTask,
 	type JevState,
 } from "./state.js";
 import { POLICY, asRecord, type Evidence, type JevConfig, type ToolOutcome } from "./types.js";
+
+export { toolPresentation } from "./presentation.js";
 
 /** A schema node as this extension builds it; the host validates the built schema itself. */
 export interface SchemaLike {
@@ -44,8 +48,9 @@ export interface SchemaBuilder {
 	enum(values: readonly [string, ...string[]]): SchemaLike;
 }
 
+
 /** One tool as registered with the host. */
-export interface PiToolDefinition {
+export interface PiToolDefinition extends Partial<ToolPresentation> {
 	name: string;
 	label: string;
 	description: string;
@@ -60,10 +65,12 @@ export interface PiToolDefinition {
 }
 
 /** Structural surface of the omp ExtensionAPI this extension uses. */
-export interface PiApi {
+export interface PiApi extends PresentationApi {
+	registerMessageRenderer?(customType: string, renderer: MessagePresentationRenderer): void;
 	on(event: string, handler: (event: unknown, ctx: unknown) => unknown): void;
 	registerTool(tool: PiToolDefinition): void;
 	registerCommand?(name: string, options: { description: string; handler: (args: string, ctx: unknown) => void }): void;
+	appendEntry?(customType: string, data: unknown): void;
 	sendMessage?(payload: unknown, options?: { deliverAs?: "steer" | "followUp" | "nextTurn" | "aside"; triggerTurn?: boolean }): void;
 	logger?: { warn?(...args: unknown[]): void };
 }
@@ -97,7 +104,26 @@ interface PendingEffect {
 	tool: string;
 	input: unknown;
 	startedAt: number;
+	owner: JevState;
+	consequential: boolean;
+	task: string | undefined;
 }
+
+interface Observations {
+	code: Map<string, Evidence>;
+	execution: Map<string, Evidence>;
+	version: number;
+}
+
+const OWNER_ONLY: Readonly<Partial<Record<string, true>>> = {
+	"jev.status": true, "jev.mode": true, "jev.diagnostic": true, "jev.acceptance": true, "jev.config": true,
+};
+const FOLLOW_UP = /^(?:also\b|continue\b|one more\b|and (?:also|now)\b|ещ[её](?:\s|$)|также(?:\s|$)|продолж\p{L}*(?:\s|$)|и (?:ещ[её]|теперь)(?:\s|$))/iu;
+const LEAN_GUIDANCE = [
+	"Jevstice is advisory. For a project change, the first check is write to xd://jev_requirements; content is JSON with items: one {text, source} per requested behavior, using a short exact quote for each source. Omit request: Jev uses the captured owner text.",
+	"Make the change and run checks for the requested behaviors. The second check is write to xd://jev_acceptance with content {\"aspect\":\"outcome\"}. Jev uses recorded code and execution. Fix a proven defect. Report unresolved items; recheck only if a specific new observation addresses a named gap. Do not run triage, staged plan, developer review or separate acceptance just to finish.",
+	"Use other Jev tools only for a separate concrete decision or at the owner's request. For an external deliverable, use jev_anti_slop.",
+].join("\n");
 
 const STRICT_WORKFLOW_NOTE =
 	" Supervised execution preserves owner-authorized roots, resource limits, effect identity and durable results. Jev checks are diagnostic only: no finding, unavailable judge or missing approval blocks work or model completion.";
@@ -126,23 +152,31 @@ function sessionIdOf(ctx: unknown): string {
 	return callString(sessionManagerOf(ctx), "getSessionId") ?? "session";
 }
 
-function notify(ctx: unknown, text: string): void {
+function notify(ctx: unknown, text: string, level: "info" | "warning" = "warning"): void {
 	const ui = asRecord(asRecord(ctx)?.["ui"]);
 	const fn = ui?.["notify"];
 	if (typeof fn !== "function") return;
 	try {
-		(fn as (message: string, level?: string) => void).call(ui, text, "warning");
+		(fn as (message: string, level?: string) => void).call(ui, text, level);
 	} catch {
 		// A host without a working UI must not break the gate.
 	}
 }
 
-function sendMessage(pi: PiApi, customType: string, text: string, deliverAs?: "steer"): void {
+function sendMessage(pi: PiApi, customType: string, text: string, summary = "Jev · Details"): void {
 	try {
-		pi.sendMessage?.({ customType, content: text, display: true }, { deliverAs, triggerTurn: false });
+		// nextTurn never steers an in-flight batch and false never starts a new turn.
+		pi.sendMessage?.({ customType, content: text, display: true, details: { summary } }, { deliverAs: "nextTurn", triggerTurn: false });
 	} catch (error) {
 		pi.logger?.warn?.("jevstice: could not deliver a session message", error);
 	}
+}
+
+function setStatus(ctx: unknown, text: string | undefined): void {
+	const ui = asRecord(asRecord(ctx)?.["ui"]);
+	const fn = ui?.["setStatus"];
+	if (typeof fn !== "function") return;
+	try { fn.call(ui, "jevstice", text); } catch { /* Presentation never changes the result. */ }
 }
 
 const DISABLED_OUTCOME: ToolOutcome = {
@@ -151,6 +185,7 @@ const DISABLED_OUTCOME: ToolOutcome = {
 	details: { enabled: false, skipped: true },
 };
 const STALE_MODE_REASON = "This diagnostic belongs to an earlier request, revision or session mode. No current approval was recorded; continued work is unaffected.";
+
 
 function toolResponse(outcome: ToolOutcome, state?: JevState): unknown {
 	const kind = asRecord(outcome.details)?.["kind"];
@@ -164,7 +199,7 @@ function toolResponse(outcome: ToolOutcome, state?: JevState): unknown {
 				: "";
 	return {
 		content: [{ type: "text", text: outcome.text + note }],
-		details: { ...outcome.details, diagnostics: state?.diagnostics, ...(state?.hold === undefined ? {} : { hold: state.hold }) },
+		details: { ...outcome.details, summary: outcomeSummary(outcome), diagnostics: state?.diagnostics, ...(state?.hold === undefined ? {} : { hold: state.hold }) },
 		isError: invalid,
 	};
 }
@@ -203,6 +238,16 @@ function excerptOf(content: unknown): string {
 	return "";
 }
 
+/** Expanded presentation preserves every text block, without evidence excerpt limits. */
+function excerptOfFullContent(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content.map(value => {
+		const text = asRecord(value)?.["text"];
+		return typeof text === "string" ? text : "";
+	}).join("\n");
+}
+
 /** The change material of a tool input - what the action wrote, edited or ran - bounded by policy. */
 function changeOf(input: unknown): string {
 	const text = JSON.stringify(input ?? null);
@@ -216,15 +261,72 @@ function formatUsd(value: number): string {
 }
 
 
+function observationExcerpt(text: string): string {
+	return text.length > 2800 ? `${text.slice(0, 1900)}\n[excerpt]\n${text.slice(-900)}` : text;
+}
+
 export function createJevController(deps: ControllerDeps): JevController {
 	const states = new Map<string, JevState>();
 	const disabledSessions = new Set<string>();
 	const ownerInputPending = new Set<string>();
 	const lastHostPrompt = new Map<string, string>();
+	const modeUpdate = new Map<string, { content: string; timestamp: number }>();
 	const activityLocks = new Map<string, Promise<void>>();
 	const acceptanceAttempts = new WeakMap<JevState, string>();
-	const observedEvidence = new WeakMap<JevState, { code: Evidence[]; execution: Evidence[] }>();
+	const outcomeChecks = new WeakMap<JevState, { binding: string; result: ToolOutcome }>();
+	const outcomeInFlight = new WeakMap<JevState, { binding: string; result: Promise<ToolOutcome> }>();
+	const settledTasks = new WeakSet<JevState>();
+	const modelFeedback = new WeakMap<JevState, { binding: string; content: string; timestamp: number }>();
+	const observedEvidence = new WeakMap<JevState, Observations>();
 	const pendingEffects = new Map<string, Map<string, PendingEffect>>();
+	const objectiveOf = (state: JevState): string | undefined => state.task?.fingerprint ?? state.request?.text;
+	const bindingOf = (state: JevState): string => JSON.stringify([
+		objectiveOf(state), state.request?.text, state.ownerMessages.length, state.revision,
+		state.plan?.planDigest, state.requirementsApproval?.items,
+	]);
+	const outcomeBinding = (state: JevState): string => `${bindingOf(state)}:${observedEvidence.get(state)?.version ?? 0}`;
+	const saveObservation = (state: JevState, tool: string, input: unknown, content: unknown, succeeded: boolean, consequential: boolean): void => {
+		if (state.request?.weight === "quiet" && state.task === undefined) return;
+		const kind = tool === "bash" || tool === "eval" ? "execution"
+			: consequential && succeeded && ["write", "edit", "ast_edit"].includes(tool) ? "code" : undefined;
+		if (kind === undefined) return;
+		const target = targetOf(input);
+		const data = asRecord(input);
+		const invocation = kind === "execution" && typeof data?.["command"] === "string" ? data["command"]
+			: kind === "execution" && typeof data?.["code"] === "string" ? data["code"]
+				: tool === "write" && typeof data?.["content"] === "string" ? data["content"] : JSON.stringify(input ?? null);
+		const output = excerptOfFullContent(content);
+		const quote = `${succeeded ? "Succeeded" : "Failed"}: ${tool} ${target.slice(0, 200)}\n` +
+			`${observationExcerpt(invocation)}\n${observationExcerpt(output)}`;
+		const observations = observedEvidence.get(state) ?? { code: new Map(), execution: new Map(), version: 0 };
+		const group = observations[kind];
+		const key = kind === "code" ? target : `${tool}:${invocation}`;
+		if (group.get(key)?.quote === quote) return;
+		// A verification before a subsequent source change does not establish the changed result.
+		if (kind === "code") observations.execution.clear();
+		// Keep distinct changed targets and verification commands, not the same five most recent effects.
+		group.delete(key);
+		group.set(key, { kind, source: `${tool}: ${target.slice(0, 200)}`, quote });
+		if (group.size > 24) group.delete(group.keys().next().value!);
+		observations.version += 1;
+		observedEvidence.set(state, observations);
+	};
+	const evidenceFor = (state: JevState): Evidence[] => {
+		const observations = observedEvidence.get(state);
+		return observations === undefined ? [] : [...observations.code.values(), ...observations.execution.values()];
+	};
+	const checkObservedOutcome = (ctx: unknown, state: JevState): Promise<ToolOutcome> => {
+		const binding = outcomeBinding(state);
+		const pending = outcomeInFlight.get(state);
+		if (pending?.binding === binding) return pending.result;
+		const snapshot = structuredClone(state);
+		snapshot.usage = state.usage;
+		const result = observedOutcome(activitiesFor(ctx), snapshot, evidenceFor(state)).finally(() => {
+			if (outcomeInFlight.get(state)?.result === result) outcomeInFlight.delete(state);
+		});
+		outcomeInFlight.set(state, { binding, result });
+		return result;
+	};
 	const disabled = (ctx: unknown): boolean => disabledSessions.has(sessionIdOf(ctx));
 	const current = (ctx: unknown, state: JevState): boolean => !disabled(ctx) && states.get(sessionIdOf(ctx)) === state;
 	const stateFor = (ctx: unknown): JevState => {
@@ -321,20 +423,35 @@ export function createJevController(deps: ControllerDeps): JevController {
 			deps.context.put({ kind: "plan", origin: "judge_approved", sessionId, content, source: state.plan.planUrl, approval: state.plan.planDigest });
 		}
 	};
-	const statusText = (state: JevState): string => {
+	const statusText = (state: JevState, compact = false): string => {
 		const spend = (state.usage.inputTokens * deps.config.billing.inputCostPerMillion + state.usage.outputTokens * deps.config.billing.outputCostPerMillion) / 1_000_000;
 		const balance = deps.config.billing.balance;
+		if (compact) {
+			const counts = (group: "work" | "checks"): string => Object.entries(state.diagnostics?.[group] ?? {})
+				.filter(([, count]) => count > 0)
+				.map(([kind, count]) => `${count} ${kind.replace("_", " ")}`).join(", ") || "none";
+			const observed = outcomeChecks.get(state);
+			const outcome = observed?.binding === outcomeBinding(state) ? outcomeSummary(observed.result) : "Not checked";
+			const aspects = (["business", "architecture"] as const).map(aspect =>
+				`${aspect}: ${acceptanceAt(state, aspect) === undefined ? "not recorded" : "passed"}`);
+			return `Work: ${counts("work")}\nChecks: ${counts("checks")}\nOutcome: ${outcome} · ${aspects.join(" · ")} · est. $${formatUsd(spend)}`;
+		}
 		const activities = Object.entries(state.stats).map(([name, count]) => `${name}: ${count.ok} completed, ${count.fail} not completed`).join(", ");
 		return `${diagnosticSummary(state)} Activity outcomes (not approval counts): ${activities || "none"}. Judge requests: ${state.usage.judgeCalls}. Estimated spend ${formatUsd(spend)}$; ${balance === undefined ? "balance not configured" : `configured balance ${formatUsd(balance)}$`}.`;
 	};
 	return {
 		register(pi: PiApi): void {
+			const renderMessage = messagePresentation(pi);
+			if (renderMessage !== undefined) {
+				for (const type of Object.keys(OWNER_ONLY)) pi.registerMessageRenderer?.(type, renderMessage);
+			}
 			const summaries = new Map<string, string>();
 			const publishStatus = (ctx: unknown, state: JevState): void => {
+				if (state.request?.weight === "quiet" && state.task === undefined) return;
 				const text = statusText(state);
 				if (summaries.get(sessionIdOf(ctx)) === text) return;
 				summaries.set(sessionIdOf(ctx), text);
-				sendMessage(pi, "jev.status", text);
+				sendMessage(pi, "jev.status", text, `Jev · ${disabled(ctx) ? "Off" : "On"}\n${statusText(state, true)}`);
 			};
 			const contextTool = async (_activity: ActivityDeps, state: JevState, params: unknown, ctx?: unknown): Promise<ToolOutcome> => {
 				const pending = pendingEffects.get(sessionIdOf(ctx));
@@ -348,6 +465,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 				if (input?.["action"] !== "list") return { ok: false, text: "Choose list or read.", details: { kind: "invalid" } };
 				try {
 					const sources = (deps.context?.list() ?? []).map(({ content: _content, ...source }) => source);
+					const observed = outcomeChecks.get(state);
 					return {
 						ok: true,
 						text: `${contextIntroduction}\nCurrent objective: ${state.task?.request ?? state.request?.text ?? "not registered"}\n${JSON.stringify(sources, null, 2)}\n${diagnosticSummary(state)}${state.hold === undefined ? "" : `\nOriginal diagnostic finding:\n${JSON.stringify(state.hold, null, 2)}`}`,
@@ -355,6 +473,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 							sources, revision: state.revision, findings: state.findings ?? [],
 							acceptance: state.acceptance.filter(entry => entry.revision === state.revision),
 							pendingEffects: [...(pending ?? [])].map(([jobId, effect]) => ({ jobId, tool: effect.tool })),
+							outcome: observed?.binding === outcomeBinding(state) ? observed.result.details : undefined,
 						},
 					};
 				} catch (error) {
@@ -383,15 +502,41 @@ export function createJevController(deps: ControllerDeps): JevController {
 								if (state.task !== undefined && state.pendingOwnerMessages?.length && name !== "jev_consult") {
 									const update = await ownerUpdate(activitiesFor(ctx), state);
 									recordDiagnostic(state, update);
+									if (deps.autonomy === undefined && settledTasks.has(state) && update.details?.["classification"] === "replace" &&
+										(name === "jev_triage" || name === "jev_requirements") &&
+										(asRecord(params)?.["request"] === state.request?.text ||
+											(name === "jev_requirements" && asRecord(params)?.["request"] === undefined))) {
+										retireTask(state);
+										settledTasks.delete(state);
+										observedEvidence.delete(state);
+									}
 								}
 								if (name === "jev_acceptance" && (pendingEffects.get(sessionIdOf(ctx))?.size ?? 0) > 0) {
 									return { ok: false, text: "Acceptance is not checked while background effects are unobserved. Work and completion may continue.", details: { prerequisite: true } };
 								}
 							}
-							const result = await activity(activitiesFor(ctx), state, params, ctx);
-							if (!current(ctx, state)) return { ok: false, text: STALE_MODE_REASON, details: { kind: "stale" } };
+							const isOutcome = name === "jev_acceptance" && asRecord(params)?.["aspect"] === "outcome";
+							const before = objectiveOf(state);
+							const binding = outcomeBinding(state);
+							const cached = isOutcome ? outcomeChecks.get(state) : undefined;
+							if (cached?.binding === binding) {
+								return { ...cached.result, details: { ...cached.result.details, replayed: true } };
+							}
+							const result: ToolOutcome = isOutcome
+								? deps.autonomy === undefined
+									? await checkObservedOutcome(ctx, state)
+									: { ok: false, text: "Use business or architecture acceptance in a strict run.", details: { kind: "invalid" } }
+								: await activity(activitiesFor(ctx), state, params, ctx);
+							if (!current(ctx, state) || (isOutcome && outcomeBinding(state) !== binding)) {
+								return { ok: false, text: STALE_MODE_REASON, details: { kind: "stale" } };
+							}
+							if (isOutcome && result.details?.["prerequisite"] === undefined) {
+								if (outcomeChecks.get(state)?.binding === binding) return { ...result, details: { ...result.details, replayed: true } };
+								outcomeChecks.set(state, { binding, result });
+							}
+							if (before !== objectiveOf(state) && name === "jev_reaim") observedEvidence.delete(state);
 							await snapshotApproval(ctx, state, name, result);
-							recordRecovery(state, name, params, result);
+							recordRecovery(state, name, isOutcome ? { aspect: "outcome", evidence: evidenceFor(state) } : params, result);
 							await deps.autonomy?.checkpoint(ctx, state, name, params);
 							return preparation.problems.length === 0 ? result : { ...result, details: { ...result.details, contextProblems: preparation.problems } };
 						} catch (error) {
@@ -402,20 +547,29 @@ export function createJevController(deps: ControllerDeps): JevController {
 					if (disabled(ctx)) return toolResponse(DISABLED_OUTCOME);
 					if (!current(ctx, state)) return toolResponse({ ok: false, text: STALE_MODE_REASON, details: { kind: "stale" } });
 					recordActivityOutcome(state, name, outcome.ok);
-					if (name !== "jev_context") recordDiagnostic(state, outcome);
+					if (name !== "jev_context" && outcome.details?.["replayed"] !== true) recordDiagnostic(state, outcome);
 					return toolResponse(outcome, state);
 				};
 			const catalog = createToolCatalog(deps.zod);
-			const instructions = `${JEV_SKILL}\n\n${toolInstructions(catalog)}`;
+			const strictInstructions = deps.autonomy === undefined ? undefined : `${JEV_SKILL}\n\n${toolInstructions(catalog)}\n${STRICT_WORKFLOW_NOTE}`;
 			for (const entry of catalog) {
 				const activity = activities[entry.name];
 				if (activity === undefined) throw new Error(`Missing diagnostic executor: ${entry.name}`);
 				const { example: _example, ...definition } = entry;
-				pi.registerTool({ ...definition, description: `${entry.description}${deps.autonomy === undefined ? "" : STRICT_WORKFLOW_NOTE}`, execute: run(entry.name, activity) });
+				pi.registerTool({
+					...definition, description: `${entry.description}${deps.autonomy === undefined ? "" : STRICT_WORKFLOW_NOTE}`,
+					execute: run(entry.name, activity),
+					...toolPresentation(pi, entry.label),
+				});
 			}
 			pi.registerCommand?.("jev-status", {
 				description: "Show diagnostic coverage, findings and judge usage",
-				handler: (_args, ctx) => sendMessage(pi, "jev.status", `Session mode: ${disabled(ctx) ? "off" : "on"}. ${statusText(stateFor(ctx))}`),
+				handler: (_args, ctx) => {
+					const state = stateFor(ctx);
+					const brief = `Jev · ${disabled(ctx) ? "Off" : "On"}\n${statusText(state, true)}`;
+					notify(ctx, brief, "info");
+					sendMessage(pi, "jev.status", `Session mode: ${disabled(ctx) ? "off" : "on"}. ${statusText(state)}\n${brief}`, brief);
+				},
 			});
 			pi.registerCommand?.("jev", {
 				description: "Inspect or switch diagnostic checks on/off; never changes work permission",
@@ -424,7 +578,9 @@ export function createJevController(deps: ControllerDeps): JevController {
 					if (mode !== "" && mode !== "off" && mode !== "on") { notify(ctx, "Use /jev, /jev on or /jev off to control diagnostics."); return; }
 					const id = sessionIdOf(ctx);
 					if (mode === "" || (mode === "off") === disabled(ctx)) {
-						sendMessage(pi, "jev.mode", `Jev diagnostics are ${disabled(ctx) ? "off" : "on"}. Work never requires a Jev continuation permission.`);
+						const summary = `Jev · ${disabled(ctx) ? "Off" : "On"}`;
+						notify(ctx, summary, "info");
+						sendMessage(pi, "jev.mode", `Jev diagnostics are ${disabled(ctx) ? "off" : "on"}. Work never requires a Jev continuation permission.`, summary);
 						return;
 					}
 					const previous = stateFor(ctx);
@@ -439,9 +595,17 @@ export function createJevController(deps: ControllerDeps): JevController {
 					activityLocks.delete(id);
 					ownerInputPending.delete(id);
 					lastHostPrompt.delete(id);
+					pendingEffects.delete(id);
 					const isIdle = asRecord(ctx)?.["isIdle"];
-					sendMessage(pi, "jev.mode", `Jev diagnostics are ${mode}. This changes checks only, not host permissions or supervisor safety limits. Continue useful work; no override is required.`,
-						typeof isIdle === "function" && !isIdle.call(ctx) ? "steer" : undefined);
+					if (typeof isIdle === "function" && !isIdle.call(ctx)) {
+						modeUpdate.set(id, { content: mode === "off"
+							? "The owner turned Jev checks off. Continue without Jev; host permissions are unchanged."
+							: "The owner turned Jev checks on. Continue useful work under the same host permissions.", timestamp: Date.now() });
+					}
+					const summary = `Jev · ${mode === "off" ? "Off" : "On"}`;
+					setStatus(ctx, mode === "off" ? undefined : summary);
+					notify(ctx, summary, "info");
+					sendMessage(pi, "jev.mode", `Jev diagnostics are ${mode}. This changes checks only, not host permissions or supervisor safety limits.`, summary);
 				},
 			});
 			pi.on("session_start", (_event, ctx) => {
@@ -451,7 +615,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 			pi.on("session_shutdown", (_event, ctx) => {
 				const id = sessionIdOf(ctx);
 				states.delete(id); disabledSessions.delete(id); ownerInputPending.delete(id);
-				lastHostPrompt.delete(id); activityLocks.delete(id); summaries.delete(id);
+				lastHostPrompt.delete(id); activityLocks.delete(id); summaries.delete(id); modeUpdate.delete(id);
 				pendingEffects.delete(id);
 			});
 			pi.on("input", (event, ctx) => {
@@ -464,21 +628,31 @@ export function createJevController(deps: ControllerDeps): JevController {
 			});
 			pi.on("before_agent_start", (event, ctx) => {
 				const input = asRecord(event);
+				if (input?.["reason"] === "prompt") modeUpdate.delete(sessionIdOf(ctx));
 				const policy = input?.["systemPrompt"];
-				const bundle = deps.autonomy === undefined ? instructions : `${instructions}\n${STRICT_WORKFLOW_NOTE}`;
-				const existing = Array.isArray(policy) ? policy.filter(entry => entry !== bundle) : [];
+				const existing = Array.isArray(policy) ? policy.filter(entry => entry !== LEAN_GUIDANCE && entry !== strictInstructions) : [];
 				if (disabled(ctx)) return { systemPrompt: existing };
+				if (strictInstructions !== undefined) return { systemPrompt: [...existing, strictInstructions] };
 				const state = stateFor(ctx);
 				if (deps.autonomy === undefined && input?.["reason"] !== "revive") {
 					const prompt = input?.["prompt"];
 					if (typeof prompt === "string") {
 						const id = sessionIdOf(ctx);
 						if (input?.["reason"] === "prompt" && !ownerInputPending.delete(id) && lastHostPrompt.get(id) !== prompt) captureOwner(ctx, prompt, "prompt");
+						const previous = state.request?.weight === "judged" ? state.request.text : state.task?.request;
 						lastHostPrompt.set(id, prompt);
 						screenRequest(state, prompt);
+						if (settledTasks.has(state) && state.request?.weight === "judged" && prompt.trim() !== previous?.trim() &&
+							!FOLLOW_UP.test(prompt.trim())) {
+							retireTask(state);
+							settledTasks.delete(state);
+							observedEvidence.delete(state);
+							modelFeedback.delete(state);
+							setStatus(ctx, undefined);
+						}
 					}
 				}
-				return { systemPrompt: [...existing, bundle] };
+				return { systemPrompt: state.request?.weight === "judged" ? [...existing, LEAN_GUIDANCE] : existing };
 			});
 			pi.on("tool_call", async (event, ctx) => {
 				// Jev never controls ordinary admission. Strict containment is a separate owner boundary.
@@ -491,31 +665,41 @@ export function createJevController(deps: ControllerDeps): JevController {
 				catch (error) { return { block: true, reason: `Supervisor admission failed: ${String(error)}` }; }
 				return undefined;
 			});
-			const diagnoseAction = (ctx: unknown, state: JevState, tool: string, input: unknown): void => {
-				// Count unreviewed work immediately; a stopped or pending judge cannot hide the gap.
-				const placeholder: ToolOutcome = { ok: true, text: "Work has not been checked.", details: { skipped: true } };
-				recordDiagnostic(state, placeholder, true);
-				if (disabled(ctx) || state.plan === undefined || state.task === undefined || state.planTopics.length === 0) return;
+			const publishDiagnostic = (ctx: unknown, state: JevState, type: "jev.diagnostic" | "jev.acceptance", subject: string, outcome: ToolOutcome): void => {
+				const brief = `${subject} · ${outcomeSummary(outcome)}`;
+				const content = `${subject}\n${outcome.text}`;
+				setStatus(ctx, brief);
+				sendMessage(pi, type, content, brief);
+				const kind = diagnosticKind(outcome);
+				if (kind === "failed" || kind === "inconclusive") {
+					modelFeedback.set(state, { binding: bindingOf(state), content, timestamp: Date.now() });
+				}
+			};
+			const diagnoseAction = (ctx: unknown, state: JevState, tool: string, input: unknown, hostOutcome: { succeeded: boolean; observed: string }): void => {
+				recordDiagnostic(state, { ok: true, text: "Work has not been checked.", details: { skipped: true } }, true);
+				if (deps.autonomy !== undefined || !hostOutcome.succeeded) return;
+				if (state.plan === undefined || state.task === undefined || state.planTopics.length === 0 || state.pendingOwnerMessages?.length) return;
+				const binding = bindingOf(state);
 				const snapshot = structuredClone(state);
 				snapshot.usage = state.usage;
-				const action = { tool, target: targetOf(input), change: JSON.stringify(input ?? null) };
-				void actionCheck(activitiesFor(ctx), snapshot, action, input).then(outcome => {
+				const action = { tool, target: targetOf(input), change: JSON.stringify(input ?? null), hostOutcome };
+				const settle = (outcome: ToolOutcome): void => {
 					if (!current(ctx, state)) return;
+					if (bindingOf(state) !== binding) {
+						pi.appendEntry?.("jev.historical-diagnostic", { binding, action, outcome });
+						return;
+					}
 					state.diagnostics!.checks.not_checked -= 1;
 					state.diagnostics!.work.not_checked -= 1;
 					recordDiagnostic(state, outcome, true);
 					recordRecovery(state, "action-diagnostic", action, outcome);
-					sendMessage(pi, "jev.diagnostic", `${outcome.text}\n${diagnosticSummary(state)}`);
-				}).catch(error => {
-					if (!current(ctx, state)) return;
-					state.diagnostics!.checks.not_checked -= 1;
-					state.diagnostics!.work.not_checked -= 1;
-					recordDiagnostic(state, { ok: false, text: String(error), details: { kind: "unavailable" } }, true);
-					publishStatus(ctx, state);
-				});
+					publishDiagnostic(ctx, state, "jev.diagnostic", `Jev · ${tool} ${action.target.slice(0, 90)}`, outcome);
+				};
+				void actionCheck(activitiesFor(ctx), snapshot, action, input).then(settle, error =>
+					settle({ ok: false, text: String(error), details: { kind: "unavailable" } }));
 			};
 			const settleBackground = (ctx: unknown, entry: Record<string, unknown>, wait = false): void => {
-				if (deps.autonomy !== undefined) return;
+				if (deps.autonomy !== undefined || disabled(ctx)) return;
 				const jobs = asRecord(entry["details"])?.["jobs"];
 				const pending = pendingEffects.get(sessionIdOf(ctx));
 				if (!Array.isArray(jobs) || pending === undefined) return;
@@ -530,25 +714,40 @@ export function createJevController(deps: ControllerDeps): JevController {
 					if (effect === undefined || effect.tool !== job?.["type"] || observedAt < effect.startedAt) continue;
 					pending.delete(id);
 					const state = stateFor(ctx);
-					const output = wait ? job?.["resultText"] ?? job?.["errorText"] : entry["content"];
-					const action = { tool: effect.tool, target: targetOf(effect.input), excerpt: typeof output === "string" ? output : excerptOf(output) };
-					if (status === "completed") recordAction(state, action); else recordFailedAction(state, action);
-					state.diagnostics!.checks.not_checked -= 1;
-					state.diagnostics!.work.not_checked -= 1;
-					diagnoseAction(ctx, state, effect.tool, effect.input);
+					const output = job?.["resultText"] ?? job?.["errorText"] ?? (jobs.length === 1 && !wait ? entry["content"] : []);
+					const observed = excerptOfFullContent(output);
+					if (state !== effect.owner || objectiveOf(state) !== effect.task) continue;
+					const action = { tool: effect.tool, target: targetOf(effect.input), excerpt: observed };
+					const succeeded = status === "completed";
+					if (effect.consequential) {
+						if (succeeded) recordAction(state, action); else recordFailedAction(state, action);
+						state.diagnostics!.checks.not_checked -= 1;
+						state.diagnostics!.work.not_checked -= 1;
+						diagnoseAction(ctx, state, effect.tool, effect.input, { succeeded, observed });
+					}
+					saveObservation(state, effect.tool, effect.input, output, succeeded, effect.consequential);
 				}
 			};
 
 			const diagnoseCompletion = (ctx: unknown, state: JevState): void => {
-				if (deps.autonomy !== undefined || state.task === undefined || state.plan === undefined) return;
-				if ((pendingEffects.get(sessionIdOf(ctx))?.size ?? 0) > 0) return;
-				const observations = observedEvidence.get(state);
-				const evidence = [...(observations?.code ?? []), ...(observations?.execution ?? [])];
-				const completionBinding = (): string => JSON.stringify([state.task?.fingerprint, state.revision, state.plan, observedEvidence.get(state)]);
-				const binding = completionBinding();
-				if (acceptanceAttempts.get(state) === binding) return;
+				if (deps.autonomy !== undefined || state.task === undefined || state.pendingOwnerMessages?.length ||
+					(pendingEffects.get(sessionIdOf(ctx))?.size ?? 0) > 0) return;
+				const evidence = evidenceFor(state);
+				if (evidence.length === 0) return;
+				const binding = outcomeBinding(state);
+				if (outcomeChecks.get(state)?.binding === binding || acceptanceAttempts.get(state) === binding) return;
 				acceptanceAttempts.set(state, binding);
+				const valid = (): boolean => current(ctx, state) && outcomeBinding(state) === binding;
 				void (async () => {
+					if (state.plan === undefined) {
+						const outcome = await checkObservedOutcome(ctx, state);
+						if (!valid() || outcomeChecks.get(state)?.binding === binding) return;
+						if (outcome.details?.["prerequisite"] === undefined) outcomeChecks.set(state, { binding, result: outcome });
+						recordDiagnostic(state, outcome);
+						recordRecovery(state, "outcome", { evidence, binding }, outcome);
+						publishDiagnostic(ctx, state, "jev.acceptance", "Jev · Observed outcome", outcome);
+						return;
+					}
 					for (const aspect of ["business", "architecture"] as const) {
 						if (acceptanceAt(state, aspect) !== undefined) continue;
 						const snapshot = structuredClone(state);
@@ -558,18 +757,18 @@ export function createJevController(deps: ControllerDeps): JevController {
 							claim: `Observed work for the registered owner request: ${state.task?.request ?? ""}`,
 							evidence,
 						});
-						if (!current(ctx, state) || completionBinding() !== binding) return;
+						if (!valid()) return;
 						const accepted = acceptanceAt(snapshot, aspect);
 						if (accepted !== undefined) recordAcceptance(state, accepted);
 						recordDiagnostic(state, outcome, false);
 						recordRecovery(state, "acceptance", { aspect, binding, evidence }, outcome);
-						sendMessage(pi, "jev.acceptance", `Automatic ${aspect} acceptance: ${outcome.text}\n${diagnosticSummary(state)}`);
+						publishDiagnostic(ctx, state, "jev.acceptance", `Jev · ${aspect === "business" ? "Business" : "Architecture"}`, outcome);
 					}
 				})().catch(error => {
-					if (!current(ctx, state)) return;
+					if (!valid()) return;
 					const outcome = { ok: false, text: `Automatic acceptance unavailable: ${String(error)}`, details: { kind: "unavailable" } };
 					recordDiagnostic(state, outcome, false);
-					sendMessage(pi, "jev.acceptance", outcome.text);
+					publishDiagnostic(ctx, state, "jev.acceptance", "Jev · Outcome", outcome);
 				});
 			};
 			pi.on("context", (event, ctx) => {
@@ -579,56 +778,67 @@ export function createJevController(deps: ControllerDeps): JevController {
 					const message = asRecord(value);
 					if (message?.["role"] === "custom" && message["customType"] === "async-result") settleBackground(ctx, message);
 				}
+				const retained = messages.filter(value => {
+					const message = asRecord(value);
+					return message?.["role"] !== "custom" || typeof message["customType"] !== "string" ||
+						!Object.hasOwn(OWNER_ONLY, message["customType"]);
+				});
+				const id = sessionIdOf(ctx);
+				const state = states.get(id);
+				const mode = modeUpdate.get(id);
+				if (mode !== undefined) {
+					retained.push({ role: "custom", customType: "jev.mode-advisory", display: false, ...mode });
+				}
+				const feedback = state === undefined || disabled(ctx) ? undefined : modelFeedback.get(state);
+				const actionable = state !== undefined && feedback !== undefined && feedback.binding === bindingOf(state);
+				if (actionable) {
+					retained.push({ role: "custom", customType: "jev.feedback", content: feedback.content, display: false, timestamp: feedback.timestamp });
+				}
+				if (mode !== undefined || retained.length !== messages.length || actionable) return { messages: retained };
 			});
 			pi.on("tool_result", async (event, ctx) => {
 				const record = asRecord(event);
-				const tool = record?.["toolName"];
-				if (typeof tool !== "string") return;
-				const input = record?.["input"];
+				const details = asRecord(record?.["details"]);
+				const forwarded = asRecord(details?.["xdev"]);
+				const delegated = deps.autonomy === undefined && typeof forwarded?.["tool"] === "string";
+				const tool = delegated ? forwarded["tool"] : record?.["toolName"];
+				if (typeof tool !== "string" || (delegated && tool.startsWith("jev_"))) return;
+				const input = delegated ? forwarded["args"] : record?.["input"];
 				const consequential = deps.autonomy?.consequential(tool, input) ?? isConsequentialMutation(tool, input);
+				if (disabled(ctx) && deps.autonomy === undefined) return;
 				const state = stateFor(ctx);
-				if (deps.autonomy === undefined && asRecord(record?.["details"])?.["async"] === undefined) {
-					const kind = tool === "bash" || tool === "eval" ? "execution"
-						: consequential && ["write", "edit", "ast_edit"].includes(tool) ? "code" : undefined;
-					if (kind !== undefined) {
-						const observations = observedEvidence.get(state) ?? { code: [], execution: [] };
-						observations[kind].push({
-							kind, source: `observed tool_result ${tool}`,
-							quote: `${targetOf(input)}\n${changeOf(input)}\n${excerptOf(record?.["content"])}`.slice(0, POLICY.maxQuoteChars),
-						});
-						if (observations[kind].length > POLICY.maxActionRecords) observations[kind].shift();
-						observedEvidence.set(state, observations);
-						if (record?.["isError"] === true) state.acceptance = [];
+				const succeeded = record?.["isError"] !== true;
+				const asyncReceipt = asRecord((delegated ? asRecord(forwarded["inner"]) : details)?.["async"]);
+				const action = { tool, target: targetOf(input), excerpt: [changeOf(input), excerptOf(record?.["content"])].join("\n") };
+				if (asyncReceipt === undefined) {
+					if (consequential) {
+						if (succeeded) recordAction(state, action); else recordFailedAction(state, action);
+						diagnoseAction(ctx, state, tool, input, { succeeded, observed: excerptOf(record?.["content"]) });
 					}
-				}
-				if (consequential) {
-					const action = { tool, target: targetOf(input), excerpt: [changeOf(input), excerptOf(record?.["content"])].join("\n") };
-					if (asRecord(record?.["details"])?.["async"] === undefined) {
-						if (record?.["isError"] === true) recordFailedAction(state, action); else recordAction(state, action);
-						diagnoseAction(ctx, state, tool, input);
-					} else {
-						if (deps.autonomy === undefined) {
-							recordAction(state, action);
-							const receipt = asRecord(asRecord(record?.["details"])?.["async"]);
-							if (typeof receipt?.["jobId"] === "string" && receipt["type"] === tool) {
-								const pending = pendingEffects.get(sessionIdOf(ctx)) ?? new Map<string, PendingEffect>();
-								pending.set(receipt["jobId"], { tool, input, startedAt: Date.now() });
-								pendingEffects.set(sessionIdOf(ctx), pending);
-							}
-						}
-						recordDiagnostic(state, { ok: true, text: "Background effect is not yet checked.", details: { skipped: true } }, true);
+					if (deps.autonomy === undefined) saveObservation(state, tool, input, record?.["content"], succeeded, consequential);
+				} else {
+					if (deps.autonomy === undefined && (consequential || tool === "bash" || tool === "eval") &&
+						typeof asyncReceipt["jobId"] === "string" && asyncReceipt["type"] === tool) {
+						if (consequential) recordAction(state, action);
+						const id = sessionIdOf(ctx);
+						const pending = pendingEffects.get(id) ?? new Map<string, PendingEffect>();
+						pending.set(asyncReceipt["jobId"], { tool, input, startedAt: Date.now(), owner: state, task: objectiveOf(state), consequential });
+						pendingEffects.set(id, pending);
 					}
+					if (consequential) recordDiagnostic(state, { ok: true, text: "Background effect is not yet checked.", details: { skipped: true } }, true);
 				}
 				if (tool === "wait" && record?.["isError"] !== true && asRecord(record?.["details"])?.["op"] === "wait") settleBackground(ctx, record!, true);
 				await deps.autonomy?.toolResult(ctx, state, event);
 			});
-			pi.on("session_stop", async (event, ctx) => {
+			pi.on("session_stop", async (_event, ctx) => {
 				const state = stateFor(ctx);
 				if (!disabled(ctx)) publishStatus(ctx, state);
 				if (deps.autonomy !== undefined) return deps.autonomy.stop(ctx, state, activitiesFor(ctx));
-				diagnoseCompletion(ctx, state);
+				if (!disabled(ctx)) {
+					if (!state.pendingOwnerMessages?.length && !(pendingEffects.get(sessionIdOf(ctx))?.size)) settledTasks.add(state);
+					diagnoseCompletion(ctx, state);
+				}
 				// No judge request, queued activity or missing verdict can hold ordinary completion.
-				void event;
 				return undefined;
 			});
 		},

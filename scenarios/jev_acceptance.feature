@@ -1,8 +1,7 @@
 # language: en
-# Requirements: PRD FR-14, FR-15, FR-26, FR-39 (pending), FR-43 (pending); FR-73, FR-74.
+# Requirements: PRD FR-14, FR-15, FR-26, FR-39, FR-43; FR-73, FR-74.
 # Source contract: src/guidance.ts ACCEPTANCE_DESCRIPTION; src/jev-skill.md section 8.
-# Normative business specification only; no step definitions or executable runner exist here.
-# Scenarios tagged @pending or @gap describe promised behavior that is NOT fully implemented.
+# Executable: tests/scenarios/steps/acceptance.ts; run by tests/scenarios/run.test.ts.
 Feature: Business and architecture acceptance rest on observed evidence
   Each aspect is submitted and recorded separately at the current revision.
   Acceptance is diagnostic evidence for the owner; it neither authorizes execution
@@ -53,7 +52,7 @@ Feature: Business and architecture acceptance rest on observed evidence
     And the result states that a claim about the work is not observation of the work
 
   # FR-26; implementation src/activities.ts evidence-basis questions; the command/output check is judged, not text-parsed
-  @gap_fr_26 @jev_acceptance_05 @fr_26
+  @jev_acceptance_05 @fr_26
   Scenario: Execution evidence carries a command and its observed output
     Given an acceptance submission includes an execution item
     When that item is validated
@@ -62,7 +61,7 @@ Feature: Business and architecture acceptance rest on observed evidence
     And a mislabeled command-only quote does not reach judgment
 
   # FR-26; implementation src/activities.ts topic_i_execution and topic_i_code answers; the evidence id is returned
-  @gap_fr_26 @jev_acceptance_06 @fr_26
+  @jev_acceptance_06 @fr_26
   Scenario: Every plan topic names the evidence it rests on
     Given the approved plan has three topics
     When acceptance is judged
@@ -119,17 +118,17 @@ Feature: Business and architecture acceptance rest on observed evidence
     Then business and architecture acceptance remain missing
     And neither check is reported as approval of the delivered outcome
 
-  # FR-39; PENDING: ordinary completion has no automatic acceptance collection.
-  @pending @jev_acceptance_12 @fr_39
+  # FR-39; implementation src/controller.ts diagnoseCompletion
+  @jev_acceptance_12 @fr_39
   Scenario: Completion automatically collects observed evidence and missing acceptance
     Given a developed task reaches completion with one aspect missing
     When the ordinary completion boundary is observed
     Then the addon collects observed code and execution evidence
-    And it submits the missing business and architecture acceptance automatically
+    And it submits the missing architecture acceptance automatically
     And it returns the unmet obligations without requiring manual acceptance calls
 
-  # FR-43; PENDING: the result names topic requirements but no approved verification section.
-  @pending @jev_acceptance_13 @fr_43
+  # FR-43; implementation src/activities.ts unmetSections
+  @jev_acceptance_13 @fr_43
   Scenario: Missing evidence returns the unmet requirement and its verification section
     Given acceptance evidence is missing or unsuitable for one requirement
     When the result is returned

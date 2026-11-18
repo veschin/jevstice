@@ -36,6 +36,20 @@ interface FakeJudge {
 /** One fake answer, given directly or derived from the question the activity submitted. */
 export type FakeAnswerSource = FakeAnswer | ((question: JudgeQuestion) => FakeAnswer | undefined);
 
+/**
+ * Clean answers for the built-in anti-slop style checks: every protocol_<fragment>_<check>
+ * question is answered explicitly rather than through a catch-all in answeringJudge.
+ */
+export function cleanProtocolAnswers(fragments = 1, checks = 4): Record<string, FakeAnswerSource> {
+	const answers: Record<string, FakeAnswerSource> = {};
+	for (let fragment = 1; fragment <= fragments; fragment += 1) {
+		for (let check = 1; check <= checks; check += 1) {
+			answers[`protocol_${fragment}_${check}`] = { probability: 0.05 };
+		}
+	}
+	return answers;
+}
+
 /** A judge that answers the named questions from a table; an unlisted question fails the outcome. */
 export function answeringJudge(table: Record<string, FakeAnswerSource>): FakeJudge {
 	const calls: JudgeCall[] = [];
@@ -92,6 +106,7 @@ interface EmittedMessage {
 	customType: string;
 	content: string;
 	deliverAs?: string;
+	details?: unknown;
 }
 
 export interface FakePi {
@@ -128,6 +143,7 @@ export function fakePi(): FakePi {
 				customType: typeof record["customType"] === "string" ? record["customType"] : "",
 				content: typeof record["content"] === "string" ? record["content"] : "",
 				deliverAs: options?.deliverAs,
+				details: record["details"],
 			});
 		},
 		logger: { warn: () => {} },

@@ -1,7 +1,7 @@
 # language: en
 # Requirements: PRD FR-78; FR-21, FR-55 superseded clauses; FR-73.
 # Source contract: AGENTS.md config and API key sections.
-# Normative business specification only; no step definitions or executable runner exist here.
+# Executable: tests/scenarios/steps/configuration.ts; run by tests/scenarios/run.test.ts.
 Feature: Diagnostic configuration and judge access stay owner-controlled
   Configuration selects diagnostic preferences and cost display. It never grants
   execution permission. A missing key or unavailable judge is reported and never
@@ -45,7 +45,7 @@ Feature: Diagnostic configuration and judge access stay owner-controlled
     Given a configuration file sets antiSlop.mode to "enforce"
     When the configuration is loaded
     Then the effective anti-slop mode is advisory
-    And the addon reports the file and the invalid key
+    And the configuration records the file and the invalid key
     And external findings are not described as a delivery gate
 
   # FR-78; implementation src/config.ts billing parsing
@@ -75,10 +75,11 @@ Feature: Diagnostic configuration and judge access stay owner-controlled
 
   # FR-78; implementation src/controller.ts session_start notification
   @jev_configuration_07 @fr_78
-  Scenario: Configuration problems are shown when a session starts
+  Scenario: Configuration problems are shown to the owner when a session starts
     Given the loaded configuration recorded one or more problems
     When a new session starts
-    Then the owner is notified of those problems
+    Then the owner is notified of each exact problem in the owner-facing UI
+    And configuration details are not sent as model content
     And the session continues with the retained effective values
 
   # FR-78; implementation src/apikey.ts resolveApiKey

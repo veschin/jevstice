@@ -1,7 +1,7 @@
 # language: en
 # Requirements: PRD FR-45 through FR-56; FR-54/FR-55 waiver/enforcement clauses superseded; FR-73, FR-78.
 # Source contract: src/guidance.ts ANTI_SLOP_DESCRIPTION; src/jev-skill.md section 8.
-# Normative business specification only; no step definitions or executable runner exist here.
+# Executable: tests/scenarios/steps/anti_slop.ts; run by tests/scenarios/run.test.ts.
 # The shipped mode is advisory: findings are reported and never authorize or block ordinary work.
 Feature: External-artifact integrity review reports findings without delivery authority
   The review checks submitted claims, inferences, language and register against submitted
@@ -61,10 +61,19 @@ Feature: External-artifact integrity review reports findings without delivery au
       | register                                    |
       | purpose                                     |
       | audience                                    |
-      | owner-supplied rules                        |
-      | at least one claim or inference             |
+      | malformed owner-supplied rules              |
+      | empty rules for an unsupported language     |
       | a claim that does not occur in the artifact |
       | unknown source class                        |
+
+  # FR-46, FR-51; implementation src/activities.ts readAntiSlop and built-in style checks
+  @jev_anti_slop_05b @fr_46 @fr_51
+  Scenario: Empty declarations are supported for Russian and English
+    Given an external deliverable has no owner rules and no factual claims
+    When the review is submitted in English and in Russian
+    Then the selected built-in protocol is recorded and asked for every fragment
+    And the normal result names its numbered steps and concrete repairs
+    And malformed supplied rules remain invalid
 
   # FR-47, FR-48; implementation src/activities.ts claim results
   @jev_anti_slop_06 @fr_47

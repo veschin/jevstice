@@ -1,7 +1,7 @@
 # language: en
 # Requirements: PRD FR-29, FR-69; FR-44 superseded; FR-73, FR-76.
 # Source contract: src/guidance.ts REAIM_DESCRIPTION; src/jev-skill.md section 6.
-# Executable: tests/scenarios/steps/reaim.ts runs every scenario against production code.
+# Executable: tests/scenarios/steps/reaim.ts; run by tests/scenarios/run.test.ts.
 Feature: Re-aim only an authentic replacement of the owner's direction
   A real change of course starts a new task and needs fresh requirements and planning.
   A clarification, addition or quoted phrase is never a re-aim, and no old approval
@@ -54,7 +54,7 @@ Feature: Re-aim only an authentic replacement of the owner's direction
       | the export flag still matters                 |
 
   # FR-29; implementation src/activities.ts reaim no-task prerequisite
-  @gap_fr_76 @jev_reaim_05 @fr_29
+  @jev_reaim_05 @fr_29
   Scenario: Re-aim is not the entry point for a new request
     Given no development task is registered
     When the executor calls jev_reaim

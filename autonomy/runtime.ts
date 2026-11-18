@@ -47,7 +47,7 @@ import {
 	type JevState,
 } from "../src/state.js";
 import { POLICY, asRecord, type JevConfig } from "../src/types.js";
-import { JEV_SKILL, type ControllerRuntime, type PiApi, type SchemaBuilder } from "../src/controller.js";
+import { JEV_SKILL, toolPresentation, type ControllerRuntime, type PiApi, type SchemaBuilder } from "../src/controller.js";
 
 /** The custom message type that carries the runtime's own context. */
 const CONTEXT_CUSTOM_TYPE = "jev.autonomy.context";
@@ -2914,6 +2914,10 @@ export function createAutonomyRuntime(options: {
 		const adapter: PiApi = {
 			on: (event, handler) => pi.on(event, handler),
 			registerTool: tool => pi.registerTool(tool),
+			...(pi.pi === undefined ? {} : { pi: pi.pi }),
+			...(pi.registerMessageRenderer === undefined ? {} : {
+				registerMessageRenderer: (type, renderer) => pi.registerMessageRenderer?.(type, renderer),
+			}),
 			...(pi.registerCommand === undefined
 				? {}
 				: { registerCommand: (name: string, options: { description: string; handler: (args: string, ctx: unknown) => void }) => pi.registerCommand?.(name, options) }),
@@ -3369,9 +3373,15 @@ export function createAutonomyRuntime(options: {
 		if (rawPi !== undefined) throw new Error("the autonomous runtime is already registered");
 		rawPi = pi;
 		const z = zod;
+		const Text = pi.pi?.Text;
+		if (Text !== undefined) pi.registerMessageRenderer?.(WAKE_CUSTOM_TYPE, (message, options) => {
+			const content = asRecord(message)?.["content"];
+			return new Text(options.expanded && typeof content === "string" ? content : "Jev · Autonomy resumed", 0, 0);
+		});
 		pi.registerTool({
 			name: CONTROL_TOOL,
 			label: "Jev autonomy",
+			...toolPresentation(pi, "Jev autonomy"),
 			description:
 				"Status, reconciliation, rotation and infeasibility for the strict autonomous run. " +
 				'action "status" reports the committed run without changing it. ' +

@@ -69,7 +69,7 @@ omp --no-extensions -e /path/to/jevstice/src/index.ts
 
 ## Tools
 
-Jevstice registers twelve tools. `src/guidance.ts` is the only catalog: registration and the startup prompt read the same descriptions, schemas and examples.
+Jevstice registers twelve tools. `src/guidance.ts` defines their descriptions and schemas. Ordinary startup shows a short workflow instead of the full catalog.
 
 | Tool | Diagnostic decision |
 | --- | --- |
@@ -80,7 +80,7 @@ Jevstice registers twelve tools. `src/guidance.ts` is the only catalog: registra
 | `jev_consult` | One diagnostic choice, score or boolean question. |
 | `jev_context` | List or read the project's trusted context archive, including requirement and plan snapshots. |
 | `jev_course_check` | Does the submitted current-work claim, proposed next action and evidence follow the approved task? |
-| `jev_acceptance` | Does the delivered work meet the business need and the architecture, judged separately? |
+| `jev_acceptance` | Which requirements does the observed work establish? Optional business and architecture checks remain separate. |
 | `jev_review` | Does a checkpoint, commit or diff hold up as developer work? |
 | `jev_reaim` | Is this an owner change of direction that replaces the current task? |
 | `jev_text_review` | Which prose fragments violate the submitted rules, and which rule does each violate? |
@@ -97,13 +97,21 @@ Two command names are registered; `/jev` takes `off`, `on` or no argument:
 | `/jev on` | Restore checks with a fresh workflow. |
 | `/jev-status` | Report session mode, diagnostic coverage, activity outcomes, judge requests and estimated spend. |
 
-`/jev off` and `/jev on` change checks only. They do not change host permissions, supervisor safety limits or the result of work in progress, and they write no configuration file. Repeating the current mode is idempotent. `/jev on` retains the session's usage and diagnostic totals, does not restore old findings or task state, and discards an in-flight judgment. A mode change steers an active executor before its next action; an idle session reports the result without starting a model turn.
+`/jev off` and `/jev on` change checks only. They do not change host permissions, supervisor safety limits or the result of work in progress, and they write no configuration file. Repeating the current mode is idempotent. `/jev on` retains the session's usage and diagnostic totals, does not restore old findings or task state, and discards an in-flight judgment. A mode change is queued as a `nextTurn` message with `triggerTurn: false` and never steers an in-flight batch. During a busy change its mode-only instruction may enter provider context at the next turn boundary; an idle session reports the result without starting a model turn.
 
 ## Diagnostics
 
 The controller classifies each visible tool call with deterministic effect classifiers in `src/gates.ts` (a consequential change, a publication, or a target outside the approved plan) and records what happened. It does not block the call: ordinary `tool_call` handlers return no decision, and `session_stop` returns no completion hold.
 
 ### Status shape
+
+The terminal shows short results for Jev tools, automatic checks and mode changes. `/jev-status`
+shows work coverage, check coverage, current acceptance and estimated spend in a compact summary.
+Expand a result or message with the terminal's normal disclosure control to read the full diagnostic.
+Status, mode, action and acceptance transcript messages keep their custom identities but use
+`nextTurn` with `triggerTurn: false` and are stripped from provider context. The model still receives
+the complete original tool text, evidence and structured details; presentation does not change
+judgment, error handling or execution permissions.
 
 Every Jev tool result while diagnostics are on carries `details.diagnostics`:
 
@@ -115,6 +123,15 @@ Every Jev tool result while diagnostics are on carries `details.diagnostics`:
 ```
 
 Both objects always carry the five keys `passed`, `failed`, `inconclusive`, `unavailable` and `not_checked`. `checks` counts Jev activity results; `work` counts coverage of consequential tool results. A consequential result is first counted as `not_checked`; the action diagnostic then runs in the background after a completed result, using the current approved plan when available. An asynchronous launch without a settled action diagnostic remains `not_checked`; launching or observing a job is not a passing check. The `/jev-status` summary reports both groups and current-revision business and architecture acceptance separately. Usage records and passing conformance checks are not proof of successful implementation.
+
+### Ordinary task workflow
+
+For a project change, call `jev_requirements` with derived items; omit `request` to use the
+captured owner prompt. After verifying the change, call `jev_acceptance` with `{"aspect":"outcome"}`.
+It compares each requirement with observed code and execution, distinguishing unsupported results
+from defects. A later source change invalidates earlier verification. Approving a detailed plan
+opts into background action checks and separate completion acceptance. Other checks are available
+for a specific question. A quiet read, search or summary does not need a Jev call.
 
 ### What a failed check means
 
@@ -149,11 +166,28 @@ The project file `<project>/.omp/jev.config.json` overrides the user file `~/.om
 
 An invalid value keeps the value already in force and names the file, key and retained value. Unknown keys are ignored. `billing.balance` is a configured snapshot; the public TypeSafe API exposes no live balance endpoint.
 
+When a session starts, each configuration problem is delivered to the owner through the host's UI notification with the exact problem text. Configuration details are not sent as a model-visible session message, so a broken file cannot inject instructions or hidden context into the model.
+
 Older files may still carry `gates.mutation`, `gates.completion`, `courseCheck.mode`, `courseCheck.interval` or `antiSlop.mode: "enforce"`. The gate and course-check keys are ignored because there is no blocking boundary or automatic schedule to configure. `enforce` is invalid in the current schema: it falls back to `advisory` with a named configuration problem. The `antiSlop` review is described below.
 
 ## Anti-slop review
 
 `jev_anti_slop` reviews an external document, research output or legal communication. It returns `supported`, `refuted` or `not_enough_info` per claim, checks inferences against premises and a stated warrant, requires a falsifier for a hypothesis, and reports language, register and meta-text violations per fragment. A quote identical to the claim does not count as evidence.
+
+The tool includes numbered Russian and English editing protocols with before-and-after examples.
+The executor follows the steps to preserve meaning, cut filler and repetition, replace formulaic
+sentence structures, and remove decorative symbols from editable prose. Quotations, names,
+uncertainty, code, mathematical notation, citations and useful Markdown remain intact.
+
+Russian and English reviews automatically check symbols, wording, syntax and coherence in addition
+to the supplied rules. Use `rules: []` when no additional rule is needed; unsupported languages
+still require explicit rules. Use `claims: []` only when the text contains no factual assertions:
+an empty list does not verify claims omitted from the submission.
+
+Each finding includes the affected quotation and a correction instruction. The tool does not
+rewrite the artifact: the executor edits it and submits the changed exact text for another review.
+An inconclusive or unavailable check is not a clean review, and unchanged submissions must not be
+repeated to seek approval. The protocols guide a model; they do not guarantee its writing quality.
 
 | Mode | Behavior |
 | --- | --- |

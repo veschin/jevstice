@@ -1,7 +1,7 @@
 # language: en
 # Requirements: PRD FR-27, FR-20; FR-73.
 # Source contract: src/guidance.ts TEXT_REVIEW_DESCRIPTION; tests/activities.test.ts FR-27.
-# Normative business specification only; no step definitions or executable runner exist here.
+# Executable: tests/scenarios/steps/text_review.ts; run by tests/scenarios/run.test.ts.
 Feature: Review exact text against the executor's submitted register rules
   The review names every violating fragment with the rule line the executor submitted.
   It writes no advice, translates nothing and makes no claim beyond the submitted rules.

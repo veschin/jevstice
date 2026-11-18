@@ -227,7 +227,7 @@ given('a configuration file sets antiSlop.mode to "enforce"', value => {
 	w.expectedProblemToken = "antiSlop.mode";
 });
 
-then("the addon reports the file and the invalid key", value => {
+then("the configuration records the file and the invalid key", value => {
 	const w = world(value);
 	const problems = w.config?.problems ?? [];
 	expect(problems.length).toBeGreaterThan(0);
@@ -346,10 +346,17 @@ when("a new session starts", async value => {
 	w.status = pi.messages.filter(message => message.customType === "jev.status").at(-1)?.content;
 });
 
-then("the owner is notified of those problems", value => {
+then("the owner is notified of each exact problem in the owner-facing UI", value => {
 	const w = world(value);
+	expect(w.notifications.length).toBeGreaterThan(0);
 	const notified = w.notifications.join("\n");
 	for (const problem of w.config?.problems ?? []) expect(notified).toContain(problem);
+});
+
+then("configuration details are not sent as model content", value => {
+	const w = world(value);
+	expect(w.pi).toBeDefined();
+	expect(w.pi?.messages.filter(message => message.customType === "jev.config")).toEqual([]);
 });
 
 then("the session continues with the retained effective values", async value => {

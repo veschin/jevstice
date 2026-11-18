@@ -1,7 +1,7 @@
 # language: en
 # Requirements: PRD FR-25, FR-70 (hold clause superseded); FR-73, FR-75.
 # Source contract: src/guidance.ts COURSE_CHECK_DESCRIPTION; src/jev-skill.md section 7.
-# Normative business specification only; no step definitions or executable runner exist here.
+# Executable: tests/scenarios/steps/course_check.ts; run by tests/scenarios/run.test.ts.
 Feature: A course check reports whether current work follows the approved plan
   The executor can ask one concise question about its current work and next action.
   An on-course answer is evidence about that submission; it is not a release, and an

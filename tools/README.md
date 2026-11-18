@@ -239,6 +239,21 @@ instead of silently continuing. All twelve scenarios have a recording.
 The recordings depend on the local `vhs`, `ttyd` and `ffmpeg` installations. A missing dependency
 fails the render instead of producing a placeholder.
 
+## Ordinary workflow comparison and native cards — 2026-11-18
+
+`bun tools/workflow-comparison.ts --arm both --baseline <frozen-baseline> --candidate
+<candidate-checkout> --out <results>` runs two prompts twice per arm. It checks files and behavior
+independently of the model or Jev verdict. Use `--summarize <results>` to rebuild the aggregate.
+The recorded run used DeepSeek Flash, low thinking and a 300-second cap. It reported 24/24
+requirements and 4/4 deliveries in each arm, with 45 versus 4 explicit Jev calls and means of
+77.6 versus 13.6 seconds. Two revised runs made no Jev calls; both revised outcome verdicts were
+inconclusive. The small, sequential-arm sample does not establish a quality gain.
+Evidence: `evidence/workflow-comparison/final-20261118T075334Z/run/summary.json`.
+
+The native terminal trace at `/tmp/jev-native-card-final-dNWfN0` shows the mounted plan-review
+prerequisite as `Not checked`, the context lookup as `Complete`, and the full tool text after
+expansion. The deterministic outage smoke passed (`/tmp/jev-live-smoke-ncYoOt`).
+
 ## Historical live records
 
 The entries below are preserved as recorded history. They describe earlier contracts - automatic

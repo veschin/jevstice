@@ -203,6 +203,10 @@ export interface AntiSlopFinding {
 	verdict: string;
 	confidence: number;
 	rule?: string;
+	/** Exact affected text; absent only in records created before quoted feedback was introduced. */
+	quote?: string;
+	/** Concrete correction instruction, not judge-authored replacement prose. */
+	repair?: string;
 }
 
 /** One claim verdict returned by the review. */

@@ -9,10 +9,10 @@
 | Scope | Ordinary diagnostic addon, its owner commands, configuration, credentials, owner follow-up and the optional strict supervisor |
 | Requirement source | `PRD.md` (owner-approved functional requirements FR-01..FR-78) |
 | Behaviour source | `AGENTS.md` "Current owner contract", `src/jev-skill.md`, tool catalog in `src/guidance.ts` |
-| Scenario source | `scenarios/*.feature` (17 files, 209 scenarios) |
+| Scenario source | `scenarios/*.feature` (17 files; definition count, ids and executability are checked by `tests/scenarios/run.test.ts`) |
 | Gherkin reference | <https://cucumber.io/docs/gherkin/reference/> |
-| Acceptance status in this document | Static traceability only. No test, typecheck, live judge call, host run or strict run was executed to produce this document. |
-| Executable status | No step definitions, Cucumber dependency or runner exist in this repository. The feature files are business specifications, not an executable suite. |
+| Acceptance status in this document | Static traceability only. This document asserts no pass or fail from a test, typecheck, live judge call, host run or strict run. |
+| Executable status | `tests/scenarios/run.test.ts` loads `tests/scenarios/steps/*.ts` and runs each scenario against production code. Missing steps fail unless the scenario is the exact known-unsupported allowlist (`jev_plan_review_13`, `jev_owner_followup_12`); a supported allowlist entry fails the contract. |
 
 ## 2. Purpose and business outcome
 
@@ -108,8 +108,8 @@ parent integrates.
 | --- | --- | --- | --- | --- | --- |
 | Diagnostic contract — `jev_diagnostics.feature` | FR-17, FR-22, FR-31, FR-72, FR-73, FR-74, FR-75 | `jev_diagnostics_01..16` | `src/state.ts:157-187` (recordDiagnostic/diagnosticSummary); `src/controller.ts:147-160` (toolResponse); `src/controller.ts:351-388` (run wrapper); `src/controller.ts:475-529` (diagnoseAction/settleBackground); `src/controller.ts:397-427` (status/mode) | `bun test tests/diagnosticController.test.ts`; `bun test tests/controller.test.ts`; `bun test tests/controllerLifecycle.test.ts`; `bun tools/live-smoke.ts direct --scenario diagnostics` | Implemented. Ordinary completion and background checks covered by controller tests. FR-17 completion check is not an ordinary gate (see GAP-10). No live host run observed here. |
 | Session mode — `jev_session_mode.feature` | FR-71, FR-76, FR-77 | `jev_session_mode_01..12` | `src/controller.ts:397-427` (`/jev`, `/jev-status`); `src/controller.ts:147-160` (disabled result); `src/controller.ts:428-437` (state reset); `src/controller.ts:428-473` (events, disable checks) | `bun test tests/controller.test.ts` (mode, stale answer, status tests); `bun tools/live-smoke.ts host --scenario workflow --model deepseek/deepseek-flash` | Implemented, host command routing live unproven. `/jev on` fresh workflow retains usage/stats/diagnostics; sources stay archived. Strict switch changes diagnostics only. |
-| Configuration and credentials — `jev_configuration.feature` | FR-73, FR-78 | `jev_configuration_01..12` | `src/config.ts:17-24` defaults; `src/config.ts:37-44` paths; `src/config.ts:57-74` mode validation; `src/config.ts:98-163` (loadJevConfig); `src/apikey.ts:23-58` (resolveApiKey); `src/judge.ts:216-255` (createTypeSafeJudge); `src/controller.ts:428-431` startup notice | `bun test tests/config.test.ts`; `bun test tests/apikey.test.ts`; `bun test tests/judge.test.ts` | Implemented. Obsolete keys ignored; enforce falls back to advisory; no live balance query. Key secrecy is structural; no test can prove absence from every possible log. |
-| Owner follow-up — `jev_owner_followup.feature` | FR-41 (pending), FR-42 (partial), FR-68, FR-69, FR-73, FR-76 | `jev_owner_followup_01..14` | `src/controller.ts:284-298` owner capture; `src/controller.ts:438-473` input/prompt capture; `src/activities.ts:693-792` classification; `src/context.ts:17-353` archive | `bun test tests/controller.test.ts`; `bun test tests/context.test.ts`; `bun test tests/state.test.ts`; `bun test tests/activities.test.ts` | Partial. Capture, classification, amendment and replacement implemented. FR-41 ordinary durable restore and FR-42 retention are being implemented by Main; no accepted outcome is recorded here. Restart behavior is unit-covered but not live. |
+| Configuration and credentials — `jev_configuration.feature` | FR-73, FR-78 | `jev_configuration_01..12` | `src/config.ts:17-24` defaults; `src/config.ts:37-44` paths; `src/config.ts:57-74` mode validation; `src/config.ts:98-163` (loadJevConfig); `src/apikey.ts:23-58` (resolveApiKey); `src/judge.ts:216-255` (createTypeSafeJudge); `src/controller.ts` `session_start` notification | `bun test tests/config.test.ts`; `bun test tests/apikey.test.ts`; `bun test tests/judge.test.ts`; `bun test tests/scenarios/run.test.ts` | Implemented. Obsolete keys ignored; enforce falls back to advisory; no live balance query. Session start sends the exact problem text to the owner UI and no `jev.config` model message. Key secrecy is structural; no test can prove absence from every possible log. |
+| Owner follow-up — `jev_owner_followup.feature` | FR-41 (unimplemented), FR-42, FR-68, FR-69, FR-73, FR-76 | `jev_owner_followup_01..14` | `src/controller.ts:284-298` owner capture; `src/controller.ts:438-473` input/prompt capture; `src/activities.ts:693-792` classification; `src/state.ts` retained requirements/plan; `src/context.ts:17-353` archive | `bun test tests/controller.test.ts`; `bun test tests/context.test.ts`; `bun test tests/state.test.ts`; `bun test tests/activities.test.ts`; `bun test tests/scenarios/run.test.ts` | Capture, classification, amendment, replacement and unaffected-decision retention are implemented with scenario coverage. FR-41 ordinary journal restore is still unimplemented and is the only owner-follow-up scenario in the runner allowlist. Restart behavior is unit-covered but not live. |
 | Triage — `jev_triage.feature` | FR-01, FR-02, FR-10, FR-30, FR-45, FR-72, FR-73 | `jev_triage_01..12` | `src/screen.ts` (weightOf); `src/activities.ts:793-898` (triage); `src/controller.ts:446-474` (before_agent_start) | `bun test tests/activities.test.ts` (FR-01/02); `bun test tests/controller.test.ts`; `bun tools/live-smoke.ts direct --scenario factorio` | Implemented. One stale response sentence says changes stay blocked (GAP-04). External uncertainty stays in review scope. No task on outage. |
 | Requirements — `jev_requirements.feature` | FR-04, FR-05, FR-06, FR-22, FR-33, FR-34, FR-35, FR-36, FR-73 | `jev_requirements_01..11` | `src/activities.ts:989-1115` (requirements); `src/state.ts:440-447` (invalidatePlan); `src/controller.ts:299-312` (snapshotApproval) | `bun test tests/activities.test.ts` (FR-04/05/06); `bun test tests/state.test.ts` | Implemented. Approval requires every item supported, coverage established and candidate needs settled. Unapproved requirements do not block work; plan review has its own prerequisite. |
 | Plan review — `jev_plan_review.feature` | FR-07 (pending), FR-24, FR-34, FR-36, FR-37, FR-73 | `jev_plan_review_01..14` | `src/activities.ts:1163-1551` (reviewPlanOutline/reviewPlanDetail/finalizePlan/planReview); `src/artifact.ts:8-40` (readLocalArtifact); `src/controller.ts:299-312` (snapshotApproval) | `bun test tests/activities.test.ts` (plan stages, content binding); `bun test tests/artifact.test.ts` (BOM and invalid UTF-8) | Implemented except FR-07. Passing steps retained; changed outline invalidates dependent details; final approval binds digest/bytes/task. A BOM is preserved and invalid UTF-8 is refused rather than normalized. No host plan-mode hook was found (GAP-07). Approval does not lock implementation. |
@@ -117,7 +117,7 @@ parent integrates.
 | Search relevance — `jev_search_relevance.feature` | FR-03, FR-20, FR-22, FR-73 | `jev_search_relevance_01..07` | `src/activities.ts:899-988` (searchRelevance); `src/guidance.ts` SEARCH_DESCRIPTION | `bun test tests/activities.test.ts` (FR-03) | Implemented. Submitted candidate/reason returned; none-relevant is valid; below-floor unusable. |
 | Re-aim — `jev_reaim.feature` | FR-29, FR-69, FR-73, FR-76 | `jev_reaim_01..09` | `src/activities.ts:614-692` (reaim); `src/state.ts:488-511` (registerTask/reaimTask) | `bun test tests/activities.test.ts` (FR-29); `bun test tests/state.test.ts` | Implemented. One stale prerequisite still names the removed `/jev-continue` (GAP-05). Re-aim clears old approvals/findings; no re-triage. |
 | Course check — `jev_course_check.feature` | FR-11/FR-12 (removed scheduling), FR-20, FR-25, FR-70, FR-73, FR-75 | `jev_course_check_01..11` | `src/activities.ts:2808-2895` (courseCheck); `:2715-2807` (explicitCourseCheck); `src/controller.ts:475-497` (diagnoseAction) | `bun test tests/activities.test.ts`; `bun test tests/controller.test.ts` | Implemented. Named prerequisite without plan; off-course defect; below-floor on-course inconclusive; approving check is evidence only. |
-| Acceptance — `jev_acceptance.feature` | FR-14, FR-15, FR-26, FR-36, FR-39 (pending), FR-43 (pending), FR-73, FR-74 | `jev_acceptance_01..15` | `src/activities.ts:1552-1696`; `src/controller.ts:368-370` (pending-effect prerequisite); `src/state.ts:553-579` (acceptance/revision) | `bun test tests/activities.test.ts` (FR-14/15/26); `bun test tests/state.test.ts`; `bun tools/live-smoke.ts direct --scenario workflow` | Partial. Separate aspects, revision binding and topic gates implemented. FR-26 execution evidence is checked by kind, not by command+output content, and topic verdicts do not name their evidence (GAP-01). Acceptance returns a prerequisite while a background effect is unobserved; this is not an execution hold. FR-39 automatic acceptance is being implemented by Main and FR-43 remains pending (GAP-02, GAP-03); no outcome is claimed here. |
+| Acceptance — `jev_acceptance.feature` | FR-14, FR-15, FR-26, FR-36, FR-39, FR-43, FR-73, FR-74 | `jev_acceptance_01..15` | `src/activities.ts:1552-1696` (evidence basis, unmet sections); `src/controller.ts` `diagnoseCompletion` (automatic acceptance for an approved plan); `src/controller.ts:368-370` (pending-effect prerequisite); `src/state.ts:553-579` (acceptance/revision) | `bun test tests/activities.test.ts` (FR-14/15/26/43); `bun test tests/state.test.ts`; `bun test tests/scenarios/run.test.ts` | Separate aspects, revision binding, topic gates, literal command/output evidence and approved verification sections are implemented. Automatic acceptance runs only when an explicit plan was approved. Acceptance returns a prerequisite while a background effect is unobserved; this is not an execution hold. Scenario coverage exists; no test pass is asserted here. |
 | Developer review — `jev_review.feature` | FR-16, FR-20, FR-22, FR-73 | `jev_review_01..09` | `src/activities.ts:1697-1765` (review); `src/guidance.ts` REVIEW_DESCRIPTION | `bun test tests/activities.test.ts` (FR-16) | Implemented. Sound review is evidence; defect is diagnostic; never replaces acceptance. |
 | Text review — `jev_text_review.feature` | FR-20, FR-22, FR-27, FR-73 | `jev_text_review_01..09` | `src/activities.ts:1766-1907` (textReview); `:1909-1933` (readRules/proseFragmentsOf) | `bun test tests/activities.test.ts` (FR-27) | Implemented. Text scope judged once; fragment scope excludes headings/tables/code; submitted rule line returned verbatim; no advice. |
 | Anti-slop — `jev_anti_slop.feature` | FR-45..FR-56, FR-63, FR-73, FR-78 | `jev_anti_slop_01..17` | `src/activities.ts:1950-2140` (readAntiSlop); `:2140-2546` (antiSlop); `src/state.ts:702-790` (antiSlopScope/antiSlopStatus); `src/activities.ts:2547-2709` (actionCheck delivery diagnostic) | `bun test tests/anti-slop.test.ts`; `bun tools/live-smoke.ts direct --scenario workflow` | Implemented core, GAP-06. Advisory findings, trust marks, falsifiers, fragments, bounds and multi-part coverage exist. The `write xd://jev_*` device route is classified as a non-mutating diagnostic call (Main fix). Residual `/jev-waive` and "cannot be delivered" text contradicts FR-54/76/78; old delivery/waiver test names remain. No waiver command is registered. |
@@ -157,7 +157,9 @@ independent (GAP-10). No live host observation is recorded here.
 **Required business behaviour.** `/jev` reports or switches diagnostics for one in-memory session.
 `off` stops checks, source capture, prompt injection and judged execution; a Jev call returns an
 explicit skipped result. `on` starts a fresh workflow, retaining usage and diagnostic totals but not
-old approvals or findings. No configuration or permission changes.
+old approvals or findings. No configuration or permission changes. A mode change is a `nextTurn`
+message with `triggerTurn: false`: it never steers an in-flight batch, its mode-only instruction may
+enter provider context at the next turn boundary, and it starts no idle model turn.
 
 **Evidence.** `src/controller.ts:397-427`; `tests/controller.test.ts` (off/on, isolation, stale
 answer, status tests). Live: `bun tools/live-smoke.ts host --scenario workflow`.
@@ -169,32 +171,39 @@ diagnostics only; safety limits remain.
 
 **Required business behaviour.** Only `antiSlop.mode` (`off`/`advisory`) and `billing.*` are read.
 Obsolete gate/course keys are ignored. `enforce` is invalid, falls back to advisory and is reported
-with file/key. Invalid values keep effective values and report. Credentials resolve from environment
-then command; missing/failing credentials produce unavailable judgment.
+with file/key. Invalid values keep effective values and report. At session start the owner sees the
+warning and the exact problem text through the host UI notification; no configuration details are
+sent as model content. Credentials resolve from environment then command; missing/failing
+credentials produce unavailable judgment.
 
 **Evidence.** `src/config.ts:16-163`; `src/apikey.ts:23-55`; `src/judge.ts:216-255`;
 `tests/config.test.ts`; `tests/apikey.test.ts`; `tests/judge.test.ts`.
 
 **Gaps.** A balance is an owner-supplied snapshot, not a live API value. The startup problem notice
-is session-start behavior; no host run is recorded here.
+is covered by the configuration scenario with an injected host context; no native host run is
+recorded here.
 
-### 7.4 Owner follow-up and restart (FR-68, FR-69, FR-41 pending, FR-42 partial)
+### 7.4 Owner follow-up and restart (FR-68, FR-69, FR-41 unimplemented, FR-42 covered)
 
 **Required business behaviour today.** Authentic interactive/RPC input is archived exactly and
 classified at the next workflow boundary. Continuation preserves approvals; amendment extends the
-objective and invalidates dependent decisions while keeping findings; replacement requires
-`jev_reaim`; unclear is diagnostic uncertainty. Approval-looking text creates no override.
+objective and invalidates dependent decisions while keeping unaffected requirements and plan
+details; replacement requires `jev_reaim`; unclear is diagnostic uncertainty. Approval-looking text
+creates no override.
 
 **Evidence.** `src/controller.ts:284-312,438-473`; `src/activities.ts:693-792`;
-`src/context.ts`; `tests/controller.test.ts`; `tests/context.test.ts`; `tests/activities.test.ts`.
+`src/state.ts` retained requirements/plan; `src/context.ts`; `tests/controller.test.ts`;
+`tests/context.test.ts`; `tests/activities.test.ts`; `tests/state.test.ts`;
+`tests/scenarios/steps/owner_followup.ts`.
 
 **Pending promises.**
 
 - FR-41: ordinary restart does not restore task/accepted decisions from the native journal; ordinary
-  state is session-local (`src/controller.ts:428-431` clears on `session_start`). GAP-02.
-- FR-42: amendment invalidates requirements, plan and acceptance wholesale
-  (`src/activities.ts:766-773`), so unaffected requirements/plan details are not retained; its
-  "execution SHALL wait" clause conflicts with FR-73. GAP-08.
+  state is session-local (`src/controller.ts` clears on `session_start`). `jev_owner_followup_12` is
+  the runner-allowlisted unimplemented case. GAP-02.
+- FR-42: `jev_owner_followup_13` and `_14` have executable scenario coverage for unaffected-decision
+  retention and the diagnostic re-binding; no pass is asserted here. Its "execution SHALL wait"
+  clause conflicts with FR-73 and is not a current obligation. GAP-08 is closed in the status note.
 
 ### 7.5 Tools: triage, requirements, plan, consult, search, re-aim, course, review, text
 
@@ -259,7 +268,8 @@ approval. Context reads do not wait for an explicit judgment.
 archive record is corrupt; the inventory problem is returned in the result details rather than
 invalidating the selected source.
 
-**Gaps.** None identified beyond the general absence of step definitions.
+**Gaps.** None identified. The context scenarios execute in `tests/scenarios/run.test.ts`; this
+document asserts no pass.
 
 ### 7.9 Strict supervisor (FR-57..FR-66)
 
@@ -289,11 +299,11 @@ reducing scope. Their feature scenarios are tagged `@pending` or `@gap_*`.
 
 | PRD | Exact promised outcome | Feature scenario | Current status |
 | --- | --- | --- | --- |
-| FR-39 | At completion, collect observed code and execution evidence, submit missing business and architecture acceptance automatically, and return unmet obligations without manual acceptance calls. | `jev_acceptance_12` | Pending implementation by Main; not verified here. Current `session_stop` only publishes diagnostics, with no automatic evidence collection or acceptance submission. |
-| FR-41 | Resuming an OMP session restores its task and accepted decisions from the native session journal; changed files or plan sections invalidate only affected details; prior completion and execution acceptance require fresh verification after restart. | `jev_owner_followup_12` | Pending implementation by Main; not verified here. Current ordinary state is session-local and cleared on `session_start`. The strict module has its own durable ledger, not the native-journal promise. |
-| FR-42 | A judged owner correction retains unaffected requirements, outline steps and plan details; dependent decisions are reviewed again; execution waits for a newly bound complete plan. | `jev_owner_followup_13`, `_14` | Partial and under implementation by Main. Passing details are retained within plan review (FR-37), but the inspected amendment path deletes the approved requirement set and plan draft wholesale. The execution-wait clause conflicts with FR-73 and is not a current obligation. |
-| FR-43 | Missing or unsuitable evidence returns the unmet requirement and its approved verification section, directing observation before implementation repair; only an established defect directs repair. | `jev_acceptance_13` | Not implemented. Acceptance returns unmet topic ids/requirements and generic next steps, not the approved verification section. |
-| FR-07 | Plan review is connected to the actual host plan-mode boundary. | `jev_plan_review_13` | Unverified. Review reads a `local://` artifact; no host plan-mode hook was found. |
+| FR-39 | At completion, collect observed code and execution evidence, submit missing business and architecture acceptance automatically, and return unmet obligations without manual acceptance calls. | `jev_acceptance_12` | Executable scenario and `src/controller.ts` `diagnoseCompletion` path exist for an explicitly approved plan. The scenario suite records the result; this document asserts no pass. |
+| FR-41 | Resuming an OMP session restores its task and accepted decisions from the native session journal; changed files or plan sections invalidate only affected details; prior completion and execution acceptance require fresh verification after restart. | `jev_owner_followup_12` | Unimplemented and allowlisted by the runner. Current ordinary state is session-local and cleared on `session_start`. The strict module has its own durable ledger, not the native-journal promise. |
+| FR-42 | A judged owner correction retains unaffected requirements, outline steps and plan details; dependent decisions are reviewed again; execution waits for a newly bound complete plan. | `jev_owner_followup_13`, `_14` | Unaffected-decision retention has executable scenario coverage. The execution-wait clause conflicts with FR-73 and is not a current obligation. No pass is asserted here. |
+| FR-43 | Missing or unsuitable evidence returns the unmet requirement and its approved verification section, directing observation before implementation repair; only an established defect directs repair. | `jev_acceptance_13` | Executable scenario coverage; acceptance returns approved verification sections in `details.unmetSections`. No pass is asserted here. |
+| FR-07 | Plan review is connected to the actual host plan-mode boundary. | `jev_plan_review_13` | Unimplemented and allowlisted by the runner. Review reads a `local://` artifact; no host plan-mode hook was found. |
 | FR-17 | Before a developed task is reported complete, Jev checks whether the work follows the owner's requirements. | `jev_diagnostics_02` (current diagnostic behaviour) | Conflicting. Ordinary completion deliberately does not run a completion check; strict runtime records evidence-bound completion. Reconcile FR-17 with FR-73/FR-62. |
 | FR-38 | Before a consequential invocation executes, submit its complete payload for Jev authorization. | No positive scenario; superseded behavior. | Conflicting and not implemented. Contradicts FR-73/FR-76; the PRD supersession table omits FR-38. |
 
@@ -303,12 +313,13 @@ reducing scope. Their feature scenarios are tagged `@pending` or `@gap_*`.
 > GAP-06, GAP-08, GAP-10, GAP-11 and GAP-12 are closed: acceptance now requires literal execution
 > and code evidence with a per-topic basis; unmet plan topics return their approved verification
 > section; the triage, re-aim and anti-slop prose no longer mentions blocking, `/jev-continue` or
-> `/jev-waive`; the waiver storage and validators were deleted; owner follow-ups retain unaffected
+> status; the waiver storage and validators were deleted; owner follow-ups retain unaffected
 > requirements; ordinary completion is diagnostic-only; and the PRD marks FR-34/38/54/56 as
-> superseded or diagnostic. GAP-02 (durable ordinary restore), GAP-07 (host plan-mode hook),
-> GAP-09/GAP-15 (strict live acceptance), GAP-13 (dead recovery vocabulary in comments) and
-> GAP-14 (no Gherkin runner) remain open. The row text below is the historical snapshot and is not
-> a current defect list.
+> superseded or diagnostic. GAP-14 is closed: `tests/scenarios/run.test.ts` executes every
+> scenario and fails a missing step unless it is one of the two allowlisted unimplemented cases.
+> GAP-02 (durable ordinary restore), GAP-07 (host plan-mode hook), GAP-09/GAP-15 (strict live
+> acceptance) and GAP-13 (dead recovery vocabulary in comments) remain open. The row text below is
+> the historical snapshot and is not a current defect list.
 
 | ID | Severity | Affected requirement / scenario | Evidence | Required resolution |
 | --- | --- | --- | --- | --- |
@@ -358,16 +369,18 @@ bun tools/live-smoke.ts host --scenario workflow --model deepseek/deepseek-flash
 bun tools/autonomy-smoke.ts --scenario all --deadline 600
 ```
 
-If executable Gherkin is added, the scenarios can be filtered by stable tags such as
-`@jev_diagnostics_01` or by requirement tags such as `@fr_73`. Until then, tag-based filtering is a
-specification query only, not a test result.
+The executable suite uses stable scenario ids such as `jev_diagnostics_01` and requirement tags
+such as `fr_73` as scenario tags. Filter a run by its test name (the scenario id is part of the
+name) or by the entire scenario file; a filtered run is a selection of tests, not by itself a
+result. Missing steps fail unless the runner allowlist names the exact unsupported scenario.
 
 ## 11. Acceptance record
 
 | Date | Scope | Result |
 | --- | --- | --- |
-| 2026-11-15 | Feature reconciliation to the diagnostic-only owner contract | Complete as a specification and traceability deliverable. 17 feature files, 209 scenarios, stable scenario and requirement tags, no executable claim. |
+| 2026-11-15 | Feature reconciliation to the diagnostic-only owner contract | Complete as a specification and traceability deliverable. 17 feature files, 209 scenarios, stable scenario and requirement tags, no executable claim at that revision. |
 | 2026-11-15 | Business implementation acceptance | Not granted. GAP-01..GAP-14 remain open; no tests or live runs were executed for this document. |
+| 2026-11-18 | Executable scenario contract and owner-facing output | Documentation revision: the runner executes every scenario, missing steps fail except the two allowlisted cases, and the configuration scenario checks exact owner-UI warnings with no model message. No test pass is asserted here. |
 
 The feature files and this document must be rechecked whenever the PRD, owner contract, ordinary
 controller, anti-slop reporting or strict supervisor changes.

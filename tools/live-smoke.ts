@@ -820,7 +820,9 @@ async function diagnosticsScenario(dir: string): Promise<{ judgeCalls: number; n
 		trueMeaning: "The report matches the observation.",
 		falseMeaning: "The report does not match the observation.",
 	}, log);
-	if (!consult.failed) throw new Error("the injected outage did not produce an unavailable judgment");
+	if (consult.failed || consult.details["kind"] !== "unavailable" || consult.details["approved"] !== false) {
+		throw new Error("the injected outage did not produce an advisory unavailable judgment");
+	}
 	await performWrite(outage.pi, outage.ctx, outageWorkspace, { path: "after-outage.ts", content: "export const continued = true;\n" }, log);
 	if (!existsSync(join(outageWorkspace, "after-outage.ts"))) throw new Error("the write after an outage did not execute");
 	if (stopDecision(await outage.pi.emit("session_stop", {}, outage.ctx)) !== undefined) throw new Error("the addon held completion after an outage");
