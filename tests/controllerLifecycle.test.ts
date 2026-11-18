@@ -121,6 +121,17 @@ describe("lean ordinary workflow", () => {
 		expect(judge.calls).toHaveLength(2);
 	});
 
+	test("completion shows status immediately without queuing a message while the host is busy", async () => {
+		const { pi } = harness();
+		const notices: string[] = [];
+		const ctx = { hasUI: true, isIdle: () => false, ui: { notify: (text: string) => notices.push(text) } };
+		await pi.emit("before_agent_start", { reason: "prompt", prompt: "Implement headline counts" }, ctx);
+		await pi.emit("session_stop", stopEvent(), ctx);
+		await pi.emit("session_stop", stopEvent(), ctx);
+		expect(notices).toEqual([expect.stringContaining("Jev · On")]);
+		expect(pi.messages).toEqual([]);
+	});
+
 	test("background outcome feedback enters a natural provider step but does not follow a new objective", async () => {
 		const pi = fakePi();
 		const judge = answeringJudge({
@@ -142,7 +153,10 @@ describe("lean ordinary workflow", () => {
 		expect(await pi.emit("context", { messages: history }, ctx)).toEqual([{ messages: [
 			expect.objectContaining({ customType: "jev.feedback", display: false, content: expect.stringContaining(request) }),
 		] }]);
-		expect(pi.messages.every(message => message.deliverAs === "nextTurn")).toBe(true);
+		expect(pi.messages).toMatchObject([
+			{ customType: "jev.status", display: true, deliverAs: "nextTurn", triggerTurn: false },
+			{ customType: "jev.acceptance", display: true, deliverAs: "nextTurn", triggerTurn: false },
+		]);
 		const newRequest = "Implement daily totals";
 		await start(newRequest);
 		expect(await pi.emit("context", { messages: history }, ctx)).toEqual([{ messages: [] }]);

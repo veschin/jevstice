@@ -106,6 +106,8 @@ interface EmittedMessage {
 	customType: string;
 	content: string;
 	deliverAs?: string;
+	display?: boolean;
+	triggerTurn?: boolean;
 	details?: unknown;
 }
 
@@ -143,6 +145,8 @@ export function fakePi(): FakePi {
 				customType: typeof record["customType"] === "string" ? record["customType"] : "",
 				content: typeof record["content"] === "string" ? record["content"] : "",
 				deliverAs: options?.deliverAs,
+				display: typeof record["display"] === "boolean" ? record["display"] : undefined,
+				triggerTurn: options?.triggerTurn,
 				details: record["details"],
 			});
 		},

@@ -25,6 +25,10 @@ results; `work` counts coverage of consequential tool results. A consequential r
 the current approved plan when one is available. An asynchronous launch without a settled action
 diagnostic remains `not_checked`; observing a launch or terminal result alone is not a passing check.
 The status summary reports both groups and current-revision business and architecture acceptance.
+In an interactive OMP session, automatic completion status uses a UI notification while the host
+is busy. It does not queue a model turn. The detailed status remains available through `/jev-status`.
+The OMP 18.22.2 regression probe recorded one assistant completion with status and two simulated
+unavailable acceptance notices visible in `/tmp/jev-notice-fixed-RpUuul/pane.txt`.
 
 There is no continuation command, approval-message override, repair permit or resolution phase.
 `/jev-continue`, `/jev-waive` and `jev_consult mode: "recovery"` are removed; the consult accepts only

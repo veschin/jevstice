@@ -451,7 +451,15 @@ export function createJevController(deps: ControllerDeps): JevController {
 				const text = statusText(state);
 				if (summaries.get(sessionIdOf(ctx)) === text) return;
 				summaries.set(sessionIdOf(ctx), text);
-				sendMessage(pi, "jev.status", text, `Jev · ${disabled(ctx) ? "Off" : "On"}\n${statusText(state, true)}`);
+				const brief = `Jev · On\n${statusText(state, true)}`;
+				const host = asRecord(ctx);
+				const isIdle = host?.["isIdle"];
+				// OMP hides non-waking transcript messages sent while a turn is stopping.
+				if (host?.["hasUI"] === true && typeof isIdle === "function" && !isIdle.call(ctx)) {
+					notify(ctx, brief, "info");
+					return;
+				}
+				sendMessage(pi, "jev.status", text, brief);
 			};
 			const contextTool = async (_activity: ActivityDeps, state: JevState, params: unknown, ctx?: unknown): Promise<ToolOutcome> => {
 				const pending = pendingEffects.get(sessionIdOf(ctx));
