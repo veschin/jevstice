@@ -163,20 +163,13 @@ function notify(ctx: unknown, text: string, level: "info" | "warning" = "warning
 	}
 }
 
-function sendMessage(pi: PiApi, customType: string, text: string, summary = "Jev · Details"): void {
+function sendMessage(pi: PiApi, customType: string, text: string, summary?: string): void {
 	try {
 		// nextTurn never steers an in-flight batch and false never starts a new turn.
-		pi.sendMessage?.({ customType, content: text, display: true, details: { summary } }, { deliverAs: "nextTurn", triggerTurn: false });
+		pi.sendMessage?.({ customType, content: text, display: true, ...(summary === undefined ? {} : { details: { summary } }) }, { deliverAs: "nextTurn", triggerTurn: false });
 	} catch (error) {
 		pi.logger?.warn?.("jevstice: could not deliver a session message", error);
 	}
-}
-
-function setStatus(ctx: unknown, text: string | undefined): void {
-	const ui = asRecord(asRecord(ctx)?.["ui"]);
-	const fn = ui?.["setStatus"];
-	if (typeof fn !== "function") return;
-	try { fn.call(ui, "jevstice", text); } catch { /* Presentation never changes the result. */ }
 }
 
 const DISABLED_OUTCOME: ToolOutcome = {
@@ -423,35 +416,22 @@ export function createJevController(deps: ControllerDeps): JevController {
 			deps.context.put({ kind: "plan", origin: "judge_approved", sessionId, content, source: state.plan.planUrl, approval: state.plan.planDigest });
 		}
 	};
-	const statusCounts = (state: JevState, group: "work" | "checks"): string => Object.entries(state.diagnostics?.[group] ?? {})
-		.filter(([, count]) => count > 0)
-		.map(([kind, count]) => `${count} ${kind.replace("_", " ")}`).join(", ") || "none";
-	const statusOutcome = (state: JevState): string => {
-		const observed = outcomeChecks.get(state);
-		return observed?.binding === outcomeBinding(state) ? outcomeSummary(observed.result) : "Not checked";
-	};
-	const statusText = (state: JevState, compact = false): string => {
+	const statusText = (state: JevState): string => {
 		const spend = (state.usage.inputTokens * deps.config.billing.inputCostPerMillion + state.usage.outputTokens * deps.config.billing.outputCostPerMillion) / 1_000_000;
 		const balance = deps.config.billing.balance;
-		if (compact) {
-			const outcome = statusOutcome(state);
-			const aspects = (["business", "architecture"] as const).map(aspect =>
-				`${aspect}: ${acceptanceAt(state, aspect) === undefined ? "not recorded" : "passed"}`);
-			return `Work: ${statusCounts(state, "work")}\nChecks: ${statusCounts(state, "checks")}\nOutcome: ${outcome} · ${aspects.join(" · ")} · est. $${formatUsd(spend)}`;
-		}
 		const activities = Object.entries(state.stats).map(([name, count]) => `${name}: ${count.ok} completed, ${count.fail} not completed`).join(", ");
-		return `${diagnosticSummary(state)} Activity outcomes (not approval counts): ${activities || "none"}. Judge requests: ${state.usage.judgeCalls}. Estimated spend ${formatUsd(spend)}$; ${balance === undefined ? "balance not configured" : `configured balance ${formatUsd(balance)}$`}.`;
+		const observed = outcomeChecks.get(state);
+		const outcome = observed?.binding === outcomeBinding(state) ? outcomeSummary(observed.result) : "Not checked";
+		return `${diagnosticSummary(state)}\n\nOutcome: ${outcome}.\n\nActivity outcomes (not approval counts): ${activities || "none"}. Judge requests: ${state.usage.judgeCalls}. Estimated spend ${formatUsd(spend)}$; ${balance === undefined ? "balance not configured" : `configured balance ${formatUsd(balance)}$`}.`;
 	};
 	return {
 		register(pi: PiApi): void {
 			const renderMessage = messagePresentation(pi);
 			if (renderMessage !== undefined) {
-				for (const type of Object.keys(OWNER_ONLY)) pi.registerMessageRenderer?.(type, renderMessage);
+				for (const type of Object.keys(OWNER_ONLY)) {
+					if (type !== "jev.status") pi.registerMessageRenderer?.(type, renderMessage);
+				}
 			}
-			const publishStatus = (ctx: unknown, state: JevState): void => {
-				if (disabled(ctx) || (state.request?.weight === "quiet" && state.task === undefined)) return;
-				setStatus(ctx, `Jev · Work: ${statusCounts(state, "work")} · Checks: ${statusCounts(state, "checks")} · Outcome: ${statusOutcome(state)}`);
-			};
 			const contextTool = async (_activity: ActivityDeps, state: JevState, params: unknown, ctx?: unknown): Promise<ToolOutcome> => {
 				const pending = pendingEffects.get(sessionIdOf(ctx));
 				const input = asRecord(params);
@@ -547,7 +527,6 @@ export function createJevController(deps: ControllerDeps): JevController {
 					if (!current(ctx, state)) return toolResponse({ ok: false, text: STALE_MODE_REASON, details: { kind: "stale" } });
 					recordActivityOutcome(state, name, outcome.ok);
 					if (name !== "jev_context" && outcome.details?.["replayed"] !== true) recordDiagnostic(state, outcome);
-					if (name !== "jev_context") publishStatus(ctx, state);
 					return toolResponse(outcome, state);
 				};
 			const catalog = createToolCatalog(deps.zod);
@@ -566,9 +545,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 				description: "Show diagnostic coverage, findings and judge usage",
 				handler: (_args, ctx) => {
 					const state = stateFor(ctx);
-					const brief = `Jev · ${disabled(ctx) ? "Off" : "On"}\n${statusText(state, true)}`;
-					notify(ctx, brief, "info");
-					sendMessage(pi, "jev.status", `Session mode: ${disabled(ctx) ? "off" : "on"}. ${statusText(state)}\n${brief}`, brief);
+					sendMessage(pi, "jev.status", `Session mode: ${disabled(ctx) ? "off" : "on"}.\n\n${statusText(state)}`);
 				},
 			});
 			pi.registerCommand?.("jev", {
@@ -603,14 +580,12 @@ export function createJevController(deps: ControllerDeps): JevController {
 							: "The owner turned Jev checks on. Continue useful work under the same host permissions.", timestamp: Date.now() });
 					}
 					const summary = `Jev · ${mode === "off" ? "Off" : "On"}`;
-					setStatus(ctx, mode === "off" ? undefined : summary);
 					notify(ctx, summary, "info");
 					sendMessage(pi, "jev.mode", `Jev diagnostics are ${mode}. This changes checks only, not host permissions or supervisor safety limits.`, summary);
 				},
 			});
 			pi.on("session_start", (_event, ctx) => {
 				states.delete(sessionIdOf(ctx)); disabledSessions.delete(sessionIdOf(ctx));
-				setStatus(ctx, undefined);
 				if (deps.config.problems.length) notify(ctx, deps.config.problems.join("\n"));
 			});
 			pi.on("session_shutdown", (_event, ctx) => {
@@ -649,7 +624,6 @@ export function createJevController(deps: ControllerDeps): JevController {
 							settledTasks.delete(state);
 							observedEvidence.delete(state);
 							modelFeedback.delete(state);
-							setStatus(ctx, undefined);
 						}
 					}
 				}
@@ -666,9 +640,8 @@ export function createJevController(deps: ControllerDeps): JevController {
 				catch (error) { return { block: true, reason: `Supervisor admission failed: ${String(error)}` }; }
 				return undefined;
 			});
-			const publishDiagnostic = (ctx: unknown, state: JevState, type: "jev.diagnostic" | "jev.acceptance", subject: string, outcome: ToolOutcome): void => {
+			const publishDiagnostic = (state: JevState, type: "jev.diagnostic" | "jev.acceptance", subject: string, outcome: ToolOutcome): void => {
 				const content = `${subject}\n${outcome.text}`;
-				publishStatus(ctx, state);
 				try { pi.appendEntry?.(type, { subject, outcome }); }
 				catch (error) { pi.logger?.warn?.("jevstice: could not archive a background diagnostic", error); }
 				const kind = diagnosticKind(outcome);
@@ -694,7 +667,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 					state.diagnostics!.work.not_checked -= 1;
 					recordDiagnostic(state, outcome, true);
 					recordRecovery(state, "action-diagnostic", action, outcome);
-					publishDiagnostic(ctx, state, "jev.diagnostic", `Jev · ${tool} ${action.target.slice(0, 90)}`, outcome);
+					publishDiagnostic(state, "jev.diagnostic", `Jev · ${tool} ${action.target.slice(0, 90)}`, outcome);
 				};
 				void actionCheck(activitiesFor(ctx), snapshot, action, input).then(settle, error =>
 					settle({ ok: false, text: String(error), details: { kind: "unavailable" } }));
@@ -727,7 +700,6 @@ export function createJevController(deps: ControllerDeps): JevController {
 						diagnoseAction(ctx, state, effect.tool, effect.input, { succeeded, observed });
 					}
 					saveObservation(state, effect.tool, effect.input, output, succeeded, effect.consequential);
-					if (effect.consequential) publishStatus(ctx, state);
 				}
 			};
 
@@ -747,7 +719,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 						if (outcome.details?.["prerequisite"] === undefined) outcomeChecks.set(state, { binding, result: outcome });
 						recordDiagnostic(state, outcome);
 						recordRecovery(state, "outcome", { evidence, binding }, outcome);
-						publishDiagnostic(ctx, state, "jev.acceptance", "Jev · Observed outcome", outcome);
+						publishDiagnostic(state, "jev.acceptance", "Jev · Observed outcome", outcome);
 						return;
 					}
 					for (const aspect of ["business", "architecture"] as const) {
@@ -764,13 +736,13 @@ export function createJevController(deps: ControllerDeps): JevController {
 						if (accepted !== undefined) recordAcceptance(state, accepted);
 						recordDiagnostic(state, outcome, false);
 						recordRecovery(state, "acceptance", { aspect, binding, evidence }, outcome);
-						publishDiagnostic(ctx, state, "jev.acceptance", `Jev · ${aspect === "business" ? "Business" : "Architecture"}`, outcome);
+						publishDiagnostic(state, "jev.acceptance", `Jev · ${aspect === "business" ? "Business" : "Architecture"}`, outcome);
 					}
 				})().catch(error => {
 					if (!valid()) return;
 					const outcome = { ok: false, text: `Automatic acceptance unavailable: ${String(error)}`, details: { kind: "unavailable" } };
 					recordDiagnostic(state, outcome, false);
-					publishDiagnostic(ctx, state, "jev.acceptance", "Jev · Outcome", outcome);
+					publishDiagnostic(state, "jev.acceptance", "Jev · Outcome", outcome);
 				});
 			};
 			pi.on("context", (event, ctx) => {
@@ -830,12 +802,10 @@ export function createJevController(deps: ControllerDeps): JevController {
 					if (consequential) recordDiagnostic(state, { ok: true, text: "Background effect is not yet checked.", details: { skipped: true } }, true);
 				}
 				if (tool === "wait" && record?.["isError"] !== true && asRecord(record?.["details"])?.["op"] === "wait") settleBackground(ctx, record!, true);
-				if (consequential) publishStatus(ctx, state);
 				await deps.autonomy?.toolResult(ctx, state, event);
 			});
 			pi.on("session_stop", async (_event, ctx) => {
 				const state = stateFor(ctx);
-				publishStatus(ctx, state);
 				if (deps.autonomy !== undefined) return deps.autonomy.stop(ctx, state, activitiesFor(ctx));
 				if (!disabled(ctx)) {
 					if (!state.pendingOwnerMessages?.length && !(pendingEffects.get(sessionIdOf(ctx))?.size)) settledTasks.add(state);

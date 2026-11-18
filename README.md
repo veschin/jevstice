@@ -107,10 +107,9 @@ The controller classifies each visible tool call with deterministic effect class
 ### Status shape
 
 OMP renders explicit Jev tool results as compact, themed rows. Expand a row to read the full
-diagnostic. Automatic checks update one entry in OMP's status area without adding transcript
-messages or starting a turn. Run `/jev-status` for the full work, check, acceptance and spend
-summary. To show Jev inline, add the `status` segment to your custom OMP status line and set
-`statusLine.showHookStatus: false` to hide the duplicate below it.
+diagnostic. Jev does not post an automatic session summary or populate the OMP status strip.
+Run `/jev-status` to see the full work, check, acceptance and spend summary without starting a
+model turn.
 The model still receives the complete tool results and actionable background feedback.
 
 Every Jev tool result while diagnostics are on carries `details.diagnostics`:

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Removed
+
+- Removed the automatic OMP status strip and compact session-status card. `/jev-status` still
+  reports session mode, work and check coverage, acceptance, and estimated judge spend on request.
+
 ## 2.3.1 - 2026-11-18
 
 ### Fixed

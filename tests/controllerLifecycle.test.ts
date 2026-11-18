@@ -121,7 +121,7 @@ describe("lean ordinary workflow", () => {
 		expect(judge.calls).toHaveLength(2);
 	});
 
-	test("automatic completion updates one OMP status entry without posting into the transcript", async () => {
+	test("automatic completion does not publish a status strip, notice or transcript message", async () => {
 		const { pi } = harness();
 		const status = new Map<string, string>();
 		const notices: string[] = [];
@@ -132,7 +132,7 @@ describe("lean ordinary workflow", () => {
 		await pi.emit("before_agent_start", { reason: "prompt", prompt: "Implement headline counts" }, ctx);
 		await pi.emit("session_stop", stopEvent(), ctx);
 		await pi.emit("session_stop", stopEvent(), ctx);
-		expect([...status]).toEqual([["jevstice", "Jev · Work: none · Checks: none · Outcome: Not checked"]]);
+		expect([...status]).toEqual([]);
 		expect(notices).toEqual([]);
 		expect(pi.messages).toEqual([]);
 	});
@@ -147,6 +147,8 @@ describe("lean ordinary workflow", () => {
 		createJevController({ judge: judge.judge, config: boundaryConfig(), zod: fakeZod() }).register(pi.api);
 		const status = new Map<string, string>();
 		const ctx = fakeCtx({ setStatus: (key, text) => { if (text !== undefined) status.set(key, text); } });
+		let reported = false;
+		pi.api.appendEntry = type => { if (type === "jev.acceptance") reported = true; };
 		const start = (prompt: string) => pi.emit("before_agent_start", { reason: "prompt", prompt, systemPrompt: [] }, ctx);
 		const request = "Implement headline counts";
 		await start(request);
@@ -154,11 +156,14 @@ describe("lean ordinary workflow", () => {
 		await pi.emit("tool_result", toolResultEvent("write", { path: "headlines.ts", content: "export const headlines = 0;" }, "Wrote headlines.ts"), ctx);
 		await pi.emit("tool_result", toolResultEvent("bash", { command: "bun test headlines.test.ts" }, "Expected 1, received 0", true), ctx);
 		expect(await pi.emit("session_stop", stopEvent(), ctx)).toEqual([undefined]);
-		expect(await until(() => status.get("jevstice")?.includes("Outcome: Findings") === true, 200)).toBe(true);
+		expect(await until(() => reported, 200)).toBe(true);
+		expect([...status]).toEqual([]);
 		expect(await pi.emit("context", { messages: [] }, ctx)).toEqual([{ messages: [
 			expect.objectContaining({ customType: "jev.feedback", display: false, content: expect.stringContaining(request) }),
 		] }]);
 		expect(pi.messages).toEqual([]);
+		pi.callCommand("jev-status", "", ctx);
+		expect(pi.messages[0]?.content).toContain("Outcome: Findings");
 		const newRequest = "Implement daily totals";
 		await start(newRequest);
 		expect(await pi.emit("context", { messages: [] }, ctx)).toEqual([undefined]);

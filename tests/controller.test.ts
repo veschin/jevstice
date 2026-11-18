@@ -210,22 +210,19 @@ describe("compact user presentation", () => {
 		}
 	});
 
-	test("administrative messages remain expandable but are absent from provider context", async () => {
+	test("explicit status shows details without a compact card or provider message", async () => {
 		const { pi, renderers } = setup();
-		expect([...renderers.keys()].sort()).toEqual(["jev.acceptance", "jev.config", "jev.diagnostic", "jev.mode", "jev.status"]);
+		expect(renderers.has("jev.status")).toBe(false);
 		const ctx = fakeCtx();
 		pi.callCommand("jev-status", "", ctx);
-		const status = pi.messages.filter(message => message.customType === "jev.status").at(-1)!;
+		expect(pi.messages).toHaveLength(1);
+		const status = pi.messages[0]!;
+		expect(status).toMatchObject({ customType: "jev.status", display: true, triggerTurn: false });
 		const content = status.content;
-		const summary = asRecord(status.details)?.["summary"];
-		expect(summary).toContain("Work: none");
-		expect(summary).toContain("Checks: none");
-		expect(summary).toContain("Outcome: Not checked");
-		for (const renderer of renderers.values()) {
-			const message = { content, details: { summary } };
-			expect(renderedText(renderer(message, { expanded: false }))).toBe(summary as string);
-			expect(renderedText(renderer(message, { expanded: true }))).toBe(content);
-		}
+		expect(content).toContain("Session mode: on");
+		expect(content).toContain("Work: 0 total");
+		expect(content).toContain("Checks: 0 total");
+		expect(content).toContain("Outcome: Not checked");
 		expect(content).toContain("Passed action checks do not prove");
 		const ownerMessage = { role: "custom", ...status };
 		const userMessage = { role: "user", content: "Continue the work" };
@@ -796,7 +793,7 @@ describe("automatic action diagnostics", () => {
 		if (stop !== undefined) expect(stopDecision(stop)).toBeUndefined();
 	});
 
-	test("session_stop reports diagnostic status without blocking", async () => {
+	test("session_stop does not broadcast status or block after a diagnostic", async () => {
 		const { pi } = controllerFor({ consult: { probability: 0.9 } });
 		const status = new Map<string, string | undefined>();
 		const ctx = fakeCtx({ setStatus: (key, text) => status.set(key, text) });
@@ -805,7 +802,7 @@ describe("automatic action diagnostics", () => {
 		const stop = await pi.emit("session_stop", stopEvent(), ctx);
 
 		expect(stopDecision(stop)).toBeUndefined();
-		expect(status.get("jevstice")).toContain("Checks: 1 passed");
+		expect([...status]).toEqual([]);
 		expect(pi.messages).toEqual([]);
 	});
 });
@@ -847,17 +844,17 @@ describe("session accounting", () => {
 		expect(status).toMatch(/spend/i);
 	});
 
-	test("turning checks off clears the footer and ordinary completion does not restore it", async () => {
+	test("session startup and mode commands never populate or clear a status strip", async () => {
 		const { pi } = controllerFor({ consult: { probability: 0.9 } });
 		const status = new Map<string, string | undefined>();
 		const ctx = fakeCtx({ setStatus: (key, text) => status.set(key, text) });
-		await pi.callTool("jev_consult", consultParams(), ctx);
-		expect(status.get("jevstice")).toContain("Checks: 1 passed");
+		await pi.emit("session_start", {}, ctx);
 
 		pi.callCommand("jev", "off", ctx);
+		pi.callCommand("jev", "on", ctx);
 		await pi.emit("session_stop", stopEvent(), ctx);
 
-		expect(status.get("jevstice")).toBeUndefined();
+		expect([...status]).toEqual([]);
 	});
 
 	test("activity totals survive a mode round trip while findings do not", async () => {

@@ -24,9 +24,9 @@ results; `work` counts coverage of consequential tool results. A consequential r
 `not_checked`; the action diagnostic then runs in the background after the completed result, using
 the current approved plan when one is available. An asynchronous launch without a settled action
 diagnostic remains `not_checked`; observing a launch or terminal result alone is not a passing check.
-The status summary reports both groups and current-revision business and architecture acceptance.
-Automatic action and completion checks update OMP's native status area without adding a transcript
-message or starting a model turn. The detailed status remains available through `/jev-status`.
+`/jev-status` reports both groups and current-revision business and architecture acceptance without
+starting a model turn. Automatic action and completion checks no longer publish a session summary
+or update OMP's status strip.
 The 2.3.1 release passed 968 tests (two pending) and the deep TypeScript check.
 An OMP 18.22.2 terminal probe with a deterministic judge showed one status entry with the settled
 outcome and no separate verdict in the transcript (`/tmp/jev-footer-p3qpLi/pane.txt`).

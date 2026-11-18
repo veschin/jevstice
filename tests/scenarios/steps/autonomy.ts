@@ -301,7 +301,7 @@ then("ordinary diagnostics follow the ordinary contract", async value => {
 	const status = new Map<string, string | undefined>();
 	const results = await pi.emit("session_stop", stopEvent(), fakeCtx({ setStatus: (key, text) => status.set(key, text) }));
 	expect(stopDecision(results)).toBeUndefined();
-	expect(status.get("jevstice")).toContain("Jev · Work:");
+	expect([...status]).toEqual([]);
 	expect(pi.messages).toEqual([]);
 });
 
