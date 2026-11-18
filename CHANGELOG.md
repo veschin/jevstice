@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+## 2.3.0 - 2026-11-18
+
+### Added
+
+- `jev_anti_slop` includes numbered Russian and English editing protocols, concrete rewriting
+  examples, and automatic checks for decorative symbols, filler, formulaic syntax and coherence.
+  The tool catalog and review results expose the same instructions to the executor.
+- Findings quote the affected text and name a correction. The protocols preserve facts,
+  uncertainty, names, quotations and technical notation; the executor still performs the edits.
+- Ordinary sessions can check derived requirements against the captured owner request, then
+  check the result against code changes and tool output with `jev_acceptance` and `aspect: "outcome"`.
+
+### Changed
+
+- OMP displays a Jev call and its verdict on one themed row. Expand the row to see the full
+  result. The model still receives the full tool response.
+- Quiet requests no longer receive the development manual. Background findings reach the model
+  at its next natural step without starting a turn or interrupting tools.
+- Russian and English reviews accept `rules: []` because built-in style checks always apply.
+  Other languages still require explicit rules. Assertion-free text accepts `claims: []`;
+  omitted factual claims are not thereby verified.
+- Inconclusive style checks remain inconclusive and expose the editing protocol without
+  recommending repeated unchanged submissions. Findings remain diagnostic and never block delivery.
+
+### Fixed
+
+- Stale background verdicts no longer update the current task. Strict reconciliation keeps an
+  intent pending if the observations, intent, session binding or revision change during judgment.
+- An inconclusive relevance or inference check no longer produces a clean anti-slop review.
+- Missing scenario steps fail the suite unless the scenario names an unsupported host boundary.
+
 ## 2.2.0 - diagnostic contract (2026-11-15)
 
 ### Changed
