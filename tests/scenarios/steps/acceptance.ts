@@ -52,7 +52,7 @@ interface AcceptanceWorld {
 	classText?: string;
 	reviewOutcome?: ToolOutcome;
 	courseOutcome?: ToolOutcome;
-	autoMessages?: Array<{ customType: string; content: string }>;
+	autoOutcomes?: Array<{ subject: string; outcome: ToolOutcome }>;
 	autoCalls?: JudgeCalls;
 	refusalText?: string;
 	block?: string;
@@ -525,7 +525,6 @@ then("the refusal remains disclosed as a diagnostic", value => {
 	const world = w(value);
 	expect(world.refusalText).toContain("A claim about the work is not evidence for it");
 	expect(world.contextText).toContain("not checked");
-	expect(world.pi?.messages.length).toBeGreaterThan(0);
 });
 
 // Scenario 11 --------------------------------------------------------------
@@ -597,6 +596,11 @@ async function developedTask(value: unknown): Promise<AcceptanceWorld> {
 	});
 	world.autoCalls = fake.calls;
 	const pi = fakePi();
+	const autoOutcomes: NonNullable<AcceptanceWorld["autoOutcomes"]> = [];
+	world.autoOutcomes = autoOutcomes;
+	pi.api.appendEntry = (type, data) => {
+		if (type === "jev.acceptance") autoOutcomes.push(data as (typeof autoOutcomes)[number]);
+	};
 	const ctx = fakeCtx({ artifactsDir });
 	world.pi = pi;
 	world.ctx = ctx;
@@ -647,9 +651,8 @@ when("the ordinary completion boundary is observed", async value => {
 	expect(pi).toBeDefined();
 	if (pi === undefined) return;
 	await pi.emit("session_stop", stopEvent(), world.ctx);
-	const seen = await until(() => pi.messages.some(message => message.customType === "jev.acceptance"));
-	expect(seen).toBe(true);
-	world.autoMessages = pi.messages.filter(message => message.customType === "jev.acceptance");
+	expect(await until(() => world.autoOutcomes?.length === 1)).toBe(true);
+	expect(pi.messages).toEqual([]);
 });
 
 then("the addon collects observed code and execution evidence", value => {
@@ -664,15 +667,15 @@ then("the addon collects observed code and execution evidence", value => {
 
 then("it submits the missing architecture acceptance automatically", value => {
 	const world = w(value);
-	const messages = world.autoMessages ?? [];
-	expect(messages).toHaveLength(1);
-	expect(messages[0]?.content).toContain("Jev · Architecture");
-	expect(messages[0]?.content).toContain("architecture acceptance:");
+	const outcomes = world.autoOutcomes ?? [];
+	expect(outcomes).toHaveLength(1);
+	expect(outcomes[0]?.subject).toBe("Jev · Architecture");
+	expect(outcomes[0]?.outcome.text).toContain("architecture acceptance:");
 });
 
 then("it returns the unmet obligations without requiring manual acceptance calls", value => {
 	const world = w(value);
-	const content = world.autoMessages?.[0]?.content ?? "";
+	const content = world.autoOutcomes?.[0]?.outcome.text ?? "";
 	expect(content).toContain("does not establish every plan topic");
 	expect(content).toContain("collect");
 	expect(content).toContain("approved verification section:");

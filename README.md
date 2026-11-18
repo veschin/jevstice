@@ -19,7 +19,7 @@
   <img alt="Bun 1.1 or newer" src="https://img.shields.io/badge/Bun-1.1%2B-black">
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
   <img alt="OMP extension" src="https://img.shields.io/badge/OMP-extension-6f42c1">
-  <img alt="Version 2.3.0" src="https://img.shields.io/badge/version-2.3.0-e05d44">
+  <img alt="Version 2.3.1" src="https://img.shields.io/badge/version-2.3.1-e05d44">
 </p>
 
 Jevstice connects [oh-my-pi](https://github.com/can1357/oh-my-pi) to Jev (`jev-latest`, TypeSafe API), a typed decision judge. The executor submits the decisions it can see - requirements, plans, search candidates, acceptance claims and single uncertain choices - and receives a typed verdict.
@@ -105,13 +105,12 @@ The controller classifies each visible tool call with deterministic effect class
 
 ### Status shape
 
-The terminal shows short results for Jev tools, automatic checks and mode changes. `/jev-status`
-shows work coverage, check coverage, current acceptance and estimated spend in a compact summary.
-Expand a result or message with the terminal's normal disclosure control to read the full diagnostic.
-Status, mode, action and acceptance transcript messages keep their custom identities but use
-`nextTurn` with `triggerTurn: false` and are stripped from provider context. The model still receives
-the complete original tool text, evidence and structured details; presentation does not change
-judgment, error handling or execution permissions.
+OMP renders explicit Jev tool results as compact, themed rows. Expand a row to read the full
+diagnostic. Automatic checks update one entry in OMP's status area without adding transcript
+messages or starting a turn. Run `/jev-status` for the full work, check, acceptance and spend
+summary. To show Jev inline, add the `status` segment to your custom OMP status line and set
+`statusLine.showHookStatus: false` to hide the duplicate below it.
+The model still receives the complete tool results and actionable background feedback.
 
 Every Jev tool result while diagnostics are on carries `details.diagnostics`:
 

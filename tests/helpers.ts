@@ -195,9 +195,9 @@ export function toolDetails(result: unknown): Record<string, unknown> {
 }
 
 /** A host context with a session id and an artifact root. */
-export function fakeCtx(options: { artifactsDir?: string | null; sessionId?: string } = {}): unknown {
+export function fakeCtx(options: { artifactsDir?: string | null; sessionId?: string; setStatus?: (key: string, text: string | undefined) => void } = {}): unknown {
 	return {
-		ui: { notify: () => {} },
+		ui: { notify: () => {}, setStatus: options.setStatus },
 		sessionManager: {
 			getArtifactsDir: () => options.artifactsDir ?? null,
 			getSessionId: () => options.sessionId ?? "session-1",

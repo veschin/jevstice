@@ -441,6 +441,7 @@ then("the session stop is not rejected for missing acceptance", value => {
 
 then("the missing acceptance and the finding are disclosed as diagnostics", async value => {
 	const world = setup(value);
+	world.pi.callCommand("jev-status", "", world.ctx);
 	const status = lastMessage(world, "jev.status");
 	expect(status).toContain("Current-revision acceptance: none");
 	expect(status).toContain("Jev diagnostics");

@@ -298,10 +298,11 @@ then("ordinary diagnostics follow the ordinary contract", async value => {
 	if (pi === undefined) throw new Error("the ordinary session was not registered");
 	const toolNames = [...pi.tools.keys()];
 	expect(toolNames).toEqual(expect.arrayContaining(["jev_context", "jev_course_check", "jev_triage"]));
-	const results = await pi.emit("session_stop", stopEvent(), fakeCtx());
+	const status = new Map<string, string | undefined>();
+	const results = await pi.emit("session_stop", stopEvent(), fakeCtx({ setStatus: (key, text) => status.set(key, text) }));
 	expect(stopDecision(results)).toBeUndefined();
-	expect(pi.messages.some(message => message.customType === "jev.status")).toBe(true);
-	expect(pi.messages.map(message => message.content).join("\n")).not.toContain("Strict autonomous initialization failed");
+	expect(status.get("jevstice")).toContain("Jev · Work:");
+	expect(pi.messages).toEqual([]);
 });
 
 // ---------------------------------------------------------------------------

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 2.3.1 - 2026-11-18
+
+### Fixed
+
+- Automatic action and completion checks update one native OMP status entry instead of posting
+  separate verdicts containing shell command text. Explicit Jev tools keep their compact, themed
+  rows and expandable results.
+
 ## 2.3.0 - 2026-11-18
 
 ### Added

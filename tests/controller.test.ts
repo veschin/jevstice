@@ -214,7 +214,7 @@ describe("compact user presentation", () => {
 		const { pi, renderers } = setup();
 		expect([...renderers.keys()].sort()).toEqual(["jev.acceptance", "jev.config", "jev.diagnostic", "jev.mode", "jev.status"]);
 		const ctx = fakeCtx();
-		await pi.emit("session_stop", stopEvent(), ctx);
+		pi.callCommand("jev-status", "", ctx);
 		const status = pi.messages.filter(message => message.customType === "jev.status").at(-1)!;
 		const content = status.content;
 		const summary = asRecord(status.details)?.["summary"];
@@ -798,16 +798,15 @@ describe("automatic action diagnostics", () => {
 
 	test("session_stop reports diagnostic status without blocking", async () => {
 		const { pi } = controllerFor({ consult: { probability: 0.9 } });
-		const ctx = fakeCtx();
+		const status = new Map<string, string | undefined>();
+		const ctx = fakeCtx({ setStatus: (key, text) => status.set(key, text) });
 		expect(toolFailed(await pi.callTool("jev_consult", consultParams(), ctx))).toBe(false);
-		pi.messages.length = 0;
 
 		const stop = await pi.emit("session_stop", stopEvent(), ctx);
 
 		expect(stopDecision(stop)).toBeUndefined();
-		expect(pi.messages.length).toBeGreaterThan(0);
-		const report = pi.messages.map(message => message.content).join("\n");
-		expect(report).toMatch(/diagnostic|passed|judge requests|spend/i);
+		expect(status.get("jevstice")).toContain("Checks: 1 passed");
+		expect(pi.messages).toEqual([]);
 	});
 });
 
@@ -848,16 +847,17 @@ describe("session accounting", () => {
 		expect(status).toMatch(/spend/i);
 	});
 
-	test("a session stop publishes one deduplicated status report", async () => {
+	test("turning checks off clears the footer and ordinary completion does not restore it", async () => {
 		const { pi } = controllerFor({ consult: { probability: 0.9 } });
-		const ctx = fakeCtx();
-		expect(toolFailed(await pi.callTool("jev_consult", consultParams(), ctx))).toBe(false);
-		pi.messages.length = 0;
+		const status = new Map<string, string | undefined>();
+		const ctx = fakeCtx({ setStatus: (key, text) => status.set(key, text) });
+		await pi.callTool("jev_consult", consultParams(), ctx);
+		expect(status.get("jevstice")).toContain("Checks: 1 passed");
 
-		await pi.emit("session_stop", stopEvent(), ctx);
+		pi.callCommand("jev", "off", ctx);
 		await pi.emit("session_stop", stopEvent(), ctx);
 
-		expect(pi.messages.filter(message => message.customType === "jev.status")).toHaveLength(1);
+		expect(status.get("jevstice")).toBeUndefined();
 	});
 
 	test("activity totals survive a mode round trip while findings do not", async () => {
@@ -888,8 +888,8 @@ describe("automatic evidence-based acceptance", () => {
 		};
 		const pi = fakePi();
 		let reports = 0;
-		pi.api.sendMessage = payload => {
-			if (asRecord(payload)?.["customType"] === "jev.acceptance") reports += 1;
+		pi.api.appendEntry = type => {
+			if (type === "jev.acceptance") reports += 1;
 		};
 		createJevController({ judge, config: config(), zod: fakeZod() }).register(pi.api);
 		const cwd = await fakeArtifacts({ "x-plan.md": PLAN_BODY });
@@ -900,6 +900,7 @@ describe("automatic evidence-based acceptance", () => {
 			await pi.emit("tool_result", toolResultEvent("bash", { command: "bun test" }, "1 pass, 0 fail: report records coverage"), ctx);
 			expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
 			expect(await until(() => reports === 2)).toBe(true);
+			expect(pi.messages).toEqual([]);
 			const result = await pi.callTool("jev_context", { action: "list" }, ctx);
 			expect(toolDetails(result)["acceptance"]).toEqual([
 				expect.objectContaining({ aspect: "business", approved: true }),
