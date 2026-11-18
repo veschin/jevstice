@@ -1,0 +1,19 @@
+Which ticket should a family buy for a day at the seaside?
+
+This is a controlled fictional fare packet. The operators, route, fares and notices are invented; make no claims about real transport. Use only the labeled source excerpts below. Do not browse or use the shell. You may use available read, write, edit and Jev tools.
+
+Two adults and two children (aged 4 and 11) want to travel from Millcross to the seaside town of Brinehaven and back on Saturday, 15 August 2026. Compare one standard same-day return per paying passenger on Gull Rail versus on Tern Coach. They can make the same trip on Wednesday, 19 August 2026 instead. Both options operate on both dates; assume the relevant tickets are available and the party travels together in both directions. No other fare products, fees, or discounts apply.
+
+Write report.md, a short family-facing note. For each day, give the two total return costs, the cheaper choice and by how much. Show how the children's fares enter each calculation. Explain why an advertised coach price might lead to the wrong Saturday answer. Attribute consequential fare and eligibility claims to the supplied source labels. Do not include tool logs or conversation in the report.
+
+[R1] Gull Rail standard fare table - issued 1 July 2026
+"Millcross-Brinehaven same-day returns cover the trip out and the trip back. Adult return: £18. Children aged 5 through 15 inclusive: £8 return. A child under 5 travels free when accompanied by a fare-paying adult. These fares apply every day."
+
+[C1] Tern Coach fare and age table - issued 1 July 2026
+"Millcross-Brinehaven standard same-day returns cover both directions. Adult return: £16. Children aged 5 through 15 inclusive: £7 return. A child under 5 travels free when accompanied by a fare-paying adult. See later operator notices for exceptions."
+
+[C2] Tern Coach summer weekend guide - published 5 July 2026
+"For two adults, one child under 5 and one child aged 5-15, the standard same-day return fare for the party is £39 on summer weekends."
+
+[C3] Tern Coach official correction to the summer weekend guide - issued 1 August 2026
+"For every Saturday and Sunday in August 2026, the under-5 exemption does not apply on Millcross-Brinehaven: children under 5 need the £7 child same-day return. This supersedes the £39 family example in the 5 July weekend guide. The adult and other child fares do not change. Monday to Friday, the fare and age rules in the 1 July table still apply."

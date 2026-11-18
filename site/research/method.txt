@@ -1,0 +1,21 @@
+Research case preregistration
+
+Design and sampling
+One controlled fictional fare packet. Three models, three repeats per model, one run per repeat with Jevstice available and one without; identical task text and no external sources. The experiment describes outcomes for this task only. A delivered nonempty report.md is scored even if partial or the process reports an error. Missing or empty report.md is a missing delivery (null), not a score of zero. Report missing counts independently.
+
+Answer key
+Both products cover both legs. The 4-year-old rides free on rail; the 11-year-old pays £8. The rail total is 2 × £18 + £8 = £44 on either date [R1]. On the base Saturday 15 August 2026, the coach correction requires both children to pay £7; the coach total is 2 × £16 + 2 × £7 = £46 [C1, C3]. Rail saves £2. The £39 advertised in [C2] reflects the pre-correction under-five exemption, not an available Saturday fare. On the alternate Wednesday 19 August 2026, the correction preserves the under-five exemption, so coach costs 2 × £16 + £7 = £39 [C1, C3]; it saves £5 against rail.
+
+Analysis plan: eight equally weighted checks (0 or 1 each)
+1. Rail: £44 for the base case and correct adult/child breakdown, with both legs covered by returns.
+2. Saturday coach: £46 with both children paying £7 and two adults paying £16; the quote or arithmetic must convey return coverage somewhere in the answer.
+3. Saturday choice: explicitly recommends rail and identifies a £2 saving.
+4. Source conflict: identifies [C2] as the superseded weekend guide and [C3] as the controlling correction; both source IDs (or unambiguous titles/dates) required.
+5. Wednesday coach: £39, based on 2 × £16 plus one £7 child fare with the 4-year-old free; correctly limits the changed rule to the relevant day.
+6. Wednesday choice: explicitly recommends coach against the unchanged £44 rail fare and identifies a £5 saving.
+7. Rail sourcing: accurate rail fare and age rules are attributable to [R1] (or its unambiguous title/date).
+8. Coach sourcing: [C1] supports the coach return prices and [C3] supports the changed age rule on Saturday and the preserved exemption on Wednesday (or unambiguous titles/dates); no incorrect attribution for those claims.
+Only the delivered report counts. Read it against the supplied source lines and recalculate totals and differences independently of Jev output. Formatting, prose style and tool use do not earn points. Contradictory assertions for the same case fail the affected check. Equivalent wording and arithmetic are accepted.
+
+Selection and evidence
+List all 18 planned trials. For each model and arm, sort scored deliveries by (score, repeat number); show the middle member (lower middle for an even count). With only one delivery, label it the sole scored run; with none, show no selected report. Off and on selections may be different repeats; the comparison is within the same model, not necessarily within the same repeat. Where a report exists, select a short verdict quotation and a short rule or arithmetic quotation when available, leaving out file paths, conversational text and tool logs. Preserve wording and flag omissions. For the social image, use the first model in the order GLM, Luna, Sol with both selected reports available; if none has both, show the first model with any selected report and disclose the missing arm.

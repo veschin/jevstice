@@ -1,0 +1,28 @@
+Admin benchmark: Night Harbor Dispatch
+
+Protocol
+Per model and arm, run this standalone brief three times against the same frozen fixture. Score the delivered index.html in a fresh offline Chromium context, 1440 × 1000 and 390 × 844 pixels, using only page controls for task actions. Inspect visible state after each action; DOM inspection is for finding controls and reading rendered evidence, not mutating the app or reading its storage. Do not repair generated artifacts before scoring. Visual design is shown, not subjectively scored.
+
+Reference operator script
+1. Read the night board and the manifest. Confirm the shift, berth limits and all six vessels; find Ibis and Kestrel Strait's overlap on A.
+2. Set berth A and expect exactly Kestrel Strait and Ibis in the manifest; clear it. Search "coastal" and expect exactly Ibis and Slate Runner. Use a no-match query to observe its empty state, then clear it.
+3. Select Kestrel Strait and try B. The 176 m vessel exceeds B's 150 m limit. Verify that it remains on A and the reason is visible; clear the selection.
+4. Search "coastal" again, select Ibis and Slate Runner, and try A. Ibis would still overlap Kestrel Strait. Both assignments must be unchanged and the overlap must be explained. Retain or reselect the same pair, then move them to B. Their time ranges touch, and Slate Runner ends when B's Gull of Elbe starts; neither is an overlap.
+5. Clear filters. Check the two changed rows, the B timeline, and the disappearance of the A overlap. Reload the page and verify both changed assignments survive.
+6. At 390 px, use a fresh context to search "slate" and reach the row-selection and bulk controls by scrolling within the page or within a labeled region.
+
+Ten binary checks (1 point each)
+F - Fixture: visible manifest agrees with all six rows' names, cargo, original berth, length and time range; all three berth limits agree with the brief.
+T - Timeline: position/width (or a column-span equivalent) encode time; Kestrel Strait crosses midnight once in lane A; an axis or day boundary visibly clarifies the day change.
+C - Conflict: initial overlap visibly identifies the Kestrel Strait + Ibis pair, directly or by marking both rows/blocks with an unambiguous conflict indication.
+Q - Filters: berth A and search "coastal" produce the specified manifest sets; no-match query gives a visible empty indication.
+S - Selection: can select the two requested vessel rows together with visible selection state or count and a bulk operation that shows its target.
+L - Length: attempting B for Kestrel Strait yields a visible capacity/length explanation (including the same reason if selection is disabled), and does not change the assignment.
+A - Atomic overlap rejection: attempting A for the pair explains the overlap and leaves both at original assignments; disabling A qualifies if the reason is shown.
+M - Valid move: both vessels move to B together, their rows and timeline update, they are not marked as conflicting, and the original overlap clears.
+P - Persistence: the two changed assignments remain visible after a same-origin reload of a successful move.
+N - Narrow viewport: no page-wide horizontal scrolling at 390 px; "slate" yields Slate Runner and row selection and the bulk reassignment controls are reachable.
+
+Scoring and reporting
+Only observed criterion passes earn points. An artifact that arrived but cannot render or function is scored on whatever can be observed, including zero. Absent deliveries or artifacts unsafe to open are marked separately as missing/unscorable (null), never as zero. Timeline and mobile checks may use a second context without requiring desktop workflow success. A blocked earlier step is not itself a later pass; attempt later checks independently if page controls permit.
+For each model and arm, sort scored runs by score, then repeat number, ascending; choose the lower middle run (index floor((n−1)/2)). With no scored run there is no representative. Capture initial desktop and furthest verified operator-script state, or label a capture if the script stalls. Feature the first model in display order with both arms represented (GLM, Luna, Sol); compare like capture states for the social plate, preferring both post-move when verified, otherwise both initial. These are task-specific observations, not statistical or causal claims.

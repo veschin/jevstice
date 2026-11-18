@@ -1,0 +1,20 @@
+Stained-glass butterfly - scoring protocol
+
+Design
+Three models, three paired repeats per model. Each pair receives the same frozen brief (brief.txt); one OMP session loads Jevstice and one does not. The only scored output is work/index.html. Ignore the agent's final message and all Jevstice judgments. A run can deliver an artifact even if the process did not exit normally.
+
+Browser procedure
+Use a fresh Chromium page for each phase, 1280 × 960 at 1× device scale, with no external network or local filesystem access from the artifact. Inspect the rendered UI; do not read its state variables or call game APIs. Photograph the initial state. Click the geometric center of the upper-right board tile once (its required initial offset is 270° clockwise). Photograph the result. On a fresh load, click a different tile (upper left); verify the result is not complete, the upper-left art actually rotates, and the reference art does not. Test Reset on that perturbed board. Allow design transitions to settle before comparing. Use equal-scale images at each checkpoint. Screenshots may be resized or annotated outside the browser, but annotation must not obscure the defect or alter the puzzle pixels.
+
+Eight binary criteria (one point per pass)
+1. Two fixed 2 × 2 layouts of square quadrants sit side by side at 1280 × 960, with board and reference tile sizes within 2 CSS pixels. The solved reference is visually distinct from the board, and does not rotate on interaction.
+2. In the reference, four recognizable and individually asymmetric wing lobes meet one central vertical butterfly body. They are distinct by shape and visible colored glass panes divided by dark leading: violet upper-left, teal upper-right, ruby lower-left and cobalt lower-right.
+3. The solved reference has one golden eye or crescent in the upper-right teal tile, above and to the right of that tile's center, with no matching golden eye in another wing tile.
+4. At load the upper-right board tile is the same reference art turned exactly one counterclockwise quarter-turn (gold feature moves to upper left). The other three tiles and body agree with the reference, and the UI is not complete. Count as one only if all these observations hold.
+5. One click at the upper-right board tile's center rotates that tile clockwise by 90° and brings all four wings into visual alignment with the reference.
+6. That one correct click produces a distinct visible completion message; clicking upper left from a fresh load does not produce a completion message.
+7. Clicking upper left from a fresh load rotates its artwork by one clockwise quarter-turn; the reference and other three board tiles are unchanged.
+8. Reset restores the startup orientation from the perturbed board and clears the completed state if present. Compare with the original screenshot; incidental hover/focus styling does not count as a changed tile.
+
+Analysis and selection
+Publish each point vector in criterion order alongside its sum / 8. A missing or empty artifact is a missing delivery, scored null (not zero). An existing artifact that fails to render or implement a check scores zero for the failed check. Mark capture infrastructure failures separately from artifact failures. Select each model × arm's observed lower median score (with three deliveries the middle score; with two the lower score). Select the lowest repeat number attaining that score. No delivery means no representative. Publish the two selected arms side by side; they may come from different repeats. Social plate: among models with two representatives, select the greatest absolute arm score gap, breaking ties GLM, Luna, Sol. If no model has both, do not advertise an observed pair. Missing deliveries remain visible in the raw table. This descriptive comparison cannot establish significance or the cause of any difference; aesthetics beyond the specified visible properties are not scored.

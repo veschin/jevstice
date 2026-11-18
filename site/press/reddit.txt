@@ -1,7 +1,7 @@
-I asked for a low-poly cone. Here are the ships my coding agent built with and without Jevstice.
+I gave three coding models the same briefs with and without Jevstice. One butterfly declared itself complete with its wings piled on top of each other.
 
-I built Jevstice for oh-my-pi so I could see which parts of an agent's work a second model could verify. For this comparison I gave DeepSeek Flash the same game brief twice. Both games ran. Without the extension, the ship looked like a disc; with it, the ship had the pointed profile I asked for. That run took 613 seconds instead of 397.
+Jevstice is my oh-my-pi plugin. It gives the agent a second opinion while it works. I tested it on a stained-glass game, a harbor dispatch desk and a family train-or-coach fare question. GLM 5.3 Flash max, GPT-6 Luna high and GPT-6.2 Sol medium each got three attempts per brief in each condition.
 
-The screenshots show a difference, but they don't tell us what caused it. On a separate editing task, both drafts met all seven criteria. Jevstice recorded that it couldn't judge the final outcome from the evidence it had.
+The clip shows repeat three. Without Jevstice, Luna put all four wings in the same spot on its target. With Jevstice it produced a playable match. Sol went the other way: its version with the plugin put the target on top of the controls.
 
-The paired screenshots, prompts and recordings are here: https://veschin.github.io/jevstice/
+The models wrote 23 of 27 requested files without the plugin and 19 of 27 with it before the deadline. The full comparison includes missing files, median examples, every score and the token and judge-call ledger: https://veschin.github.io/jevstice/

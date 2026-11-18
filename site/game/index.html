@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A butterfly tile puzzle, generated in 18 matched oh-my-pi runs and scored by visible browser checks.">
+  <meta property="og:title" content="The Glasswing | Jevstice">
+  <meta property="og:image" content="https://veschin.github.io/jevstice/game/pair.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <title>The Glasswing | Jevstice</title>
+  <link rel="stylesheet" href="../fonts.css">
+  <link rel="stylesheet" href="game.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to the game comparison</a>
+  <header>
+    <nav aria-label="Sections"><a href="../#introduction">Introduction</a><a href="../game/" aria-current="page">Game</a><a href="../admin/">Admin</a><a href="../research/">Research</a><a href="../features/">Tools</a></nav>
+    <h1>The Glasswing</h1>
+    <p class="dek">The brief called for a butterfly with one wing turned the wrong way. A single click on the teal tile should move its golden spot from above and left of center to above and right of center, matching the fixed target.</p>
+    <p class="jump"><a href="#pairs">Representative runs</a><a href="#runs">All 18 results</a><a href="brief.txt">Frozen brief</a><a href="method.txt">Scoring protocol</a></p>
+  </header>
+  <main id="main">
+    <figure class="cover"><a href="pair.png"><img src="pair.png" width="1200" height="630" alt="GPT-6.2 Sol: without Jevstice, 8/8. The displaced gold crescent moves to the upper right and the wing rejoins the butterfly. The completion message appears; Reset restores the displayed mismatch. With Jevstice, 2/8. Board and Target occupy the same space and their headings overlap. The visible target covers the playable butterfly; clicks on the upper tile centers reveal no rotation or completion, and Reset cannot be verified."></a><figcaption>GPT-6.2 Sol had the largest gap between representative scores. <span>Browser crops before and after one upper-right click. Open the filmstrips for full frames.</span></figcaption></figure>
+    <section id="body-check" aria-labelledby="body-check-title">
+      <h2 id="body-check-title">Two faults you can see</h2>
+      <div class="plates">
+        <figure>
+          <figcaption>GPT-6 Luna, without Jevstice <span>Repeat 1 · after the upper-right click</span></figcaption>
+          <a href="frames/luna-1-off.webp"><img src="luna-target-body.webp" width="1020" height="615" loading="lazy" alt="The board has a gold butterfly body above the wings' meeting point. The target has the same four wings but no body."></a>
+          <p>Four wings match. The page says the specimen is complete, but the target omits the body visible on the board.</p>
+        </figure>
+        <figure>
+          <figcaption>GPT-6.2 Sol, with Jevstice <span>Repeat 3 · at load</span></figcaption>
+          <a href="frames/sol-3-on.webp"><img src="sol-overlap.webp" width="1020" height="715" loading="lazy" alt="The Board and Target headings are drawn on top of each other. Only one butterfly is visible."></a>
+          <p>The Board and Target overlap. One upper-right click leaves the visible picture unchanged and never shows completion.</p>
+        </figure>
+      </div>
+      <p class="note">These are individual runs. The comparisons below use the middle score in each arm.</p>
+    </section>
+    <section id="pairs" aria-labelledby="pair-title">
+      <h2 id="pair-title">Representative runs</h2>
+      <p>Each column shows the run with its arm's middle score. We used the lower score when there were two deliveries and the earliest repeat among ties. The two columns can show different repeats.</p>
+      <p class="jump"><a href="#glm">GLM</a><a href="#luna">Luna</a><a href="#sol">Sol</a></p>
+    </section>
+    <section id="glm" aria-labelledby="glm-title">
+      <h2 id="glm-title">GLM 5.3 Flash</h2>
+      <div class="plates">
+        <figure>
+          <figcaption>Without Jevstice <span>Repeat 1 · 8/8</span></figcaption>
+          <a href="frames/glm-1-off.webp"><img src="frames/glm-1-off.webp" width="1280" height="1638" loading="lazy" alt="Five GLM browser frames showing the gold eye turn toward the target, completion, an upper-left click, and both resets."></a>
+          <p>The displaced wing rejoins the butterfly after one click. Reset restores the opening position.</p>
+        </figure>
+        <p>With Jevstice: No delivery in three repeats.</p>
+      </div>
+    </section>
+    <section id="luna" aria-labelledby="luna-title">
+      <h2 id="luna-title">GPT-6 Luna</h2>
+      <div class="plates">
+        <figure>
+          <figcaption>Without Jevstice <span>Repeat 1 · 5/8</span></figcaption>
+          <a href="frames/luna-1-off.webp"><img src="frames/luna-1-off.webp" width="1280" height="1638" loading="lazy" alt="Five Luna browser frames showing the four wings align while the target still lacks the butterfly body."></a>
+          <p>The target has no body, and its gold eye sits at the teal tile's horizontal midpoint. The game announces completion after one click.</p>
+        </figure>
+        <figure>
+          <figcaption>With Jevstice <span>Repeat 2 · 8/8</span></figcaption>
+          <a href="frames/luna-2-on.webp"><img src="frames/luna-2-on.webp" width="1280" height="1638" loading="lazy" alt="Five Luna browser frames showing the golden spot move from upper left to upper right and the completed board match the target."></a>
+          <p>The displaced gold spot moves to the upper right and the board matches the target. Both Reset checks restore the opening state.</p>
+        </figure>
+      </div>
+    </section>
+    <section id="sol" aria-labelledby="sol-title">
+      <h2 id="sol-title">GPT-6.2 Sol</h2>
+      <div class="plates">
+        <figure>
+          <figcaption>Without Jevstice <span>Repeat 1 · 8/8</span></figcaption>
+          <a href="frames/sol-1-off.webp"><img src="frames/sol-1-off.webp" width="1280" height="1638" loading="lazy" alt="Five Sol browser frames showing the golden crescent turn into place, completion, and the opening state restored by Reset."></a>
+          <p>The golden crescent moves to the upper right and the wing rejoins the butterfly. Reset restores the opening position.</p>
+        </figure>
+        <figure>
+          <figcaption>With Jevstice <span>Repeat 3 · 2/8</span></figcaption>
+          <a href="frames/sol-3-on.webp"><img src="frames/sol-3-on.webp" width="1280" height="1638" loading="lazy" alt="Five Sol browser frames with the Board and Target overlapping. The visible butterfly does not rotate after either click."></a>
+          <p>The target covers the board. Neither click visibly rotates a wing, and Reset cannot be verified.</p>
+        </figure>
+      </div>
+    </section>
+    <section id="runs" aria-labelledby="run-title">
+      <h2 id="run-title">All 18 results</h2>
+      <p>We scored the delivered pages in isolated Chromium sessions using mouse clicks and visible evidence. Jevstice's own findings did not enter the score. The table lists each check in order: <code>1</code> passes and <code>0</code> fails.</p>
+      <p><strong>12 of 18 runs delivered a game.</strong> The remaining 6 runs produced no <code>index.html</code> and have no score. In the GLM sessions with Jevstice, none of the three runs delivered a game.</p>
+      <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable game results table">
+        <table>
+          <thead><tr><th scope="col">Model</th><th scope="col">Repeat</th><th scope="col">Jevstice</th><th scope="col">Score</th><th scope="col">Checks 1-8</th><th scope="col">Browser record</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">GLM 5.3 Flash</th><td>1</td><td>Off</td><td>8/8</td><td><code>1 1 1 1 1 1 1 1</code></td><td><a href="frames/glm-1-off.webp" aria-label="GLM 5.3 Flash repeat 1, Without Jevstice: browser filmstrip">Filmstrip</a></td></tr>
+            <tr><th scope="row">GLM 5.3 Flash</th><td>1</td><td>On</td><td>Missing</td><td>-</td><td>-</td></tr>
+            <tr><th scope="row">GLM 5.3 Flash</th><td>2</td><td>Off</td><td>Missing</td><td>-</td><td>-</td></tr>
+            <tr><th scope="row">GLM 5.3 Flash</th><td>2</td><td>On</td><td>Missing</td><td>-</td><td>-</td></tr>
+            <tr><th scope="row">GLM 5.3 Flash</th><td>3</td><td>Off</td><td>Missing</td><td>-</td><td>-</td></tr>
+            <tr><th scope="row">GLM 5.3 Flash</th><td>3</td><td>On</td><td>Missing</td><td>-</td><td>-</td></tr>
+            <tr><th scope="row">GPT-6 Luna</th><td>1</td><td>Off</td><td>5/8</td><td><code>1 0 0 0 1 1 1 1</code></td><td><a href="frames/luna-1-off.webp" aria-label="GPT-6 Luna repeat 1, Without Jevstice: browser filmstrip">Filmstrip</a></td></tr>
+            <tr><th scope="row">GPT-6 Luna</th><td>1</td><td>On</td><td>4/8</td><td><code>1 0 0 0 0 1 1 1</code></td><td><a href="frames/luna-1-on.webp" aria-label="GPT-6 Luna repeat 1, With Jevstice: browser filmstrip">Filmstrip</a></td></tr>
+            <tr><th scope="row">GPT-6 Luna</th><td>2</td><td>Off</td><td>8/8</td><td><code>1 1 1 1 1 1 1 1</code></td><td><a href="frames/luna-2-off.webp" aria-label="GPT-6 Luna repeat 2, Without Jevstice: browser filmstrip">Filmstrip</a></td></tr>
+            <tr><th scope="row">GPT-6 Luna</th><td>2</td><td>On</td><td>8/8</td><td><code>1 1 1 1 1 1 1 1</code></td><td><a href="frames/luna-2-on.webp" aria-label="GPT-6 Luna repeat 2, With Jevstice: browser filmstrip">Filmstrip</a></td></tr>
+            <tr><th scope="row">GPT-6 Luna</th><td>3</td><td>Off</td><td>3/8</td><td><code>0 0 0 0 0 1 1 1</code></td><td><a href="frames/luna-3-off.webp" aria-label="GPT-6 Luna repeat 3, Without Jevstice: browser filmstrip">Filmstrip</a></td></tr>
+            <tr><th scope="row">GPT-6 Luna</th><td>3</td><td>On</td><td>8/8</td><td><code>1 1 1 1 1 1 1 1</code></td><td><a href="frames/luna-3-on.webp" aria-label="GPT-6 Luna repeat 3, With Jevstice: browser filmstrip">Filmstrip</a></td></tr>
+            <tr><th scope="row">GPT-6.2 Sol</th><td>1</td><td>Off</td><td>8/8</td><td><code>1 1 1 1 1 1 1 1</code></td><td><a href="frames/sol-1-off.webp" aria-label="GPT-6.2 Sol repeat 1, Without Jevstice: browser filmstrip">Filmstrip</a></td></tr>
+            <tr><th scope="row">GPT-6.2 Sol</th><td>1</td><td>On</td><td>Missing</td><td>-</td><td>-</td></tr>
+            <tr><th scope="row">GPT-6.2 Sol</th><td>2</td><td>Off</td><td>8/8</td><td><code>1 1 1 1 1 1 1 1</code></td><td><a href="frames/sol-2-off.webp" aria-label="GPT-6.2 Sol repeat 2, Without Jevstice: browser filmstrip">Filmstrip</a></td></tr>
+            <tr><th scope="row">GPT-6.2 Sol</th><td>2</td><td>On</td><td>8/8</td><td><code>1 1 1 1 1 1 1 1</code></td><td><a href="frames/sol-2-on.webp" aria-label="GPT-6.2 Sol repeat 2, With Jevstice: browser filmstrip">Filmstrip</a></td></tr>
+            <tr><th scope="row">GPT-6.2 Sol</th><td>3</td><td>Off</td><td>8/8</td><td><code>1 1 1 1 1 1 1 1</code></td><td><a href="frames/sol-3-off.webp" aria-label="GPT-6.2 Sol repeat 3, Without Jevstice: browser filmstrip">Filmstrip</a></td></tr>
+            <tr><th scope="row">GPT-6.2 Sol</th><td>3</td><td>On</td><td>2/8</td><td><code>0 1 1 0 0 0 0 0</code></td><td><a href="frames/sol-3-on.webp" aria-label="GPT-6.2 Sol repeat 3, With Jevstice: browser filmstrip">Filmstrip</a></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+    <section id="scoring" aria-labelledby="scoring-title">
+      <h2 id="scoring-title">What counted</h2>
+      <ol class="key">
+        <li><strong>Scale.</strong> Two side-by-side 2 × 2 pictures at the same scale, one a fixed target.</li>
+        <li><strong>Wings.</strong> Four asymmetric glass lobes (violet, teal, ruby, cobalt) meet one vertical body.</li>
+        <li><strong>Gold.</strong> One gold eye or crescent above and right of the teal target tile's center.</li>
+        <li><strong>Start.</strong> Only the teal tile is off by one counterclockwise turn. The game is incomplete.</li>
+        <li><strong>Solution.</strong> One click on the teal tile rotates it clockwise and aligns all four wings.</li>
+        <li><strong>Completion.</strong> The upper-right click shows completion; the upper-left click from a fresh load does not.</li>
+        <li><strong>Wrong tile.</strong> The upper-left click rotates only that tile, clockwise. The target stays fixed.</li>
+        <li><strong>Reset.</strong> Reset restores the starting position and clears any completion message.</li>
+      </ol>
+      <p class="note">The scores describe these deliveries. Three repeats per model do not establish a general improvement or identify the cause of a difference.</p>
+    </section>
+  </main>
+  <footer><a href="../#introduction">Back to Jevstice</a><a href="results.json">Download the run scores</a><a href="../ledger/">Token and tool-call ledger</a></footer>
+</body>
+</html>

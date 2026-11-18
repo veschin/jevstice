@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Compare generated overnight harbor dispatch consoles against a fixed fixture and a ten-point browser test.">
+<title>Night Harbor Dispatch | Jevstice</title>
+<link rel="stylesheet" href="../fonts.css">
+<link rel="stylesheet" href="../front.css">
+<style>
+  body{padding-bottom:1rem}
+  h1,h2,h3{font-family:Fraunces,Georgia,serif;font-weight:560;line-height:1.06;letter-spacing:-.03em;text-wrap:balance}
+  h1{font-size:clamp(2.7rem,7vw,5.5rem);margin:0}
+  h2{font-size:clamp(2rem,4vw,3.35rem);margin:0 0 .55rem}
+  h3{font-size:clamp(1.55rem,3vw,2.15rem);margin:0 0 .5rem}
+  p,li{font-size:1.23rem;line-height:1.4}
+  p{max-width:62ch;margin:.55em 0}
+  .mast{margin-bottom:clamp(2rem,5vw,4rem)}
+  .imprint{margin-bottom:.6rem}
+  .opening{display:grid;gap:clamp(1rem,5vw,4rem);align-items:end;grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr);margin-bottom:1.6rem}
+  .opening p{margin:0;max-width:38ch;font-size:clamp(1.2rem,2.25vw,1.5rem)}
+  section{padding:clamp(1.4rem,4vw,2.7rem) 0}
+  main>section{border-top:1px solid var(--ink)}
+  .meta,.jump,caption,th,summary,.plate-note{font:600 .85rem/1.45 system-ui,sans-serif}
+  .jump{display:flex;flex-wrap:wrap;gap:.35rem 1.45rem;margin:1rem 0 1.5rem}
+  .jump a{color:var(--red)}
+  .matched article{border-top:1px solid var(--line);padding:1.45rem 0 1.2rem}
+  .matched article:last-child{padding-bottom:0}
+  .plates{gap:.75rem}
+  .plates figure{min-width:0}
+  .plates figcaption{padding:0 0 .5rem;color:var(--muted);display:block}
+  .plates figcaption strong{font-weight:700;color:var(--ink);display:block}
+  .plates img,.walk img{border:1px solid var(--line);height:auto;width:100%;display:block}
+  .plates img{aspect-ratio:1440/1000;object-fit:cover;object-position:top}
+  .plates .missing{padding:1rem;border:1px solid var(--line);font-size:1.05rem;margin:0}
+  .walk{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,14rem),1fr));gap:.8rem;padding:0;list-style:none;margin:1rem 0}
+  .walk figure{margin:0}
+  .walk img{aspect-ratio:1440/1000;object-fit:cover;object-position:top}
+  .walk figcaption{margin:.42rem 0 0;font:500 .8rem/1.4 system-ui,sans-serif}
+  .how{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:1.5rem 4rem}
+  .how ol{margin:.65rem 0;padding-left:1.3em}
+  .how li+li{margin-top:.4rem}
+  .table-wrap{overflow-x:auto;margin:1.3rem 0 .7rem}
+  table{width:100%;border-collapse:collapse;font-size:1.13rem;font-variant-numeric:tabular-nums;min-width:31rem}
+  caption{text-align:left;padding:0 0 .6rem;color:var(--muted)}
+  th,td{text-align:left;padding:.5rem .75rem .5rem 0;border-bottom:1px solid var(--line);vertical-align:baseline}
+  thead th{border-bottom:1px solid var(--ink)}
+  tbody+tbody tr:first-child>*{border-top:2px solid var(--ink)}
+  td code{font: .86rem ui-monospace,monospace;white-space:normal}
+  .missing{color:var(--muted)}
+  .small{font-size:1.08rem;color:var(--muted)}
+  @media(max-width:700px){.opening,.how{grid-template-columns:1fr;gap:.75rem}.plates figcaption{min-height:3.5em}.plates{gap:.4rem}th,td{padding-right:.5rem}}
+</style>
+</head>
+<body>
+<a href="#main" class="skip">Skip to the dispatch benchmark</a>
+<header class="mast">
+  <div class="imprint"><span>Jevstice / Matched runs</span><a href="https://github.com/veschin/jevstice">GitHub repository</a></div>
+  <nav aria-label="Sections"><a href="../#introduction">Introduction</a><a href="../game/">Game</a><a href="../admin/" aria-current="page">Admin</a><a href="../research/">Research</a><a href="../features/">Features</a></nav>
+</header>
+<main id="main">
+  <div class="opening">
+    <h1>Night Harbor Dispatch</h1>
+    <p>Two freighters need a new berth. The dispatch console must reject a vessel that is too long, leave both assignments untouched after an overlapping move, and save the valid move across a reload.</p>
+  </div>
+  <nav class="jump" aria-label="On this page"><a href="#operator">Operator script</a><a href="#gallery">Median gallery</a><a href="#scores">All 18 scores</a></nav>
+  <p><strong>Both Luna and Sol scored 10/10 on every repeat, with and without Jevstice.</strong> GLM delivered one console in six attempts. It completed the workflow but changed three time ranges from the fixture.</p>
+  <section aria-labelledby="walk-title"><h2 id="walk-title">At the dispatch desk</h2><p>Browser captures from GPT-6 Luna, repeat 2, without jevstice. Select a frame for the full-size capture.</p><ol class="walk"><li><figure><a href="luna-2-off-length.webp"><img src="luna-2-off-length.webp" width="1440" height="1157" alt="Rejected move to B: Kestrel Strait exceeds 150 m"></a><figcaption>Rejected move to B: Kestrel Strait exceeds 150 m</figcaption></figure></li><li><figure><a href="luna-2-off-selected.webp"><img src="luna-2-off-selected.webp" width="1440" height="1000" alt="Ibis and Slate Runner selected together"></a><figcaption>Ibis and Slate Runner selected together</figcaption></figure></li><li><figure><a href="luna-2-off-overlap.webp"><img src="luna-2-off-overlap.webp" width="1440" height="1000" alt="Rejected move to A: Ibis overlaps Kestrel Strait"></a><figcaption>Rejected move to A: Ibis overlaps Kestrel Strait</figcaption></figure></li><li><figure><a href="luna-2-off-unfiltered.webp"><img src="luna-2-off-unfiltered.webp" width="1440" height="1157" alt="After the valid move: Ibis and Slate Runner on B"></a><figcaption>After the valid move: Ibis and Slate Runner on B</figcaption></figure></li><li><figure><a href="luna-2-off-reloaded.webp"><img src="luna-2-off-reloaded.webp" width="1440" height="1120" alt="After reload: both vessels still on B"></a><figcaption>After reload: both vessels still on B</figcaption></figure></li></ol></section>
+  <p class="meta"><a href="luna-2-off-phone.webp">390 px capture: Slate Runner selected, with the bulk move controls visible</a></p>
+  <section class="matched" id="gallery" aria-labelledby="gallery-title">
+    <h2 id="gallery-title">Median gallery</h2>
+    <p>Three repeats per model and condition. Each plate shows the lower middle scored run for its condition, ordered by score and then by repeat number.</p>
+    <nav class="jump" aria-label="Models"><a href="#glm">GLM</a><a href="#luna">Luna</a><a href="#sol">Sol</a></nav>
+    <article id="glm" aria-labelledby="glm-title"><h3 id="glm-title">GLM 5.3 Flash</h3><div class="plates"><figure><figcaption><strong>Without Jevstice</strong>Repeat 2 · 9/10 · Initial dispatch board</figcaption><a href="glm-2-off-initial.webp"><img src="glm-2-off-initial.webp" width="1440" height="1550" alt="Initial dispatch board from GLM 5.3 Flash, repeat 2, without jevstice." loading="lazy"></a><p class="plate-note"><a href="glm-2-off-reloaded.webp">After reload: both vessels still on B</a></p></figure><figure><figcaption><strong>With Jevstice</strong></figcaption><p class="missing">No scored run in this condition.</p></figure></div></article>
+    <article id="luna" aria-labelledby="luna-title"><h3 id="luna-title">GPT-6 Luna</h3><div class="plates"><figure><figcaption><strong>Without Jevstice</strong>Repeat 2 · 10/10 · After the valid move: Ibis and Slate Runner on B</figcaption><a href="luna-2-off-unfiltered.webp"><img src="luna-2-off-unfiltered.webp" width="1440" height="1157" alt="After the valid move: Ibis and Slate Runner on B from GPT-6 Luna, repeat 2, without jevstice." loading="lazy"></a><p class="plate-note"><a href="luna-2-off-initial.webp">Initial dispatch board</a> · <a href="luna-2-off-reloaded.webp">After reload: both vessels still on B</a></p></figure><figure><figcaption><strong>With Jevstice</strong>Repeat 2 · 10/10 · After the valid move: Ibis and Slate Runner on B</figcaption><a href="luna-2-on-unfiltered.webp"><img src="luna-2-on-unfiltered.webp" width="1440" height="1434" alt="After the valid move: Ibis and Slate Runner on B from GPT-6 Luna, repeat 2, with jevstice." loading="lazy"></a><p class="plate-note"><a href="luna-2-on-initial.webp">Initial dispatch board</a> · <a href="luna-2-on-reloaded.webp">After reload: both vessels still on B</a></p></figure></div></article>
+    <article id="sol" aria-labelledby="sol-title"><h3 id="sol-title">GPT-6.2 Sol</h3><div class="plates"><figure><figcaption><strong>Without Jevstice</strong>Repeat 2 · 10/10 · After the valid move: Ibis and Slate Runner on B</figcaption><a href="sol-2-off-unfiltered.webp"><img src="sol-2-off-unfiltered.webp" width="1440" height="1068" alt="After the valid move: Ibis and Slate Runner on B from GPT-6.2 Sol, repeat 2, without jevstice." loading="lazy"></a><p class="plate-note"><a href="sol-2-off-initial.webp">Initial dispatch board</a> · <a href="sol-2-off-reloaded.webp">After reload: both vessels still on B</a></p></figure><figure><figcaption><strong>With Jevstice</strong>Repeat 2 · 10/10 · After the valid move: Ibis and Slate Runner on B</figcaption><a href="sol-2-on-unfiltered.webp"><img src="sol-2-on-unfiltered.webp" width="1440" height="1079" alt="After the valid move: Ibis and Slate Runner on B from GPT-6.2 Sol, repeat 2, with jevstice." loading="lazy"></a><p class="plate-note"><a href="sol-2-on-initial.webp">Initial dispatch board</a> · <a href="sol-2-on-reloaded.webp">After reload: both vessels still on B</a></p></figure></div></article>
+    <p class="meta"><a href="pair.png">Download the side-by-side comparison (PNG)</a></p>
+    <p class="small">In Luna's median run with Jevstice, the header still read “01 UNASSIGNED” after the move and after reload. The schedule showed “UNASSIGNED (0) None,” and both moved vessels appeared on B. The rubric did not score the header count.</p>
+    <p class="small">GLM's only delivery showed Ibis departing at 00:50 instead of 01:10, Slate Runner at 00:50–01:00 instead of 01:10–02:00, and Gull of Elbe arriving at 01:00 instead of 02:00. The five other GLM runs reached the time limit without writing an artifact.</p>
+  </section>
+  <section class="how" id="operator" aria-labelledby="operator-title">
+    <div>
+      <h2 id="operator-title">Operator script</h2>
+      <p>The shift runs from 22:00 to 06:00. Ibis overlaps Kestrel Strait at North Quay (A). Slate Runner starts without a berth. Floodgate Pier (B) accepts vessels up to 150 m.</p>
+      <p class="meta"><a href="brief.txt">Frozen prompt and fixture</a> · <a href="method.txt">Preregistered scoring method</a></p>
+    </div>
+    <ol>
+      <li>Verify the fixture and overlap. Filter to berth A, then search for Coastal freight and test a search with no matches.</li>
+      <li>Try moving Kestrel Strait to B. Its 176 m length exceeds that berth's limit.</li>
+      <li>Select Ibis and Slate Runner together. Try moving them to A. The overlap must block both changes.</li>
+      <li>Move the same pair to B. Their reservations touch without overlapping. Clear the filters, verify the schedule and reload.</li>
+      <li>On a phone-sized viewport, search for Slate Runner and reach the row selection and bulk move controls.</li>
+    </ol>
+  </section>
+  <section id="scores" aria-labelledby="scores-title">
+    <h2 id="scores-title">All 18 scores</h2>
+    <p>One point per passed check. A missing or unscorable delivery has no score. See the <a href="method.txt">preregistered criteria</a> for what counts as a pass and the <a href="../ledger/">run ledger</a> for token and tool-call counts.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Admin scores">
+      <table>
+        <caption>Run-level results. <a href="results.json">Machine-readable results</a>.</caption>
+        <thead><tr><th scope="col">Model</th><th scope="col">Repeat</th><th scope="col">Jevstice</th><th scope="col">Score</th><th scope="col">Checks passed</th></tr></thead>
+        <tbody><tr><th scope="row"><a href="#glm">GLM 5.3 Flash</a></th><td>1</td><td>Off</td><td>Missing</td><td>Not scored</td></tr><tr><th scope="row"><a href="#glm">GLM 5.3 Flash</a></th><td>1</td><td>On</td><td>Missing</td><td>Not scored</td></tr><tr><th scope="row"><a href="#glm">GLM 5.3 Flash</a></th><td>2</td><td>Off</td><td>9/10</td><td><code>TCQSLAMPN</code></td></tr><tr><th scope="row"><a href="#glm">GLM 5.3 Flash</a></th><td>2</td><td>On</td><td>Missing</td><td>Not scored</td></tr><tr><th scope="row"><a href="#glm">GLM 5.3 Flash</a></th><td>3</td><td>Off</td><td>Missing</td><td>Not scored</td></tr><tr><th scope="row"><a href="#glm">GLM 5.3 Flash</a></th><td>3</td><td>On</td><td>Missing</td><td>Not scored</td></tr></tbody>
+        <tbody><tr><th scope="row"><a href="#luna">GPT-6 Luna</a></th><td>1</td><td>Off</td><td>10/10</td><td><code>FTCQSLAMPN</code></td></tr><tr><th scope="row"><a href="#luna">GPT-6 Luna</a></th><td>1</td><td>On</td><td>10/10</td><td><code>FTCQSLAMPN</code></td></tr><tr><th scope="row"><a href="#luna">GPT-6 Luna</a></th><td>2</td><td>Off</td><td>10/10</td><td><code>FTCQSLAMPN</code></td></tr><tr><th scope="row"><a href="#luna">GPT-6 Luna</a></th><td>2</td><td>On</td><td>10/10</td><td><code>FTCQSLAMPN</code></td></tr><tr><th scope="row"><a href="#luna">GPT-6 Luna</a></th><td>3</td><td>Off</td><td>10/10</td><td><code>FTCQSLAMPN</code></td></tr><tr><th scope="row"><a href="#luna">GPT-6 Luna</a></th><td>3</td><td>On</td><td>10/10</td><td><code>FTCQSLAMPN</code></td></tr></tbody>
+        <tbody><tr><th scope="row"><a href="#sol">GPT-6.2 Sol</a></th><td>1</td><td>Off</td><td>10/10</td><td><code>FTCQSLAMPN</code></td></tr><tr><th scope="row"><a href="#sol">GPT-6.2 Sol</a></th><td>1</td><td>On</td><td>10/10</td><td><code>FTCQSLAMPN</code></td></tr><tr><th scope="row"><a href="#sol">GPT-6.2 Sol</a></th><td>2</td><td>Off</td><td>10/10</td><td><code>FTCQSLAMPN</code></td></tr><tr><th scope="row"><a href="#sol">GPT-6.2 Sol</a></th><td>2</td><td>On</td><td>10/10</td><td><code>FTCQSLAMPN</code></td></tr><tr><th scope="row"><a href="#sol">GPT-6.2 Sol</a></th><td>3</td><td>Off</td><td>10/10</td><td><code>FTCQSLAMPN</code></td></tr><tr><th scope="row"><a href="#sol">GPT-6.2 Sol</a></th><td>3</td><td>On</td><td>10/10</td><td><code>FTCQSLAMPN</code></td></tr></tbody>
+      </table>
+    </div>
+    <p class="small">F fixture · T timeline · C initial conflict · Q filters · S bulk selection · L length rejection · A atomic overlap rejection · M successful move · P persistence · N narrow viewport</p>
+  </section>
+</main>
+<footer><a href="../#introduction">Back to Introduction</a><a href="../features/">Inspect the Jevstice tools</a></footer>
+</body>
+</html>
