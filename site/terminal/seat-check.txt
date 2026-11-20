@@ -1,4 +1,4 @@
-Booking desk checks (separate from Luna's development run)
+Booking desk checks (separate from the development run)
 
 Question
 I am updating the booking desk notice for this workshop pilot. How many seats does North offer, and how many does South offer? The signed pilot policy is authoritative.

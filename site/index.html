@@ -4,7 +4,7 @@
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>Jevstice</title>
-	<meta name="description" content="Turn through Luna's booking drafts and see what Jev checked against the brief, the plan, and the studio policy.">
+	<meta name="description" content="See how Jevstice checks an agent's requirements, plan, and work against what you asked for.">
 	<meta property="og:image" content="https://veschin.github.io/jevstice/judge.webp">
 	<meta name="twitter:card" content="summary_large_image">
 	<link rel="stylesheet" href="bootstrap.min.css">
@@ -39,8 +39,8 @@
 						<section id="introduction" class="broadside story-section" tabindex="-1">
 							<div class="intro-body">
 								<h2>What is Jevstice?</h2>
-								<p class="lede">In oh-my-pi, one model writes the code. Jev gives its work a second reading.</p>
-								<p class="body-copy">Jevstice lets the assistant send a plan, a change or a claim to Jev, a separate model from TypeSafe. Its findings appear in the terminal without stopping the work.</p>
+								<p class="lede">Jevstice is an oh-my-pi addon that checks whether the agent understood your request and built what you asked for.</p>
+								<p class="body-copy">Jev compares the agent's decisions with the request, plan, and evidence from the session. Its findings appear in the terminal without stopping the work.</p>
 							</div>
 							<svg class="seal" viewBox="0 0 240 240" aria-hidden="true" focusable="false">
 								<defs>
@@ -67,14 +67,14 @@
 
 				<section id="examples" class="examples story-section" tabindex="-1">
 					<h2>Examples</h2>
-					<p class="copy">GPT-6 Luna and GPT-6 Sol each added a second studio to a booking service. Each model reviewed its first draft twice: once with Jev and once on its own. All four versions passed the same seven HTTP checks.</p>
-					<p class="takeaway">Luna added the help text to its checklist with Jev. Its solo checklist left it out.</p>
+					<p class="copy">When I give a cheap model a coding task in YOLO mode, it can start calling tools and writing code before it has worked out what I asked for or made a plan.</p>
+					<p class="takeaway">Jev checks the requirements against my request and the plan against those requirements. At acceptance, it checks what the code and test results actually prove.</p>
 				</section>
 
 				<section id="triage" class="chapter story-section" tabindex="-1">
 					<div class="chapter-heading"><h2>Triage</h2><span class="folio utility">1 / 4</span></div>
 					<figure class="proof">
-						<figcaption class="proof-caption utility"><span>Luna's booking brief</span><progress value="0" aria-label="Replay progress" hidden></progress><button class="press-run" type="button" aria-controls="brief-press" hidden>Play</button></figcaption>
+						<figcaption class="proof-caption utility"><span>The booking brief</span><progress value="0" aria-label="Replay progress" hidden></progress><button class="press-run" type="button" aria-controls="brief-press" hidden>Play</button></figcaption>
 						<fieldset class="revisions">
 							<legend class="visually-hidden">Choose a version of the triage submission</legend>
 							<input class="btn-check" type="radio" name="triage-proof" id="brief-first" value="1" checked><label class="btn" for="brief-first">First submission</label>
@@ -82,8 +82,8 @@
 							<div class="stage" id="brief-press">
 								<div class="press-art" aria-hidden="true"><span class="sort quote-sort">&#8220;</span></div>
 								<div class="impressions" aria-live="polite">
-									<div class="impression" data-leaf="1"><span class="stamp">Invalid input</span><h3>A date slipped into the brief.</h3><p>Luna sent the terminal's date and working directory along with the booking request. Triage rejected the extra text before Jev read the brief.</p></div>
-									<div class="impression" data-leaf="2"><span class="stamp good">Registered</span><h3>The booking API and the help page.</h3><p>Luna removed the terminal reminder. Jev registered two topics: moving the bookings to two studios and checking what the help page promised.</p></div>
+									<div class="impression" data-leaf="1"><span class="stamp">Invalid input</span><h3>A date slipped into the brief.</h3><p>The agent sent the terminal's date and working directory along with the booking request. Triage rejected the extra text before Jev read the brief.</p></div>
+									<div class="impression" data-leaf="2"><span class="stamp good">Registered</span><h3>The booking API and the help page.</h3><p>The agent removed the terminal reminder. Jev registered two topics: moving the bookings to two studios and checking what the help page promised.</p></div>
 								</div>
 							</div>
 						</fieldset>
@@ -93,7 +93,7 @@
 				<section id="requirements" class="chapter story-section" tabindex="-1">
 					<div class="chapter-heading"><h2>Requirements</h2><span class="folio utility">2 / 4</span></div>
 					<figure class="proof">
-						<figcaption class="proof-caption utility"><span>Luna's checklist</span><progress value="0" aria-label="Replay progress" hidden></progress><button class="press-run" type="button" aria-controls="checklist-press" hidden>Play</button></figcaption>
+						<figcaption class="proof-caption utility"><span>The requirements checklist</span><progress value="0" aria-label="Replay progress" hidden></progress><button class="press-run" type="button" aria-controls="checklist-press" hidden>Play</button></figcaption>
 						<fieldset class="revisions">
 							<legend class="visually-hidden">Choose a version of the requirements checklist</legend>
 							<input class="btn-check" type="radio" name="list-proof" id="list-six" value="1" checked><label class="btn" for="list-six">Six items</label>
@@ -103,8 +103,8 @@
 								<div class="press-art" aria-hidden="true"><span class="sort count-sort"></span></div>
 								<div class="impressions" aria-live="polite">
 									<div class="impression" data-leaf="1"><span class="stamp good">Passed</span><h3>Six items about the API.</h3><p>The checklist covered seat limits, duplicate emails and old bookings. It said nothing about South's waitlist.</p></div>
-									<div class="impression" data-leaf="2"><span class="stamp">Findings</span><h3>A seventh item for the help page.</h3><p>Luna added the seat and waitlist policy. Jev supported that item but couldn't confirm the checklist covered the whole brief.</p></div>
-									<div class="impression" data-leaf="3"><span class="stamp good">Passed</span><h3>No new waitlist route.</h3><p>Luna saved the distinction in the checklist: “Keep the policy-accurate help copy in this draft, not an API route.”</p></div>
+									<div class="impression" data-leaf="2"><span class="stamp">Findings</span><h3>A seventh item for the help page.</h3><p>The agent added the seat and waitlist policy. Jev supported that item but couldn't confirm the checklist covered the whole brief.</p></div>
+									<div class="impression" data-leaf="3"><span class="stamp good">Passed</span><h3>No new waitlist route.</h3><p>The agent saved the distinction in the checklist: “Keep the policy-accurate help copy in this draft, not an API route.”</p></div>
 								</div>
 							</div>
 						</fieldset>
@@ -114,7 +114,7 @@
 				<section id="plan" class="chapter story-section" tabindex="-1">
 					<div class="chapter-heading"><h2>Plan review</h2><span class="folio utility">3 / 4</span></div>
 					<figure class="proof">
-						<figcaption class="proof-caption utility"><span>Luna's route plan</span><progress value="0" aria-label="Replay progress" hidden></progress><button class="press-run" type="button" aria-controls="route-press" hidden>Play</button></figcaption>
+						<figcaption class="proof-caption utility"><span>The route plan</span><progress value="0" aria-label="Replay progress" hidden></progress><button class="press-run" type="button" aria-controls="route-press" hidden>Play</button></figcaption>
 						<fieldset class="revisions">
 							<legend class="visually-hidden">Choose a version of the plan outline</legend>
 							<input class="btn-check" type="radio" name="route-proof" id="route-first" value="1" checked><label class="btn" for="route-first">First outline</label>
@@ -129,9 +129,9 @@
 									</svg>
 								</div>
 								<div class="impressions" aria-live="polite">
-									<div class="impression" data-leaf="1"><span class="stamp">Findings</span><h3>Server setup in the route step.</h3><p>Luna put studio selection, seat limits and email checks there too. Jev sent that step back and accepted the other six.</p></div>
-									<div class="impression" data-leaf="2"><span class="stamp">Findings</span><h3>Which booking methods?</h3><p>Luna specified a 400 for missing or unknown studios on “requests to /bookings.” That step still didn't name GET and POST.</p></div>
-									<div class="impression" data-leaf="3"><span class="stamp good">Outline passed</span><h3>Check the studio before GET or POST.</h3><p>Luna moved studio validation ahead of both methods. The review stopped at the outline; Jev didn't review the detailed steps.</p></div>
+									<div class="impression" data-leaf="1"><span class="stamp">Findings</span><h3>Server setup in the route step.</h3><p>The agent put studio selection, seat limits and email checks there too. Jev sent that step back and accepted the other six.</p></div>
+									<div class="impression" data-leaf="2"><span class="stamp">Findings</span><h3>Which booking methods?</h3><p>The agent specified a 400 for missing or unknown studios on “requests to /bookings.” That step still didn't name GET and POST.</p></div>
+									<div class="impression" data-leaf="3"><span class="stamp good">Outline passed</span><h3>Check the studio before GET or POST.</h3><p>The agent moved studio validation ahead of both methods. The review stopped at the outline; Jev didn't review the detailed steps.</p></div>
 								</div>
 							</div>
 						</fieldset>
@@ -143,14 +143,14 @@
 					<figure class="proof">
 						<figcaption class="proof-caption utility"><span>The booking desk notice</span><progress value="0" aria-label="Replay progress" hidden></progress><button class="press-run" type="button" data-start="2" aria-controls="notice-press" hidden>Play</button></figcaption>
 						<fieldset class="revisions">
-							<legend class="visually-hidden">Compare Luna's full draft with the booking desk checks</legend>
-							<input class="btn-check" type="radio" name="fact-proof" id="fact-run" value="1"><label class="btn" for="fact-run">Luna's run</label>
+							<legend class="visually-hidden">Compare the agent's full draft with the booking desk checks</legend>
+							<input class="btn-check" type="radio" name="fact-proof" id="fact-run" value="1"><label class="btn" for="fact-run">Development run</label>
 							<input class="btn-check" type="radio" name="fact-proof" id="fact-old" value="2"><label class="btn" for="fact-old">Old notice</label>
 							<input class="btn-check" type="radio" name="fact-proof" id="fact-correct" value="3" checked><label class="btn" for="fact-correct">Corrected notice</label>
 							<div class="stage" id="notice-press">
 								<div class="press-art" aria-hidden="true"><div class="seats"><span class="seat-row"><b>N</b><i></i><i></i></span><span class="seat-row"><b>S</b><i></i><i class="extra-seat"></i></span></div></div>
 								<div class="impressions" aria-live="polite">
-									<div class="impression" data-leaf="1"><span class="stamp open">Inconclusive</span><h3>Luna's full help text.</h3><p>Jev supported the policy claims but couldn't tell whether the draft covered the whole request. Neither of Luna's two fact-checks passed overall.</p></div>
+									<div class="impression" data-leaf="1"><span class="stamp open">Inconclusive</span><h3>The agent's full help text.</h3><p>Jev supported the policy claims but couldn't tell whether the draft covered the whole request. Neither of the two fact-checks passed overall.</p></div>
 									<div class="impression" data-leaf="2"><span class="stamp">Incomplete</span><h3>“Both studios have two seats.”</h3><p>That was the old notice. In a separate check, Jev supported North's count and left South's count unresolved. The signed policy gives South just one seat.</p></div>
 									<div class="impression" data-leaf="3"><span class="stamp good">Both claims supported</span><h3>North offers two seats. South offers one seat.</h3><p>Jev checked each count against the signed policy and found that the corrected notice answered the booking desk's question.</p></div>
 								</div>
@@ -163,7 +163,7 @@
 							<a class="utility" href="terminal/seat-check.txt">Read the recorded fact-check</a>
 						</details>
 					</figure>
-					<p class="caption">The old and corrected notices were checked separately from Luna's run, against the same signed policy.</p>
+					<p class="caption">The old and corrected notices were checked separately from the development run, against the same signed policy.</p>
 				</section>
 
 				<section id="more-tools" class="tools story-section" tabindex="-1">
