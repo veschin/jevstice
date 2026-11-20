@@ -275,7 +275,7 @@ See [the autonomy reference](docs/autonomy.md) for the lifecycle, deployment lim
 
 ## Demos
 
-The [Jevstice site](https://veschin.github.io/jevstice/) shows real oh-my-pi terminal captures of diff review, requirements, and fact-checking.
+The [Jevstice site](https://veschin.github.io/jevstice/) shows real terminal captures of Jev checks in oh-my-pi.
 
 ## Development
 

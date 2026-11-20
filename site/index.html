@@ -3,103 +3,143 @@
 <head>
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1">
-	<title>Jevstice — A second opinion for your coding agent</title>
-	<meta name="description" content="See Jev review a diff, check requirements, and fact-check a draft inside oh-my-pi.">
+	<title>Jevstice</title>
+	<meta name="description" content="Jevstice brings Jev's checks into oh-my-pi. See terminal examples of triage, requirements, plan review, and fact-checking.">
 	<meta property="og:image" content="https://veschin.github.io/jevstice/terminal/fact-check.png">
 	<meta name="twitter:card" content="summary_large_image">
 	<link rel="stylesheet" href="bootstrap.min.css">
 	<style>
-		:root { --bs-body-bg: #f8f8ff; --bs-body-color: #19182a; --bs-link-color-rgb: 70, 49, 151; }
-		.hero-copy { max-width: 37rem; }
-		h1, h2 { text-wrap: balance; }
-		.btn-dark { --bs-btn-bg: #32216b; --bs-btn-border-color: #32216b; }
+		@font-face {
+			font-family: "Source Serif 4";
+			src: url("fonts/source-serif-4.woff2") format("woff2");
+			font-weight: 400 800;
+			font-display: swap;
+		}
+		:root {
+			--bs-body-bg: #fff;
+			--bs-body-color: #222;
+			--bs-link-color-rgb: 34, 34, 34;
+			--bs-link-hover-color-rgb: 34, 34, 34;
+			--bs-body-font-family: "Source Serif 4", Georgia, serif;
+			--bs-body-font-size: 1.125rem;
+			--bs-body-line-height: 1.6;
+			--rule: #ccc;
+			scroll-behavior: auto;
+		}
+		a { text-underline-offset: .18em; }
+		h1, h2 { font-weight: 700; line-height: 1.15; }
+		h1 { font-size: clamp(2.375rem, 4vw, 3.25rem); }
+		h2 { font-size: 1.625rem; }
+		.container { max-width: 65rem; }
+		.masthead { border-bottom: 1px solid var(--bs-body-color); }
+		.utility { font: 600 .875rem/1.35 var(--bs-font-sans-serif); }
+		.copy { max-width: 64ch; }
+		.contents { position: sticky; top: 1rem; }
+		.contents a { display: flex; align-items: center; min-height: 2.5rem; }
+		.story-section + .story-section { border-top: 1px solid var(--rule); }
+		.story-section { scroll-margin-top: 1rem; }
 		.terminal { background: #1e1e2e; }
-		.terminal img { display: block; width: 100%; min-width: 42rem; height: auto; }
-		:focus-visible { outline: .2rem solid #5a3fc1; outline-offset: .2rem; }
+		.terminal img { display: block; width: 100%; height: auto; }
+		:focus-visible { outline: .15rem solid currentColor; outline-offset: .15rem; }
+		.terminal a { display: block; min-width: 43rem; }
+		.terminal a:focus-visible { outline-color: white; outline-offset: -.2rem; }
+		@media (max-width: 991.98px) {
+			.contents { top: 0; z-index: 2; background: var(--bs-body-bg); border-bottom: 1px solid var(--rule); }
+			.contents ul { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+			.contents a { justify-content: center; text-align: center; }
+			.story-section { scroll-margin-top: 6rem; }
+		}
 	</style>
 </head>
 <body>
-	<header class="container">
-		<nav class="d-flex justify-content-between align-items-center flex-wrap gap-2 py-3 border-bottom" aria-label="Main">
-			<a class="fw-bold text-body text-decoration-none" href="./">Jevstice</a>
-			<div class="d-flex gap-3">
-				<a href="#tools">Tools</a>
-				<a href="https://github.com/veschin/jevstice">GitHub</a>
-			</div>
-		</nav>
+	<a href="#introduction" class="visually-hidden-focusable">Skip to the article</a>
+	<header class="container" id="top">
+		<div class="masthead d-flex justify-content-between align-items-baseline gap-3 pt-4 pb-3">
+			<h1 class="mb-0">Jevstice</h1>
+			<a href="https://github.com/veschin/jevstice" class="utility">GitHub</a>
+		</div>
 	</header>
 	<main class="container">
-		<section class="pt-5 pb-4">
-			<h1 class="display-2 fw-bold mb-3">A second opinion for your coding agent</h1>
-			<p class="lead hero-copy mb-3">Jevstice brings Jev into oh-my-pi. Use it to check requirements, review diffs, and verify claims. Jev's verdicts are advisory.</p>
-			<a class="btn btn-dark" href="https://github.com/veschin/jevstice#install">Install Jevstice</a>
-		</section>
-		<section class="pb-4" aria-label="Jev in action">
-			<figure class="mb-4" data-terminal-demo>
-				<div class="terminal rounded-3 overflow-auto" tabindex="0" role="region" aria-label="Fact-check terminal screenshot">
-					<img src="terminal/fact-check.png" width="1440" height="490" alt="OMP prompt asking Jev to check a 30-day claim. The source says Basic retains backups for 7 days and Pro for 30 days.">
-				</div>
-				<figcaption class="d-flex flex-wrap justify-content-between column-gap-3 mt-2">
-					<span><strong>Fact-check.</strong> The draft says Basic keeps backups for 30 days. The source says 7 days.</span>
-					<a href="terminal/fact-check.png" aria-label="Open full-size fact-check screenshot">Full size</a>
-				</figcaption>
-			</figure>
-			<figure class="mb-4" data-terminal-demo>
-				<div class="terminal rounded-3 overflow-auto" tabindex="0" role="region" aria-label="Requirements terminal screenshot">
-					<img src="terminal/requirements.png" width="1440" height="685" loading="lazy" alt="OMP prompt asking Jev to scope a dry-run flag. Jev triage and Jev requirements return their verdicts.">
-				</div>
-				<figcaption class="d-flex flex-wrap justify-content-between column-gap-3 mt-2">
-					<span><strong>Requirements.</strong> Jev flags gaps in the requirements for a dry-run flag.</span>
-					<a href="terminal/requirements.png" aria-label="Open full-size requirements screenshot">Full size</a>
-				</figcaption>
-			</figure>
-			<figure class="mb-0" data-terminal-demo>
-				<div class="terminal rounded-3 overflow-auto" tabindex="0" role="region" aria-label="Diff review terminal screenshot">
-					<img src="terminal/diff-review.png" width="1440" height="1260" loading="lazy" alt="OMP prompt asking Jev to review a diff. The check returns 95 for 100 plus a fee of 5, and Jev reports a defect.">
-				</div>
-				<figcaption class="d-flex flex-wrap justify-content-between column-gap-3 mt-2">
-					<span><strong>Diff review.</strong> Jev flags a change that subtracts a fee instead of adding it.</span>
-					<a href="terminal/diff-review.png" aria-label="Open full-size diff review screenshot">Full size</a>
-				</figcaption>
-			</figure>
-		</section>
-		<section id="tools" class="py-4 border-top">
-			<h2 class="h3 fw-bold mb-3">Jev tools</h2>
-			<div class="row row-cols-1 row-cols-md-3 g-3">
-				<div class="col">
-					<h3 class="h6 fw-bold">Planning</h3>
-					<ul class="list-unstyled mb-0">
-						<li><code>jev_triage</code></li>
-						<li><code>jev_requirements</code></li>
-						<li><code>jev_plan_review</code></li>
-						<li><code>jev_reaim</code></li>
-					</ul>
-				</div>
-				<div class="col">
-					<h3 class="h6 fw-bold">During and after the work</h3>
-					<ul class="list-unstyled mb-0">
-						<li><code>jev_consult</code></li>
-						<li><code>jev_context</code></li>
-						<li><code>jev_course_check</code></li>
-						<li><code>jev_review</code></li>
-						<li><code>jev_acceptance</code></li>
-					</ul>
-				</div>
-				<div class="col">
-					<h3 class="h6 fw-bold">Sources and writing</h3>
-					<ul class="list-unstyled mb-0">
-						<li><code>jev_search_relevance</code></li>
-						<li><code>jev_fact_check</code></li>
-						<li><code>jev_text_review</code></li>
-						<li><code>jev_anti_slop</code></li>
-					</ul>
-				</div>
-			</div>
-			<a class="d-inline-block mt-3" href="https://github.com/veschin/jevstice#tools">Read the tool descriptions</a>
-		</section>
+		<div class="row gx-lg-5 flex-lg-row-reverse">
+			<nav class="contents col-lg-3 align-self-lg-start py-lg-4" aria-label="Contents">
+				<p class="utility mb-1 d-none d-lg-block">Contents</p>
+				<ul class="utility list-unstyled mb-0">
+					<li><a href="#introduction">Introduction</a></li>
+					<li><a href="#why">Why use it?</a></li>
+					<li><a href="#triage">Triage</a></li>
+					<li><a href="#requirements">Requirements</a></li>
+					<li><a href="#plan">Plan review</a></li>
+					<li><a href="#fact-check">Fact-check</a></li>
+				</ul>
+			</nav>
+			<article class="col-lg-9">
+				<section id="introduction" class="story-section py-4" tabindex="-1">
+					<h2>What is Jevstice?</h2>
+					<p class="copy"><strong>omp</strong> (oh-my-pi) runs an AI assistant in your terminal. The assistant can read and edit project files and run commands.</p>
+					<p class="copy"><strong>Jev</strong> is a separate AI model from TypeSafe that answers questions about a request, a plan, a code change, or a source.</p>
+					<p class="copy mb-0"><strong>Jevstice</strong> connects omp to Jev and shows its findings in the terminal. The checks give you a second opinion without stopping the assistant's work.</p>
+				</section>
+
+				<section id="why" class="story-section py-4" tabindex="-1">
+					<h2>Why use it?</h2>
+					<p class="copy mb-0">The model doing the work can invent facts, forget a part of your request, or make changes you didn't ask for. It can still report that everything is done. Jev checks what the assistant submits against what you asked for or what a source actually says.</p>
+				</section>
+
+				<section id="triage" class="story-section py-4" tabindex="-1">
+					<h2>Triage</h2>
+					<figure class="mb-0">
+						<div class="terminal overflow-auto" tabindex="0" role="region" aria-label="Triage terminal screenshot">
+							<a href="terminal/triage.png" title="Open full-size triage screenshot"><img src="terminal/triage.png" width="1440" height="225" loading="lazy" alt="An English request for a dry-run option and help text, followed by Jev's triage result: development, three topics."></a>
+						</div>
+						<figcaption class="copy mt-3">
+							<p class="mb-0">The request asks for an option to preview an export without saving it and an update to the command's help text. Jev treats it as a development task and identifies three topics to check. That sets the scope of the review before any files change.</p>
+						</figcaption>
+					</figure>
+				</section>
+
+				<section id="requirements" class="story-section py-4" tabindex="-1">
+					<h2>Requirements</h2>
+					<figure class="mb-0">
+						<div class="terminal overflow-auto" tabindex="0" role="region" aria-label="Requirements terminal screenshot">
+							<a href="terminal/requirements.png" title="Open full-size requirements screenshot"><img src="terminal/requirements.png" width="1440" height="260" loading="lazy" alt="Jev reports two uncovered needs in a five-item checklist and passes the revised seven-item checklist."></a>
+						</div>
+						<figcaption class="copy mt-3">
+							<p class="mb-0">Jev compares the assistant's checklist with the request for the export option. It finds two needs missing from the first list. The assistant submits a revised list, and that list passes. The check helps you agree on what counts as done before anyone writes code.</p>
+						</figcaption>
+					</figure>
+				</section>
+
+				<section id="plan" class="story-section py-4" tabindex="-1">
+					<h2>Plan review</h2>
+					<figure class="mb-0">
+						<div class="terminal overflow-auto" tabindex="0" role="region" aria-label="Plan review terminal screenshot">
+							<a href="terminal/plan.png" title="Open full-size plan review screenshot"><img src="terminal/plan.png" width="1440" height="370" loading="lazy" alt="Jev completes the plan review, and the assistant reports that the four-step outline passed without any files changing."></a>
+						</div>
+						<figcaption class="copy mt-3">
+							<p class="mb-0">Jev finds that the four-step outline covers the requirements, including what the export should preview and what the help text should say. Reviewing the outline gives you a chance to spot missing steps before the assistant edits any files.</p>
+						</figcaption>
+					</figure>
+				</section>
+
+				<section id="fact-check" class="story-section py-4" tabindex="-1">
+					<h2>Fact-check</h2>
+					<figure class="mb-0">
+						<div class="terminal overflow-auto" tabindex="0" role="region" aria-label="Fact-check terminal screenshot">
+							<a href="terminal/fact-check.png" title="Open full-size fact-check screenshot"><img src="terminal/fact-check.png" width="1440" height="490" loading="lazy" alt="Jev reports a contradiction between a claim of 30 days for Basic and an excerpt that says 7 days."></a>
+						</div>
+						<figcaption class="copy mt-3">
+							<p class="mb-0">The draft says the Basic plan keeps backups for 30 days. Jev compares that claim with a sample policy and flags the mismatch: the policy gives Basic 7 days and Pro 30. The number was in the source, but it described a different plan.</p>
+						</figcaption>
+					</figure>
+				</section>
+			</article>
+		</div>
 	</main>
 	<footer class="container">
-		<p class="border-top py-3 mb-0"><a href="https://github.com/veschin/jevstice#install">Install Jevstice</a></p>
+		<div class="utility d-flex justify-content-between gap-3 border-top py-3 mb-3">
+			<a href="https://github.com/veschin/jevstice#install">Install Jevstice</a>
+			<a href="#top">Back to top</a>
+		</div>
 	</footer>
 </body>
 </html>
