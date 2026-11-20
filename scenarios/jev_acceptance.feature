@@ -120,12 +120,12 @@ Feature: Business and architecture acceptance rest on observed evidence
 
   # FR-39; implementation src/controller.ts diagnoseCompletion
   @jev_acceptance_12 @fr_39
-  Scenario: Completion automatically collects observed evidence and missing acceptance
-    Given a developed task reaches completion with one aspect missing
+  Scenario: Completion reviews each plan task against observed work
+    Given a developed task reaches completion with a registered plan
     When the ordinary completion boundary is observed
     Then the addon collects observed code and execution evidence
-    And it submits the missing architecture acceptance automatically
-    And it returns the unmet obligations without requiring manual acceptance calls
+    And it checks each plan task automatically
+    And it names the missing verification without requiring manual acceptance calls
 
   # FR-43; implementation src/activities.ts unmetSections
   @jev_acceptance_13 @fr_43

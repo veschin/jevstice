@@ -872,22 +872,25 @@ describe("session accounting", () => {
 });
 
 describe("automatic evidence-based acceptance", () => {
-	test("completion checks both missing aspects from observed code and execution without a manual tool call", async () => {
+	test("ordinary completion publishes task and integrated reviews without waiting for either", async () => {
+		const pending = Promise.withResolvers<void>();
 		const judge: Judge = async (material, questions) => {
-			const aspect = asRecord(material)?.["aspect"];
-			const fake = answeringJudge({
+			if (asRecord(material)?.["check"] === "plan_task") await pending.promise;
+			return answeringJudge({
 				needs_development: NEEDS_DEVELOPMENT, ...PLAN_APPROVED,
-				acceptance: { label: aspect === "business" ? "serves_business_need" : "sound_for_next_change", confidence: 0.95 },
-				execution_evidence: { probability: 0.95 }, code_evidence: { probability: 0.95 },
-				topic_1_execution: { label: "evidence_2", confidence: 0.95 },
-				topic_1_code: { label: "evidence_1", confidence: 0.95 },
-			});
-			return fake.judge(material, questions);
+				task_definition: { label: "checkable" },
+				task_review: { label: "observed" },
+				task_basis: { label: "evidence_3" },
+				cleanup_evidence_1: { label: "unnecessary_abstraction" },
+				cleanup_evidence_2: { label: "out_of_scope" },
+				integration: { label: "observed" },
+				integration_basis: { label: "evidence_3" },
+			}).judge(material, questions);
 		};
 		const pi = fakePi();
-		let reports = 0;
-		pi.api.appendEntry = type => {
-			if (type === "jev.acceptance") reports += 1;
+		const reports: unknown[] = [];
+		pi.api.appendEntry = (type, data) => {
+			if (type === "jev.acceptance") reports.push(data);
 		};
 		createJevController({ judge, config: config(), zod: fakeZod() }).register(pi.api);
 		const cwd = await fakeArtifacts({ "x-plan.md": PLAN_BODY });
@@ -895,15 +898,27 @@ describe("automatic evidence-based acceptance", () => {
 		try {
 			await planned(pi, ctx);
 			await pi.emit("tool_result", toolResultEvent("write", { path: "src/a.ts", content: "export const coverage = 100;" }, "Wrote src/a.ts"), ctx);
+			await pi.emit("tool_result", toolResultEvent("edit", { input: "*** Begin Patch\n[src/extra.ts#A1B2]\nPUT >1:\n+export const extra = true;\n*** End Patch" }, "Edited src/extra.ts"), ctx);
 			await pi.emit("tool_result", toolResultEvent("bash", { command: "bun test" }, "1 pass, 0 fail: report records coverage"), ctx);
 			expect(stopDecision(await pi.emit("session_stop", stopEvent(), ctx))).toBeUndefined();
-			expect(await until(() => reports === 2)).toBe(true);
+			expect(reports).toHaveLength(0);
+			pending.resolve();
+			expect(await until(() => reports.length === 1)).toBe(true);
 			expect(pi.messages).toEqual([]);
-			const result = await pi.callTool("jev_context", { action: "list" }, ctx);
-			expect(toolDetails(result)["acceptance"]).toEqual([
-				expect.objectContaining({ aspect: "business", approved: true }),
-				expect.objectContaining({ aspect: "architecture", approved: true }),
-			]);
+			const result = await pi.callTool("jev_acceptance", { aspect: "outcome" }, ctx);
+			expect(toolDetails(result)).toMatchObject({
+				approved: true,
+				replayed: true,
+				tasks: [{ id: "collect", status: "approved", cleanup: { recommendations: [
+					{ basis: { source: "write: src/a.ts" }, recommendation: expect.stringContaining("Inline") },
+					{ basis: { source: "edit: src/extra.ts" }, recommendation: expect.stringContaining("Remove") },
+				] } }],
+				overall: { status: "approved", cleanup: { recommendations: [expect.any(Object), expect.any(Object)] } },
+			});
+			const messages = await pi.emit("context", { messages: [] }, ctx);
+			expect(JSON.stringify(messages)).toContain("src/a.ts");
+			pi.callCommand("jev-status", "", ctx);
+			expect(lastMessage(pi, "jev.status")).toContain("collect");
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
 		}

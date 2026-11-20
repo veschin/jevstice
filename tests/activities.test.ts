@@ -6,6 +6,7 @@ import {
 	completionCheck,
 	consult,
 	courseCheck,
+	observedOutcome,
 	ownerUpdate,
 	planReview,
 	reaim,
@@ -413,6 +414,25 @@ describe("FR-26 - acceptance is judged from the submitted evidence", () => {
 		expect(asRecord(outcome.details)?.["kind"]).toBe("refusal");
 	});
 
+	test("inconclusive aspect results distinguish missing and ambiguous literal evidence", async () => {
+		const state = freshState();
+		registerTask(state, "Report coverage for the last run");
+		const { deps } = depsFor({
+			acceptance: { label: "unsupported", confidence: 0.95 },
+			execution_evidence: { probability: 0.1 },
+			code_evidence: { probability: 0.52 },
+		});
+		const result = await acceptance(deps, state, {
+			aspect: "business",
+			claim: "The report contains the coverage count.",
+			evidence: [{ kind: "execution", quote: "12 pass" }, { kind: "code", quote: "return result.coverage;" }],
+		});
+		expect(result.details).toMatchObject({ kind: "unclear", approved: false, evidenceQuestions: { execution: 0.1, code: 0.52 } });
+		expect(result.text).toContain("literal command with its observed output: missing");
+		expect(result.text).toContain("code, diff, static diagnostic or measurement: inconclusive");
+		expect(result.text).not.toContain("ask the owner");
+	});
+
 	test("FR-26: a topic with no identified execution basis is not approved", async () => {
 		const state = freshState();
 		registerTask(state, "Report the coverage of the last run");
@@ -497,6 +517,48 @@ describe("FR-26 - acceptance is judged from the submitted evidence", () => {
 		expect(outcome.text).toContain("do not change the implementation");
 		expect(asRecord(outcome.details)?.["unmetSections"]).toEqual([{ id: "collect", requirement: "Collect run data", section }]);
 	});
+});
+
+test("planned review keeps a proven task, a weak task and a contradiction distinct", async () => {
+	const request = "Show coverage and cap page size at five.";
+	const state = freshState();
+	const task = registerTask(state, request);
+	const source = "## Coverage\nShow 98%.\n\n## Polish\nImprove display polish.\n\n## Cap\nCap at five.";
+	state.plan = { taskFingerprint: task.fingerprint, planUrl: "local://plan.md", planDigest: sha256(source) };
+	state.planTopics = [
+		{ id: "coverage", section: "Show 98%.", requirement: "Show coverage.", paths: ["report.ts"] },
+		{ id: "polish", section: "Improve display polish.", requirement: "Show coverage.", paths: ["report.ts"] },
+		{ id: "cap", section: "Cap at five.", requirement: "Cap page size at five.", paths: ["report.ts"] },
+	];
+	const calls: string[] = [];
+	const result = await observedOutcome({
+		config: boundaryConfig(),
+		readArtifact: async () => source,
+		judge: (material, questions) => {
+			const id = String(asRecord(asRecord(material)?.["task"])?.["id"]);
+			calls.push(id);
+			return answeringJudge({
+				task_definition: { label: id === "polish" ? "uncheckable" : "checkable" },
+				task_review: { label: id === "cap" ? "deviates" : "observed" },
+				task_basis: { label: "evidence_2" },
+				cleanup_evidence_1: { label: "none" },
+			}).judge(material, questions);
+		},
+	}, state, [
+		{ kind: "code", quote: "export const display = '98%'; export const limit = 10;" },
+		{ kind: "execution", quote: "bun test report.test.ts\nCoverage 98%; expected page limit 5, got 10" },
+	]);
+	expect(result.details).toMatchObject({
+		approved: false,
+		tasks: [
+			{ id: "coverage", status: "approved" },
+			{ id: "polish", status: "bad_task", reason: expect.stringContaining("Improve display polish.") },
+			{ id: "cap", status: "defect", basis: expect.arrayContaining([expect.objectContaining({ quote: expect.stringContaining("expected page limit 5, got 10") })]) },
+		],
+		overall: { status: "not_checked" },
+	});
+	expect(result.text).toContain("Name one scenario");
+	expect(calls).toEqual(["coverage", "polish", "cap"]);
 });
 
 describe("T2 - triage decides whether the deeper activities apply (FR-01, FR-02, FR-10)", () => {

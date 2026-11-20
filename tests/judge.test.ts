@@ -1,3 +1,4 @@
+import { APIConnectionError, APIError, APITimeoutError } from "@typesafe-ai/sdk";
 import { describe, expect, test } from "bun:test";
 import {
 	answerOf,
@@ -180,16 +181,45 @@ describe("T1 - fail-closed normalization", () => {
 		expect(outsideRubric.ok).toBe(false);
 	});
 
-	test("fail-closed: a transport error never echoes the API key", async () => {
-		const judge = createTypeSafeJudge({
-			resolveKey: async () => "secret-key",
-			createClient: () => ({
-				systemOne: async () => { throw new Error("authentication rejected secret-key"); },
-			}),
-		});
-		const outcome = await judge({}, [DECISION]);
-		expect(outcome.ok).toBe(false);
-		expect(JSON.stringify(outcome)).not.toContain("secret-key");
+	test("fail-closed: SDK failures produce fixed diagnostics without request or response data", async () => {
+		const headers = new Headers({ "x-typesafe-request-id": "secret-header" });
+		const httpError = (status: number) => APIError.fromResponse(status, { detail: "secret-body" }, headers);
+		const cause = new Error("secret-cause");
+		const cases: Array<[unknown, string]> = [
+			[httpError(401), "the judge service rejected authentication or authorization"],
+			[httpError(403), "the judge service rejected authentication or authorization"],
+			[httpError(429), "the judge service rate limit was exceeded"],
+			[new APITimeoutError(12345, { cause }), "the judge request timed out"],
+			[new APIConnectionError("secret-connection", { cause }), "the connection to the judge service failed"],
+			[httpError(400), "the judge service rejected the request as invalid"],
+			[httpError(422), "the judge service rejected the request as invalid"],
+			[httpError(503), "the judge service returned an HTTP error"],
+			[httpError(404), "the judge service returned an HTTP error"],
+			[new Error("401 authentication rejected secret-error"), "the judge request failed unexpectedly"],
+			[{ status: 401, message: "secret-thrown-value" }, "the judge request failed unexpectedly"],
+		];
+		for (const [error, problem] of cases) {
+			const judge = createTypeSafeJudge({
+				resolveKey: async () => "secret-key",
+				createClient: () => ({
+					systemOne: async () => { throw error; },
+				}),
+			});
+			expect(await judge("secret-evidence", [DECISION])).toEqual({ ok: false, kind: "unavailable", problem });
+		}
+	});
+
+	test("fail-closed: malformed answer diagnostics do not echo unexpected data", async () => {
+		const cases: Array<[JudgeQuestion, unknown, string]> = [
+			[WORTH, { "secret-answer-name": { type: "noul", noul: 0.9 } }, "the judge answered questions that were not asked"],
+			[DECISION, { decision: { type: "choice", choice: "secret-choice-label", confidence: 0.9 } }, "answer 'decision' selected a choice that was not offered"],
+			[EFFORT, { effort: { type: "score", score: 987654321, confidence: 0.9 } }, "answer 'effort' has a score outside the submitted rubric 0..2"],
+		];
+		for (const [question, answers, problem] of cases) {
+			const { client } = transportReturning({ answers });
+			const judge = createTypeSafeJudge({ resolveKey: async () => "key", createClient: () => client });
+			expect(await judge({}, [question])).toEqual({ ok: false, kind: "unusable", problem });
+		}
 	});
 
 	test("fail-closed: a malformed request is refused before any call", async () => {
@@ -203,21 +233,6 @@ describe("T1 - fail-closed normalization", () => {
 		expect(questionProblem([])).toBeDefined();
 		expect(questionProblem([{ name: "x", mode: "noul", instructions: "?", trueMeaning: "yes" }])).toBeDefined();
 		expect(questionProblem(THREE_MODES)).toBeUndefined();
-	});
-
-	test("fail-closed: a transport failure never approves", async () => {
-		const judge = createTypeSafeJudge({
-			resolveKey: async () => "key",
-			createClient: () => ({
-				systemOne: async () => {
-					throw new Error("socket reset");
-				},
-			}),
-		});
-
-		const outcome = await judge({}, THREE_MODES);
-
-		expect(outcome.ok).toBe(false);
 	});
 
 	test("fail-closed: an answer below the floor is not an approval", () => {

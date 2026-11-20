@@ -284,7 +284,7 @@ function unusable(problem: string, kind: RecoveryKind = "unavailable"): ToolOutc
 		text:
 			kind === "stale"
 				? `No answer was kept: ${problem}. ${STALE_FAULT} Next: read the current task and revision, then submit the call again.`
-				: `No judge decision exists: ${problem}. ${UNAVAILABLE_FAULT} Next: restore judge availability and submit this exact material again, since it was never judged; if the service stays unavailable, report the outage and ask the owner how to proceed. An outage is not a defect and releases nothing.`,
+				: `No judge decision exists: ${problem}. ${UNAVAILABLE_FAULT} Continue useful work and report the unavailable check separately. An outage is not a defect and releases nothing.`,
 		details: { kind, approved: false },
 	};
 }
@@ -568,6 +568,7 @@ async function askJudge(
 	state: JevState,
 	judged: unknown,
 	questions: readonly JudgeQuestion[],
+	includeArtifact = true,
 ): Promise<Judged> {
 	const task = state.task;
 	const revision = state.revision;
@@ -581,7 +582,7 @@ async function askJudge(
 		return { ok: false, kind: "stale", problem: "the approved plan artifact is missing or changed; reapprove its current bytes before judgment" };
 	}
 	const outcome: JudgeOutcome = await Promise.resolve().then(async () =>
-		deps.judge(artifact === undefined ? judged : { ...asRecord(judged), approvedPlanArtifact: artifact }, questions),
+		deps.judge(artifact === undefined || !includeArtifact ? judged : { ...asRecord(judged), approvedPlanArtifact: artifact }, questions),
 	).catch(() => ({
 		ok: false as const,
 		kind: "unavailable" as const,
@@ -612,8 +613,11 @@ async function askJudge(
 	return outcome;
 }
 
-/** Preserve a stale answer as stale; every other judge failure is an unavailable judgment. */
+/** A service failure, unusable reply and stale result do not establish the same thing. */
 function judgeFailure(outcome: { ok: false; kind: string; problem: string }): ToolOutcome {
+	if (outcome.kind === "unusable") {
+		return { ok: false, text: `No usable judge decision: ${outcome.problem}. An unusable reply is not a defect. Work may continue.`, details: { kind: "unusable", approved: false } };
+	}
 	return unusable(outcome.problem, outcome.kind === "stale" ? "stale" : "unavailable");
 }
 
@@ -1651,10 +1655,13 @@ async function reviewPlanDetail(
 		};
 	}
 	recordRefusal(state, { boundary, digest: call.digest });
+	const rewrite = confidence < POLICY.minConfidenceToApprove ? undefined
+		: verdict === "missing_operation" ? REWRITE_TASK.missing_outcome
+		: verdict === "missing_check" ? REWRITE_TASK.missing_check : undefined;
 	return {
 		ok: true,
-		text: `detail for '${topic.id}' is not approved: ${verdict} (confidence ${percent(confidence)}). ${confidence < POLICY.minConfidenceToApprove || verdict === "unclear" ? "Class: inconclusive - no defect is established; the answer is no decision either way." : "Class: defect - the returned category is established for this step."} Next: revise only this step against the returned category or submit evidence that settles it; the other approved steps stand.`,
-		details: { kind: confidence < POLICY.minConfidenceToApprove || verdict === "unclear" ? "unclear" : "defect", verdict: PLAN_REVISE, step: topic.id, assessment: verdict, confidence, approvedDetails: draft.details.map(entry => entry.id) },
+		text: `detail for '${topic.id}' is not approved: ${verdict} (confidence ${percent(confidence)}). ${rewrite ? `Task wording needs revision. ${rewrite}\nRequirement: ${topic.requirement}\nTask text:\n${topic.section}` : confidence < POLICY.minConfidenceToApprove || verdict === "unclear" ? "No specific defect is established. Recheck this section against its requirement." : "Revise only this section against the established scope or conflict."}\nThe other approved steps stand. Work may continue.`,
+		details: { kind: confidence < POLICY.minConfidenceToApprove || verdict === "unclear" ? "unclear" : "defect", verdict: PLAN_REVISE, step: topic.id, assessment: verdict, confidence, approvedDetails: draft.details.map(entry => entry.id), ...(rewrite === undefined ? {} : { rewrite, section: topic.section }) },
 	};
 }
 
@@ -1934,6 +1941,16 @@ export async function acceptance(deps: ActivityDeps, state: JevState, params: un
 	const label = answer.label ?? "";
 	const executionEvidence = probabilityOf(outcome, EXECUTION_EVIDENCE_QUESTION);
 	const codeEvidence = probabilityOf(outcome, CODE_EVIDENCE_QUESTION);
+	const evidenceQuestions = { execution: executionEvidence ?? null, code: codeEvidence ?? null };
+	const evidenceLines = ([
+		["literal command with its observed output", executionEvidence],
+		["code, diff, static diagnostic or measurement", codeEvidence],
+	] as const).flatMap(([description, probability]) => {
+		if (probability !== undefined && probability >= POLICY.minProbabilityToApprove) return [];
+		const status = probability === undefined ? "not returned" : 1 - probability >= POLICY.minProbabilityToApprove ? "missing" : "inconclusive";
+		return [`  - ${description}: ${status}${probability === undefined ? "" : ` (${percent(probability)} yes)`}.`];
+	});
+	const evidenceStatus = evidenceLines.length === 0 ? "" : `\nLiteral evidence:\n${evidenceLines.join("\n")}`;
 	const literalEvidence =
 		(executionEvidence ?? 0) >= POLICY.minProbabilityToApprove &&
 		(codeEvidence ?? 0) >= POLICY.minProbabilityToApprove;
@@ -1979,14 +1996,12 @@ export async function acceptance(deps: ActivityDeps, state: JevState, params: un
 		return {
 			ok: true,
 			text: `${named} acceptance: ${label} (confidence ${percent(answer.confidence)}), recorded for work revision ${state.revision}.${remaining} Evidence basis: ${basisLine || "no plan topics to evidence"}.`,
-			details: { aspect: named, verdict: label, approved, confidence: answer.confidence, basis, revision: state.revision },
+			details: { aspect: named, verdict: label, approved, confidence: answer.confidence, basis, evidenceQuestions, revision: state.revision },
 		};
 	}
 	if (choseLabel(outcome, "acceptance", approving)) {
-		const evidenceLines = [
-			...(literalEvidence
-				? []
-				: [`  - the submission carries no literal command-and-output execution item or no actual code, diff, static diagnostic or measurement (execution_evidence ${executionEvidence === undefined ? "was not returned" : percent(executionEvidence)}, code_evidence ${codeEvidence === undefined ? "was not returned" : percent(codeEvidence)}); a narrative about the work is not the observed command and output.`]),
+		const gapLines = [
+			...evidenceLines,
 			...unmet.map(entry =>
 				`  - ${entry.topic.id} (probability ${percent(entry.probability ?? 0)}): ${entry.topic.requirement}\n` +
 				`    approved verification section:\n${entry.topic.section.split("\n").map(line => `      ${line}`).join("\n")}`),
@@ -2000,21 +2015,21 @@ export async function acceptance(deps: ActivityDeps, state: JevState, params: un
 			}),
 		];
 		const settledGap =
-			unmet.length > 0 ||
+			unmet.some(entry => entry.probability !== undefined && 1 - entry.probability >= POLICY.minProbabilityToApprove) ||
 			unevidenced.length > 0 ||
 			(executionEvidence !== undefined && 1 - executionEvidence >= POLICY.minProbabilityToApprove) ||
 			(codeEvidence !== undefined && 1 - codeEvidence >= POLICY.minProbabilityToApprove);
 		return {
 			ok: false,
-			text: `${named} acceptance: the aspect verdict passed, but the submitted evidence does not establish every plan topic:\n${evidenceLines.join("\n")}\nClass: ${settledGap ? "refusal - the missing evidence is named above" : "inconclusive - the answers settle neither the evidence basis nor a defect"}, so no acceptance is approved. Next: observe the behavior named above and quote the literal execution output and the code, diff, static diagnostic or measurement; do not change the implementation before that observation.${budget}`,
-			details: { kind: settledGap ? "refusal" : "unclear", aspect: named, verdict: label, approved: false, unmet: unmet.map(entry => entry.topic.id), unmetSections, basis, evidenceQuestions: { execution: executionEvidence ?? null, code: codeEvidence ?? null }, revision: state.revision },
+			text: `${named} acceptance: the aspect verdict passed, but the submitted evidence does not establish every plan topic:\n${gapLines.join("\n")}\nClass: ${settledGap ? "refusal - the missing evidence is named above" : "inconclusive - the answers settle neither the evidence basis nor a defect"}, so no acceptance is approved. Next: observe the behavior named above and quote the literal execution output and the code, diff, static diagnostic or measurement; do not change the implementation before that observation.${budget}`,
+			details: { kind: settledGap ? "refusal" : "unclear", aspect: named, verdict: label, approved: false, unmet: unmet.map(entry => entry.topic.id), unmetSections, basis, evidenceQuestions, revision: state.revision },
 		};
 	}
 	if (label === approving) {
 		return {
 			ok: false,
-			text: `The approving ${named} label has confidence ${percent(answer.confidence)}, below the ${POLICY.minConfidenceToApprove} reliability floor, so no acceptance is approved.${LOW_SCORE_RECOVERY}${budget}`,
-			details: { kind: "unclear", approved: false, aspect: named, verdict: label, confidence: answer.confidence, basis },
+			text: `The approving ${named} label has confidence ${percent(answer.confidence)}, below the ${POLICY.minConfidenceToApprove} reliability floor, so no acceptance is approved.${LOW_SCORE_RECOVERY}${budget}${evidenceStatus}`,
+			details: { kind: "unclear", approved: false, aspect: named, verdict: label, confidence: answer.confidence, basis, evidenceQuestions, revision: state.revision },
 		};
 	}
 	const unmetTopics = unmet.map(entry => `${entry.topic.id}: ${entry.topic.requirement} - approved verification section: ${entry.topic.section.replace(/\s+/gu, " ").trim()}`).join("; ");
@@ -2023,15 +2038,15 @@ export async function acceptance(deps: ActivityDeps, state: JevState, params: un
 			? ""
 			: unmet.length === 0
 				? " All plan-topic evidence checks passed; they do not establish aspect acceptance."
-				: ` Plan-topic evidence also misses: ${unmetTopics}.`;
+				: ` Plan-topic evidence does not establish: ${unmetTopics}.`;
 	const gapRecovery =
 		named === "business"
 			? "Class: defect - a business gap was established. Next: compare the registered task with the finished outcome, complete the unmet business obligation, then submit execution and code evidence of the fix."
 			: "Class: defect - an architectural defect was established. Next: compare the required change with the design, correct the defect, then submit execution and code evidence of the fix.";
 	return {
 		ok: true,
-		text: `${named} acceptance: ${label} (confidence ${percent(answer.confidence)}), not approved.${topicStatus} ${label === PLAN_UNSUPPORTED || answer.confidence < POLICY.minConfidenceToApprove ? LOW_SCORE_RECOVERY : gapRecovery}${budget}`,
-		details: { kind: label === PLAN_UNSUPPORTED || answer.confidence < POLICY.minConfidenceToApprove ? "unclear" : "defect", aspect: named, verdict: label, approved: false, confidence: answer.confidence, unmetSections, basis, revision: state.revision },
+		text: `${named} acceptance: ${label} (confidence ${percent(answer.confidence)}), not approved.${topicStatus} ${label === PLAN_UNSUPPORTED || answer.confidence < POLICY.minConfidenceToApprove ? LOW_SCORE_RECOVERY : gapRecovery}${budget}${evidenceStatus}`,
+		details: { kind: label === PLAN_UNSUPPORTED || answer.confidence < POLICY.minConfidenceToApprove ? "unclear" : "defect", approved: false, aspect: named, verdict: label, confidence: answer.confidence, unmetSections, basis, evidenceQuestions, revision: state.revision },
 	};
 }
 
@@ -2063,6 +2078,179 @@ function observedBasisRecord(
 	return { status: "selected", id: basis.id, index: index < 0 ? 0 : index + 1, quote: basis.quote };
 }
 
+const REWRITE_TASK = {
+	missing_outcome: "Replace the activity with one observable result for the named requirement. Name the affected operation and what must change for its consumer.",
+	missing_check: "Name one scenario, its input or starting state, and the exact expected result. Replace any check that depends on routine owner approval with an observable result.",
+} as const;
+
+const CLEANUP = {
+	unnecessary_abstraction: "Inline the cited abstraction at its caller if it adds no behavior; keep the required behavior and its verification.",
+	redundant_material: "Remove the cited repetition and retain the implementation or explanation that already carries its behavior or meaning.",
+	out_of_scope: "Remove the cited addition from this change; retain the behavior required by the plan.",
+} as const;
+
+const cleanupQuestion = (item: NumberedEvidence) => `cleanup_${item.id}`;
+
+interface CleanupResult {
+	status: "not_checked" | "inconclusive" | "no_supported_cut" | "recommended";
+	recommendations: { kind: keyof typeof CLEANUP; basis: NumberedEvidence; recommendation: string }[];
+	unresolved: number;
+}
+
+function cleanupQuestions(code: readonly NumberedEvidence[]): JudgeQuestion[] {
+	return code.map(item => ({
+		name: cleanupQuestion(item), mode: "choice",
+		instructions: `Only assess numbered code observation ${item.id} for a concrete removal or simplification. Check needless indirection, duplicated code or prose, and work outside scope. Preserve required behavior and safety. At task level, only report material attributable to this task. Do not infer from unobserved callers or code. A category identifies a real opportunity in this cited material, not a generic suggestion.`,
+		options: { ...CLEANUP, none: "this observation supports no cut in this review scope", unclear: "the observations do not allow a reliable cleanup assessment" },
+	}));
+}
+
+function evidenceOptions(items: readonly NumberedEvidence[]): Record<string, string> {
+	return { ...Object.fromEntries(items.map(item => [item.id, item.source ?? `numbered ${item.kind} observation ${item.id}`])), none: "no suitable observed item" };
+}
+
+function cleanupResult(outcome: JudgeOutcome, code: readonly NumberedEvidence[], preserve: string): CleanupResult {
+	const recommendations: CleanupResult["recommendations"] = [];
+	let unresolved = 0;
+	for (const basis of code) {
+		const answer = answerOf(outcome, cleanupQuestion(basis));
+		const kind = answer?.label as keyof typeof CLEANUP;
+		if (answer === undefined || answer.confidence < POLICY.minConfidenceToApprove) unresolved += 1;
+		else if (Object.hasOwn(CLEANUP, kind)) recommendations.push({ kind, basis, recommendation: `${CLEANUP[kind]} Preserve: ${preserve}` });
+		else if (answer.label !== "none") unresolved += 1;
+	}
+	const status = recommendations.length > 0 ? "recommended" : unresolved > 0 ? "inconclusive" : code.length > 0 ? "no_supported_cut" : "not_checked";
+	return { status, recommendations, unresolved };
+}
+
+function renderCleanup(cleanup: CleanupResult): string {
+	const recommendations = cleanup.recommendations.map(({ basis, recommendation }) =>
+		`\n  Cut at ${basis.source ?? basis.id}: ${recommendation}\n  Observed material:\n${basis.quote}`);
+	return recommendations.join("") + (cleanup.unresolved > 0 ? `\n  Unresolved cleanup checks: ${cleanup.unresolved}.` :
+		cleanup.status === "recommended" ? "" : `\n  Cleanup: ${cleanup.status.replaceAll("_", " ")}.`);
+}
+
+/** Ordinary plan review produces one independent verdict per task, then checks the assembled work. */
+async function reviewPlannedWork(
+	deps: ActivityDeps,
+	state: JevState,
+	evidence: readonly Evidence[],
+	isCurrent: () => boolean,
+	topics: readonly PlanTopic[],
+): Promise<ToolOutcome> {
+	const task = state.task!;
+	const numbered = numberedEvidence(evidence.filter(item => (item.kind === "code" || item.kind === "execution") && item.quote.trim()));
+	const code = numbered.filter(item => item.kind === "code");
+	const context = { rule: DATA_RULE, request: task.request, submittedEvidence: numbered };
+	const reviewOptions = {
+		observed: "the observations establish the required result",
+		deviates: "a cited observation shows a contradiction",
+		not_observed: "the observations lack verification for the required result",
+		unclear: "the observations are ambiguous",
+	};
+	const failureStatus = (answer: Exclude<Judged, { ok: true }>) => answer.kind === "unavailable" ? "unavailable" : "inconclusive";
+	const stale = () => unusable("the plan or work observations changed during review", "stale");
+	const tasks = [];
+	const lines: string[] = [];
+	for (const topic of topics) {
+		if (!isCurrent()) return stale();
+		const answer = await askJudge(deps, state, { ...context, check: "plan_task", task: topic }, [
+			{
+				name: "task_definition", mode: "choice",
+				instructions: "Review the task wording in task.section, independently of any completed work. Does it specify a concrete result and a verifiable check without routine owner approval? Do not invent details missing from the task. The separate requirement explains its purpose; it does not prove the task says how to check it.",
+				options: {
+					checkable: "the task describes an observable result and a check",
+					uncheckable: "the task lacks a concrete result or an observable verification independent of routine owner evaluation",
+					unclear: "the wording does not support a reliable diagnosis",
+				},
+			},
+			{
+				name: "task_review", mode: "choice",
+				instructions: "Use the numbered observations together to check this task's required result. If runtime verification is required, it must include the command and its observed output. Actual contradictory behavior is a defect; missing verification is not. Do not treat the plan or an executor's assertion as evidence.",
+				options: reviewOptions,
+			},
+			...(numbered.length === 0 ? [] : [{
+				name: "task_basis", mode: "choice" as const,
+				instructions: "Choose the strongest numbered observation that anchors this task's result. Prefer the literal command and output for runtime behavior, or the actual changed code for static behavior. Do not penalize a task for having two types of evidence; choose one that supports the conclusion. Select none only when there is no relevant observation.",
+				options: evidenceOptions(numbered),
+			}]),
+			...cleanupQuestions(code),
+		], false);
+		if (!isCurrent() || (!answer.ok && answer.kind === "stale")) return stale();
+		if (!answer.ok) {
+			const status = failureStatus(answer);
+			tasks.push({ id: topic.id, requirement: topic.requirement, status, reason: answer.problem });
+			lines.push(`${topic.id}: ${status.replaceAll("_", " ")}. ${answer.problem}. Work may continue.`);
+			continue;
+		}
+		const verdict = answerOf(answer, "task_review");
+		const label = verdict?.label ?? "unclear";
+		const reliable = verdict !== undefined && verdict.confidence >= POLICY.minConfidenceToApprove;
+		const observation = numbered.length === 0 ? null : selectedBasis(answer, "task_basis", numbered);
+		const definition = answerOf(answer, "task_definition");
+		const issue = definition?.label ?? "unclear";
+		const rewrite = choseLabel(answer, "task_definition", "uncheckable") ? `${REWRITE_TASK.missing_outcome} ${REWRITE_TASK.missing_check}` : undefined;
+		const cleanup = cleanupResult(answer, code, topic.requirement);
+		const status = rewrite !== undefined ? "bad_task"
+			: !reliable ? "inconclusive"
+			: label === "deviates" && observation ? "defect"
+			: label === "not_observed" || label === "observed" && observation === null ? "missing_evidence"
+			: label === "observed" && observation ? "approved"
+			: "inconclusive";
+		const reason = rewrite !== undefined ? `${rewrite}\n  Requirement: ${topic.requirement}\n  Task text:\n${topic.section}`
+			: status === "missing_evidence" ? `Run the task's verification and retain the command with its output, or show the relevant code. Task:\n${topic.section}`
+			: status === "defect" ? "Correct the cited contradiction and rerun the task's verification."
+			: status === "inconclusive"
+				? `${reliable && observation === undefined && (label === "observed" || label === "deviates")
+					? "The verdict named a result but did not reliably identify supporting evidence."
+					: "No reliable decision."} Verify the task against its stated check:\n${topic.section}`
+				: "The cited observation anchors the evidence for the required result.";
+		const basis = observation ? [observation] : [];
+		tasks.push({ id: topic.id, requirement: topic.requirement, status, label, confidence: verdict?.confidence, definition: { label: issue, confidence: definition?.confidence }, reason, basis, cleanup });
+		lines.push(`${topic.id}: ${status.replaceAll("_", " ")}. ${reason}${basis.length === 0 ? "" : `\n  Basis: ${basis.map(item => item.source ?? item.id).join("; ")}.`}${renderCleanup(cleanup)}`);
+	}
+	const accepted = tasks.filter(task => task.status === "approved").length;
+	let overall: Record<string, unknown> = { status: "not_checked", reason: "Integrated review requires acceptance of every plan task on this revision." };
+	if (accepted > 0 && accepted === tasks.length) {
+		const answer = await askJudge(deps, state, { ...context, check: "integrated_review", tasks: topics }, [
+			{
+				name: "integration", mode: "choice",
+				instructions: "Check the assembled work against the owner request and the plan tasks. Do the numbered observations show that the parts work together, or do they show a cross-task regression or omitted requirement? Individual task passes are not evidence of integration. Use not_observed or unclear when the evidence does not establish the integrated result.",
+				options: reviewOptions,
+			},
+			{
+				name: "integration_basis", mode: "choice",
+				instructions: "Select the observed command and output or actual changed code that establishes or contradicts the integrated result, not evidence unrelated to the interaction being checked.",
+				options: evidenceOptions(numbered),
+			},
+			...cleanupQuestions(code),
+		]);
+		if (!isCurrent() || (!answer.ok && answer.kind === "stale")) return stale();
+		if (!answer.ok) overall = { status: failureStatus(answer), reason: answer.problem };
+		else {
+			const basis = selectedBasis(answer, "integration_basis", numbered);
+			const cleanup = cleanupResult(answer, code, task.request);
+			const status = basis && choseLabel(answer, "integration", "observed") ? "approved"
+				: basis && choseLabel(answer, "integration", "deviates") ? "defect"
+				: choseLabel(answer, "integration", "not_observed") ? "missing_evidence" : "inconclusive";
+			const reason = status === "approved" ? "The cited observation establishes the integrated result."
+				: status === "defect" ? "Correct the cited integration defect and verify the changed behavior."
+				: "Run an integrated verification that covers how the accepted tasks work together.";
+			overall = { status, reason, basis, cleanup };
+			lines.push(`Integrated review: ${status.replaceAll("_", " ")}. ${reason}${basis ? `\n  Basis: ${basis.source ?? basis.id}.` : ""}${renderCleanup(cleanup)}`);
+		}
+	}
+	if (overall["cleanup"] === undefined) lines.push(`Integrated review: ${String(overall["status"]).replaceAll("_", " ")}. ${overall["reason"]}`);
+	const approved = overall["status"] === "approved";
+	const statuses = [...tasks.map(task => task.status), overall["status"]];
+	const kind = statuses.includes("defect") ? "defect" : statuses.includes("unavailable") ? "unavailable" : "unclear";
+	return {
+		ok: approved,
+		text: `Plan acceptance: ${accepted}/${tasks.length} tasks accepted at revision ${state.revision}.\n${lines.join("\n")}\nFindings and removal recommendations do not block work or completion.`,
+		details: { check: "planned_outcome", approved, ...(approved ? {} : { kind }), task: task.fingerprint, revision: state.revision, planDigest: state.plan?.planDigest, tasks, overall },
+	};
+}
+
 /**
  * One ordinary result check (not an acceptance gate): each approved requirement is decided only
  * against the actual code and execution observations the controller retained. It needs approved
@@ -2073,6 +2261,7 @@ export async function observedOutcome(
 	deps: ActivityDeps,
 	state: JevState,
 	evidence: readonly Evidence[],
+	isCurrent: () => boolean = () => true,
 ): Promise<ToolOutcome> {
 	const task = state.task;
 	if (task === undefined) {
@@ -2080,6 +2269,17 @@ export async function observedOutcome(
 			"no development task is registered, so no approved requirement can be observed",
 			"register the current objective with jev_requirements against the captured owner request, or jev_triage",
 		);
+	}
+	if (state.autonomous !== true) {
+		if (state.plan?.taskFingerprint === task.fingerprint && state.planTopics.length > 0) {
+			return reviewPlannedWork(deps, state, evidence, isCurrent, state.planTopics);
+		}
+		const draft = state.planDraft;
+		if (draft?.taskFingerprint === task.fingerprint && draft.outlineApproved && draft.steps.length > 0) {
+			// Only the outline is registered as current here. Do not judge unbound artifact text.
+			const topics = draft.steps.map(step => ({ id: step.id, requirement: step.requirement, section: step.summary, paths: [] }));
+			return reviewPlannedWork(deps, state, evidence, isCurrent, topics);
+		}
 	}
 	const approval = state.requirementsApproval;
 	if (approval?.taskFingerprint !== task.fingerprint || approval.items.length === 0) {

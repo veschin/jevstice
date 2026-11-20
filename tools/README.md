@@ -71,6 +71,29 @@ other cases retain the paragraph. No step grants publication permission.
   accepted the measurement, disputed the proposed cause and fix, and left the tracker unchanged
   (`/tmp/jev-issue-skill.lSq0Ez/omp.jsonl`).
 
+## Issue 3: task and integrated acceptance
+
+Run `bun tools/acceptance-baseline.ts` with the configured TypeSafe key. The runner freezes six
+synthetic scenarios, writes the fixture code in isolated workspaces and records the Bun command,
+output and exit code where a check is specified. Each scenario contributes one final revision;
+the runner does not repeat attempts or select the best result. It reports non-runs separately.
+
+Observed with `jev-latest` on cohort `e2514aeb590f`:
+
+| Measure | Eligible | Approved | Weak task | Missing evidence | Defect | Inconclusive | Unavailable | Not checked |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Planned tasks | 6 | 3 | 1 | 1 | 1 | 0 | 0 | 0 |
+| Integrated reviews | 4 | 1 | 0 | 0 | 0 | 0 | 0 | 3 |
+| Unplanned results | 2 | 1 | 0 | 0 | 0 | 0 | 0 | 1 |
+
+The three integrated reviews did not run because not all tasks passed. The unplanned non-run
+had no execution evidence. The cohort includes deliberate failures and does not estimate
+approval rates for production sessions.
+
+A fresh OMP process registered a two-task outline, wrote `clamp.ts`, and ran a Bun check that
+printed `0` and `5`. The native `jev_acceptance` outcome returned two accepted tasks and one
+accepted integrated review, all at revision 2.
+
 ## Modes
 
 | Mode | Judge | What it verifies |

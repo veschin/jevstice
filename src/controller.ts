@@ -27,7 +27,7 @@ import { messagePresentation, outcomeSummary, toolPresentation, type MessagePres
 import {
 	freshState, recordAction, recordFailedAction, recordActivityOutcome, recordDiagnostic,
 	diagnosticKind, diagnosticSummary, recordRecovery, recoveryFeedback, queueOwnerMessage, screenRequest, sha256,
-	acceptanceAt, recordAcceptance, retireTask,
+	retireTask,
 	type JevState,
 } from "./state.js";
 import { POLICY, asRecord, type Evidence, type JevConfig, type ToolOutcome } from "./types.js";
@@ -133,6 +133,7 @@ const FOLLOW_UP = /^(?:also\b|continue\b|one more\b|and (?:also|now)\b|ещ[её
 const LEAN_GUIDANCE = [
 	"Jevstice is advisory. For a project change, the first check is write to xd://jev_requirements; content is JSON with items: one {text, source} per requested behavior, using a short exact quote for each source. Omit request: Jev uses the captured owner text.",
 	"Make the change and run checks for the requested behaviors. The second check is write to xd://jev_acceptance with content {\"aspect\":\"outcome\"}. Jev uses recorded code and execution. Fix a proven defect. Report unresolved items; recheck only if a specific new observation addresses a named gap. Do not run triage, staged plan, developer review or separate acceptance just to finish.",
+	"When a plan is registered, outcome reviews each task independently and runs an integrated review only after every task passes. Improve weak task wording without asking for routine owner evaluation. Consider evidence-backed cuts separately from acceptance.",
 	"Use other Jev tools only for a separate concrete decision or at the owner's request. For an external deliverable, use jev_anti_slop.",
 ].join("\n");
 
@@ -219,6 +220,10 @@ function targetOf(input: unknown): string {
 		const named = paths.filter((entry): entry is string => typeof entry === "string" && entry.length > 0);
 		if (named.length > 0) return named.join(", ");
 	}
+	if (typeof record?.["input"] === "string") {
+		const paths = [...record["input"].matchAll(/^\[([^#\r\n]+)#[0-9A-F]{4}\]$/gmu)].map(match => match[1]);
+		if (paths.length > 0) return paths.join(", ");
+	}
 	// A shell command is the action's own target: the course and completion checks judge it from the
 	// command text and its output.
 	const command = record?.["command"];
@@ -276,8 +281,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 	const lastHostPrompt = new Map<string, string>();
 	const modeUpdate = new Map<string, { content: string; timestamp: number }>();
 	const activityLocks = new Map<string, Promise<void>>();
-	const acceptanceAttempts = new WeakMap<JevState, string>();
-	const outcomeChecks = new WeakMap<JevState, { binding: string; result: ToolOutcome }>();
+	const outcomeChecks = new WeakMap<JevState, { binding: string; result: ToolOutcome; automaticAt?: number }>();
 	const outcomeInFlight = new WeakMap<JevState, { binding: string; result: Promise<ToolOutcome> }>();
 	const settledTasks = new WeakSet<JevState>();
 	const modelFeedback = new WeakMap<JevState, { binding: string; content: string; timestamp: number }>();
@@ -287,7 +291,8 @@ export function createJevController(deps: ControllerDeps): JevController {
 	const objectiveOf = (state: JevState): string | undefined => state.task?.fingerprint ?? state.request?.text;
 	const bindingOf = (state: JevState): string => JSON.stringify([
 		objectiveOf(state), state.request?.text, state.ownerMessages.length, state.revision,
-		state.plan?.planDigest, state.requirementsApproval?.items,
+		state.plan?.planUrl, state.plan?.planDigest, state.requirementsApproval?.items,
+		state.plan === undefined && state.planDraft?.outlineApproved ? state.planDraft.steps : null,
 	]);
 	const outcomeBinding = (state: JevState): string => `${bindingOf(state)}:${observedEvidence.get(state)?.version ?? 0}`;
 	const saveObservation = (state: JevState, tool: string, input: unknown, content: unknown, succeeded: boolean, consequential: boolean): void => {
@@ -299,7 +304,8 @@ export function createJevController(deps: ControllerDeps): JevController {
 		const data = asRecord(input);
 		const invocation = kind === "execution" && typeof data?.["command"] === "string" ? data["command"]
 			: kind === "execution" && typeof data?.["code"] === "string" ? data["code"]
-				: tool === "write" && typeof data?.["content"] === "string" ? data["content"] : JSON.stringify(input ?? null);
+				: tool === "edit" && typeof data?.["input"] === "string" ? data["input"]
+					: tool === "write" && typeof data?.["content"] === "string" ? data["content"] : JSON.stringify(input ?? null);
 		const output = excerptOfFullContent(content);
 		const quote = `${succeeded ? "Succeeded" : "Failed"}: ${tool} ${target.slice(0, 200)}\n` +
 			`${observationExcerpt(invocation)}\n${observationExcerpt(output)}`;
@@ -326,7 +332,8 @@ export function createJevController(deps: ControllerDeps): JevController {
 		if (pending?.binding === binding) return pending.result;
 		const snapshot = structuredClone(state);
 		snapshot.usage = state.usage;
-		const result = observedOutcome(activitiesFor(ctx), snapshot, evidenceFor(state)).finally(() => {
+		const result = observedOutcome(activitiesFor(ctx), snapshot, evidenceFor(state),
+			() => current(ctx, state) && outcomeBinding(state) === binding).finally(() => {
 			if (outcomeInFlight.get(state)?.result === result) outcomeInFlight.delete(state);
 		});
 		outcomeInFlight.set(state, { binding, result });
@@ -434,7 +441,9 @@ export function createJevController(deps: ControllerDeps): JevController {
 		const activities = Object.entries(state.stats).map(([name, count]) => `${name}: ${count.ok} completed, ${count.fail} not completed`).join(", ");
 		const observed = outcomeChecks.get(state);
 		const outcome = observed?.binding === outcomeBinding(state) ? outcomeSummary(observed.result) : "Not checked";
-		return `${diagnosticSummary(state)}\n\nOutcome: ${outcome}.\n\nActivity outcomes (not approval counts): ${activities || "none"}. Judge requests: ${state.usage.judgeCalls}. Estimated spend ${formatUsd(spend)}$; ${balance === undefined ? "balance not configured" : `configured balance ${formatUsd(balance)}$`}.`;
+		const currentReview = observed?.binding === outcomeBinding(state) && observed.result.details?.["check"] === "planned_outcome"
+			? `\n\n${observed.result.text}` : "";
+		return `${diagnosticSummary(state)}\n\nOutcome: ${outcome}.${currentReview}\n\nActivity outcomes (not approval counts): ${activities || "none"}. Judge requests: ${state.usage.judgeCalls}. Estimated spend ${formatUsd(spend)}$; ${balance === undefined ? "balance not configured" : `configured balance ${formatUsd(balance)}$`}.`;
 	};
 	return {
 		register(pi: PiApi): void {
@@ -521,6 +530,14 @@ export function createJevController(deps: ControllerDeps): JevController {
 							const binding = outcomeBinding(state);
 							const cached = isOutcome ? outcomeChecks.get(state) : undefined;
 							if (cached?.binding === binding) {
+								const plan = state.plan;
+								if (plan !== undefined) {
+									const artifact = await activitiesFor(ctx).readArtifact!(plan.planUrl).catch(() => null);
+									if (!current(ctx, state) || outcomeBinding(state) !== binding || artifact === null || sha256(artifact) !== plan.planDigest) {
+										outcomeChecks.delete(state);
+										return { ok: false, text: "The plan or observations changed; no previous acceptance applies to the current work.", details: { kind: "stale" } };
+									}
+								}
 								return { ...cached.result, details: { ...cached.result.details, replayed: true } };
 							}
 							const result: ToolOutcome = isOutcome
@@ -531,7 +548,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 							if (!current(ctx, state) || (isOutcome && outcomeBinding(state) !== binding)) {
 								return { ok: false, text: STALE_MODE_REASON, details: { kind: "stale" } };
 							}
-							if (isOutcome && result.details?.["prerequisite"] === undefined) {
+							if (isOutcome && result.details?.["prerequisite"] === undefined && result.details?.["kind"] !== "stale") {
 								if (outcomeChecks.get(state)?.binding === binding) return { ...result, details: { ...result.details, replayed: true } };
 								outcomeChecks.set(state, { binding, result });
 							}
@@ -678,7 +695,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 				try { pi.appendEntry?.(type, { subject, outcome }); }
 				catch (error) { pi.logger?.warn?.("jevstice: could not archive a background diagnostic", error); }
 				const kind = diagnosticKind(outcome);
-				if (kind === "failed" || kind === "inconclusive") {
+				if ((kind === "failed" || kind === "inconclusive") && outcome.details?.["check"] !== "planned_outcome") {
 					modelFeedback.set(state, { binding: bindingOf(state), content, timestamp: Date.now() });
 				}
 			};
@@ -740,40 +757,19 @@ export function createJevController(deps: ControllerDeps): JevController {
 				if (deps.autonomy !== undefined || state.task === undefined || state.pendingOwnerMessages?.length ||
 					(pendingEffects.get(sessionIdOf(ctx))?.size ?? 0) > 0) return;
 				const evidence = evidenceFor(state);
-				if (evidence.length === 0) return;
+				if (evidence.length === 0 && state.plan === undefined && state.planDraft?.outlineApproved !== true) return;
 				const binding = outcomeBinding(state);
-				if (outcomeChecks.get(state)?.binding === binding || acceptanceAttempts.get(state) === binding) return;
-				acceptanceAttempts.set(state, binding);
-				const valid = (): boolean => current(ctx, state) && outcomeBinding(state) === binding;
-				void (async () => {
-					if (state.plan === undefined) {
-						const outcome = await checkObservedOutcome(ctx, state);
-						if (!valid() || outcomeChecks.get(state)?.binding === binding) return;
-						if (outcome.details?.["prerequisite"] === undefined) outcomeChecks.set(state, { binding, result: outcome });
-						recordDiagnostic(state, outcome);
-						recordRecovery(state, "outcome", { evidence, binding }, outcome);
-						publishDiagnostic(state, "jev.acceptance", "Jev · Observed outcome", outcome);
-						return;
-					}
-					for (const aspect of ["business", "architecture"] as const) {
-						if (acceptanceAt(state, aspect) !== undefined) continue;
-						const snapshot = structuredClone(state);
-						snapshot.usage = state.usage;
-						const outcome = await acceptance(activitiesFor(ctx), snapshot, {
-							aspect,
-							claim: `Observed work for the registered owner request: ${state.task?.request ?? ""}`,
-							evidence,
-						});
-						if (!valid()) return;
-						const accepted = acceptanceAt(snapshot, aspect);
-						if (accepted !== undefined) recordAcceptance(state, accepted);
-						recordDiagnostic(state, outcome, false);
-						recordRecovery(state, "acceptance", { aspect, binding, evidence }, outcome);
-						publishDiagnostic(state, "jev.acceptance", `Jev · ${aspect === "business" ? "Business" : "Architecture"}`, outcome);
-					}
-				})().catch(error => {
+				if (outcomeChecks.get(state)?.binding === binding || outcomeInFlight.get(state)?.binding === binding) return;
+				const valid = () => current(ctx, state) && outcomeBinding(state) === binding;
+				void checkObservedOutcome(ctx, state).then(outcome => {
+					if (!valid() || outcomeChecks.get(state)?.binding === binding || outcome.details?.["kind"] === "stale") return;
+					if (outcome.details?.["prerequisite"] === undefined) outcomeChecks.set(state, { binding, result: outcome, automaticAt: Date.now() });
+					recordDiagnostic(state, outcome);
+					recordRecovery(state, "outcome", { evidence, binding }, outcome);
+					publishDiagnostic(state, "jev.acceptance", outcome.details?.["check"] === "planned_outcome" ? "Jev · Plan acceptance" : "Jev · Observed outcome", outcome);
+				}).catch(() => {
 					if (!valid()) return;
-					const outcome = { ok: false, text: `Automatic acceptance unavailable: ${String(error)}`, details: { kind: "unavailable" } };
+					const outcome = { ok: false, text: "Automatic acceptance could not be completed. Work may continue.", details: { kind: "unavailable" } };
 					recordDiagnostic(state, outcome, false);
 					publishDiagnostic(state, "jev.acceptance", "Jev · Outcome", outcome);
 				});
@@ -796,9 +792,14 @@ export function createJevController(deps: ControllerDeps): JevController {
 				if (mode !== undefined) {
 					retained.push({ role: "custom", customType: "jev.mode-advisory", display: false, ...mode });
 				}
+				const review = state === undefined || disabled(ctx) ? undefined : outcomeChecks.get(state);
+				const currentReview = state !== undefined && review?.automaticAt !== undefined && review.binding === outcomeBinding(state) &&
+					review.result.details?.["check"] === "planned_outcome" ? review : undefined;
 				const feedback = state === undefined || disabled(ctx) ? undefined : modelFeedback.get(state);
 				const actionable = state !== undefined && feedback !== undefined && feedback.binding === bindingOf(state);
-				if (actionable) {
+				if (currentReview !== undefined) {
+					retained.push({ role: "custom", customType: "jev.feedback", content: currentReview.result.text, display: false, timestamp: currentReview.automaticAt });
+				} else if (actionable) {
 					retained.push({ role: "custom", customType: "jev.feedback", content: feedback.content, display: false, timestamp: feedback.timestamp });
 				}
 				const research = state === undefined || disabled(ctx) ? undefined : researchTurns.get(state);

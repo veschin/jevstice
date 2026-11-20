@@ -82,7 +82,7 @@ Jevstice registers thirteen tools in ordinary sessions. `src/guidance.ts` define
 | `jev_consult` | One diagnostic choice, score or boolean question. |
 | `jev_context` | List or read the project's trusted context archive, including requirement and plan snapshots. |
 | `jev_course_check` | Does the submitted current-work claim, proposed next action and evidence follow the approved task? |
-| `jev_acceptance` | Which requirements does the observed work establish? Optional business and architecture checks remain separate. |
+| `jev_acceptance` | Which plan tasks or requirements does the observed work establish, and what can be removed? |
 | `jev_review` | Does a checkpoint, commit or diff hold up as developer work? |
 | `jev_reaim` | Is this an owner change of direction that replaces the current task? |
 | `jev_text_review` | Which prose fragments violate the submitted rules, and which rule does each violate? |
@@ -128,10 +128,15 @@ Both objects always carry the five keys `passed`, `failed`, `inconclusive`, `una
 
 For a project change, call `jev_requirements` with derived items; omit `request` to use the
 captured owner prompt. After verifying the change, call `jev_acceptance` with `{"aspect":"outcome"}`.
-It compares each requirement with observed code and execution, distinguishing unsupported results
-from defects. A later source change invalidates earlier verification. Approving a detailed plan
-opts into background action checks and separate completion acceptance. Other checks are available
-for a specific question. A quiet local read or summary does not need a Jev call.
+With a registered plan, Jev checks each task independently. It distinguishes a weak task
+description from missing evidence, uncertainty and an observed defect. Once all tasks pass on
+the same revision, Jev checks the integrated change. Both levels cite observed material when
+recommending a cut. Jev also schedules this review at completion without delaying work, asking
+for routine owner approval, or starting another turn. See the results with `/jev-status`.
+
+Without a registered plan, Jev compares approved requirements with observed code and execution.
+A later source change invalidates earlier verification. Business and architecture checks remain
+available separately. A quiet local read or summary does not need a Jev call.
 
 ### Research fact-check
 

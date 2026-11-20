@@ -8,12 +8,20 @@
   relevance and the owner's question separately, and requests one continuation if the model
   tries to finish without attempting the review.
 
+### Changed
+
+- Ordinary acceptance reports independent plan-task verdicts, gives concrete guidance for
+  uncheckable tasks, and reviews the integrated change only after every task passes on the same
+  revision. Both review levels cite evidence for suggested cuts, and neither blocks work.
+
 ### Fixed
 
 - Fact-check distinguishes a missing source excerpt, insufficient context, a contradiction and
   an inconclusive judgment, with a different action for each.
 - Anti-slop recognizes explicit issue creation, names why a review did not run, and quotes the
   affected sentence when it can locate it reliably.
+- Aspect acceptance reports missing or ambiguous literal evidence even if its verdict is
+  inconclusive. Judge failures report safe categories for SDK errors without exposing payloads.
 
 ### Removed
 

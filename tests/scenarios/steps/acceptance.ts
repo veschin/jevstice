@@ -310,7 +310,7 @@ then("a mislabeled command-only quote does not reach judgment", value => {
 	const mislabeled = world.outcomes?.[2];
 	expect(mislabeled?.details?.["approved"]).not.toBe(true);
 	expect(asRecord(mislabeled?.details)?.["evidenceQuestions"]).toMatchObject({ code: 0.1 });
-	expect(mislabeled?.text).toContain("literal command");
+	expect(mislabeled?.text).toContain("code, diff, static diagnostic or measurement: missing");
 });
 
 // Scenario 6 ---------------------------------------------------------------
@@ -572,7 +572,6 @@ const COMPLETION_PLAN = "## Collect the numbers\n\nRead the run data and report 
 async function developedTask(value: unknown): Promise<AcceptanceWorld> {
 	const world = w(value);
 	const artifactsDir = await fakeArtifacts({ "coverage-plan.md": COMPLETION_PLAN });
-	let phase: "manual" | "auto" = "manual";
 	const fake = answeringJudge({
 		needs_development: { probability: 0.95 },
 		coverage: { probability: 0.95 },
@@ -583,16 +582,10 @@ async function developedTask(value: unknown): Promise<AcceptanceWorld> {
 		finalize_consistency: { probability: 0.95 },
 		finalize_scope: { probability: 0.95 },
 		action: { label: "on_course", confidence: 0.9 },
-		acceptance: question => {
-			const options = question.options ?? {};
-			const label = Object.keys(options).find(name => name === "serves_business_need" || name === "sound_for_next_change");
-			return { label: label ?? "unclear", confidence: 0.93 };
-		},
-		execution_evidence: { probability: 0.95 },
-		code_evidence: { probability: 0.95 },
-		topic_1: () => ({ probability: phase === "manual" ? 0.95 : 0.2 }),
-		topic_1_execution: () => ({ label: phase === "manual" ? "evidence_1" : "evidence_2", confidence: 0.9 }),
-		topic_1_code: () => ({ label: phase === "manual" ? "evidence_2" : "evidence_1", confidence: 0.9 }),
+		task_definition: { label: "checkable" },
+		task_review: { label: "not_observed" },
+		task_basis: { label: "none" },
+		cleanup_evidence_1: { label: "none" },
 	});
 	world.autoCalls = fake.calls;
 	const pi = fakePi();
@@ -629,19 +622,12 @@ async function developedTask(value: unknown): Promise<AcceptanceWorld> {
 	expect(finalized["verdict"]).toBe("serves");
 	await pi.emit("tool_result", toolResultEvent("write", { path: "src/report.ts", content: "export const count = 1;" }, "Wrote src/report.ts"), ctx);
 	await pi.emit("tool_result", toolResultEvent("bash", { command: "bun test" }, "12 pass / 0 fail"), ctx);
-	const accepted = await pi.callTool("jev_acceptance", {
-		aspect: "business",
-		claim: "the report serves the owner's need",
-		evidence: [{ kind: "execution", quote: "12 pass / 0 fail" }, { kind: "code", quote: "export const count = 1;" }],
-	}, ctx);
-	expect(toolDetails(accepted)["approved"]).toBe(true);
-	phase = "auto";
 	return world;
 }
 
 const COMPLETION_REQUEST = "Report the coverage of the last run";
 
-given("a developed task reaches completion with one aspect missing", async value => {
+given("a developed task reaches completion with a registered plan", async value => {
 	await developedTask(value);
 });
 
@@ -657,30 +643,27 @@ when("the ordinary completion boundary is observed", async value => {
 
 then("the addon collects observed code and execution evidence", value => {
 	const world = w(value);
-	const acceptanceCalls = (world.autoCalls ?? []).filter(call => call.questions.some(question => question.name === "acceptance"));
-	const automatic = acceptanceCalls.at(-1);
+	const automatic = (world.autoCalls ?? []).find(call => call.questions.some(question => question.name === "task_review"));
 	expect(automatic).toBeDefined();
 	const judged = JSON.stringify(automatic?.state);
 	expect(judged).toContain("Wrote src/report.ts");
 	expect(judged).toContain("12 pass / 0 fail");
 });
 
-then("it submits the missing architecture acceptance automatically", value => {
+then("it checks each plan task automatically", value => {
 	const world = w(value);
 	const outcomes = world.autoOutcomes ?? [];
 	expect(outcomes).toHaveLength(1);
-	expect(outcomes[0]?.subject).toBe("Jev · Architecture");
-	expect(outcomes[0]?.outcome.text).toContain("architecture acceptance:");
+	expect(outcomes[0]?.subject).toBe("Jev · Plan acceptance");
+	expect(outcomes[0]?.outcome.details).toMatchObject({ tasks: [{ id: "collect", status: "missing_evidence" }], overall: { status: "not_checked" } });
 });
 
-then("it returns the unmet obligations without requiring manual acceptance calls", value => {
+then("it names the missing verification without requiring manual acceptance calls", value => {
 	const world = w(value);
 	const content = world.autoOutcomes?.[0]?.outcome.text ?? "";
-	expect(content).toContain("does not establish every plan topic");
-	expect(content).toContain("collect");
-	expect(content).toContain("approved verification section:");
+	expect(content).toContain("collect: missing evidence");
+	expect(content).toContain("retain the command with its output");
 	expect(content).toContain("Read the run data and report the count.");
-	expect(content).toContain("observe the behavior");
 });
 
 // Scenario 13 --------------------------------------------------------------

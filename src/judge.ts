@@ -11,7 +11,7 @@
  * choice label or a confidence outside [0, 1] produce `{ ok: false }`. Callers must treat
  * that as "no answer", never as approval.
  */
-import { choice, noul, score, TypeSafeClient, type ChoiceCriteria, type EntryType, type Questions } from "@typesafe-ai/sdk";
+import { APIConnectionError, APIError, APITimeoutError, choice, noul, score, TypeSafeClient, type ChoiceCriteria, type EntryType, type Questions } from "@typesafe-ai/sdk";
 import { POLICY, asRecord, type Evidence } from "./types.js";
 
 /** The three question shapes the executor may choose from. */
@@ -152,8 +152,9 @@ export function normalizeAnswers(
 			? { inputTokens, outputTokens }
 			: undefined;
 	if (answers === undefined) return { ok: false, kind: "unusable", problem: "the judge response carries no answers" };
-	const extra = Object.keys(answers).filter(name => !questions.some(question => question.name === name));
-	if (extra.length > 0) return { ok: false, kind: "unusable", problem: `the judge answered questions that were not asked: ${extra.map(name => JSON.stringify(name)).join(", ")}` };
+	if (Object.keys(answers).some(name => !questions.some(question => question.name === name))) {
+		return { ok: false, kind: "unusable", problem: "the judge answered questions that were not asked" };
+	}
 
 	const normalized: JudgeAnswer[] = [];
 	for (const question of questions) {
@@ -175,7 +176,7 @@ export function normalizeAnswers(
 			const label = answer["choice"];
 			if (typeof label !== "string") return { ok: false, kind: "unusable", problem: `answer '${question.name}' has no choice label` };
 			if (!Object.hasOwn(question.options ?? {}, label)) {
-				return { ok: false, kind: "unusable", problem: `answer '${question.name}' selected ${JSON.stringify(label)}, which was not offered` };
+				return { ok: false, kind: "unusable", problem: `answer '${question.name}' selected a choice that was not offered` };
 			}
 			normalized.push({ name: question.name, mode: "choice", label, confidence });
 			continue;
@@ -189,7 +190,7 @@ export function normalizeAnswers(
 				kind: "unusable",
 				problem:
 					typeof value === "number"
-						? `answer '${question.name}' has score ${value}, outside the submitted rubric 0..${highest}`
+						? `answer '${question.name}' has a score outside the submitted rubric 0..${highest}`
 						: `answer '${question.name}' has no numeric score; the submitted rubric runs 0..${highest}`,
 			};
 		}
@@ -207,6 +208,24 @@ function defaultClient(apiKey: string, model: string): SystemOneClient {
 		timeout: 12000,
 		retry: { maxRetries: 1 },
 	});
+}
+
+function judgeFailureProblem(error: unknown): string {
+	if (error instanceof APITimeoutError) return "the judge request timed out";
+	if (error instanceof APIConnectionError) return "the connection to the judge service failed";
+	if (!(error instanceof APIError)) return "the judge request failed unexpectedly";
+	switch (error.status) {
+		case 400:
+		case 422:
+			return "the judge service rejected the request as invalid";
+		case 401:
+		case 403:
+			return "the judge service rejected authentication or authorization";
+		case 429:
+			return "the judge service rate limit was exceeded";
+		default:
+			return "the judge service returned an HTTP error";
+	}
 }
 
 /**
@@ -247,8 +266,8 @@ export function createTypeSafeJudge(deps: {
 			}
 			const raw = await client.systemOne({ state: state as EntryType, questions: buildQuestions(questions), model });
 			return normalizeAnswers(questions, raw);
-		} catch {
-			return { ok: false, kind: "unavailable", problem: "the judge service did not answer (transport, authentication or service error)" };
+		} catch (error) {
+			return { ok: false, kind: "unavailable", problem: judgeFailureProblem(error) };
 		}
 	};
 }

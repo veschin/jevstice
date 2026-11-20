@@ -552,10 +552,9 @@ then("the result is recorded as unavailable or unusable as appropriate", value =
 	if (outcome === undefined) return;
 	expect(outcome.ok).toBe(false);
 	if (outcome.ok) return;
-	if (w.failure === "a transport or authentication error") expect(outcome.kind).toBe("unavailable");
-	else expect(outcome.kind).toBe("unusable");
-	expect(toolText(w.result)).toContain("No judge decision exists");
-	expect(toolDetails(w.result)["kind"]).toBe("unavailable");
+	const expected = w.failure === "a transport or authentication error" ? "unavailable" : "unusable";
+	expect(outcome.kind).toBe(expected);
+	expect(toolDetails(w.result)).toMatchObject({ kind: expected, approved: false });
 });
 
 then("the work is not called defective", value => {
