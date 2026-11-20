@@ -1,6 +1,105 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Jevstice - The comparison issue</title><meta name="description" content="Compare what coding agents delivered with and without Jevstice, from a harbor dispatch board to a family fare calculation."><meta property="og:title" content="Jevstice - The comparison issue"><meta property="og:image" content="https://veschin.github.io/jevstice/admin/pair.png"><meta name="twitter:card" content="summary_large_image"><link rel="stylesheet" href="fonts.css"><link rel="stylesheet" href="issue.css"></head>
-<body><a class="skip" href="#introduction">Skip to introduction</a><header><div class="folio"><span>Software field trials</span><span>Issue <b>02</b></span><a href="https://github.com/veschin/jevstice">Repository ↗</a></div><div class="masthead"><h1>Jevstice</h1><p>The comparison issue</p></div><nav aria-label="Sections"><a href="#introduction" aria-current="page">Introduction</a><a href="game/">Game</a><a href="admin/">Admin UI</a><a href="research/">Research</a><a href="features/">Tool recordings</a></nav></header>
-<main id="introduction"><div class="intro"><p>Jevstice gives an <a href="https://github.com/can1357/oh-my-pi">oh-my-pi</a> agent a second opinion. When does that change what the agent delivers?</p><p class="notes">Three models. Three briefs. Three repeats per condition.<br><a href="ledger/">Method &amp; token ledger ↗</a></p></div>
-<div class="columns"><article><p class="kicker">02 <span>/</span> Admin UI</p><h2><a href="admin/">The night shift.</a></h2><p>Two vessels need a new berth. Can the dispatcher move both without double-booking the quay?</p><figure><a href="admin/" aria-label="Compare the harbor dispatch boards"><img loading="lazy" src="admin/pair.png" alt="Two versions of the harbor dispatch board."></a></figure><a class="read" href="admin/">Work the dispatch board &rarr;</a></article><article><p class="kicker">03 <span>/</span> Research</p><h2><a href="research/">Four to the shore.</a></h2><p>A family wants the cheaper return ticket. An old fare guide and a weekend correction give different answers.</p><figure><a href="research/" aria-label="Compare the fare calculations"><img loading="lazy" src="research/pair.png" alt="Two reports from the same model and fare packet, without and with Jevstice."></a></figure><a class="read" href="research/">Check the family fare &rarr;</a></article></div>
-<aside class="strip"><p class="kicker">The tool desk</p><h2><a href="features/">Twelve tools, on film.</a></h2><a class="read" href="features/">Browse the recordings →</a></aside></main><footer><a href="ledger/">Method &amp; token ledger</a><a href="https://github.com/veschin/jevstice#install">Install Jevstice ↗</a></footer></body></html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Jevstice — A second opinion for your coding agent</title>
+	<meta name="description" content="See Jev review a diff, check requirements, and fact-check a draft inside oh-my-pi.">
+	<meta property="og:image" content="https://veschin.github.io/jevstice/terminal/fact-check.png">
+	<meta name="twitter:card" content="summary_large_image">
+	<link rel="stylesheet" href="bootstrap.min.css">
+	<style>
+		:root { --bs-body-bg: #f8f8ff; --bs-body-color: #19182a; --bs-link-color-rgb: 70, 49, 151; }
+		.hero-copy { max-width: 37rem; }
+		h1, h2 { text-wrap: balance; }
+		.btn-dark { --bs-btn-bg: #32216b; --bs-btn-border-color: #32216b; }
+		.terminal { background: #1e1e2e; }
+		.terminal img { display: block; width: 100%; min-width: 42rem; height: auto; }
+		:focus-visible { outline: .2rem solid #5a3fc1; outline-offset: .2rem; }
+	</style>
+</head>
+<body>
+	<header class="container">
+		<nav class="d-flex justify-content-between align-items-center flex-wrap gap-2 py-3 border-bottom" aria-label="Main">
+			<a class="fw-bold text-body text-decoration-none" href="./">Jevstice</a>
+			<div class="d-flex gap-3">
+				<a href="#tools">Tools</a>
+				<a href="https://github.com/veschin/jevstice">GitHub</a>
+			</div>
+		</nav>
+	</header>
+	<main class="container">
+		<section class="pt-5 pb-4">
+			<h1 class="display-2 fw-bold mb-3">A second opinion for your coding agent</h1>
+			<p class="lead hero-copy mb-3">Jevstice brings Jev into oh-my-pi. Use it to check requirements, review diffs, and verify claims. Jev's verdicts are advisory.</p>
+			<a class="btn btn-dark" href="https://github.com/veschin/jevstice#install">Install Jevstice</a>
+		</section>
+		<section class="pb-4" aria-label="Jev in action">
+			<figure class="mb-4" data-terminal-demo>
+				<div class="terminal rounded-3 overflow-auto" tabindex="0" role="region" aria-label="Fact-check terminal screenshot">
+					<img src="terminal/fact-check.png" width="1440" height="490" alt="OMP prompt asking Jev to check a 30-day claim. The source says Basic retains backups for 7 days and Pro for 30 days.">
+				</div>
+				<figcaption class="d-flex flex-wrap justify-content-between column-gap-3 mt-2">
+					<span><strong>Fact-check.</strong> The draft says Basic keeps backups for 30 days. The source says 7 days.</span>
+					<a href="terminal/fact-check.png" aria-label="Open full-size fact-check screenshot">Full size</a>
+				</figcaption>
+			</figure>
+			<figure class="mb-4" data-terminal-demo>
+				<div class="terminal rounded-3 overflow-auto" tabindex="0" role="region" aria-label="Requirements terminal screenshot">
+					<img src="terminal/requirements.png" width="1440" height="685" loading="lazy" alt="OMP prompt asking Jev to scope a dry-run flag. Jev triage and Jev requirements return their verdicts.">
+				</div>
+				<figcaption class="d-flex flex-wrap justify-content-between column-gap-3 mt-2">
+					<span><strong>Requirements.</strong> Jev flags gaps in the requirements for a dry-run flag.</span>
+					<a href="terminal/requirements.png" aria-label="Open full-size requirements screenshot">Full size</a>
+				</figcaption>
+			</figure>
+			<figure class="mb-0" data-terminal-demo>
+				<div class="terminal rounded-3 overflow-auto" tabindex="0" role="region" aria-label="Diff review terminal screenshot">
+					<img src="terminal/diff-review.png" width="1440" height="1260" loading="lazy" alt="OMP prompt asking Jev to review a diff. The check returns 95 for 100 plus a fee of 5, and Jev reports a defect.">
+				</div>
+				<figcaption class="d-flex flex-wrap justify-content-between column-gap-3 mt-2">
+					<span><strong>Diff review.</strong> Jev flags a change that subtracts a fee instead of adding it.</span>
+					<a href="terminal/diff-review.png" aria-label="Open full-size diff review screenshot">Full size</a>
+				</figcaption>
+			</figure>
+		</section>
+		<section id="tools" class="py-4 border-top">
+			<h2 class="h3 fw-bold mb-3">Jev tools</h2>
+			<div class="row row-cols-1 row-cols-md-3 g-3">
+				<div class="col">
+					<h3 class="h6 fw-bold">Planning</h3>
+					<ul class="list-unstyled mb-0">
+						<li><code>jev_triage</code></li>
+						<li><code>jev_requirements</code></li>
+						<li><code>jev_plan_review</code></li>
+						<li><code>jev_reaim</code></li>
+					</ul>
+				</div>
+				<div class="col">
+					<h3 class="h6 fw-bold">During and after the work</h3>
+					<ul class="list-unstyled mb-0">
+						<li><code>jev_consult</code></li>
+						<li><code>jev_context</code></li>
+						<li><code>jev_course_check</code></li>
+						<li><code>jev_review</code></li>
+						<li><code>jev_acceptance</code></li>
+					</ul>
+				</div>
+				<div class="col">
+					<h3 class="h6 fw-bold">Sources and writing</h3>
+					<ul class="list-unstyled mb-0">
+						<li><code>jev_search_relevance</code></li>
+						<li><code>jev_fact_check</code></li>
+						<li><code>jev_text_review</code></li>
+						<li><code>jev_anti_slop</code></li>
+					</ul>
+				</div>
+			</div>
+			<a class="d-inline-block mt-3" href="https://github.com/veschin/jevstice#tools">Read the tool descriptions</a>
+		</section>
+	</main>
+	<footer class="container">
+		<p class="border-top py-3 mb-0"><a href="https://github.com/veschin/jevstice#install">Install Jevstice</a></p>
+	</footer>
+</body>
+</html>

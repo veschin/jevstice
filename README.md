@@ -7,7 +7,7 @@
 <p align="center"><strong>Jev records diagnostic judgment at OMP tool boundaries. It never grants or withholds execution permission.</strong></p>
 
 <p align="center">
-  <a href="https://veschin.github.io/jevstice/">Watch the demos</a> ·
+  <a href="https://veschin.github.io/jevstice/">See Jev in action</a> ·
   <a href="#install">Install</a> ·
   <a href="#tools">Tools</a> ·
   <a href="#diagnostics">Diagnostics</a> ·
@@ -275,9 +275,7 @@ See [the autonomy reference](docs/autonomy.md) for the lifecycle, deployment lim
 
 ## Demos
 
-See the [demonstration site](https://veschin.github.io/jevstice/) for the [twelve tool recordings](https://veschin.github.io/jevstice/features/) and [session controls and optional autonomy](https://veschin.github.io/jevstice/controls/).
-
-The [game and dashboard comparisons](https://veschin.github.io/jevstice/archive/) use matched prompts, models and time limits. The game produced two different ship profiles; the dashboard passed the same 26 interaction checks in both runs. In a [separate editing trial](https://veschin.github.io/jevstice/comparison/), both drafts met all seven criteria. These are examples, not a benchmark.
+The [Jevstice site](https://veschin.github.io/jevstice/) shows real oh-my-pi terminal captures of diff review, requirements, and fact-checking.
 
 ## Development
 
