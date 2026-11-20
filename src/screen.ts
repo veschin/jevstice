@@ -33,9 +33,13 @@ const CHANGE =
 const EXTERNAL_DELIVERABLE =
 	/\b(?:publish|send|email|post|deliver|submit|file|serve|document|memo|memorandum|report|article|paper|brief|contract|agreement|letter|filing|submission|manuscript|research|analysis|policy|essay|thesis|dissertation|abstract|proposal|presentation|law|statute|regulation)\w*\b|(?:опублик|отправ|переда|подай|сдай|разошли|размести|документ|меморандум|отч[её]т|стать[яеиюё]|договор|соглашен|письм|заявлен|заключен|исследован|справк|доклад|юридическ|контракт|публикац|эссе|реферат|тезис|диссертац|презентац|предложен|закон|устав|регламент)/iu;
 
+// Direct tracker publication can be routine even though it creates a remote artifact.
+const ISSUE_PUBLICATION =
+	/^(?:(?:please[ ,]+)?(?:create|file|post|publish)\s+(?:(?:a|an|new)\s+)*(?:(?:github|gitlab)\s+)?(?:issue|ticket)\b|(?:создай|создать|заведи|завести|опубликуй|опубликовать)\s+(?:нов(?:ый|ую)\s+)?(?:ишью|issue|тикет)(?=$|[\s.,!?]))/iu;
+
 /** Whether a quiet request names an external deliverable rather than an internal inspection. */
 export function namesExternalDeliverable(request: string): boolean {
-	return EXTERNAL_DELIVERABLE.test(request);
+	return ISSUE_PUBLICATION.test(request.trimStart()) || EXTERNAL_DELIVERABLE.test(request);
 }
 
 /**
@@ -45,6 +49,7 @@ export function namesExternalDeliverable(request: string): boolean {
 export function weightOf(request: string): RequestWeight {
 	const text = request.trim();
 	if (text.length === 0) return "judged";
-	if (CHANGE.test(text)) return "judged";
-	return ROUTINE.test(text) ? "quiet" : "judged";
+	const publication = ISSUE_PUBLICATION.exec(text);
+	if (CHANGE.test(publication === null ? text : text.slice(publication[0].length))) return "judged";
+	return publication !== null || ROUTINE.test(text) ? "quiet" : "judged";
 }

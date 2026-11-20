@@ -70,12 +70,13 @@ omp --no-extensions -e /path/to/jevstice/src/index.ts
 
 ## Tools
 
-Jevstice registers twelve tools. `src/guidance.ts` defines their descriptions and schemas. Ordinary startup shows a short workflow instead of the full catalog.
+Jevstice registers thirteen tools in ordinary sessions. `src/guidance.ts` defines their descriptions and schemas. Ordinary startup shows a short workflow instead of the full catalog.
 
 | Tool | Diagnostic decision |
 | --- | --- |
 | `jev_triage` | Does this request need development planning, and which topics does it need? |
 | `jev_search_relevance` | Which supplied search candidate is relevant, or is none? |
+| `jev_fact_check` | Which research claims are supported, which topics belong, and does the draft answer the owner's question? |
 | `jev_requirements` | Does each proposed requirement follow from the owner's request, and does the set cover it? |
 | `jev_plan_review` | Does the outline, each plan section and the assembled plan serve the task? |
 | `jev_consult` | One diagnostic choice, score or boolean question. |
@@ -130,7 +131,32 @@ captured owner prompt. After verifying the change, call `jev_acceptance` with `{
 It compares each requirement with observed code and execution, distinguishing unsupported results
 from defects. A later source change invalidates earlier verification. Approving a detailed plan
 opts into background action checks and separate completion acceptance. Other checks are available
-for a specific question. A quiet read, search or summary does not need a Jev call.
+for a specific question. A quiet local read or summary does not need a Jev call.
+
+### Research fact-check
+
+An explicit fact-check or research request, an observed search, or an external read triggers a
+fact-check reminder in ordinary sessions. Before delivering, submit the exact draft to
+`jev_fact_check` with self-contained claims, verbatim claim fragments, and source excerpts.
+Give each source by the exact locator used to open it. Jevstice checks quoted material against
+recent `read` and `bash` results from that turn. Search snippets alone do not count as evidence.
+For table claims, quote the relevant row with its headings, units, conditions and caption.
+An unambiguous passage in the source can establish a result when the extracted columns are unclear.
+Each verdict gives a next action: reopen an unverified source, add missing context, correct an
+evidenced contradiction, or leave a below-confidence result unresolved.
+
+The protocol adapts [VERIFY, FactBench §4](https://arxiv.org/html/2410.22257v2#S4): separate
+checkable assertions, retrieve evidence through OMP, and distinguish support, contradiction and
+insufficient evidence. [FActScore](https://aclanthology.org/2023.emnlp-main.741/) measures the
+share of supported assertions; [SAFE](https://neurips.cc/virtual/2024/poster/96675) checks
+individual facts against search and estimates recall using a preferred answer length. Jevstice
+checks completeness against the original question instead. It judges each claim and draft topic
+for relevance separately from truth, and distinguishes local evidence from broader conclusions.
+
+If the model skips the tool, OMP receives one request to continue for the review. Jevstice reports
+a skipped review as not checked and never waits for a passing verdict. The review identifies the
+submitted draft by digest; changes do not inherit its verdict. Review changed claims before
+delivery and disclose unresolved findings. `/jev off` disables reminders and checks.
 
 ### What a failed check means
 
@@ -172,6 +198,13 @@ Older files may still carry `gates.mutation`, `gates.completion`, `courseCheck.m
 ## Anti-slop review
 
 `jev_anti_slop` reviews an external document, research output or legal communication. It returns `supported`, `refuted` or `not_enough_info` per claim, checks inferences against premises and a stated warrant, requires a falsifier for a hypothesis, and reports language, register and meta-text violations per fragment. A quote identical to the claim does not count as evidence.
+
+An explicit request to create or file an issue can bring its draft into review scope. A request
+to inspect an existing issue does not. When scope or configuration skips the review, the tool
+reports it as not checked and names the reason. An editorial finding quotes an exact sentence
+when it can locate the issue reliably; otherwise it quotes the paragraph. Mark mandatory rules
+with `severity: "blocker"` and preferences with `"warning"` (the default). These classifications
+do not authorize or prevent publication.
 
 The tool includes numbered Russian and English editing protocols with before-and-after examples.
 The executor follows the steps to preserve meaning, cut filler and repetition, replace formulaic

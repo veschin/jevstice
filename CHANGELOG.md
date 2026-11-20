@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Added
+
+- `jev_fact_check` adapts VERIFY for research in ordinary OMP sessions. It checks claim evidence,
+  relevance and the owner's question separately, and requests one continuation if the model
+  tries to finish without attempting the review.
+
+### Fixed
+
+- Fact-check distinguishes a missing source excerpt, insufficient context, a contradiction and
+  an inconclusive judgment, with a different action for each.
+- Anti-slop recognizes explicit issue creation, names why a review did not run, and quotes the
+  affected sentence when it can locate it reliably.
+
 ### Removed
 
 - Removed the automatic OMP status strip and compact session-status card. `/jev-status` still

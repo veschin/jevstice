@@ -30,6 +30,9 @@ const REAIM_DESCRIPTION =
 const SEARCH_DESCRIPTION =
 	"Submit one search question with its candidates. Arguments: query (required); candidates (required: two or more {title?, url?, evidence (the exact excerpt), reason (why it answers the query, or why it does not)}). Jev selects a candidate or none; the reason is yours, not Jev's. A below-floor selection is unusable; resubmit only with different candidates or excerpts.";
 
+const FACT_CHECK_DESCRIPTION =
+	"Check research before delivery or verify text on request. Submit artifact (the exact text) and claims [{quote (verbatim draft fragment), statement (one self-contained factual assertion preserving scope), evidence [{source (exact path or URL passed to read, command passed to bash, or 'owner'), quote (verbatim excerpt)}]}]. Open the source; a search snippet is only a lead. For table claims, include the matching row, headings, units, conditions and caption, or quote the result in unambiguous source prose. Include every factual assertion, including implied premises, and cite contrary evidence. Use an empty evidence array when no evidence is available, and an empty claims array only for text without assertions. The tool reports factuality separately from relevance and goal coverage. Follow each claim's action: reopen the source, add context, correct a contradiction, or leave a low-confidence result unresolved. Recheck changed claims and disclose unresolved findings; the review never blocks delivery.";
+
 const REQUIREMENTS_DESCRIPTION =
 	"Check derived obligations against the owner's objective. In ordinary work omit request to use the exact captured objective; an explicit request must match it. Supervised work requires the exact request. Supply items (one {text: a checkable obligation, source: a short exact quote from the request}); candidateNeeds and evidence with optional sourceId are optional. A diagnostic does not block work; resubmit only when the list materially changes.";
 
@@ -46,7 +49,7 @@ const TEXT_REVIEW_DESCRIPTION =
 	"Judge prose against explicit rules. Arguments: text (required: the exact text to judge); rules (required: {class, rule, scope?} items, where scope=text judges the whole text once and is the default, scope=fragment judges each prose fragment, and headings and table blocks are never fragments). Submit the exact rules; revise only the returned violating fragments. No returned defect means the text meets the submitted rules.";
 
 const ANTI_SLOP_DESCRIPTION =
-	"Use before delivering an external document, research output, legal or other external communication. Arguments: artifact (required: the exact text), language, register, purpose, audience (all required), rules (required array of {class, rule, severity?: blocker|warning}; use [] for built-in Russian or English checks alone; other languages need explicit rules), claims (required array of {id, text, kind: fact|hypothesis, evidence [{kind, quote, source?, sourceClass}], falsifier?}; use [] only for text without factual assertions; a hypothesis needs a falsifier), inferences (optional: {id, premises, warrant, conclusion}), part (optional: {index, total} for numbered parts). Russian and English automatically receive independent symbols, wording, syntax and coherence checks in addition to supplied rules. Jev returns claim trust marks and findings with the affected quote and a repair instruction; the executor edits the text, not the tool. Unlisted claims are not fact-checked. An inconclusive or unavailable result is not clean. Report findings and incomplete checks without repeating unchanged submissions to seek approval. All findings are diagnostic and never block execution or delivery.\n\n" +
+	"Use before delivering an external document, research output, legal or other external communication, including a new tracker issue. Arguments: artifact (required: the exact text), language, register, purpose, audience (all required), rules (required array of {class, rule, severity?: blocker|warning}; use [] for built-in Russian or English checks alone; other languages need explicit rules), claims (required array of {id, text, kind: fact|hypothesis, evidence [{kind, quote, source?, sourceClass}], falsifier?}; use [] only for text without factual assertions; a hypothesis needs a falsifier), inferences (optional: {id, premises, warrant, conclusion}), part (optional: {index, total} for numbered parts). Russian and English automatically receive independent symbols, wording, syntax and coherence checks in addition to supplied rules. Findings identify severity, quote the affected sentence when localized reliably or the enclosing paragraph otherwise, and specify a repair; the executor edits the text, not the tool. Use severity blocker for an explicit mandatory rule and warning for editorial preferences. If scope or configuration skips the review, the result gives the reason. Unlisted claims are not fact-checked. An inconclusive or unavailable result is not clean. Report findings and incomplete checks without repeating unchanged submissions to seek approval. All findings are diagnostic and never block execution or delivery.\n\n" +
 	ANTI_SLOP_PROTOCOL_GUIDANCE;
 
 const CONTEXT_DESCRIPTION =
@@ -338,6 +341,27 @@ export function createToolCatalog(z: SchemaBuilder): ToolCatalogEntry[] {
 			example: {
 				interjection: "Stop the export flag work and fix the login redirect instead.",
 				evidence: [{ kind: "user", quote: "Stop the export flag work and fix the login redirect instead." }],
+			},
+		},
+		{
+			name: "jev_fact_check",
+			label: "Jev fact-check",
+			description: FACT_CHECK_DESCRIPTION,
+			parameters: z.object({
+				artifact: z.string(),
+				claims: z.array(z.object({
+					quote: z.string(),
+					statement: z.string(),
+					evidence: z.array(z.object({ source: z.string(), quote: z.string() })),
+				})),
+			}),
+			example: {
+				artifact: "The survey included 72 respondents.",
+				claims: [{
+					quote: "The survey included 72 respondents.",
+					statement: "The survey included 72 respondents.",
+					evidence: [{ source: "survey/methods.md", quote: "Seventy-two participants submitted responses." }],
+				}],
 			},
 		},
 		{

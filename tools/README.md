@@ -41,6 +41,36 @@ Read-only admission is bounded and quote-aware, and an `http://`/`https://` read
 rather than a project inspection. Those classifiers decide what is consequential enough to record;
 they do not decide whether a call may execute.
 
+## Issue 2: actionable review diagnostics
+
+The [benchmark](https://arxiv.org/html/2611.02155v1#A2.T3) reports 89.3% recall for Jev 1.14
+with definitions alone, 98.2% with Opus examples, and 120 ms median latency with Opus examples.
+The original run's exact submissions were not available. Missing headings were a plausible cause,
+not an established cause. In a fresh pre-change probe, adding the headings and caption left the
+swapped recall value marked supported. The regression covers an unlabeled row, verified context,
+the condition swap and an inconclusive answer. A live probe of the final prompt rejected the swapped
+value with the headed table alone and with source prose. It supported the correct value with source
+prose; the correct table-only and row-only submissions remained inconclusive
+(`/tmp/jev-issue-2.6Yo6rO/benchmark-final.jsonl`).
+
+The initial classifier returned external for `File a GitHub issue` but not `Create a GitHub issue`;
+both still needed triage because neither had quiet request weight. Native OMP now reaches the
+review for explicit creation and returns `not_checked` with `out_of_scope` for an existing-issue
+review. Rule severity was already explicit: use `blocker` for a mandatory register rule and
+`warning` for editorial preferences. Sentence selection narrows a settled finding when reliable;
+other cases retain the paragraph. No step grants publication permission.
+
+- The selected candidate passed `bun run typecheck` and `bun test` in an isolated tree:
+  911 passed, 0 failed and 2 pending (`/tmp/jev-issue-candidate.DskcZU/test.log`).
+- Native fact-check: the observed Section 6 excerpt contradicted the swapped figure and returned
+  `correct_claim` (`/tmp/jev-fact-native-final.WH0UBM/omp.jsonl`).
+- Native anti-slop: a mandatory register finding quoted `We kinda need this fixed.` while the
+  overall review remained inconclusive (`/tmp/jev-editorial-final.7KNHqe/omp.jsonl`). The existing
+  issue review was skipped (`/tmp/jev-issue-skip.L3BZvH/omp.jsonl`).
+- A fresh OMP process selected the installed issue-acceptance skill for an existing issue. It
+  accepted the measurement, disputed the proposed cause and fix, and left the tracker unchanged
+  (`/tmp/jev-issue-skill.lSq0Ez/omp.jsonl`).
+
 ## Modes
 
 | Mode | Judge | What it verifies |

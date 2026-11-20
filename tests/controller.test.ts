@@ -47,6 +47,7 @@ const ORDINARY_TOOLS = [
 	"jev_consult",
 	"jev_context",
 	"jev_course_check",
+	"jev_fact_check",
 	"jev_plan_review",
 	"jev_reaim",
 	"jev_requirements",
@@ -138,7 +139,7 @@ function lastMessage(pi: FakePi, customType: string): string | undefined {
 }
 
 describe("T1 - the registered ordinary surface", () => {
-	test("the twelve ordinary tools are registered with no judgement at registration", () => {
+	test("all ordinary tools are registered with no judgement at registration", () => {
 		const { pi, calls } = controllerFor({});
 
 		expect([...pi.tools.keys()].sort()).toEqual(ORDINARY_TOOLS);

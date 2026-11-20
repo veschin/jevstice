@@ -20,6 +20,7 @@ import {
 import type { ContextArchive, ContextSource } from "./context.js";
 import { createToolCatalog, toolInstructions } from "./guidance.js";
 import { readLocalArtifact } from "./artifact.js";
+import { factCheck, FACT_CHECK_GUIDANCE, isResearchTool, requestsFactCheck, type FactSource } from "./factCheck.js";
 import { isConsequentialMutation, type GateVerdict } from "./gates.js";
 import type { Judge } from "./judge.js";
 import { messagePresentation, outcomeSummary, toolPresentation, type MessagePresentationRenderer, type PresentationApi, type ToolPresentation } from "./presentation.js";
@@ -114,9 +115,19 @@ interface Observations {
 	execution: Map<string, Evidence>;
 	version: number;
 }
+interface ResearchTurn {
+	objective: string;
+	sources: Map<string, FactSource>;
+	required: boolean;
+	attempted: boolean;
+	continued: boolean;
+	reported: boolean;
+	timestamp: number;
+}
+
 
 const OWNER_ONLY: Readonly<Partial<Record<string, true>>> = {
-	"jev.status": true, "jev.mode": true, "jev.diagnostic": true, "jev.acceptance": true, "jev.config": true,
+	"jev.status": true, "jev.mode": true, "jev.diagnostic": true, "jev.acceptance": true, "jev.config": true, "jev.fact-check-status": true,
 };
 const FOLLOW_UP = /^(?:also\b|continue\b|one more\b|and (?:also|now)\b|ещ[её](?:\s|$)|также(?:\s|$)|продолж\p{L}*(?:\s|$)|и (?:ещ[её]|теперь)(?:\s|$))/iu;
 const LEAN_GUIDANCE = [
@@ -271,6 +282,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 	const settledTasks = new WeakSet<JevState>();
 	const modelFeedback = new WeakMap<JevState, { binding: string; content: string; timestamp: number }>();
 	const observedEvidence = new WeakMap<JevState, Observations>();
+	const researchTurns = new WeakMap<JevState, ResearchTurn>();
 	const pendingEffects = new Map<string, Map<string, PendingEffect>>();
 	const objectiveOf = (state: JevState): string | undefined => state.task?.fingerprint ?? state.request?.text;
 	const bindingOf = (state: JevState): string => JSON.stringify([
@@ -459,11 +471,21 @@ export function createJevController(deps: ControllerDeps): JevController {
 					return { ok: false, text: `Archive inventory unavailable: ${String(error)}. ${recoveryFeedback(state)}`, details: { kind: "unavailable" } };
 				}
 			};
+			const factCheckTool: typeof contextTool = async (activity, state, params) => {
+				const turn = researchTurns.get(state);
+				const objective = state.task?.request && state.task.request !== turn?.objective &&
+					(turn === undefined || FOLLOW_UP.test(turn.objective.trim()))
+					? [state.task.request, turn?.objective].filter(Boolean).join("\n\n") : (turn?.objective ?? state.request?.text ?? "");
+				const result = await factCheck(activity.judge, state, params, objective, turn?.sources ?? new Map());
+				if (turn !== undefined && result.details?.["kind"] !== "invalid") turn.attempted = true;
+				return result;
+			};
 			const activities: Record<string, (activity: ActivityDeps, state: JevState, params: unknown) => Promise<ToolOutcome>> = {
 				jev_consult: consult, jev_triage: triage, jev_reaim: reaim, jev_requirements: requirements,
 				jev_plan_review: planReview, jev_acceptance: acceptance, jev_review: review,
 				jev_text_review: textReview, jev_anti_slop: antiSlop, jev_search_relevance: searchRelevance,
 				jev_course_check: courseCheck, jev_context: contextTool,
+				jev_fact_check: factCheckTool,
 			};
 			const run = (name: string, activity: typeof contextTool) =>
 				async (_id: string, params: unknown, _signal: unknown, _onUpdate: unknown, ctx: unknown): Promise<unknown> => {
@@ -529,7 +551,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 					if (name !== "jev_context" && outcome.details?.["replayed"] !== true) recordDiagnostic(state, outcome);
 					return toolResponse(outcome, state);
 				};
-			const catalog = createToolCatalog(deps.zod);
+			const catalog = createToolCatalog(deps.zod).filter(entry => deps.autonomy === undefined || entry.name !== "jev_fact_check");
 			const strictInstructions = deps.autonomy === undefined ? undefined : `${JEV_SKILL}\n\n${toolInstructions(catalog)}\n${STRICT_WORKFLOW_NOTE}`;
 			for (const entry of catalog) {
 				const activity = activities[entry.name];
@@ -606,18 +628,28 @@ export function createJevController(deps: ControllerDeps): JevController {
 				const input = asRecord(event);
 				if (input?.["reason"] === "prompt") modeUpdate.delete(sessionIdOf(ctx));
 				const policy = input?.["systemPrompt"];
-				const existing = Array.isArray(policy) ? policy.filter(entry => entry !== LEAN_GUIDANCE && entry !== strictInstructions) : [];
+				const existing = Array.isArray(policy) ? policy.filter(entry => entry !== LEAN_GUIDANCE && entry !== strictInstructions && entry !== FACT_CHECK_GUIDANCE) : [];
 				if (disabled(ctx)) return { systemPrompt: existing };
 				if (strictInstructions !== undefined) return { systemPrompt: [...existing, strictInstructions] };
 				const state = stateFor(ctx);
 				if (deps.autonomy === undefined && input?.["reason"] !== "revive") {
 					const prompt = input?.["prompt"];
 					if (typeof prompt === "string") {
+						if (prompt === FACT_CHECK_GUIDANCE && researchTurns.get(state)?.continued) {
+							return { systemPrompt: [...existing, FACT_CHECK_GUIDANCE] };
+						}
 						const id = sessionIdOf(ctx);
 						if (input?.["reason"] === "prompt" && !ownerInputPending.delete(id) && lastHostPrompt.get(id) !== prompt) captureOwner(ctx, prompt, "prompt");
+						const ownerPrompt = state.ownerMessages.at(-1) ?? prompt;
 						const previous = state.request?.weight === "judged" ? state.request.text : state.task?.request;
 						lastHostPrompt.set(id, prompt);
 						screenRequest(state, prompt);
+						if (input?.["reason"] === "prompt" || !researchTurns.has(state)) {
+							researchTurns.set(state, {
+								objective: ownerPrompt, sources: new Map(), required: requestsFactCheck(ownerPrompt),
+								attempted: false, continued: false, reported: false, timestamp: Date.now(),
+							});
+						}
 						if (settledTasks.has(state) && state.request?.weight === "judged" && prompt.trim() !== previous?.trim() &&
 							!FOLLOW_UP.test(prompt.trim())) {
 							retireTask(state);
@@ -627,7 +659,8 @@ export function createJevController(deps: ControllerDeps): JevController {
 						}
 					}
 				}
-				return { systemPrompt: state.request?.weight === "judged" ? [...existing, LEAN_GUIDANCE] : existing };
+				return { systemPrompt: [...existing, ...(state.request?.weight === "judged" ? [LEAN_GUIDANCE] : []),
+					...(researchTurns.get(state)?.required ? [FACT_CHECK_GUIDANCE] : [])] };
 			});
 			pi.on("tool_call", async (event, ctx) => {
 				// Jev never controls ordinary admission. Strict containment is a separate owner boundary.
@@ -768,7 +801,10 @@ export function createJevController(deps: ControllerDeps): JevController {
 				if (actionable) {
 					retained.push({ role: "custom", customType: "jev.feedback", content: feedback.content, display: false, timestamp: feedback.timestamp });
 				}
-				if (mode !== undefined || retained.length !== messages.length || actionable) return { messages: retained };
+				const research = state === undefined || disabled(ctx) ? undefined : researchTurns.get(state);
+				const required = research?.required === true && !research.attempted;
+				if (required) retained.push({ role: "custom", customType: "jev.fact-check-reminder", content: FACT_CHECK_GUIDANCE, display: false, timestamp: research.timestamp });
+				if (mode !== undefined || retained.length !== messages.length || actionable || required) return { messages: retained };
 			});
 			pi.on("tool_result", async (event, ctx) => {
 				const record = asRecord(event);
@@ -783,6 +819,25 @@ export function createJevController(deps: ControllerDeps): JevController {
 				const state = stateFor(ctx);
 				const succeeded = record?.["isError"] !== true;
 				const asyncReceipt = asRecord((delegated ? asRecord(forwarded["inner"]) : details)?.["async"]);
+				const research = deps.autonomy === undefined ? researchTurns.get(state) : undefined;
+				if (research !== undefined && asyncReceipt === undefined) {
+					if (isResearchTool(tool, input)) research.required = true;
+					const args = asRecord(input);
+					const locator = tool === "read" ? args?.["path"] ?? args?.["url"] ?? args?.["file_path"]
+						: tool === "bash" ? args?.["command"] : undefined;
+					if (succeeded && typeof locator === "string" && locator.length <= 4096) {
+						const sourceDetails = delegated ? asRecord(forwarded["inner"]) : details;
+						const display = tool === "read" ? asRecord(sourceDetails?.["displayContent"]) : undefined;
+						const lines = display?.["lineNumbers"];
+						const text = typeof display?.["text"] === "string" && Array.isArray(lines) && lines.length > 0 &&
+							lines.every((line, index) => typeof line === "number" && (index === 0 || line === lines[index - 1] + 1))
+							? display["text"] : excerptOfFullContent(record?.["content"]);
+						const kind = tool === "bash" ? "observed execution" : /^https?:\/\//iu.test(locator) ? "public document" : "local material";
+						research.sources.delete(locator);
+						research.sources.set(locator, { kind, text: text.slice(0, 64_000) });
+						if (research.sources.size > 32) research.sources.delete(research.sources.keys().next().value!);
+					}
+				}
 				const action = { tool, target: targetOf(input), excerpt: [changeOf(input), excerptOf(record?.["content"])].join("\n") };
 				if (asyncReceipt === undefined) {
 					if (consequential) {
@@ -804,10 +859,22 @@ export function createJevController(deps: ControllerDeps): JevController {
 				if (tool === "wait" && record?.["isError"] !== true && asRecord(record?.["details"])?.["op"] === "wait") settleBackground(ctx, record!, true);
 				await deps.autonomy?.toolResult(ctx, state, event);
 			});
-			pi.on("session_stop", async (_event, ctx) => {
+			pi.on("session_stop", async (event, ctx) => {
 				const state = stateFor(ctx);
 				if (deps.autonomy !== undefined) return deps.autonomy.stop(ctx, state, activitiesFor(ctx));
 				if (!disabled(ctx)) {
+					// Research gets at most one follow-up. No verdict is needed to finish.
+					const research = researchTurns.get(state);
+					if (research?.required && !research.attempted && !research.reported) {
+						if (!research.continued && asRecord(event)?.["stop_hook_active"] !== true) {
+							research.continued = true;
+							return { continue: true, additionalContext: FACT_CHECK_GUIDANCE };
+						}
+						research.reported = true;
+						const text = "Research fact-check not checked: no valid submission was made.";
+						recordDiagnostic(state, { ok: false, text, details: { skipped: true } });
+						sendMessage(pi, "jev.fact-check-status", text, "Jev · Fact-check · Not checked");
+					}
 					if (!state.pendingOwnerMessages?.length && !(pendingEffects.get(sessionIdOf(ctx))?.size)) settledTasks.add(state);
 					diagnoseCompletion(ctx, state);
 				}

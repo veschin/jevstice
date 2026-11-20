@@ -12,6 +12,7 @@ import {
 	type JevState,
 } from "../src/state.js";
 import type { Judge } from "../src/judge.js";
+import { weightOf } from "../src/screen.js";
 import { asRecord, type Evidence, type JevConfig, type ToolOutcome } from "../src/types.js";
 import {
 	answeringJudge,
@@ -460,6 +461,26 @@ describe("FR-51, FR-52 - language, register, meta-text and relevance findings", 
 		expect(outcome.details["blockers"]).toBe(2);
 		expect(outcome.details["warnings"]).toBe(2);
 	});
+
+	test.each([
+		{ confidence: 0.95, quote: "We kinda need this fixed." },
+		{ confidence: 0.55, quote: "The application stops on startup. We kinda need this fixed." },
+	])("quotes only the reliably localized sentence ($confidence)", async ({ confidence, quote }) => {
+		const { deps } = depsFor({
+			...CLEAN_FRAGMENT, rule_1_1: { probability: 0.95 }, rule_1_2: { probability: 0.05 },
+			locator_1: { label: "sentence_2", confidence },
+		});
+		const result = await antiSlop(deps, externalState(), params({
+			artifact: "The application stops on startup. We kinda need this fixed.",
+			claims: [], inferences: [],
+			rules: [
+				{ class: "register", rule: 'Never use informal contractions such as "kinda".', severity: "blocker" },
+				{ class: "concision", rule: "Prefer shorter phrasing when it improves clarity." },
+			],
+		}));
+		expect(result.details?.["findings"]).toMatchObject([{ kind: "register_violation", severity: "blocker", quote }]);
+		expect(result.text).toContain(`Quote: ${JSON.stringify(quote)}`);
+	});
 });
 
 describe("FR-48 - weak sources and inconclusive judgments are marked, not trusted", () => {
@@ -558,6 +579,35 @@ describe("FR-47, FR-50 - missing evidence and missing falsifier need no claim qu
 	});
 });
 
+test.each([
+	"Create a GitHub issue", "File a GitHub issue", "Create a GitLab issue for the parser",
+	"Создай ишью",
+])("explicit issue publication can be reviewed without triage: %s", async request => {
+	const state = freshState();
+	state.request = { text: request, weight: weightOf(request) };
+	const { deps } = depsFor(CLEAN_FRAGMENT);
+	const result = await antiSlop(deps, state, params({ claims: [], inferences: [] }));
+	expect(result.ok).toBe(true);
+	expect(state.antiSlopReviews[0]?.request).toBe(request);
+});
+
+test("reviewing an existing issue leaves anti-slop out of scope", async () => {
+	const request = "Review an existing GitHub issue";
+	const state = freshState();
+	state.request = { text: request, weight: weightOf(request) };
+	const { deps, calls } = depsFor({});
+	const result = await antiSlop(deps, state, params({ claims: [], inferences: [] }));
+	expect(diagnosticKind(result)).toBe("not_checked");
+	expect(result.details).toMatchObject({ kind: "not_checked", reason: "out_of_scope" });
+	expect(result.text).toContain("none is in scope");
+	expect(result.text).toContain("not checked");
+	expect(calls).toHaveLength(0);
+});
+
+test("filing an issue does not hide an additional development request", () => {
+	expect(weightOf("Create a GitHub issue and implement the fix")).toBe("judged");
+});
+
 describe("FR-56 - fail-closed and part coverage", () => {
 	test("off refuses without a judge call while a quiet external publication is reviewable", async () => {
 		const quiet = freshState();
@@ -565,6 +615,8 @@ describe("FR-56 - fail-closed and part coverage", () => {
 		const off = depsFor(CLEAN_FRAGMENT, "off");
 		const refused = await antiSlop(off.deps, quiet, params({ claims: [CLAIM_1], inferences: [] }));
 		expect(refused.ok).toBe(false);
+		expect(refused.details).toMatchObject({ kind: "not_checked", reason: "disabled" });
+		expect(refused.text).toContain("not checked");
 		expect(off.calls).toHaveLength(0);
 
 		const advisory = depsFor({ claim_1: { label: "supported", confidence: 0.95 }, ...CLEAN_FRAGMENT });
