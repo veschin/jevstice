@@ -13,6 +13,7 @@
 - Ordinary acceptance reports independent plan-task verdicts, gives concrete guidance for
   uncheckable tasks, and reviews the integrated change only after every task passes on the same
   revision. Both review levels cite evidence for suggested cuts, and neither blocks work.
+- The website replaces tables and screenshots with Luna's playable booking revisions, a before-and-after fact-check and a guide to the other Jev tools. The cover tears as you scroll. Each replay shows progress and ends on the recorded verdict.
 
 ### Fixed
 

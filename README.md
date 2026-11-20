@@ -275,7 +275,7 @@ See [the autonomy reference](docs/autonomy.md) for the lifecycle, deployment lim
 
 ## Demos
 
-The [Jevstice site](https://veschin.github.io/jevstice/) shows real terminal captures of Jev checks in oh-my-pi.
+On the [Jevstice site](https://veschin.github.io/jevstice/), you can replay Luna's revisions and compare two booking notices against the signed studio policy.
 
 ## Development
 
@@ -286,6 +286,8 @@ bun run typecheck
 ```
 
 The suite uses injected judges and makes no live API calls. Static checks and the live smoke are the caller's responsibility; this README records no suite count or release verdict.
+
+To exercise the website without a test dependency, serve the checkout locally (`python3 -m http.server --bind 127.0.0.1`) and open `http://127.0.0.1:8000/tests/site-playback.html`. It checks that the booking notice plays through to the correction and stops when the reader picks a version.
 
 Live checks use the production judge; the `diagnostics` scenario uses an injected judge and needs no key. Host mode also needs a real OMP process:
 

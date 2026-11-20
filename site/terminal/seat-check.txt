@@ -1,0 +1,24 @@
+Booking desk checks (separate from Luna's development run)
+
+Question
+I am updating the booking desk notice for this workshop pilot. How many seats does North offer, and how many does South offer? The signed pilot policy is authoritative.
+
+policy.txt
+Workshop pilot policy, signed off by operations. North offers two seats and South offers one. The public waitlist is available when North fills up. South has no waitlist for this pilot. This policy is the source for the help copy; the waitlist itself is outside the API implementation task.
+
+Old notice, draft 9acf98487d81
+"Both studios have two seats."
+Claim inventory: incomplete. Task coverage: unclear.
+North: supported; relevance unclear.
+South: unclear; relevance unclear.
+
+Corrected notice, draft b1357b0a848f
+"North offers two seats. South offers one seat."
+
+Jev output, verbatim excerpt:
+Claim inventory: unclear. Coverage could not be established; check the draft for omitted claims.
+Task coverage: answered. The draft answers the owner's substantive question and preserves its constraints.
+- "North offers two seats." - supported; relevant. The verified excerpts support the assertion at its stated scope. Keep: removal would weaken the answer, its evidence, or a material caveat.
+  local material: policy.txt - "North offers two seats and South offers one."
+- "South offers one seat." - supported; relevant. The verified excerpts support the assertion at its stated scope. Keep: removal would weaken the answer, its evidence, or a material caveat.
+  local material: policy.txt - "North offers two seats and South offers one."

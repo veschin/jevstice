@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Jevstice booking notice playback check</title>
+<p><output>Checking the old notice, corrected notice and manual interruption...</output></p>
+<iframe title="Booking notice" width="600" height="380"></iframe>
+<script type="module">
+const frame = document.querySelector("iframe");
+const output = document.querySelector("output");
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+frame.addEventListener("load", async () => {
+	try {
+		const doc = frame.contentDocument;
+		const button = doc.querySelector("#fact-check .press-run");
+		const selected = id => doc.getElementById(id).checked;
+		assert(selected("fact-correct"), "The corrected notice must be shown first.");
+		button.click();
+		assert(selected("fact-old"), "Replay must begin with the old notice, not Luna's unrelated run.");
+		const progress = doc.querySelector("#fact-check progress");
+		assert(progress?.checkVisibility() && progress.value > 0 && progress.value < progress.max, "Play must show progress on the first ink strike.");
+		const started = performance.now();
+		await new Promise((resolve, reject) => {
+			const observer = new MutationObserver(() => {
+				if (!selected("fact-correct")) return;
+				clearTimeout(timeout);
+				observer.disconnect();
+				resolve();
+			});
+			const timeout = setTimeout(() => { observer.disconnect(); reject(new Error("Playback still stalls before the correction.")); }, 2400);
+			observer.observe(button, { childList: true });
+		});
+		const interval = performance.now() - started;
+		assert(progress.value === progress.max, "The meter did not finish with the corrected notice.");
+		assert(doc.querySelector('#fact-check [data-leaf="3"]').checkVisibility(), "The corrected result must be readable.");
+		button.click();
+		doc.querySelector('label[for="fact-run"]').click();
+		await new Promise(resolve => setTimeout(resolve, interval + 500));
+		assert(selected("fact-run"), "Automatic playback overwrote the reader's choice.");
+		const sheet = doc.querySelector(".cover-sheet");
+		const view = doc.defaultView;
+		view.scrollTo(0, 0);
+		await new Promise(resolve => view.requestAnimationFrame(() => view.requestAnimationFrame(resolve)));
+		const rest = view.getComputedStyle(sheet).transform;
+		view.scrollTo(0, doc.querySelector(".cover").getBoundingClientRect().height * .5);
+		await new Promise(resolve => view.requestAnimationFrame(() => view.requestAnimationFrame(resolve)));
+		assert(view.getComputedStyle(sheet).transform !== rest, "The sheet must already lift while its lower half is on screen.");
+		output.value = "PASS: immediate ink progress, fast correction, manual interruption and a scroll-driven tear.";
+	} catch (error) { output.value = `FAIL: ${error.message}`; }
+}, { once: true });
+frame.src = "../site/index.html#fact-check";
+</script>
+</html>

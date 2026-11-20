@@ -4,142 +4,210 @@
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>Jevstice</title>
-	<meta name="description" content="Jevstice brings Jev's checks into oh-my-pi. See terminal examples of triage, requirements, plan review, and fact-checking.">
-	<meta property="og:image" content="https://veschin.github.io/jevstice/terminal/fact-check.png">
+	<meta name="description" content="Turn through Luna's booking drafts and see what Jev checked against the brief, the plan, and the studio policy.">
+	<meta property="og:image" content="https://veschin.github.io/jevstice/judge.webp">
 	<meta name="twitter:card" content="summary_large_image">
 	<link rel="stylesheet" href="bootstrap.min.css">
-	<style>
-		@font-face {
-			font-family: "Source Serif 4";
-			src: url("fonts/source-serif-4.woff2") format("woff2");
-			font-weight: 400 800;
-			font-display: swap;
-		}
-		:root {
-			--bs-body-bg: #fff;
-			--bs-body-color: #222;
-			--bs-link-color-rgb: 34, 34, 34;
-			--bs-link-hover-color-rgb: 34, 34, 34;
-			--bs-body-font-family: "Source Serif 4", Georgia, serif;
-			--bs-body-font-size: 1.125rem;
-			--bs-body-line-height: 1.6;
-			--rule: #ccc;
-			scroll-behavior: auto;
-		}
-		a { text-underline-offset: .18em; }
-		h1, h2 { font-weight: 700; line-height: 1.15; }
-		h1 { font-size: clamp(2.375rem, 4vw, 3.25rem); }
-		h2 { font-size: 1.625rem; }
-		.container { max-width: 65rem; }
-		.masthead { border-bottom: 1px solid var(--bs-body-color); }
-		.utility { font: 600 .875rem/1.35 var(--bs-font-sans-serif); }
-		.copy { max-width: 64ch; }
-		.contents { position: sticky; top: 1rem; }
-		.contents a { display: flex; align-items: center; min-height: 2.5rem; }
-		.story-section + .story-section { border-top: 1px solid var(--rule); }
-		.story-section { scroll-margin-top: 1rem; }
-		.terminal { background: #1e1e2e; }
-		.terminal img { display: block; width: 100%; height: auto; }
-		:focus-visible { outline: .15rem solid currentColor; outline-offset: .15rem; }
-		.terminal a { display: block; min-width: 43rem; }
-		.terminal a:focus-visible { outline-color: white; outline-offset: -.2rem; }
-		@media (max-width: 991.98px) {
-			.contents { top: 0; z-index: 2; background: var(--bs-body-bg); border-bottom: 1px solid var(--rule); }
-			.contents ul { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
-			.contents a { justify-content: center; text-align: center; }
-			.story-section { scroll-margin-top: 6rem; }
-		}
-	</style>
+	<link rel="stylesheet" href="press.css">
 </head>
 <body>
 	<a href="#introduction" class="visually-hidden-focusable">Skip to the article</a>
 	<header class="container" id="top">
 		<div class="masthead d-flex justify-content-between align-items-baseline gap-3 pt-4 pb-3">
-			<h1 class="mb-0">Jevstice</h1>
-			<a href="https://github.com/veschin/jevstice" class="utility">GitHub</a>
+			<h1 class="mb-0">Jev<span>stice</span></h1>
+			<div class="utility"><span class="swatches" aria-hidden="true"><i></i><i></i><i></i></span><a href="https://github.com/veschin/jevstice">GitHub</a></div>
 		</div>
 	</header>
 	<main class="container">
-		<div class="row gx-lg-5 flex-lg-row-reverse">
+		<div class="row gx-xl-5 flex-lg-row-reverse">
 			<nav class="contents col-lg-3 align-self-lg-start py-lg-4" aria-label="Contents">
 				<p class="utility mb-1 d-none d-lg-block">Contents</p>
-				<ul class="utility list-unstyled mb-0">
-					<li><a href="#introduction">Introduction</a></li>
-					<li><a href="#why">Why use it?</a></li>
-					<li><a href="#triage">Triage</a></li>
-					<li><a href="#requirements">Requirements</a></li>
-					<li><a href="#plan">Plan review</a></li>
-					<li><a href="#fact-check">Fact-check</a></li>
+				<ul class="nav utility">
+					<li class="nav-item"><a class="nav-link" href="#introduction">Introduction</a></li>
+					<li class="nav-item"><a class="nav-link" href="#why">Why use it?</a></li>
+					<li class="nav-item"><a class="nav-link" href="#examples">Examples</a></li>
+					<li class="nav-item"><a class="nav-link" href="#triage">Triage</a></li>
+					<li class="nav-item"><a class="nav-link" href="#requirements">Requirements</a></li>
+					<li class="nav-item"><a class="nav-link" href="#plan">Plan review</a></li>
+					<li class="nav-item"><a class="nav-link" href="#fact-check">Fact-check</a></li>
+					<li class="nav-item"><a class="nav-link" href="#more-tools">What else?</a></li>
 				</ul>
 			</nav>
 			<article class="col-lg-9">
-				<section id="introduction" class="story-section py-4" tabindex="-1">
-					<h2>What is Jevstice?</h2>
-					<p class="copy"><strong>omp</strong> (oh-my-pi) runs an AI assistant in your terminal. The assistant can read and edit project files and run commands.</p>
-					<p class="copy"><strong>Jev</strong> is a separate AI model from TypeSafe that answers questions about a request, a plan, a code change, or a source.</p>
-					<p class="copy mb-0"><strong>Jevstice</strong> connects omp to Jev and shows its findings in the terminal. The checks give you a second opinion without stopping the assistant's work.</p>
+				<div class="cover">
+					<div class="cover-sheet">
+						<section id="introduction" class="broadside story-section" tabindex="-1">
+							<div class="intro-body">
+								<h2>What is Jevstice?</h2>
+								<p class="lede">In oh-my-pi, one model writes the code. Jev gives its work a second reading.</p>
+								<p class="body-copy">Jevstice lets the assistant send a plan, a change or a claim to Jev, a separate model from TypeSafe. Its findings appear in the terminal without stopping the work.</p>
+							</div>
+							<svg class="seal" viewBox="0 0 240 240" aria-hidden="true" focusable="false">
+								<defs>
+									<clipPath id="portrait-cut"><circle cx="120" cy="120" r="88"/></clipPath>
+								</defs>
+								<circle cx="114" cy="127" r="105" fill="#a03723"/>
+								<g class="plate">
+									<circle cx="120" cy="120" r="105" fill="#fbebc7" stroke="#262422" stroke-width="2"/>
+									<circle cx="120" cy="120" r="100" fill="none" stroke="#262422" stroke-dasharray="1 5"/>
+									<image href="judge.webp" x="32" y="32" width="176" height="176" clip-path="url(#portrait-cut)"/>
+									<circle cx="120" cy="120" r="89" fill="none" stroke="#262422" stroke-width="2"/>
+								</g>
+								<path d="M0 120h23m194 0h23M120 0v18m0 204v18" stroke="#262422"/>
+							</svg>
+						</section>
+						<section id="why" class="why story-section" tabindex="-1">
+							<h2>Why use it?</h2>
+							<p class="copy mb-0">A booking test can tell you whether South accepts a reservation. It won't tell you whether the help page promises a waitlist that South doesn't offer. Jev can check those words against the studio policy.</p>
+						</section>
+						<div class="perforation" aria-hidden="true"></div>
+					</div>
+				</div>
+				<div class="tear-tail" aria-hidden="true"></div>
+
+				<section id="examples" class="examples story-section" tabindex="-1">
+					<h2>Examples</h2>
+					<p class="copy">GPT-6 Luna and GPT-6 Sol each added a second studio to a booking service. Each model reviewed its first draft twice: once with Jev and once on its own. All four versions passed the same seven HTTP checks.</p>
+					<p class="takeaway">Luna added the help text to its checklist with Jev. Its solo checklist left it out.</p>
 				</section>
 
-				<section id="why" class="story-section py-4" tabindex="-1">
-					<h2>Why use it?</h2>
-					<p class="copy mb-0">The model doing the work can invent facts, forget a part of your request, or make changes you didn't ask for. It can still report that everything is done. Jev checks what the assistant submits against what you asked for or what a source actually says.</p>
-				</section>
-
-				<section id="triage" class="story-section py-4" tabindex="-1">
-					<h2>Triage</h2>
-					<figure class="mb-0">
-						<div class="terminal overflow-auto" tabindex="0" role="region" aria-label="Triage terminal screenshot">
-							<a href="terminal/triage.png" title="Open full-size triage screenshot"><img src="terminal/triage.png" width="1440" height="225" loading="lazy" alt="An English request for a dry-run option and help text, followed by Jev's triage result: development, three topics."></a>
-						</div>
-						<figcaption class="copy mt-3">
-							<p class="mb-0">The request asks for an option to preview an export without saving it and an update to the command's help text. Jev treats it as a development task and identifies three topics to check. That sets the scope of the review before any files change.</p>
-						</figcaption>
+				<section id="triage" class="chapter story-section" tabindex="-1">
+					<div class="chapter-heading"><h2>Triage</h2><span class="folio utility">1 / 4</span></div>
+					<figure class="proof">
+						<figcaption class="proof-caption utility"><span>Luna's booking brief</span><progress value="0" aria-label="Replay progress" hidden></progress><button class="press-run" type="button" aria-controls="brief-press" hidden>Play</button></figcaption>
+						<fieldset class="revisions">
+							<legend class="visually-hidden">Choose a version of the triage submission</legend>
+							<input class="btn-check" type="radio" name="triage-proof" id="brief-first" value="1" checked><label class="btn" for="brief-first">First submission</label>
+							<input class="btn-check" type="radio" name="triage-proof" id="brief-exact" value="2"><label class="btn" for="brief-exact">Exact request</label>
+							<div class="stage" id="brief-press">
+								<div class="press-art" aria-hidden="true"><span class="sort quote-sort">&#8220;</span></div>
+								<div class="impressions" aria-live="polite">
+									<div class="impression" data-leaf="1"><span class="stamp">Invalid input</span><h3>A date slipped into the brief.</h3><p>Luna sent the terminal's date and working directory along with the booking request. Triage rejected the extra text before Jev read the brief.</p></div>
+									<div class="impression" data-leaf="2"><span class="stamp good">Registered</span><h3>The booking API and the help page.</h3><p>Luna removed the terminal reminder. Jev registered two topics: moving the bookings to two studios and checking what the help page promised.</p></div>
+								</div>
+							</div>
+						</fieldset>
 					</figure>
 				</section>
 
-				<section id="requirements" class="story-section py-4" tabindex="-1">
-					<h2>Requirements</h2>
-					<figure class="mb-0">
-						<div class="terminal overflow-auto" tabindex="0" role="region" aria-label="Requirements terminal screenshot">
-							<a href="terminal/requirements.png" title="Open full-size requirements screenshot"><img src="terminal/requirements.png" width="1440" height="260" loading="lazy" alt="Jev reports two uncovered needs in a five-item checklist and passes the revised seven-item checklist."></a>
-						</div>
-						<figcaption class="copy mt-3">
-							<p class="mb-0">Jev compares the assistant's checklist with the request for the export option. It finds two needs missing from the first list. The assistant submits a revised list, and that list passes. The check helps you agree on what counts as done before anyone writes code.</p>
-						</figcaption>
+				<section id="requirements" class="chapter story-section" tabindex="-1">
+					<div class="chapter-heading"><h2>Requirements</h2><span class="folio utility">2 / 4</span></div>
+					<figure class="proof">
+						<figcaption class="proof-caption utility"><span>Luna's checklist</span><progress value="0" aria-label="Replay progress" hidden></progress><button class="press-run" type="button" aria-controls="checklist-press" hidden>Play</button></figcaption>
+						<fieldset class="revisions">
+							<legend class="visually-hidden">Choose a version of the requirements checklist</legend>
+							<input class="btn-check" type="radio" name="list-proof" id="list-six" value="1" checked><label class="btn" for="list-six">Six items</label>
+							<input class="btn-check" type="radio" name="list-proof" id="list-seven" value="2"><label class="btn" for="list-seven">Seventh item</label>
+							<input class="btn-check" type="radio" name="list-proof" id="list-final" value="3"><label class="btn" for="list-final">Revised list</label>
+							<div class="stage" id="checklist-press">
+								<div class="press-art" aria-hidden="true"><span class="sort count-sort"></span></div>
+								<div class="impressions" aria-live="polite">
+									<div class="impression" data-leaf="1"><span class="stamp good">Passed</span><h3>Six items about the API.</h3><p>The checklist covered seat limits, duplicate emails and old bookings. It said nothing about South's waitlist.</p></div>
+									<div class="impression" data-leaf="2"><span class="stamp">Findings</span><h3>A seventh item for the help page.</h3><p>Luna added the seat and waitlist policy. Jev supported that item but couldn't confirm the checklist covered the whole brief.</p></div>
+									<div class="impression" data-leaf="3"><span class="stamp good">Passed</span><h3>No new waitlist route.</h3><p>Luna saved the distinction in the checklist: “Keep the policy-accurate help copy in this draft, not an API route.”</p></div>
+								</div>
+							</div>
+						</fieldset>
 					</figure>
 				</section>
 
-				<section id="plan" class="story-section py-4" tabindex="-1">
-					<h2>Plan review</h2>
-					<figure class="mb-0">
-						<div class="terminal overflow-auto" tabindex="0" role="region" aria-label="Plan review terminal screenshot">
-							<a href="terminal/plan.png" title="Open full-size plan review screenshot"><img src="terminal/plan.png" width="1440" height="370" loading="lazy" alt="Jev completes the plan review, and the assistant reports that the four-step outline passed without any files changing."></a>
-						</div>
-						<figcaption class="copy mt-3">
-							<p class="mb-0">Jev finds that the four-step outline covers the requirements, including what the export should preview and what the help text should say. Reviewing the outline gives you a chance to spot missing steps before the assistant edits any files.</p>
-						</figcaption>
+				<section id="plan" class="chapter story-section" tabindex="-1">
+					<div class="chapter-heading"><h2>Plan review</h2><span class="folio utility">3 / 4</span></div>
+					<figure class="proof">
+						<figcaption class="proof-caption utility"><span>Luna's route plan</span><progress value="0" aria-label="Replay progress" hidden></progress><button class="press-run" type="button" aria-controls="route-press" hidden>Play</button></figcaption>
+						<fieldset class="revisions">
+							<legend class="visually-hidden">Choose a version of the plan outline</legend>
+							<input class="btn-check" type="radio" name="route-proof" id="route-first" value="1" checked><label class="btn" for="route-first">First outline</label>
+							<input class="btn-check" type="radio" name="route-proof" id="route-gap" value="2"><label class="btn" for="route-gap">Second outline</label>
+							<input class="btn-check" type="radio" name="route-proof" id="route-final" value="3"><label class="btn" for="route-final">Revised outline</label>
+							<div class="stage" id="route-press">
+								<div class="press-art" aria-hidden="true">
+									<svg class="route-art" viewBox="0 0 100 96" fill="none" stroke="currentColor" focusable="false">
+										<path d="M14 68h24V28h48" stroke-dasharray="2 4"/>
+										<path class="ink-route" d="M14 68h24V28h48" pathLength="150" stroke-width="5"/>
+										<circle cx="14" cy="68" r="7" fill="var(--plate)" stroke-width="3"/><circle cx="86" cy="28" r="7" fill="var(--plate)" stroke-width="3"/>
+									</svg>
+								</div>
+								<div class="impressions" aria-live="polite">
+									<div class="impression" data-leaf="1"><span class="stamp">Findings</span><h3>Server setup in the route step.</h3><p>Luna put studio selection, seat limits and email checks there too. Jev sent that step back and accepted the other six.</p></div>
+									<div class="impression" data-leaf="2"><span class="stamp">Findings</span><h3>Which booking methods?</h3><p>Luna specified a 400 for missing or unknown studios on “requests to /bookings.” That step still didn't name GET and POST.</p></div>
+									<div class="impression" data-leaf="3"><span class="stamp good">Outline passed</span><h3>Check the studio before GET or POST.</h3><p>Luna moved studio validation ahead of both methods. The review stopped at the outline; Jev didn't review the detailed steps.</p></div>
+								</div>
+							</div>
+						</fieldset>
 					</figure>
 				</section>
 
-				<section id="fact-check" class="story-section py-4" tabindex="-1">
-					<h2>Fact-check</h2>
-					<figure class="mb-0">
-						<div class="terminal overflow-auto" tabindex="0" role="region" aria-label="Fact-check terminal screenshot">
-							<a href="terminal/fact-check.png" title="Open full-size fact-check screenshot"><img src="terminal/fact-check.png" width="1440" height="490" loading="lazy" alt="Jev reports a contradiction between a claim of 30 days for Basic and an excerpt that says 7 days."></a>
-						</div>
-						<figcaption class="copy mt-3">
-							<p class="mb-0">The draft says the Basic plan keeps backups for 30 days. Jev compares that claim with a sample policy and flags the mismatch: the policy gives Basic 7 days and Pro 30. The number was in the source, but it described a different plan.</p>
-						</figcaption>
+				<section id="fact-check" class="chapter story-section" tabindex="-1">
+					<div class="chapter-heading"><h2>Fact-check</h2><span class="folio utility">4 / 4</span></div>
+					<figure class="proof">
+						<figcaption class="proof-caption utility"><span>The booking desk notice</span><progress value="0" aria-label="Replay progress" hidden></progress><button class="press-run" type="button" data-start="2" aria-controls="notice-press" hidden>Play</button></figcaption>
+						<fieldset class="revisions">
+							<legend class="visually-hidden">Compare Luna's full draft with the booking desk checks</legend>
+							<input class="btn-check" type="radio" name="fact-proof" id="fact-run" value="1"><label class="btn" for="fact-run">Luna's run</label>
+							<input class="btn-check" type="radio" name="fact-proof" id="fact-old" value="2"><label class="btn" for="fact-old">Old notice</label>
+							<input class="btn-check" type="radio" name="fact-proof" id="fact-correct" value="3" checked><label class="btn" for="fact-correct">Corrected notice</label>
+							<div class="stage" id="notice-press">
+								<div class="press-art" aria-hidden="true"><div class="seats"><span class="seat-row"><b>N</b><i></i><i></i></span><span class="seat-row"><b>S</b><i></i><i class="extra-seat"></i></span></div></div>
+								<div class="impressions" aria-live="polite">
+									<div class="impression" data-leaf="1"><span class="stamp open">Inconclusive</span><h3>Luna's full help text.</h3><p>Jev supported the policy claims but couldn't tell whether the draft covered the whole request. Neither of Luna's two fact-checks passed overall.</p></div>
+									<div class="impression" data-leaf="2"><span class="stamp">Incomplete</span><h3>“Both studios have two seats.”</h3><p>That was the old notice. In a separate check, Jev supported North's count and left South's count unresolved. The signed policy gives South just one seat.</p></div>
+									<div class="impression" data-leaf="3"><span class="stamp good">Both claims supported</span><h3>North offers two seats. South offers one seat.</h3><p>Jev checked each count against the signed policy and found that the corrected notice answered the booking desk's question.</p></div>
+								</div>
+							</div>
+						</fieldset>
+						<details class="source-note">
+							<summary class="utility">Read the policy and Jev's result</summary>
+							<blockquote>“North offers two seats and South offers one. The public waitlist is available when North fills up. South has no waitlist for this pilot.”</blockquote>
+							<p class="mb-1">Jev marked both counts relevant. It left open whether the claim list was exhaustive.</p>
+							<a class="utility" href="terminal/seat-check.txt">Read the recorded fact-check</a>
+						</details>
 					</figure>
+					<p class="caption">The old and corrected notices were checked separately from Luna's run, against the same signed policy.</p>
+				</section>
+
+				<section id="more-tools" class="tools story-section" tabindex="-1">
+					<div class="chapter-heading"><h2>What else Jev can do</h2></div>
+					<div class="drawers">
+						<details class="drawer" name="tool-drawer" open>
+							<summary>What did we agree to build?</summary>
+							<dl>
+								<div><dt>Context</dt><dd>Reopen the brief to see which studio gets the old bookings.</dd></div>
+								<div><dt>Consult</dt><dd>Weigh two ways to keep those bookings: copy the rows or add a studio column in place.</dd></div>
+								<div><dt>Re-aim</dt><dd>Record a new brief if you decide to build the waitlist after all.</dd></div>
+							</dl>
+						</details>
+						<details class="drawer" name="tool-drawer">
+							<summary>Does the code do what we asked?</summary>
+							<dl>
+								<div><dt>Course check</dt><dd>See whether the current change still leaves the waitlist out of the API.</dd></div>
+								<div><dt>Developer review</dt><dd>Ask whether the database change could drop a booking.</dd></div>
+								<div><dt>Acceptance</dt><dd>Check the test result: did an old North booking survive a restart?</dd></div>
+							</dl>
+						</details>
+						<details class="drawer" name="tool-drawer">
+							<summary>What belongs in the help text?</summary>
+							<dl>
+								<div><dt>Search relevance</dt><dd>Compare the signed policy and the old notice as sources for South's waitlist.</dd></div>
+								<div><dt>Text review</dt><dd>Flag “when it fills up” if the help page doesn't say which studio “it” means.</dd></div>
+								<div><dt>Anti-slop</dt><dd>Flag a promise like “You'll always get a seat” when the policy makes no such guarantee.</dd></div>
+							</dl>
+						</details>
+					</div>
+					<div class="harness-note copy">
+						<p>Jevstice runs in oh-my-pi. For DeepSeek Harness, <a href="https://github.com/bondiano/dsh-jev-planning">dsh-jev-planning</a> offers Jev planning.</p>
+						<p class="mb-0">If you're adapting Jevstice for another harness, <a href="mailto:veschindev@gmail.com">write to me</a> or <a href="https://github.com/veschin/jevstice">visit the repository</a>.</p>
+					</div>
 				</section>
 			</article>
 		</div>
 	</main>
 	<footer class="container">
-		<div class="utility d-flex justify-content-between gap-3 border-top py-3 mb-3">
+		<div class="utility d-flex justify-content-between gap-3 py-3 mb-3">
 			<a href="https://github.com/veschin/jevstice#install">Install Jevstice</a>
 			<a href="#top">Back to top</a>
 		</div>
 	</footer>
+	<script src="paper.js" defer></script>
 </body>
 </html>
