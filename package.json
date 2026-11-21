@@ -1,6 +1,6 @@
 {
   "name": "jevstice",
-  "version": "2.3.1",
+  "version": "2.3.2",
   "omp": { "extensions": ["src/index.ts"] },
   "type": "module",
   "scripts": {

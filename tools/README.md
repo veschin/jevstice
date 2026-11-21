@@ -94,6 +94,23 @@ A fresh OMP process registered a two-task outline, wrote `clamp.ts`, and ran a B
 printed `0` and `5`. The native `jev_acceptance` outcome returned two accepted tasks and one
 accepted integrated review, all at revision 2.
 
+## OMP 19.1 command routing
+
+In a fresh OMP 19.1 session, use separate `bash` calls without a PTY:
+
+```bash
+jev_requirements --help
+jev_acceptance --help
+jev_requirements -j '{"items":[]}'
+jev_acceptance -j '{"aspect":"outcome"}'
+```
+
+Both help calls returned their schemas. The execution events identified `jev_requirements` and
+`jev_acceptance` as the actual inner tools. With no registered project objective or evidence, each
+returned its local validation or prerequisite result; this checked routing, not judgment approval.
+The focused controller, fact-check, and autonomy tests passed (125 tests), including the
+regression for standalone diagnostics versus a command with a file redirection.
+
 ## Modes
 
 | Mode | Judge | What it verifies |

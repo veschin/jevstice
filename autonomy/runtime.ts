@@ -3380,6 +3380,7 @@ export function createAutonomyRuntime(options: {
 		});
 		pi.registerTool({
 			name: CONTROL_TOOL,
+			loadMode: "essential",
 			label: "Jev autonomy",
 			...toolPresentation(pi, "Jev autonomy"),
 			description:

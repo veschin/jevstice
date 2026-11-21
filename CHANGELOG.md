@@ -29,6 +29,14 @@
 - Removed the automatic OMP status strip and compact session-status card. `/jev-status` still
   reports session mode, work and check coverage, acceptance, and estimated judge spend on request.
 
+## 2.3.2 - 2026-11-21
+
+### Fixed
+
+- OMP 19.1 sessions use native Jev commands instead of the removed `xd://` write route.
+  Standalone diagnostic commands do not count as project changes.
+- Supervised Jev tools remain directly callable without the shell transport.
+
 ## 2.3.1 - 2026-11-18
 
 ### Fixed

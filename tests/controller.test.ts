@@ -375,12 +375,29 @@ describe("startup guidance and authentic owner capture", () => {
 		expect(prompt).toContain("Host policy");
 		const joined = prompt.join("\n");
 		expect(joined).toContain("jev_requirements");
+		expect(joined).toContain("jev_requirements --help");
+		expect(joined).not.toContain("xd://");
 		expect(joined).toContain('"aspect":"outcome"');
 		expect(joined).not.toContain("jev_plan_review");
 		expect(joined.length).toBeLessThan(1200);
 
 		const again = await pi.emit("before_agent_start", { ...event, systemPrompt: prompt }, ctx);
 		expect(promptOf(again)).toHaveLength(prompt.length);
+	});
+
+	test("a Jev command result does not move the project revision, but shell effects alongside it do", async () => {
+		const { pi } = controllerFor({});
+		const ctx = fakeCtx();
+		const dispatch = { tool: "jev_acceptance", mode: "execute", exitCode: 0, args: { aspect: "outcome" }, inner: {} };
+		const command = "jev_acceptance -j '{\"aspect\":\"outcome\"}'";
+		const result = (shell: string) => ({
+			...toolResultEvent("bash", { command: shell }, "Jev outcome") as object,
+			details: { toolCommands: [dispatch] },
+		});
+		await pi.emit("tool_result", result(command), ctx);
+		expect(toolDetails(await pi.callTool("jev_context", { action: "list" }, ctx))["revision"]).toBe(0);
+		await pi.emit("tool_result", result(`${command} > report.txt`), ctx);
+		expect(toolDetails(await pi.callTool("jev_context", { action: "list" }, ctx))["revision"]).toBe(1);
 	});
 
 	test("the native print prompt is archived once and revives add nothing", async () => {

@@ -4,7 +4,7 @@ This manual and the tool catalog below describe one diagnostic workflow for one 
 
 Jevstice never blocks execution. It judges submitted material and records findings as diagnostics, so the executor can see how much of the work did not pass its checks. The host owns permissions; no Jev verdict replaces them, and no finding must be cleared, repaired or waived before work continues.
 
-Invoke a Jev tool through `write`, with `path: "xd://<tool name>"` and `content` holding the JSON argument object. One example: `write({path: "xd://jev_context", content: "{\"action\":\"list\"}"})` lists trusted sources. Each catalog block below is that raw parameter object - the `content` value, not a whole call. Do not route Jev tools through `eval` or `tool.jev_*`: that wrapper hides the call from the addon's diagnostics.
+Call the supervised Jev tools directly by name with the JSON arguments shown in the catalog. Do not wrap the calls in `bash` or `eval`. For example, call `jev_context` with `{"action":"list"}` to list trusted sources.
 
 ## 0. Owner mode commands take precedence
 

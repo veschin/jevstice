@@ -13,6 +13,12 @@ The host owns tool execution and completion. The optional strict supervisor keep
 owner-authorized roots, resource limits, effect identity, durable ledger and pending-effect
 reconciliation; Jev verdicts are evidence inside that runtime, not authority.
 
+## OMP 19.1 command routing
+
+OMP 19.1 replaced `xd://` with shell tool commands. The bundled skill and the ordinary injected
+workflow now follow the active host inventory. The strict supervisor keeps its Jev tools direct.
+See [the native routing smoke](tools/README.md#omp-191-command-routing) for observed dispatches.
+
 ## Superseded features and unfinished claims
 
 - **Obsolete:** the two-phase `jev_consult mode: "recovery"` (`repair` authorizes one exact action,

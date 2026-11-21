@@ -56,6 +56,7 @@ export interface PiToolDefinition extends Partial<ToolPresentation> {
 	label: string;
 	description: string;
 	parameters: unknown;
+	loadMode?: "essential";
 	execute(
 		toolCallId: string,
 		params: unknown,
@@ -131,8 +132,8 @@ const OWNER_ONLY: Readonly<Partial<Record<string, true>>> = {
 };
 const FOLLOW_UP = /^(?:also\b|continue\b|one more\b|and (?:also|now)\b|ещ[её](?:\s|$)|также(?:\s|$)|продолж\p{L}*(?:\s|$)|и (?:ещ[её]|теперь)(?:\s|$))/iu;
 const LEAN_GUIDANCE = [
-	"Jevstice is advisory. For a project change, the first check is write to xd://jev_requirements; content is JSON with items: one {text, source} per requested behavior, using a short exact quote for each source. Omit request: Jev uses the captured owner text.",
-	"Make the change and run checks for the requested behaviors. The second check is write to xd://jev_acceptance with content {\"aspect\":\"outcome\"}. Jev uses recorded code and execution. Fix a proven defect. Report unresolved items; recheck only if a specific new observation addresses a named gap. Do not run triage, staged plan, developer review or separate acceptance just to finish.",
+	"Jevstice is advisory. Follow the host tool inventory. For a command, run `<tool> --help` in bash and submit it alone as `<tool> -j '<JSON>'`, without a PTY. For a directly listed tool, pass the JSON arguments directly.",
+	"First call jev_requirements (jev_requirements --help for command syntax) with items: one {text, source} per behavior, using a short exact owner quote. Omit request to use the captured owner text. After implementation and verification, call jev_acceptance with {\"aspect\":\"outcome\"}. It uses recorded code and execution. Fix proven defects; recheck only with new evidence for a named gap.",
 	"When a plan is registered, outcome reviews each task independently and runs an integrated review only after every task passes. Improve weak task wording without asking for routine owner evaluation. Consider evidence-backed cuts separately from acceptance.",
 	"Use other Jev tools only for a separate concrete decision or at the owner's request. For an external deliverable, use jev_anti_slop.",
 ].join("\n");
@@ -569,6 +570,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 					return toolResponse(outcome, state);
 				};
 			const catalog = createToolCatalog(deps.zod).filter(entry => deps.autonomy === undefined || entry.name !== "jev_fact_check");
+			const diagnosticNames = new Set(catalog.map(entry => entry.name));
 			const strictInstructions = deps.autonomy === undefined ? undefined : `${JEV_SKILL}\n\n${toolInstructions(catalog)}\n${STRICT_WORKFLOW_NOTE}`;
 			for (const entry of catalog) {
 				const activity = activities[entry.name];
@@ -576,6 +578,7 @@ export function createJevController(deps: ControllerDeps): JevController {
 				const { example: _example, ...definition } = entry;
 				pi.registerTool({
 					...definition, description: `${entry.description}${deps.autonomy === undefined ? "" : STRICT_WORKFLOW_NOTE}`,
+					...(deps.autonomy === undefined ? {} : { loadMode: "essential" }),
 					execute: run(entry.name, activity),
 					...toolPresentation(pi, entry.label),
 				});
@@ -810,6 +813,14 @@ export function createJevController(deps: ControllerDeps): JevController {
 			pi.on("tool_result", async (event, ctx) => {
 				const record = asRecord(event);
 				const details = asRecord(record?.["details"]);
+				// A standalone Jev command can background before OMP returns its dispatch receipt.
+				// Accept only the documented literal form; compound shell runs still need classification.
+				const shell = asRecord(record?.["input"]);
+				const command = shell?.["command"];
+				if (deps.autonomy === undefined && record?.["toolName"] === "bash" && shell?.["pty"] !== true && typeof command === "string") {
+					const name = /^(jev_[a-z_]+)[ \t]+(?:--help|-j[ \t]+'[^']*'(?:\\''[^']*')*)[ \t]*$/u.exec(command.trim())?.[1];
+					if (name !== undefined && diagnosticNames.has(name)) return;
+				}
 				const forwarded = asRecord(details?.["xdev"]);
 				const delegated = deps.autonomy === undefined && typeof forwarded?.["tool"] === "string";
 				const tool = delegated ? forwarded["tool"] : record?.["toolName"];

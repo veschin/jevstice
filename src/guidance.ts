@@ -410,7 +410,7 @@ export function toolInstructions(catalog: readonly ToolCatalogEntry[]): string {
 			`### \`${entry.name}\` - ${entry.label}`,
 			"",
 			entry.description,
-			`Device: \`xd://${entry.name}\`. The JSON below is the raw parameter object, which is the \`content\` value for \`write\` with that path. Do not invoke Jev tools through \`eval\` or \`tool.${entry.name}\`: that wrapper hides the call from the addon's diagnostics.`,
+			"Call this tool directly with the JSON arguments below.",
 			"",
 			"```json",
 			JSON.stringify(entry.example, null, 2),

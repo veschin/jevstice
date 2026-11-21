@@ -72,6 +72,10 @@ omp --no-extensions -e /path/to/jevstice/src/index.ts
 
 Jevstice registers thirteen tools in ordinary sessions. `src/guidance.ts` defines their descriptions and schemas. Ordinary startup shows a short workflow instead of the full catalog.
 
+For the bundled workflow, link the checkout with `omp plugin link /path/to/jevstice` and restart
+OMP. In OMP 19.1, run `<tool> --help` in `bash` for Jev commands, then pass the arguments with
+`-j '<JSON>'`. If OMP lists the tool directly, pass the JSON to that tool instead.
+
 | Tool | Diagnostic decision |
 | --- | --- |
 | `jev_triage` | Does this request need development planning, and which topics does it need? |

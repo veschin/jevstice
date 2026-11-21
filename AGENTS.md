@@ -42,8 +42,9 @@ It never grants or withholds execution permission.
 - `jev_anti_slop`: external-artifact findings, always diagnostic.
 - `jev_context`: trusted source listing/reading and original finding material.
 
-Use the injected catalog for schemas and `write` devices (`xd://jev_context`, for example) to call
-tools. Read-only questions, project inspection and external reads need no triage ritual. For a
+Use the route advertised by OMP: run `<tool> --help` and `<tool> -j '<JSON>'` in `bash` for
+mounted commands, or invoke directly listed tools with their JSON arguments. Read-only questions,
+project inspection and external reads need no triage ritual. For a
 development task, use triage, requirements and staged planning to improve the work, not as permission
 gates. Preserve exact owner words and source bytes; archive provenance is not truth or authority.
 
