@@ -2,8 +2,16 @@
 
 ## Unreleased
 
+## 2.4.0 - 2026-11-22
+
 ### Added
 
+- Added optional `jev_issue` for preparing or verifying a tracker post and for understanding,
+  developing and accepting work on the filed issue. Developer stages link to the reviewed issue
+  and actual verification.
+- Added `jev_todo` for plan coverage, meaningful checks, resumption and threshold-based cleanup.
+- Ordinary diagnostics retain session-local result references and their observed inputs. Find
+  current results in `/jev-status` and inspect an exact result with `jev_context`.
 - `jev_fact_check` adapts VERIFY for research in ordinary OMP sessions. It checks claim evidence,
   relevance and the owner's question separately, and requests one continuation if the model
   tries to finish without attempting the review.
@@ -13,10 +21,16 @@
 - Ordinary acceptance reports independent plan-task verdicts, gives concrete guidance for
   uncheckable tasks, and reviews the integrated change only after every task passes on the same
   revision. Both review levels cite evidence for suggested cuts, and neither blocks work.
+- Added executable Gherkin coverage for every registered tool, including the optional supervisor,
+  and updated the functional and nonfunctional requirements.
 - The website replaces tables and screenshots with Luna's playable booking revisions, a before-and-after fact-check and a guide to the other Jev tools. The cover tears as you scroll. Each replay shows progress and ends on the recorded verdict.
 
 ### Fixed
 
+- Ordinary outcome retries an unavailable judge without throwing away the failed attempt.
+- Fact-check keeps observed evidence on task continuation. Anti-slop can use a matching fact-check,
+  combines only matching multipart text, and does not attribute changed delivery bytes to a review.
+- Native issue verification resolves a clipped command result from its session-owned output file.
 - Fact-check distinguishes a missing source excerpt, insufficient context, a contradiction and
   an inconclusive judgment, with a different action for each.
 - Anti-slop recognizes explicit issue creation, names why a review did not run, and quotes the

@@ -37,6 +37,7 @@ import {
 	toolFailed,
 	toolResultEvent,
 	toolText,
+	until,
 } from "../tests/helpers.js";
 
 const WORKFLOW_REQUEST =
@@ -595,10 +596,15 @@ function expectDiagnosticShape(label: string, details: Record<string, unknown>):
 	return snapshot;
 }
 
-function statusTextOf(pi: FakePi, ctx: unknown): string {
+async function statusTextOf(pi: FakePi, ctx: unknown): Promise<string> {
+	const first = pi.messages.length;
+	let message: FakePi["messages"][number] | undefined;
 	pi.callCommand("jev-status", "", ctx);
-	const message = pi.messages.filter(entry => entry.customType === "jev.status").at(-1);
-	if (message === undefined) throw new Error("/jev-status emitted no status message");
+	await until(() => {
+		message = pi.messages.find((entry, index) => index >= first && entry.customType === "jev.status");
+		return message !== undefined;
+	});
+	if (message === undefined) throw new Error("/jev-status emitted no new status message within 500 ms");
 	return message.content;
 }
 
@@ -673,7 +679,7 @@ async function direct(scenario: Scenario, dir: string): Promise<{ judgeCalls: nu
 	if (implementation === undefined) {
 		addEvidence(log, { kind: "stage", name: "planning", status: "plan approved; implementation intentionally not performed" });
 		const snapshot = expectDiagnosticShape("jev_context", (await callTool(pi, ctx, "jev_context", { action: "list" }, log)).details);
-		assertStatusTruth(statusTextOf(pi, ctx), "planning-only");
+		assertStatusTruth(await statusTextOf(pi, ctx), "planning-only");
 		return { judgeCalls, diagnostics: snapshot, acceptance: {} };
 	}
 
@@ -691,7 +697,7 @@ async function direct(scenario: Scenario, dir: string): Promise<{ judgeCalls: nu
 	const held = stopDecision(stop);
 	if (held !== undefined) throw new Error(`the addon held ordinary completion: ${held}`);
 	addEvidence(log, { kind: "stage", name: "completion", status: "settled without a Jev hold" });
-	assertStatusTruth(statusTextOf(pi, ctx), scenario.name);
+	assertStatusTruth(await statusTextOf(pi, ctx), scenario.name);
 	const final = expectDiagnosticShape(
 		"jev_context",
 		(await callTool(pi, ctx, "jev_context", { action: "list" }, log)).details,
@@ -733,8 +739,6 @@ async function diagnosticsScenario(dir: string): Promise<{ judgeCalls: number; n
 		detail: { label: "ready", confidence: 0.95 },
 		finalize_consistency: { probability: 0.95 },
 		finalize_scope: { probability: 0.95 },
-		topic_1: { probability: 0.95 },
-		topic_2: { probability: 0.95 },
 		topic_3: { probability: 0.95 },
 		execution_evidence: { probability: 0.95 },
 		code_evidence: { probability: 0.95 },
@@ -793,7 +797,7 @@ async function diagnosticsScenario(dir: string): Promise<{ judgeCalls: number; n
 
 	const stop = await pi.emit("session_stop", {}, ctx);
 	if (stopDecision(stop) !== undefined) throw new Error("the addon held completion after a negative verdict");
-	const status = statusTextOf(pi, ctx);
+	const status = await statusTextOf(pi, ctx);
 	assertStatusTruth(status, "negative");
 	if ((parseCount(status, "failed", "Checks") ?? 0) < 2) throw new Error(`the negative diagnostics were not counted as failed: ${status}`);
 	const negative = expectDiagnosticShape("jev_context", (await callTool(pi, ctx, "jev_context", { action: "list" }, log)).details);
@@ -826,7 +830,7 @@ async function diagnosticsScenario(dir: string): Promise<{ judgeCalls: number; n
 	await performWrite(outage.pi, outage.ctx, outageWorkspace, { path: "after-outage.ts", content: "export const continued = true;\n" }, log);
 	if (!existsSync(join(outageWorkspace, "after-outage.ts"))) throw new Error("the write after an outage did not execute");
 	if (stopDecision(await outage.pi.emit("session_stop", {}, outage.ctx)) !== undefined) throw new Error("the addon held completion after an outage");
-	const outageStatus = statusTextOf(outage.pi, outage.ctx);
+	const outageStatus = await statusTextOf(outage.pi, outage.ctx);
 	assertStatusTruth(outageStatus, "outage");
 	if ((parseCount(outageStatus, "unavailable", "Checks") ?? 0) < 1) throw new Error(`the outage was not counted as unavailable: ${outageStatus}`);
 	const outageDiagnostics = expectDiagnosticShape("jev_context", (await callTool(outage.pi, outage.ctx, "jev_context", { action: "list" }, log)).details);
@@ -937,7 +941,26 @@ export function normalizeHostEvent(event: HostEvent): HostEvent {
 }
 
 export function normalizeHostEvents(events: HostEvent[]): HostEvent[] {
-	return events.map(normalizeHostEvent);
+	const normalized: HostEvent[] = [];
+	for (const event of events) {
+		normalized.push(normalizeHostEvent(event));
+		if (event.type !== "tool_execution_end" || event.toolName !== "bash") continue;
+		const commands = eventDetails(event)["toolCommands"];
+		if (!Array.isArray(commands)) continue;
+		for (const value of commands) {
+			const receipt = asRecord(value);
+			const tool = receipt?.["tool"];
+			if (typeof tool !== "string" || !tool.startsWith("jev_") || receipt?.["mode"] !== "execute") continue;
+			normalized.push({
+				...event,
+				toolName: tool,
+				args: receipt["args"],
+				isError: receipt["exitCode"] !== 0,
+				result: { ...asRecord(event.result), details: asRecord(receipt["inner"]) ?? {} },
+			});
+		}
+	}
+	return normalized;
 }
 
 /**

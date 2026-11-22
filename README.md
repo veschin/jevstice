@@ -20,7 +20,7 @@
   <img alt="Bun 1.1 or newer" src="https://img.shields.io/badge/Bun-1.1%2B-black">
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
   <img alt="OMP extension" src="https://img.shields.io/badge/OMP-extension-6f42c1">
-  <img alt="Version 2.3.1" src="https://img.shields.io/badge/version-2.3.1-e05d44">
+  <img alt="Package version 2.4.0" src="https://img.shields.io/badge/version-2.4.0-e05d44">
 </p>
 
 Jevstice connects [oh-my-pi](https://github.com/can1357/oh-my-pi) to Jev (`jev-latest`, TypeSafe API), a typed decision judge. The executor submits the decisions it can see - requirements, plans, search candidates, acceptance claims and single uncertain choices - and receives a typed verdict.

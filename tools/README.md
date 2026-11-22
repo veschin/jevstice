@@ -9,6 +9,28 @@ Both use the production judge and real OMP where indicated. Missing credentials,
 services and refusals are recorded as observed failures; they are never converted into skipped or
 passing results, and no run retries unchanged material to obtain a favorable answer.
 
+## 2.4.0 verification
+
+- `bun test`: 1,044 passed, none failed, and two remain pending
+  (`/tmp/jevstice-2.4.0-tests.1O5Kyp`). They cover the unsupported native plan-mode boundary and
+  the unimplemented ordinary session-journal restore. All 16 registered tools have executable
+  features; four additional features cover cross-tool and host behavior.
+- `bun run typecheck` passed. The final deep Code Guard run checked TypeScript across the project
+  after the last scenario binding edit: 0 findings on the 23 selected files. Prettier and ESLint
+  did not run because the project has no configuration for either.
+- `bun tools/live-smoke.ts direct --scenario diagnostics` passed. Its injected negative verdict
+  and judge outage remained distinct, and both paths continued through work and completion
+  (`/tmp/jev-live-smoke-8h2spu/summary.json`).
+- `bun test tools/live-smoke.test.ts` passed the mounted OMP 19.1 command-receipt regression.
+  The oracle uses each executed command's `inner` details and ignores help-only dispatches.
+- An OMP 19.1 RPC process loaded the checkout and listed `jev`, `jev-status` and `skill:jevstice`.
+  RPC `bash` does not exercise the model's mounted shell tools.
+- `bun tools/live-smoke.ts host --scenario workflow --model deepseek/deepseek-flash --max-time 180`
+  reached the model provider, which returned `402 Insufficient Balance` before a Jev tool call.
+  This run did not verify the live workflow (`/tmp/jev-live-smoke-GhmhFZ/omp-events.jsonl`).
+  It does not establish a Jevstice defect. No issue was filed, and full strict autonomy
+  end-to-end acceptance was not rerun.
+
 ## Current contract
 
 Jev results are diagnostics. The controller classifies visible tool calls deterministically, records
@@ -145,12 +167,11 @@ check may still be in flight. A diagnostic finding must not invalidate that unre
 judgment; a stale result there is a source regression, not a harness artifact. The scenario does not
 wait for background checks to settle or retry a stale answer.
 
-The host mode normalizes omp's `write xd://jev_*` device route: the logical call arrives under
-`result.details.xdev` as `{tool, args, inner}`. Validation reads typed `inner` details
-(`needsDevelopment`, `approved`, `planDigest`, `diagnostics`) rather than English reply text. It
-requires the extension to be loaded and exercised, the planned files and test command to execute,
-and the diagnostic record to be present and consistent. It does not require an acceptance approval:
-a negative verdict must be recorded as negative, not converted into a pass.
+Host mode normalizes Jev calls observed through OMP's direct tools or supported command route.
+It checks typed results (`needsDevelopment`, `approved`, `planDigest`, `diagnostics`) rather
+than English reply text. The planned files and test command must execute, and the diagnostic
+record must be present and consistent. A negative verdict must remain negative; acceptance
+approval is not a prerequisite for host completion. Historical events can also use `xd://`.
 
 No smoke claims full live-workflow quality, whole-task acceptance, autonomy acceptance or
 release readiness. A run establishes only the observations written to its evidence directory.

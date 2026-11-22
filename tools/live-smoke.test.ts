@@ -103,6 +103,32 @@ describe("host verification", () => {
 		expect(verdict.problems).toEqual([]);
 	});
 
+	test("OMP 19.1 mounted verdicts satisfy the same verification as direct calls", () => {
+		const scenario = scenarioOf("workflow");
+		const diagnostics = counts(1, 4, 0);
+		const execute = (tool: string, args: Record<string, unknown>, inner: Record<string, unknown>) => ({
+			tool, mode: "execute", tier: "read", exitCode: 0, args, inner: { ...inner, diagnostics },
+		});
+		const events = [
+			end("write", {}, { path: scenario.probePath }),
+			end("bash", { toolCommands: [
+				{ tool: "jev_triage", mode: "help", exitCode: 0 },
+				execute("jev_triage", { request: scenario.request }, { needsDevelopment: true }),
+			] }),
+			end("bash", { toolCommands: [
+				execute("jev_requirements", {}, { approved: true }),
+				execute("jev_plan_review", { phase: "finalize" }, { planDigest: "digest" }),
+			] }),
+			end("write", {}, { path: "src/slug.ts" }),
+			end("bash", {}, { command: "bun test tests/slug.test.ts" }),
+			end("bash", { toolCommands: [
+				execute("jev_acceptance", { aspect: "business" }, { approved: false, revision: 1 }),
+				execute("jev_acceptance", { aspect: "architecture" }, { approved: true, revision: 1 }),
+			] }),
+		];
+		expect(verifyHost(scenario, events)).toEqual({ pass: true, problems: [] });
+	});
+
 	test("a failed pre-plan write and a hidden negative are reported", () => {
 		const scenario = scenarioOf("workflow");
 		const passedOnly = counts(0, 4, 0);

@@ -1,4 +1,19 @@
-# Jevstice handoff — 2026-11-15
+# Jevstice handoff
+
+## 2.4.0 release
+
+Jevstice 2.4.0 adds optional issue and backlog diagnostics. The issue diagnostic separates author preparation and readback from developer understanding, development and acceptance. The backlog diagnostic offers review, resumption and cleanup proposals.
+
+### Commit boundaries
+
+| Include together | Keep separate or local |
+| --- | --- |
+| Runtime modules, registered schemas, unit and Gherkin tests, bundled skill and the corresponding README, PRD and changelog entries. | Site capture updates and the demo recorder belong in a separate change. The four modified PNGs have no current reference in `site/index.html`. |
+| The executable smoke correction, verification notes and package version. The remote `v2.3.2` tag points at `1b1a2d3`, the OMP 19.1 routing fix; `451e588` introduced per-task acceptance. | Keep `TODO.md`, raw demo event data, local plans, configuration, credentials, caches and press drafts out of commits. Retain the scenario review ledger as historical evidence; rewritten scenarios do not inherit its verdicts. |
+
+The release uses package version 2.4.0 and tag `v2.4.0`.
+
+See [2.4.0 verification](tools/README.md#240-verification) for the current candidate's observed results and remaining release limits.
 
 ## Current contract
 
