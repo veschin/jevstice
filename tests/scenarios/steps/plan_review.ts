@@ -231,7 +231,7 @@ then("the outline is reported approved with its step ids", value => {
 	expect(w.state.planDraft?.outlineApproved).toBe(true);
 });
 
-then("the next review stage is one detail per approved step", value => {
+then("the result calls for a detail review for each approved step", value => {
 	const w = setup(value);
 	expect(w.outcome?.details?.["phase"]).toBe("detail");
 	expect(w.outcome?.text).toContain("phase detail");
@@ -257,7 +257,7 @@ then("no judge request is made", value => {
 	expect(w.calls).toHaveLength(0);
 });
 
-then("the result names the step and requires an exact approved obligation", value => {
+then("the result identifies the step and asks for an exact approved obligation", value => {
 	const w = setup(value);
 	expect(w.outcome?.text).toContain("outline step 's1'");
 	expect(w.outcome?.text).toContain("must cite one exact Jev-approved requirement");
@@ -301,7 +301,7 @@ then("the first step remains approved", value => {
 	expect(w.results.at(-1)?.details?.["approvedSteps"]).toContain("s1");
 });
 
-then("only the revised step receives a new decision", value => {
+then("the judge rechecks only the revised step", value => {
 	const w = setup(value);
 	const questions = questionsSince(w, w.judgeBaseline);
 	expect(questions.map(question => question.name)).toEqual(["outline_requirement_1", "outline_step_1"]);
@@ -350,7 +350,7 @@ when("a materially changed outline is submitted", async value => {
 	]);
 });
 
-then("the dependent detail approval no longer counts", value => {
+then("approval of the dependent detail is no longer valid", value => {
 	const w = setup(value);
 	expect(w.state.planDraft?.details).toEqual([]);
 });
@@ -376,7 +376,7 @@ given("the plan artifact contains section {string}", async (value, title) => {
 	expect(planSections(SINGLE_SECTION).some(section => section.title === title)).toBe(true);
 });
 
-when("the detail names {string}", async (value, selector) => {
+when("the executor selects the detail section using {string}", async (value, selector) => {
 	const w = setup(value);
 	const variants: Record<string, { artifact?: string; section: string }> = {
 		"the exact unique heading": { section: "Implementation" },
@@ -471,7 +471,7 @@ when("the artifact changes before the answer returns", async value => {
 	expect(await readLocalArtifact(artifactHost(w), PLAN_NAME)).toBe(changedArtifact);
 });
 
-then("the answer is discarded as stale", value => {
+then("the review discards the answer as stale", value => {
 	const w = setup(value);
 	expect(w.detailOutcome?.ok).toBe(false);
 	expect(w.detailOutcome?.details?.["kind"]).toBe("stale");
@@ -536,7 +536,7 @@ then("the approved step remains approved", value => {
 	expect(w.state.planDraft?.details.map(detail => detail.id)).toEqual(["all"]);
 });
 
-then("the overlapping step must use a disjoint section", value => {
+then("the second step needs a section that does not overlap", value => {
 	const w = setup(value);
 	expect(w.detailOutcome?.text).toContain("use disjoint sections");
 	expect(w.calls.length - w.judgeBaseline).toBe(0);
@@ -569,7 +569,7 @@ when("the final plan is submitted with the complete artifact", async value => {
 	await review(w, { phase: "finalize", plan: PLAN_URL });
 });
 
-then("assembly consistency and added material are judged", value => {
+then("the judge reviews how the sections fit together and what was added", value => {
 	const w = setup(value);
 	expect(questionsSince(w, w.judgeBaseline).map(question => question.name)).toEqual([
 		"finalize_consistency",
@@ -634,7 +634,7 @@ then("finalization is refused", value => {
 	expect(w.outcome?.text).toContain("no longer contains the complete approved sections for 's1'");
 });
 
-then("only the affected section must be reviewed again", value => {
+then("the result asks for a new review of only the affected section", value => {
 	const w = setup(value);
 	expect(w.outcome?.text).toContain("re-review only those sections");
 	expect(w.state.planDraft?.details).toEqual([]);
@@ -699,7 +699,7 @@ when("the approval is recorded", async value => {
 	expect(toolDetails(w.planResult)["verdict"]).toBe("serves");
 });
 
-then("the exact plan bytes are stored with their digest and task identity", value => {
+then("the archive stores the exact plan bytes, their digest and the task identity", value => {
 	const w = setup(value);
 	const records = w.archive!.list().filter(source => source.kind === "plan");
 	expect(records).toHaveLength(1);
@@ -772,7 +772,7 @@ then("the change is not refused for missing plan approval", value => {
 	expect(setup(value).blocked).toBeUndefined();
 });
 
-then("the action remains recorded as not checked because no approved plan was available", async value => {
+then("the record says the change was not checked because no approved plan was available", async value => {
 	const w = setup(value);
 	w.listed = await w.pi!.callTool("jev_context", { action: "list" }, w.ctx);
 	const work = asRecord(asRecord(toolDetails(w.listed)["diagnostics"])?.["work"]);
@@ -794,7 +794,7 @@ then("the missing plan review is disclosed as a diagnostic gap", value => {
 
 // Scenario 12 ----------------------------------------------------------------
 
-given("no approved requirement set exists", value => {
+given("the task no longer has a requirement approval on record", value => {
 	const w = setup(value);
 	expect(w.state.task).toBeDefined();
 	delete w.state.requirementsApproval;
@@ -814,7 +814,7 @@ then("the result names the missing requirement approval", value => {
 	expect(w.outcome?.details?.["prerequisite"]).toBe(true);
 });
 
-then("it supplies the corrective call", value => {
+then("the result directs the executor to jev_requirements", value => {
 	const w = setup(value);
 	expect(w.outcome?.text).toContain("submit jev_requirements for the registered task");
 });
@@ -841,7 +841,7 @@ given("the plan artifact contains {string}", async (value, testCase) => {
 	}
 });
 
-when("the artifact is read for review", async value => {
+when("plan review reads the artifact", async value => {
 	const w = setup(value);
 	w.readText = await readLocalArtifact(artifactHost(w), PLAN_NAME);
 });

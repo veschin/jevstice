@@ -110,7 +110,7 @@ given("ordinary Jev diagnostics are enabled", value => {
 
 // Scenario 1 (outline) -------------------------------------------------------
 
-given("the exact text contains a heading, a pipe table, fenced code and two prose paragraphs", value => {
+given("a draft mixes two prose paragraphs with a heading, a pipe table and fenced code", value => {
 	const w = setup(value);
 	w.body = STRUCTURED_TEXT;
 	w.prose = STRUCTURED_PROSE;
@@ -134,7 +134,7 @@ given("one submitted rule has scope {string}", (value, scope) => {
 	}
 });
 
-when("the text review runs", async value => {
+when("the executor submits the text for review", async value => {
 	await run(world(value));
 });
 
@@ -176,10 +176,6 @@ given("the judge establishes that one prose fragment violates a submitted rule",
 	w.table.fragment_1_1 = { probability: 0.93 };
 });
 
-when("the result is returned", async value => {
-	await run(world(value));
-});
-
 then("the result names the violating fragment", value => {
 	const w = world(value);
 	expect(w.outcome?.ok).toBe(false);
@@ -193,7 +189,7 @@ then("it reproduces the submitted rule text byte-identically", value => {
 	expect((w.outcome?.details?.["defects"] as Array<Record<string, unknown>> | undefined)?.[0]?.["rule"]).toBe(w.rule);
 });
 
-then("it adds no rewritten sentence or style advice", value => {
+then("the result offers neither a replacement sentence nor style advice", value => {
 	const w = world(value);
 	const defects = w.outcome?.details?.["defects"] as Array<Record<string, unknown>> | undefined;
 	expect(defects).toHaveLength(1);
@@ -221,7 +217,7 @@ when("every rule check is decisively satisfied", async value => {
 	await run(world(value));
 });
 
-then("the result reports no violation for those rules", value => {
+then("the diagnostic reports that no submitted rule was violated", value => {
 	const w = world(value);
 	expect(w.outcome?.ok).toBe(true);
 	expect(w.outcome?.details?.["approved"]).toBe(true);
@@ -344,7 +340,7 @@ when("the text review validates it", async value => {
 	await run(world(value));
 });
 
-then("no judge request is made", value => {
+then("the judge receives no request", value => {
 	expect(world(value).calls).toBe(0);
 });
 
@@ -386,7 +382,7 @@ given("the text review establishes a violation", async value => {
 	expect(w.hold?.["boundary"]).toBe("jev_text_review");
 });
 
-when("the executor edits the text or performs another project action", async value => {
+when("the executor makes a subsequent project edit", async value => {
 	const w = world(value);
 	expect(w.pi).toBeDefined();
 	expect(w.ctx).toBeDefined();
@@ -439,7 +435,7 @@ then("the result states that no judgment exists", value => {
 	expect(world(value).outcome?.text).toContain("No judge decision exists");
 });
 
-then("the text is not reported as meeting the rules", value => {
+then("the tool does not say the text meets the rules", value => {
 	const w = world(value);
 	expect(w.outcome?.details?.["approved"]).toBe(false);
 	expect(w.outcome?.details?.["kind"]).toBe("unavailable");
@@ -468,7 +464,7 @@ when("the executor resubmits them unchanged", async value => {
 	await run(world(value));
 });
 
-then("no additional judge request is made", value => {
+then("resubmission makes no additional judge request", value => {
 	expect(world(value).calls).toBe(1);
 });
 

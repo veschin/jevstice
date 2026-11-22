@@ -177,7 +177,7 @@ when("business is submitted again at revision 5 and changes its verdict", async 
 	world.outcome = await submit(world);
 });
 
-then("the business record is replaced", value => {
+then("the new business verdict replaces the earlier business verdict", value => {
 	const record = acceptanceAt(w(value).state, "business");
 	expect(record?.label).toBe("business_gap");
 	expect(record?.approved).toBe(false);
@@ -340,7 +340,7 @@ when("acceptance is judged", async value => {
 	world.outcome = await submit(world);
 });
 
-then("each topic receives its own verdict", value => {
+then("Jev reports a separate verdict for each topic", value => {
 	const basis = w(value).outcome?.details?.["basis"] as Array<Record<string, unknown>> | undefined;
 	expect(basis?.map(entry => entry["topic"])).toEqual(["collect", "render", "verify"]);
 	expect(basis?.map(entry => entry["met"])).toEqual([true, true, false]);
@@ -569,7 +569,7 @@ then("neither check is reported as approval of the delivered outcome", value => 
 
 const COMPLETION_PLAN = "## Collect the numbers\n\nRead the run data and report the count.\n";
 
-async function developedTask(value: unknown): Promise<AcceptanceWorld> {
+async function developedTask(value: unknown, overrides: Record<string, FakeAnswerSource> = {}): Promise<AcceptanceWorld> {
 	const world = w(value);
 	const artifactsDir = await fakeArtifacts({ "coverage-plan.md": COMPLETION_PLAN });
 	const fake = answeringJudge({
@@ -586,6 +586,7 @@ async function developedTask(value: unknown): Promise<AcceptanceWorld> {
 		task_review: { label: "not_observed" },
 		task_basis: { label: "none" },
 		cleanup_evidence_1: { label: "none" },
+		...overrides,
 	});
 	world.autoCalls = fake.calls;
 	const pi = fakePi();
@@ -689,7 +690,7 @@ when("the result is returned", async value => {
 	world.outcomes = [gap, defect];
 });
 
-then("it names the unmet requirement", value => {
+then("the result identifies the requirement not yet demonstrated", value => {
 	const gap = w(value).outcomes?.[0];
 	expect(gap?.text).toContain("Report coverage");
 	expect(gap?.text).toContain("collect");
@@ -837,4 +838,119 @@ then("ordinary work and completion continue", async value => {
 	const stop = stopDecision(await pi.emit("session_stop", stopEvent(), world.ctx));
 	expect(block).toBeUndefined();
 	expect(stop).toBeUndefined();
+});
+
+// Outcome acceptance -------------------------------------------------------
+
+const OUTCOME_REQUEST = "Implement the coverage dashboard";
+const OUTCOME_COMMAND = "bun test coverage.test.ts";
+const OUTCOME_CODE = "export const coverage = 100;";
+const OUTCOME_OUTPUT = "2 pass, 0 fail";
+
+async function checkOutcome(world: AcceptanceWorld): Promise<void> {
+	world.toolResult = await world.pi!.callTool("jev_acceptance", { aspect: "outcome" }, world.ctx);
+}
+
+given("recorded code changes and a running verification for an approved requirement", async value => {
+	const world = w(value);
+	const fake = answeringJudge({
+		coverage: { probability: 0.95 },
+		item_1: { probability: 0.95 },
+		requirement_1: { label: "observed" },
+		requirement_1_execution: { label: "evidence_2" },
+		requirement_1_code: { label: "evidence_1" },
+	});
+	const pi = fakePi();
+	const ctx = fakeCtx();
+	world.pi = pi;
+	world.ctx = ctx;
+	world.calls = fake.calls;
+	createJevController({ judge: fake.judge, config: boundaryConfig(), zod: fakeZod() }).register(pi.api);
+	await pi.emit("before_agent_start", { reason: "prompt", prompt: OUTCOME_REQUEST }, ctx);
+	const requirements = await pi.callTool("jev_requirements", { items: [{ text: OUTCOME_REQUEST, source: OUTCOME_REQUEST }] }, ctx);
+	expect(toolDetails(requirements)["approved"]).toBe(true);
+	await pi.emit("tool_result", toolResultEvent("write", { path: "coverage.ts", content: OUTCOME_CODE }, "Wrote coverage.ts"), ctx);
+	await pi.emit("tool_result", {
+		type: "tool_result", toolName: "bash", toolCallId: "call-verify", input: { command: OUTCOME_COMMAND },
+		content: [{ type: "text", text: "Started in background" }], isError: false,
+		details: { async: { jobId: "verify", type: "bash", state: "running" } },
+	}, ctx);
+});
+
+when("the executor checks outcome acceptance without a claim or quotes", async value => {
+	await checkOutcome(w(value));
+});
+
+then("Jev reports the pending verification without judging the outcome", value => {
+	const world = w(value);
+	expect(toolDetails(world.toolResult)["prerequisite"]).toBeDefined();
+	expect(world.calls).toHaveLength(1);
+});
+
+when("the verification finishes and the executor checks again", async value => {
+	const world = w(value);
+	await world.pi!.emit("context", { messages: [{
+		role: "custom", customType: "async-result", timestamp: Date.now() + 100, content: OUTCOME_OUTPUT,
+		details: { jobs: [{ jobId: "verify", type: "bash", status: "completed" }] },
+	}] }, world.ctx);
+	await checkOutcome(world);
+});
+
+then("the outcome passes and cites the recorded code and completed test output", value => {
+	expect(toolDetails(w(value).toolResult)).toMatchObject({ approved: true, requirements: [{
+		status: "met",
+		code: { quote: expect.stringContaining(OUTCOME_CODE) },
+		execution: { quote: expect.stringContaining(OUTCOME_OUTPUT) },
+	}] });
+});
+
+then("repeating the check on unchanged work returns the verdict without another judgment", async value => {
+	const world = w(value);
+	await checkOutcome(world);
+	expect(toolDetails(world.toolResult)).toMatchObject({ replayed: true, approved: true });
+	expect(world.calls).toHaveLength(2);
+});
+
+when("the executor edits the code and checks again without rerunning verification", async value => {
+	const world = w(value);
+	await world.pi!.emit("tool_result", toolResultEvent("write", { path: "coverage.ts", content: "export const coverage = 0;" }, "Changed coverage.ts"), world.ctx);
+	await checkOutcome(world);
+});
+
+then("Jev asks for execution evidence and does not reuse the previous verdict", value => {
+	const world = w(value);
+	const result = toolDetails(world.toolResult);
+	expect(result["missingEvidence"]).toEqual(["execution"]);
+	expect(result["approved"]).not.toBe(true);
+	expect(world.calls).toHaveLength(2);
+});
+
+given("a registered plan with an observed result for its task", async value => {
+	await developedTask(value, {
+		task_review: { label: "observed" },
+		task_basis: { label: "evidence_2" },
+		integration: { label: "observed" },
+		integration_basis: { label: "evidence_2" },
+	});
+});
+
+then("the plan task passes with the recorded test output as its basis", value => {
+	const tasks = toolDetails(w(value).toolResult)["tasks"];
+	if (!Array.isArray(tasks)) throw new Error("Expected plan task verdicts");
+	const task = asRecord(tasks.find(item => asRecord(item)?.["id"] === "collect"));
+	expect(task?.["status"]).toBe("approved");
+	const basis = task?.["basis"];
+	if (!Array.isArray(basis)) throw new Error("Expected recorded basis for collect");
+	expect(asRecord(basis[0])?.["quote"]).toContain("12 pass / 0 fail");
+});
+
+then("Jev runs an integrated review and reports its own evidence and verdict", value => {
+	const world = w(value);
+	const checks = world.autoCalls?.map(call => asRecord(call.state)?.["check"]);
+	expect(checks?.slice(-2)).toEqual(["plan_task", "integrated_review"]);
+	const result = toolDetails(world.toolResult);
+	const overall = asRecord(result["overall"]);
+	expect(result["approved"]).toBe(true);
+	expect(overall?.["status"]).toBe("approved");
+	expect(asRecord(overall?.["basis"])?.["quote"]).toContain("12 pass / 0 fail");
 });

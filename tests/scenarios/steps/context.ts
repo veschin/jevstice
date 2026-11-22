@@ -170,7 +170,7 @@ when("the executor calls jev_context with action list", async value => {
 	w.calls = [...(w.fake?.calls ?? [])];
 });
 
-then("the inventory is empty", value => {
+then("Jev returns no archived sources or findings", value => {
 	const w = setup(value);
 	expect(toolDetails(w.result)["sources"]).toEqual([]);
 	expect(toolText(w.result)).toContain("[]");
@@ -567,7 +567,7 @@ given("a later attempt submitted different material", value => {
 	expect(toolDetails(w.second)["hold"]).toBeDefined();
 });
 
-then("the latest recorded finding shows its original submission and returned result", value => {
+then("the finding still shows the first request and the answer it received", value => {
 	const w = setup(value);
 	const hold = asRecord(toolDetails(w.result)["hold"]);
 	expect(hold).toBeDefined();
@@ -803,4 +803,81 @@ then("the intact citation is not rejected because of the unrelated record", valu
 	expect(toolDetails(w.result)["kind"]).toBeUndefined();
 	expect(toolText(w.result)).toContain("Consult (boolean)");
 	expect(toolText(w.result)).not.toMatch(/Diagnostic unavailable/);
+});
+
+// Diagnostic result lookup -------------------------------------------------
+
+const LOOKUP_REQUEST = "Implement and verify the report count.";
+const LOOKUP_CODE = "export const count = 1;";
+const LOOKUP_OUTPUT = "1 pass, 0 fail";
+
+given("an outcome check could not reach the judge and returned a result ID", async value => {
+	const w = setup(value);
+	const fake = answeringJudge({
+		coverage: { probability: 0.95 },
+		item_1: { probability: 0.95 },
+		requirement_1: { label: "observed" },
+		requirement_1_execution: { label: "evidence_2" },
+		requirement_1_code: { label: "evidence_1" },
+	});
+	w.offline = true;
+	const judge: Judge = (state, questions) => w.offline === true && questions.some(question => question.name === "requirement_1")
+		? Promise.resolve({ ok: false, kind: "unavailable", problem: "offline" }) : fake.judge(state, questions);
+	const pi = controller(w, { judge });
+	await pi.emit("before_agent_start", { reason: "prompt", prompt: LOOKUP_REQUEST }, w.ctx);
+	const requirements = await pi.callTool("jev_requirements", { items: [{ text: LOOKUP_REQUEST, source: LOOKUP_REQUEST }] }, w.ctx);
+	const priorId = toolDetails(requirements)["resultId"];
+	expect(typeof priorId).toBe("string");
+	w.requirementResultId = priorId;
+	await pi.emit("tool_result", toolResultEvent("write", { path: "report.ts", content: LOOKUP_CODE }, "Wrote report.ts"), w.ctx);
+	await pi.emit("tool_result", toolResultEvent("bash", { command: "bun test report.test.ts" }, LOOKUP_OUTPUT), w.ctx);
+	const first = toolDetails(await pi.callTool("jev_acceptance", { aspect: "outcome" }, w.ctx));
+	expect(first["kind"]).toBe("unavailable");
+	expect(typeof first["resultId"]).toBe("string");
+	w.readId = first["resultId"] as string;
+});
+
+when("the judge recovers and the same work passes outcome acceptance", async value => {
+	const w = setup(value);
+	w.offline = false;
+	const passed = toolDetails(await w.pi!.callTool("jev_acceptance", { aspect: "outcome" }, w.ctx));
+	expect(passed["approved"]).toBe(true);
+	expect(typeof passed["resultId"]).toBe("string");
+	expect(passed["resultId"]).not.toBe(w.readId);
+	w.passedResultId = passed["resultId"];
+});
+
+then("the latest result ID is listed as current", async value => {
+	const w = setup(value);
+	const list = toolDetails(await w.pi!.callTool("jev_context", { action: "list" }, w.ctx));
+	const results = list["results"] as Array<Record<string, unknown>>;
+	const current = results.find(result => result["id"] === w.passedResultId);
+	expect(current).toMatchObject({ tool: "jev_acceptance/outcome", applicability: "current" });
+});
+
+when("the executor requests jev_context with action result and the previous ID as sourceId", async value => {
+	const w = setup(value);
+	w.result = await w.pi!.callTool("jev_context", { action: "result", sourceId: w.readId }, w.ctx);
+});
+
+then("the previous diagnostic is marked historical and linked to its requirement result", value => {
+	const w = setup(value);
+	expect(toolDetails(w.result)["result"]).toMatchObject({
+		id: w.readId, tool: "jev_acceptance/outcome", applicability: "historical", prior: [w.requirementResultId],
+	});
+});
+
+then("it retains the submitted code and execution observations and the unavailable verdict", value => {
+	const w = setup(value);
+	const recorded = toolDetails(w.result)["result"];
+	expect(recorded).toMatchObject({
+		status: "unavailable",
+		result: { details: { kind: "unavailable" } },
+	});
+	const observations = asRecord(asRecord(recorded)?.["input"])?.["observations"];
+	if (!Array.isArray(observations)) throw new Error("Expected retained code and execution observations");
+	const code = asRecord(observations.find(item => asRecord(item)?.["kind"] === "code"));
+	const execution = asRecord(observations.find(item => asRecord(item)?.["kind"] === "execution"));
+	expect(code?.["quote"]).toContain(LOOKUP_CODE);
+	expect(execution?.["quote"]).toContain(LOOKUP_OUTPUT);
 });

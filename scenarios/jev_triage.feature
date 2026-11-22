@@ -2,17 +2,17 @@
 # Requirements: PRD FR-01, FR-02, FR-10, FR-30, FR-45, FR-72, FR-73.
 # Source contract: src/guidance.ts TRIAGE_DESCRIPTION; src/jev-skill.md section 1.
 # Executable: tests/scenarios/steps/triage.ts; run by tests/scenarios/run.test.ts.
-Feature: Triage records request depth and external scope without granting permission
-  A request is read once, locally, and judged only when it needs deeper activity.
-  Triage records the objective and narrow topics. It never blocks project reads,
-  and its absence or uncertainty is a diagnostic fact, not an execution error.
+Feature: Classify the owner's request before deeper review
+  A routine read can proceed without a triage call. When the executor submits
+  a request for classification, triage checks the exact owner text and records
+  the kind of work, relevant topics and external review scope. It grants no permission.
 
   # FR-30; implementation src/screen.ts, src/controller.ts before_agent_start
   @jev_triage_01 @fr_30 @fr_72
-  Scenario Outline: A quiet request needs no triage call
+  Scenario Outline: Read-only requests bypass the judge
     Given no development task is registered
     When the owner asks to "<request>"
-    And the executor performs only the requested recognized read-only work
+    And the executor carries out only the recognized read-only request
     Then no triage judgment is requested
     And project reads and public URL reads remain available
     And no development registration is invented
@@ -24,97 +24,97 @@ Feature: Triage records request depth and external scope without granting permis
 
   # FR-02, FR-30; implementation src/activities.ts triage (registration branch)
   @jev_triage_02 @fr_02 @fr_30
-  Scenario: A judged development request registers the exact objective
+  Scenario: Development triage registers the owner's words verbatim
     Given the owner asks to add a dry-run flag and update the usage text
     When triage decides at the floor that the request requires development
-    Then the exact owner request is registered as the task objective
+    Then the registered objective reproduces the owner's words exactly
     And the result names the task fingerprint
     And no approval of implementation is recorded
 
   # FR-02; implementation src/activities.ts triage simple branch
   @jev_triage_03 @fr_02
-  Scenario: A simple request names the skipped stages
+  Scenario: Simple triage explains which reviews can be skipped
     Given the owner asks only to verify existing output
     When triage decides at the floor that the request is simple
-    Then the result lists the deeper stages that are unnecessary
+    Then the result lists the reviews the executor can skip
     And no development task is registered
     And the requested ordinary work is not held for requirements or a plan
 
   # FR-01; implementation src/activities.ts triage topic selection
   @jev_triage_04 @fr_01
-  Scenario: Only concrete requested expertise topics are retained
+  Scenario: A concrete topic survives but a generic label does not
     Given the executor proposes the topics "export CLI flag" and "general development"
     When triage judges each topic for this specific request
-    Then "export CLI flag" is retained only at the floor
+    Then "export CLI flag" is kept when it meets the confidence threshold
     And "general development" is rejected as a generic label
     And the rejected topic is not silently promoted into a requirement
 
   # FR-10; implementation src/activities.ts triage question set
   @jev_triage_05 @fr_10
-  Scenario: No generic catalog is attached to every prompt
+  Scenario: Guidance does not attach a default expertise catalog
     Given an ordinary owner prompt arrives
     When the addon prepares guidance
-    Then no generic expertise catalog is selected automatically
+    Then the guidance does not select a generic expertise catalog
     And only topics actually submitted for the current request are judged
 
   # FR-45; implementation src/activities.ts triage external question
   @jev_triage_06 @fr_45
-  Scenario: Triage records whether the deliverable is external
+  Scenario: One call distinguishes an external document from an internal code change
     Given a request whose deliverable is a document for an outside audience
     When triage settles depth and external scope in one batch
-    Then the registered task records the external classification
+    Then the task record classifies the document as external
     And an internal code change is not classified as an external deliverable
 
   # FR-45, FR-73; implementation src/activities.ts triage external uncertainty
   @jev_triage_07 @fr_45
-  Scenario: Uncertain external scope is not silently treated as internal
+  Scenario: An uncertain classification keeps external review in scope
     Given triage returns external probability 0.55 and internal probability 0.45
     When the result is recorded
-    Then the deliverable is kept in external review scope
+    Then the document stays in scope for external review
     And later anti-slop review is not silently excluded
     And no external delivery is authorized by the classifier
 
   # FR-20, FR-30; implementation src/activities.ts triage unsettled branch
   @jev_triage_08 @fr_20
-  Scenario: Unsettled triage registers nothing and is recorded as uncertainty
+  Scenario: Below-threshold classification leaves the request unregistered
     Given a valid triage submission
     When development and simple probabilities both stay below the floor
     Then no development task and no simple result are registered
-    And the result is classified as inconclusive rather than a defect
+    And the result reports uncertainty, not an established defect
     And the executor may continue independent work and submit clearer material
 
   # FR-30; implementation src/activities.ts triage request validation
   @jev_triage_09 @fr_30
-  Scenario: A mismatched request is refused locally with the current words
+  Scenario: A paraphrased or substituted request cannot reach the judge
     Given the current owner message is "Add the export flag"
     When the executor submits "Add a login redirect" to triage
     Then no judge request is made
-    And the result names the current owner message and its digest
+    And the result includes the actual owner message and its digest
     And the executor can resubmit the exact owner text
 
   # FR-30; implementation src/activities.ts triage registered-task prerequisite
   @jev_triage_10 @fr_30
-  Scenario: Triage is registered once per request
+  Scenario: A repeated triage call points to the existing task
     Given a development task is already registered
     When the executor calls triage again for the same request
     Then the result names the existing task as the prerequisite
-    And it directs the executor to requirements, planning or jev_reaim
+    And the result points to requirements, plan review or jev_reaim
     And no second task identity is created
 
   # FR-73; implementation src/controller.ts tool_call boundary
   @jev_triage_11 @fr_73
-  Scenario: Missing triage does not block project work
+  Scenario: The host can allow work before triage returns a decision
     Given a judged change has no triage decision yet
     When the executor reads a project file or performs a consequential action
     Then the action is not refused for missing triage
     And the work is recorded as not yet reviewed rather than approved
-    And the host remains the authority for the action
+    And the host still decides whether the action is allowed
 
   # FR-73; implementation src/activities.ts judgeFailure
   @jev_triage_12 @fr_73
-  Scenario: A judge outage registers no task and does not stop work
+  Scenario: A judge outage leaves no classification on record
     Given a valid triage request is ready
     When the judge is unavailable during triage
     Then no development or simple registration is created
-    And the triage result states that no judgment exists
+    And the tool reports that no judgment was made
     And ordinary work continues under the host's permissions

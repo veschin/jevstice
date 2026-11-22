@@ -52,6 +52,8 @@ const REQUIRED_FEATURES = [
 	"jev_context.feature",
 	"jev_course_check.feature",
 	"jev_diagnostics.feature",
+	"jev_fact_check.feature",
+	"jev_issue.feature",
 	"jev_owner_followup.feature",
 	"jev_plan_review.feature",
 	"jev_reaim.feature",
@@ -60,6 +62,7 @@ const REQUIRED_FEATURES = [
 	"jev_search_relevance.feature",
 	"jev_session_mode.feature",
 	"jev_text_review.feature",
+	"jev_todo.feature",
 	"jev_triage.feature",
 ] as const;
 
@@ -76,6 +79,8 @@ const MINIMUM_SCENARIOS: Record<string, number> = {
 	"jev_context.feature": 11,
 	"jev_course_check.feature": 11,
 	"jev_diagnostics.feature": 16,
+	"jev_fact_check.feature": 5,
+	"jev_issue.feature": 12,
 	"jev_owner_followup.feature": 14,
 	"jev_plan_review.feature": 14,
 	"jev_reaim.feature": 9,
@@ -84,6 +89,7 @@ const MINIMUM_SCENARIOS: Record<string, number> = {
 	"jev_search_relevance.feature": 7,
 	"jev_session_mode.feature": 12,
 	"jev_text_review.feature": 9,
+	"jev_todo.feature": 9,
 	"jev_triage.feature": 12,
 };
 

@@ -545,10 +545,9 @@ export function registerSimple(state: JevState, request: string, external = fals
  * cheap half of the decision, with the judge answering the expensive half if the request enters.
  */
 export function screenRequest(state: JevState, request: string): RequestWeight {
-	if (state.request?.text !== request) {
-		state.refusedCalls.clear();
-		delete state.stop;
-	}
+	if (state.request?.text === request) return state.request.weight;
+	state.refusedCalls.clear();
+	delete state.stop;
 	state.request = { text: request, weight: weightOf(request) };
 	return state.request.weight;
 }
@@ -731,6 +730,7 @@ export function recordAntiSlopReview(state: JevState, review: AntiSlopReviewReco
 	const samePart = (existing: AntiSlopReviewRecord): boolean =>
 		existing.taskFingerprint === review.taskFingerprint &&
 		existing.request === review.request &&
+		existing.part.documentDigest === review.part.documentDigest &&
 		existing.part.index === review.part.index;
 	state.antiSlopReviews = [...state.antiSlopReviews.filter(existing => !samePart(existing)), review].slice(
 		-POLICY.maxAntiSlopReviews,
@@ -769,7 +769,7 @@ export function antiSlopStatus(state: JevState, scope: AntiSlopScope): AntiSlopS
 	const total = latest?.part.total ?? 1;
 	const byIndex = new Map<number, AntiSlopReviewRecord>();
 	for (const review of reviews) {
-		if (review.part.total === total) byIndex.set(review.part.index, review);
+		if (review.part.total === total && review.part.documentDigest === latest?.part.documentDigest) byIndex.set(review.part.index, review);
 	}
 	const missing: number[] = [];
 	for (let index = 1; index <= total; index += 1) {
@@ -783,11 +783,14 @@ export function antiSlopStatus(state: JevState, scope: AntiSlopScope): AntiSlopS
 			review.register !== latest?.register ||
 			review.rulesDigest !== latest?.rulesDigest,
 	);
+	const digest = latest?.part.documentDigest;
+	const bound = digest === undefined ||
+		(ordered.every(review => review.artifact !== undefined) && sha256(ordered.map(review => review.artifact).join("")) === digest);
 	return {
 		reviews: ordered,
 		missing,
 		blockers,
 		inconsistent,
-		complete: missing.length === 0 && blockers.length === 0 && !inconsistent,
+		complete: missing.length === 0 && blockers.length === 0 && !inconsistent && bound,
 	};
 }

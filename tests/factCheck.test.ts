@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createJevController } from "../src/controller.js";
-import { answeringJudge, boundaryConfig, fakeCtx, fakePi, fakeZod, failingJudge, stopEvent, toolDetails, toolResultEvent, toolText } from "./helpers.js";
+import { answeringJudge, boundaryConfig, cleanProtocolAnswers, fakeCtx, fakePi, fakeZod, failingJudge, stopEvent, toolDetails, toolResultEvent, toolText } from "./helpers.js";
 import { asRecord } from "../src/types.js";
 
 const request = "Research whether this greenhouse trial establishes year-round water savings.";
@@ -78,6 +78,50 @@ test("native follow-up preserves the original question and multiline read eviden
 	}, ctx);
 	expect(toolDetails(result)["claims"]).toMatchObject([{ verdict: "supported" }]);
 	expect(toolText(result)).toContain(request);
+});
+
+test("fact-check sources survive a continuation, not an unrelated objective", async () => {
+	const judge = answeringJudge({
+		coverage: { label: "complete" }, objective: { label: "answered" },
+		fact_0: { label: "supported" }, relevance_0: { label: "relevant" }, section_0: { label: "relevant" },
+	});
+	const { pi, ctx } = await start(request, judge.judge);
+	const draft = params.claims[0]!;
+	await pi.emit("tool_result", toolResultEvent("read", { path: source }, excerpt), ctx);
+	const verify = () => pi.callTool("jev_fact_check", { artifact: draft.quote, claims: [draft] }, ctx).then(toolDetails);
+	expect((await verify())["claims"]).toMatchObject([{ verdict: "supported" }]);
+	await pi.emit("before_agent_start", { reason: "prompt", prompt: "Continue the same fact-check." }, ctx);
+	expect((await verify())["claims"]).toMatchObject([{ verdict: "supported" }]);
+	await pi.emit("before_agent_start", { reason: "prompt", prompt: "Research a separate greenhouse trial." }, ctx);
+	expect((await verify())["claims"]).toMatchObject([{ verdict: "unverified_excerpt" }]);
+});
+
+test("anti-slop consumes the same draft's unresolved fact instead of trusting the submitted source label", async () => {
+	const judge = answeringJudge({
+		coverage: { label: "complete" }, objective: { label: "answered" },
+		fact_0: { label: "supported" }, relevance_0: { label: "relevant" }, section_0: { label: "relevant" },
+		...cleanProtocolAnswers(), language_1: { probability: 0.01 }, meta_1: { probability: 0.01 },
+		relevance_1: { label: "serves" }, claim_1: { label: "supported" },
+	});
+	const { pi, ctx } = await start("Review and publish the report.", judge.judge);
+	const artifact = "The report counted one record.";
+	const ref = { source, quote: "Total records: one." };
+	await pi.emit("tool_result", toolResultEvent("read", { path: source }, "Total records: two."), ctx);
+	const fact = toolDetails(await pi.callTool("jev_fact_check", {
+		artifact, claims: [{ quote: artifact, statement: artifact, evidence: [ref] }],
+	}, ctx));
+	expect(fact["claims"]).toMatchObject([{ verdict: "unverified_excerpt" }]);
+	const review = toolDetails(await pi.callTool("jev_anti_slop", {
+		artifact, language: "English", register: "plain", purpose: "report the count", audience: "readers", rules: [],
+		claims: [{ id: "count", text: artifact, kind: "fact", evidence: [{ ...ref, kind: "documentation", sourceClass: "official" }] }],
+	}, ctx));
+	expect(review).toMatchObject({ kind: "unclear", claims: [{ trust: "unverified", verdict: "unverified_excerpt" }] });
+	expect(judge.calls.at(-1)?.questions.map(question => question.name)).not.toContain("claim_1");
+	const saved = toolDetails(await pi.callTool("jev_context", { action: "result", sourceId: review["resultId"] }, ctx));
+	expect(saved["result"]).toMatchObject({ prior: [fact["resultId"]], applicability: "current" });
+	await pi.emit("tool_result", toolResultEvent("read", { path: source }, ref.quote), ctx);
+	const stale = toolDetails(await pi.callTool("jev_context", { action: "result", sourceId: review["resultId"] }, ctx));
+	expect(stale["result"]).toMatchObject({ applicability: "historical" });
 });
 
 test("an excerpt invented for an observed source is not support; omitted claims are not covered", async () => {

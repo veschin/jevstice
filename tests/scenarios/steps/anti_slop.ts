@@ -35,6 +35,7 @@ import {
 	stopEvent,
 	toolCallEvent,
 	toolDetails,
+	toolResultEvent,
 	toolText,
 	type FakeAnswerSource,
 	type FakePi,
@@ -268,7 +269,7 @@ given("a document intended for an audience outside the project", value => {
 	expect(w.state.task?.external).toBe(true);
 });
 
-when("the executor submits the exact artifact and its required declarations", async value => {
+when("the executor submits the unmodified draft with its review declarations", async value => {
 	const w = setup(value);
 	await run(w, submission());
 });
@@ -382,6 +383,8 @@ given("an external artifact review records a blocker finding in advisory mode", 
 	createJevController({ judge: fake.judge, config: boundaryConfig(), zod: fakeZod() }).register(pi.api);
 	w.pi = pi;
 	w.ctx = asRecord(ctx);
+	await pi.emit("before_agent_start", { reason: "prompt", prompt: REQUEST }, ctx);
+	await pi.emit("tool_result", toolResultEvent("read", { path: CLAIM.evidence[0]!.source }, CLAIM.evidence[0]!.quote), ctx);
 	const triaged = await pi.callTool("jev_triage", { request: REQUEST }, ctx);
 	expect(toolText(triaged)).toContain("External deliverable");
 	const reviewed = await pi.callTool("jev_anti_slop", submission(), ctx);
@@ -1094,21 +1097,21 @@ then("no review part is recorded as complete", value => {
 	expect(antiSlopStatus(w.state, scope!).complete).toBe(false);
 });
 
-then("affected claims and inferences remain unverified", value => {
+then("unresolved items remain unverified without discarding a separately supported claim", value => {
 	const w = world(value);
 	expect(w.attempts[0]?.text).toContain("No judge decision exists");
 	expect(w.attempts[1]?.text).toContain("inconclusive");
 	expect(w.attempts[1]?.details?.["uncertain"]).toEqual(
 		expect.arrayContaining([expect.stringContaining("inference inference-1")]),
 	);
-	expect(listOf(detailsOf(w.attempts[1]), "claims")).toHaveLength(0);
+	expect(listOf(detailsOf(w.attempts[1]), "claims")).toMatchObject([{ id: "claim-1", trust: "trusted" }]);
 	const inferences = listOf(detailsOf(w.attempts[1]), "inferences");
 	expect(inferences).toHaveLength(1);
 	expect(inferences[0]?.["trust"]).toBe("unverified");
 	expect(inferences[0]?.["status"]).toBe("unresolved");
 });
 
-then("no trusted mark is manufactured", value => {
+then("the whole review is not trusted or approved", value => {
 	const w = world(value);
 	for (const outcome of w.attempts) {
 		expect(outcome.ok).toBe(false);
@@ -1212,7 +1215,7 @@ given("the review records a blocker finding", async value => {
 	w.toolNames = [...pi.tools.keys()];
 });
 
-when("the executor reports it", value => {
+when("the executor reports the finding and the owner acknowledges it", value => {
 	const w = setup(value);
 	const id = w.findingIds[0] ?? "";
 	w.reportText = w.outcome?.text ?? "";

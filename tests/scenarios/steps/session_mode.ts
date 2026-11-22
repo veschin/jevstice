@@ -22,6 +22,7 @@ import {
 	toolFailed,
 	toolResultEvent,
 	toolText,
+	until,
 } from "../../helpers.js";
 import { scoped } from "../registry.js";
 import {
@@ -178,6 +179,7 @@ given("the owner has turned diagnostics off after earlier approvals and findings
 	const details = await observe(world);
 	expect(details["acceptance"]).toEqual([]);
 	world.pi.callCommand("jev-status", "", world.ctx);
+	expect(await until(() => lastMessage(world, "jev.status").length > 0)).toBe(true);
 	world.info["status"] = lastMessage(world, "jev.status");
 	world.info["checks"] = { ...counts(details, "checks") };
 	world.info["work"] = { ...counts(details, "work") };

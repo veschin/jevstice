@@ -127,7 +127,7 @@ then("the claim is judged against the objective, requirements and plan", value =
 	expect(judged).toContain("collect");
 });
 
-then("the result reports the typed course answer and confidence", value => {
+then("the result gives the course verdict and its confidence", value => {
 	const outcome = w(value).outcome;
 	expect(outcome?.details?.["label"]).toBe("on_course");
 	expect(typeof outcome?.details?.["confidence"]).toBe("number");
@@ -154,7 +154,7 @@ when("the executor calls jev_course_check with a claim", async value => {
 	world.outcome = await submit(world);
 });
 
-then("the result names the approved-plan prerequisite", value => {
+then("the tool says an approved plan is needed for the check", value => {
 	const outcome = w(value).outcome;
 	expect(outcome?.ok).toBe(false);
 	expect(outcome?.text).toContain("approved plan");
@@ -190,7 +190,7 @@ then("no judge request is made", value => {
 	expect(w(value).calls).toEqual([]);
 });
 
-then("the result asks for one concise claim", value => {
+then("the tool asks for a concise claim", value => {
 	const text = w(value).outcome?.text ?? "";
 	expect(text).toContain("claim is required");
 	expect(text).toContain("state concisely");
@@ -220,7 +220,7 @@ then("the result names the departure as an established defect", value => {
 	expect(outcome?.text).toContain("Class: defect");
 });
 
-then("the finding is recorded with its boundary and revision", value => {
+then("the finding identifies the checked boundary and revision", value => {
 	const world = w(value);
 	const finding = world.state.findings?.[0];
 	expect(finding).toBeDefined();
@@ -244,7 +244,7 @@ when("the judge answers on_course below the choice floor", async value => {
 	world.outcome = await submit(world);
 });
 
-then("the result is inconclusive", value => {
+then("the tool reports the answer as inconclusive", value => {
 	const outcome = w(value).outcome;
 	expect(outcome?.ok).toBe(false);
 	expect(outcome?.details?.["kind"]).toBe("unclear");
@@ -283,7 +283,7 @@ when("the executor obtains an on-course answer at the floor", async value => {
 	world.outcome = await submit(world);
 });
 
-then("the earlier finding remains recorded", value => {
+then("the previous finding stays on record", value => {
 	const world = w(value);
 	const earlier = world.state.findings?.[0];
 	expect(earlier?.boundary).toBe("review");
@@ -336,7 +336,7 @@ then("it judges the action against the whole approved task", value => {
 	expect(world.calls[0]?.questions[0]?.instructions).toContain("approved task plan");
 });
 
-then("it does not require the action to serve every topic at once", value => {
+then("the action need not address every plan topic at once", value => {
 	const world = w(value);
 	expect(world.calls[0]?.questions).toHaveLength(1);
 	expect(world.calls[0]?.questions[0]?.name).toBe("action");
@@ -397,7 +397,7 @@ then("an unfinished background effect remains not checked", value => {
 	expect(work?.["not_checked"]).toBeGreaterThanOrEqual(1);
 });
 
-then("neither case becomes a passing course check", value => {
+then("the record shows no passing course check for either case", value => {
 	const details = w(value).asyncDetails ?? {};
 	const work = asRecord(asRecord(details["diagnostics"])?.["work"]);
 	expect(work?.["passed"]).toBe(0);
@@ -412,7 +412,7 @@ when("the judge is unavailable", async value => {
 	world.outcome = await submit(world);
 });
 
-then("the result states that no judgment exists", value => {
+then("the result says there was no judgment", value => {
 	const outcome = w(value).outcome;
 	expect(outcome?.ok).toBe(false);
 	expect(outcome?.details?.["kind"]).toBe("unavailable");
@@ -454,7 +454,7 @@ when("the task or revision changes before the answer returns", async value => {
 	world.outcome = await submit(world);
 });
 
-then("the answer is discarded as stale", value => {
+then("the check discards the answer as stale", value => {
 	const outcome = w(value).outcome;
 	expect(outcome?.ok).toBe(false);
 	expect(outcome?.details?.["kind"]).toBe("stale");
@@ -492,7 +492,7 @@ when("the configuration is loaded", value => {
 	world.config = loadJevConfig({ cwd: world.configDir ?? tmpdir(), home: join(world.configDir ?? tmpdir(), "home") });
 });
 
-then("no interval-scheduled or completion-only course check is configured", value => {
+then("the settings schedule neither periodic nor completion-only checks", value => {
 	const config = w(value).config as unknown as Record<string, unknown>;
 	expect("courseCheck" in config).toBe(false);
 	expect(config["problems"]).toEqual([]);

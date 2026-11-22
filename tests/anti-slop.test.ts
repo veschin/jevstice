@@ -9,6 +9,7 @@ import {
 	recordAntiSlopReview,
 	registerSimple,
 	registerTask,
+	sha256,
 	type JevState,
 } from "../src/state.js";
 import type { Judge } from "../src/judge.js";
@@ -863,6 +864,26 @@ describe("FR-55 - review status and advisory default", () => {
 		return state;
 	}
 
+	test("multipart review requires matching document bytes, scope, and part order", async () => {
+		const state = externalState();
+		const { deps } = depsFor(CLEAN_FRAGMENT);
+		const observed = { ...deps, verifyObserved: () => false };
+		const first = "Use a test workspace.";
+		const second = "Then check the saved record.";
+		const digest = sha256(first + second);
+		const review = (artifact: string, index: number, documentDigest: string, audience = "external") =>
+			antiSlop(observed, state, params({ artifact, claims: [], inferences: [], audience, part: { index, total: 2, documentDigest } }));
+		expect((await review(first, 1, digest)).ok).toBe(true);
+		expect((await review(second, 2, sha256("Another document." + second))).ok).toBe(true);
+		expect(antiSlopStatus(state, scopeOf(state))).toMatchObject({ complete: false, missing: [1] });
+		expect((await review("Unexpected content.", 2, digest)).ok).toBe(true);
+		expect(antiSlopStatus(state, scopeOf(state))).toMatchObject({ complete: false, missing: [] });
+		expect((await review(second, 2, digest)).ok).toBe(true);
+		expect(antiSlopStatus(state, scopeOf(state)).complete).toBe(true);
+		expect((await review(second, 2, digest, "another audience")).ok).toBe(true);
+		expect(antiSlopStatus(state, scopeOf(state)).complete).toBe(false);
+	});
+
 	test("advisory records an incomplete review and keeps a blocker recorded as a diagnostic", async () => {
 		const state = acceptedState();
 		const missing = antiSlopStatus(state, scopeOf(state));
@@ -932,8 +953,8 @@ describe("FR-55 - review status and advisory default", () => {
 	});
 });
 
-describe("FR-55 - an external delivery waits for a complete review", () => {
-	test("a delivery invocation is refused without a review and admitted after one", async () => {
+describe("FR-55 - ordinary delivery diagnostics use the exact review", () => {
+	test("an unrelated or unobserved body does not inherit a review", async () => {
 		const state = externalState();
 		recordAction(state, { tool: "write", target: "memo.md", excerpt: "memo" });
 		state.plan = {
@@ -986,19 +1007,27 @@ describe("FR-55 - an external delivery waits for a complete review", () => {
 			request: REQUEST,
 			revision: state.revision,
 			part: { index: 1, total: 1 },
-			partDigest: "d",
+			partDigest: sha256("memo"),
+			artifact: "memo",
 			language: "en",
 			register: "formal",
 			rulesDigest: "r",
 			findings: [],
 		});
 		const withReview = await actionCheck(deps, state, {
-			tool: "write",
-			target: "memo.md",
-			change: "memo",
-		});
+			tool: "send_email",
+			target: "recipient",
+			change: '{"body":"memo"}',
+		}, { body: "memo" });
 		expect(toolDetails(withReview)["approved"]).toBe(true);
 		expect(toolDetails(withReview)["antiSlopDelivery"]).toBe(true);
+		const wrong = await actionCheck(deps, state, {
+			tool: "send_email",
+			target: "recipient",
+			change: '{"body":"unreviewed"}',
+		}, { body: "unreviewed" });
+		expect(toolDetails(wrong)).toMatchObject({ approved: false, kind: "unclear" });
+		expect(toolDetails(wrong)["antiSlopDelivery"]).not.toBe(true);
 	});
 });
 
@@ -1204,7 +1233,7 @@ describe("observedOutcome - one ordinary result check", () => {
 	test("a successful test run can establish that the tests passed without a code quote", async () => {
 		const state = observedState(["The tests run and pass."]);
 		const { deps } = depsFor(requirementAnswers("observed", "evidence_1", "not_needed"));
-		const outcome = await observedOutcome(deps, state, OBSERVATIONS);
+		const outcome = await observedOutcome(deps, state, OBSERVATIONS.filter(item => item.kind === "execution"));
 		expect(outcome.details).toMatchObject({ approved: true, requirements: [{
 			status: "met", execution: { status: "selected", id: "evidence_1" }, code: { status: "not_needed" },
 		}] });

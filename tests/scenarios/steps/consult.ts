@@ -199,7 +199,7 @@ then("the consultation returns that typed answer", value => {
 	expect(w.outcome?.text.startsWith(`Consult (${w.mode})`)).toBe(true);
 });
 
-then("the answer is accompanied by the submitted context that grounded it", value => {
+then("the judge receives the submitted question and context", value => {
 	const w = setup(value);
 	const call = w.calls?.[0];
 	const material = asRecord(call?.state);
@@ -267,7 +267,7 @@ then("no judge request is made", value => {
 	expect(setup(value).calls).toEqual([]);
 });
 
-then("the result names the missing or invalid field", value => {
+then("the result points to the field that is invalid or missing", value => {
 	const w = setup(value);
 	expect(w.outcome?.ok).toBe(false);
 	expect(w.outcome?.text).toContain(w.expectedField!);
@@ -309,7 +309,7 @@ then("the result directs the executor to continue work with the finding recorded
 	expect(w.outcome?.text).toContain("finding");
 });
 
-then("no repair permit or finding-resolution phase is created", value => {
+then("the tool creates neither a repair permit nor a finding-resolution phase", value => {
 	const w = setup(value);
 	const state = w.state as unknown as Record<string, unknown>;
 	expect(w.state?.hold).toBeUndefined();
@@ -335,7 +335,7 @@ when("the judge answer stays below its approval floor", async value => {
 	w.outcome = await runConsult(w, w.params!);
 });
 
-then("the result is unsettled and marked inconclusive", value => {
+then("the result explicitly marks the answer inconclusive", value => {
 	const w = setup(value);
 	expect(w.outcome?.ok).toBe(false);
 	expect(w.outcome?.details?.["kind"]).toBe("unclear");
@@ -386,7 +386,7 @@ when("the executor asks a different question with different material", async val
 	w.calls = [...(w.fake?.calls ?? [])];
 });
 
-then("the second question is judged on its own submitted material", value => {
+then("the judge considers the second question on its own submitted material", value => {
 	const w = setup(value);
 	expect(toolFailed(w.second)).toBe(false);
 	expect(toolDetails(w.second)["mode"]).toBe("choice");
@@ -436,7 +436,7 @@ when("the executor obtains a usable consultation answer", async value => {
 	w.calls = [...(w.fake?.calls ?? [])];
 });
 
-then("the result states that the finding remains a diagnostic record", value => {
+then("the response says the existing finding remains on record", value => {
 	const w = setup(value);
 	expect(toolFailed(w.second)).toBe(false);
 	expect(toolText(w.second)).toContain("stays a diagnostic record");
@@ -484,7 +484,7 @@ given("the executor submits a question with quoted code and an archive sourceId"
 	controller(w, fake.judge, { context: archive });
 });
 
-when("the consultation is prepared", async value => {
+when("the tool prepares the question and checks its evidence", async value => {
 	const w = setup(value);
 	w.result = await w.pi!.callTool("jev_consult", w.params, w.ctx);
 	w.outcome = observed(w.result);
@@ -567,7 +567,7 @@ async function staleConsult(mutate: (state: JevState) => void): Promise<ToolOutc
 	return consult({ judge, config: boundaryConfig() }, state, validConsult("boolean"));
 }
 
-then("a changed task or revision makes the answer stale", async () => {
+then("a change to the task or revision makes that answer stale", async () => {
 	const revisionChanged = await staleConsult(state => {
 		state.revision += 1;
 	});
@@ -612,7 +612,7 @@ then("no decision is returned", value => {
 	expect(w.outcome?.details?.["approved"]).not.toBe(true);
 });
 
-then("the result states that no judgment exists", value => {
+then("the result says there was no judgment", value => {
 	const w = setup(value);
 	expect(w.outcome?.text).toContain("No judge decision exists");
 });
@@ -652,7 +652,7 @@ when("the executor performs the corresponding project change", async value => {
 	);
 });
 
-then("the host's permissions decide whether the change executes", value => {
+then("only the host's permissions determine whether the change can execute", value => {
 	const w = setup(value);
 	expect(blockReason(w.blocks ?? [])).toBeUndefined();
 });

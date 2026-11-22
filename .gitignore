@@ -1,11 +1,13 @@
 node_modules/
-PRD.md
+/TODO.md
 PLAN.md
 TASKS.md
 ACCEPTANCE.md
 POLICY-DRAFT.md
 evidence/
 .omp/
+/.ruff_cache/
+/demos/comparisons/ui/raw-*.json
 /site/press/
 /docs/presale-reddit.md
 /docs/presale-twitter.md

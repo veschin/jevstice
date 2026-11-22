@@ -2,9 +2,10 @@
 # Requirements: PRD FR-08, FR-09, FR-13, FR-19, FR-20, FR-22; FR-67 superseded.
 # Source contract: src/guidance.ts CONSULT_DESCRIPTION; src/jev-skill.md sections 4-5.
 # Executable: tests/scenarios/steps/consult.ts; run by tests/scenarios/run.test.ts.
-Feature: Consult one decision with a typed diagnostic answer
-  Choice, score and boolean consultations answer one question from submitted context.
-  The answer informs the executor; it clears no finding and authorizes no effect.
+Feature: Ask the judge one advisory question
+  The executor provides a question and the context needed to answer it. The
+  requested mode determines how the answer is reported. No answer clears an
+  existing finding or authorizes a project action.
 
   Background:
     Given ordinary Jev diagnostics are enabled
@@ -12,11 +13,11 @@ Feature: Consult one decision with a typed diagnostic answer
 
   # FR-08; implementation src/activities.ts consult
   @jev_consult_01 @fr_08 @fr_13
-  Scenario Outline: Return the submitted answer shape
+  Scenario Outline: The consultation mode determines what answer comes back
     Given a valid "<mode>" consultation with question, context and "<definition>"
     When the judge returns a usable "<answer>" at the applicable floor
     Then the consultation returns that typed answer
-    And the answer is accompanied by the submitted context that grounded it
+    And the judge receives the submitted question and context
     And no project action, acceptance or completion is approved
     Examples:
       | mode    | definition                              | answer                        |
@@ -26,11 +27,11 @@ Feature: Consult one decision with a typed diagnostic answer
 
   # FR-08; implementation src/activities.ts consult validation
   @jev_consult_02 @fr_08
-  Scenario Outline: Malformed consultation arguments are refused locally
+  Scenario Outline: An invalid submission identifies the problem without asking the judge
     Given the executor submits a "<defect>" consultation
     When the tool validates the arguments
     Then no judge request is made
-    And the result names the missing or invalid field
+    And the result points to the field that is invalid or missing
     And no finding or approval is recorded
     Examples:
       | defect                               |
@@ -42,19 +43,19 @@ Feature: Consult one decision with a typed diagnostic answer
 
   # FR-67, FR-76; implementation src/activities.ts consult recovery rejection
   @jev_consult_03 @fr_76
-  Scenario: Recovery and repair consultations are not available
+  Scenario: A consultation cannot be used to obtain a repair permit
     Given the executor submits mode "recovery" or a repair request
     When the consultation is validated
     Then it is refused locally
     And the result directs the executor to continue work with the finding recorded
-    And no repair permit or finding-resolution phase is created
+    And the tool creates neither a repair permit nor a finding-resolution phase
 
   # FR-20; implementation src/activities.ts consult floors
   @jev_consult_04 @fr_20
-  Scenario Outline: Below-floor answers are unsettled, not decisions
+  Scenario Outline: Confidence below the mode's floor leaves the question open
     Given a valid <mode> consultation
     When the judge answer stays below its approval floor
-    Then the result is unsettled and marked inconclusive
+    Then the result explicitly marks the answer inconclusive
     And the result does not claim an approved decision or a proven defect
     And the executor may resubmit only with materially changed material
     Examples:
@@ -65,54 +66,54 @@ Feature: Consult one decision with a typed diagnostic answer
 
   # FR-22; implementation src/activities.ts consult boundary identity
   @jev_consult_05 @fr_22
-  Scenario: Different questions are judged independently
+  Scenario: A new question is not constrained by the verdict on another question
     Given one consultation question was refused or left unsettled
     When the executor asks a different question with different material
-    Then the second question is judged on its own submitted material
+    Then the judge considers the second question on its own submitted material
     And the earlier result does not block or approve the second question
     And the earlier finding remains recorded
 
   # FR-73; implementation src/activities.ts consult diagnostic note
   @jev_consult_06 @fr_73
-  Scenario: The answer does not clear a standing finding
+  Scenario: A usable answer leaves an earlier diagnostic intact
     Given a diagnostic finding is recorded for the task
     When the executor obtains a usable consultation answer
-    Then the result states that the finding remains a diagnostic record
+    Then the response says the existing finding remains on record
     And the answer neither clears it nor authorizes or blocks an effect
     And the next tool call and completion do not wait for the finding
 
   # FR-09; implementation src/controller.ts prepareContext, activities evidence
   @jev_consult_07 @fr_09
-  Scenario: Submitted evidence and context are what the judge sees
+  Scenario: The tool verifies quoted evidence before sending it to the judge
     Given the executor submits a question with quoted code and an archive sourceId
-    When the consultation is prepared
+    When the tool prepares the question and checks its evidence
     Then the exact quote is verified against the archived source before judging
     And the judge receives the submitted question, context and evidence
     And no unsubmitted private reasoning is invented as context
 
   # FR-19; implementation src/activities.ts material
   @jev_consult_08 @fr_19
-  Scenario: A registered task is included as decision context
+  Scenario: The answer applies to the registered task and work revision
     Given a development task is registered
     When a consultation is judged
     Then the registered objective and current approvals accompany the submitted material
     And the answer is bound to that task and work revision
-    And a changed task or revision makes the answer stale
+    And a change to the task or revision makes that answer stale
 
   # FR-73; implementation src/activities.ts judgeFailure
   @jev_consult_09 @fr_73
-  Scenario: An unavailable judge yields no decision and no hold
+  Scenario: Judge unavailability does not create a decision or delay completion
     Given a valid consultation
     When the judge is unavailable
     Then no decision is returned
-    And the result states that no judgment exists
+    And the result says there was no judgment
     And ordinary work and completion remain available
 
   # FR-73; implementation src/controller.ts tool boundary
   @jev_consult_10 @fr_73
-  Scenario: Consultation advice is not an execution approval
+  Scenario: Selecting an alternative does not authorize the corresponding change
     Given a consultation approved a proposed alternative
     When the executor performs the corresponding project change
-    Then the host's permissions decide whether the change executes
+    Then only the host's permissions determine whether the change can execute
     And the consultant answer is not recorded as action authorization
     And any action diagnostic remains separate evidence

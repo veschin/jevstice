@@ -180,7 +180,7 @@ then("no owner confirmation is requested", value => {
 	expect(w.calls).toHaveLength(1);
 });
 
-then("implementation choices are not rejected merely because the owner did not name them", value => {
+then("the review allows supported implementation choices the owner did not specify", value => {
 	const w = setup(value);
 	const coverage = w.calls[0]?.questions.find(question => question.name === "coverage");
 	expect(coverage?.instructions).toContain(
@@ -223,7 +223,7 @@ then("each item receives its own supported, rejected or unsettled decision", val
 	expect(w.outcome?.details?.["unsettledItems"]).toEqual([]);
 });
 
-then("the result shows the submitted source line for each item", value => {
+then("the judge checks each obligation against its submitted source quote", value => {
 	const w = setup(value);
 	const questions = w.calls.flatMap(call => [...call.questions]);
 	w.items.forEach((item, index) => {
@@ -260,7 +260,7 @@ then("no judge request is made", value => {
 	expect(w.calls.length).toBe(w.judgeBaseline ?? 0);
 });
 
-then("the result names the missing source", value => {
+then("the tool identifies the missing source", value => {
 	const w = setup(value);
 	const text = w.outcome?.text ?? "";
 	expect(w.outcome?.ok).toBe(false);
@@ -297,7 +297,7 @@ when("coverage is not established and the need is missing", async value => {
 	await runRequirements(w);
 });
 
-then("the result separates overall coverage, rejected items and the uncovered need", value => {
+then("the report lists coverage, rejected obligations and the omitted need separately", value => {
 	const w = setup(value);
 	const details = w.outcome?.details ?? {};
 	expect(details["coverage"]).toBe(0.3);
@@ -356,7 +356,7 @@ when("the result is classified", async value => {
 	await runRequirements(setup(value));
 });
 
-then("coverage is reported as established", value => {
+then("the result says the list establishes coverage", value => {
 	const w = setup(value);
 	expect(w.outcome?.details?.["coverage"]).toBe(POLICY.minRequirementsCoverageConfidence);
 	expect(w.outcome?.details?.["covered"]).toBe(true);
@@ -393,7 +393,7 @@ when("the requirement result is reported", async value => {
 	await runRequirements(setup(value));
 });
 
-then("that item is named as not settled", value => {
+then("the report identifies the item whose support remains uncertain", value => {
 	const w = setup(value);
 	expect(w.outcome?.text).toContain("item_1 not settled");
 	expect(w.outcome?.details?.["unsettledItems"]).toEqual(["item_1"]);
@@ -450,7 +450,7 @@ when("the executor submits a materially different requirement set", async value 
 	expect(w.outcome?.details?.["approved"]).toBe(true);
 });
 
-then("the old planning approvals no longer count as current", value => {
+then("the old plan approvals no longer apply to the new requirement set", value => {
 	const w = setup(value);
 	expect(w.state.requirementsApproval?.items).toEqual([NEW_OBLIGATION]);
 	expect(w.state.planDraft).toBeUndefined();
@@ -514,7 +514,7 @@ then("the exact obligation text is stored with task and approval provenance", va
 	expect(record.id).toMatch(/^[0-9a-f]{64}$/);
 });
 
-then("jev_context can list and read it later", async value => {
+then("jev_context can list the archived approval and retrieve its content", async value => {
 	const w = setup(value);
 	w.listed = await w.pi!.callTool("jev_context", { action: "list" }, w.ctx);
 	const sources = toolDetails(w.listed)["sources"];
@@ -563,7 +563,7 @@ then("the edit is not refused for missing requirement approval", value => {
 	expect(setup(value).blocked).toBeUndefined();
 });
 
-then("the work is recorded as not yet reviewed", async value => {
+then("the edit is recorded as not yet reviewed", async value => {
 	const w = setup(value);
 	w.listed = await w.pi!.callTool("jev_context", { action: "list" }, w.ctx);
 	const work = asRecord(asRecord(toolDetails(w.listed)["diagnostics"])?.["work"]);
@@ -596,7 +596,7 @@ when("the judge is unavailable", async value => {
 	await runRequirements(w);
 });
 
-then("the result states that no judgment exists", value => {
+then("the tool reports that no judgment was made", value => {
 	const w = setup(value);
 	expect(w.results).toHaveLength(1);
 	expect(w.results[0]?.text).toContain("No judge decision exists");
@@ -636,7 +636,7 @@ when("the executor resubmits byte-identical obligations and sources", async valu
 	await runRequirements(w, { items: w.items.map(item => ({ ...item })) });
 });
 
-then("the earlier result is returned as the diagnostic record", value => {
+then("the tool returns the earlier diagnostic", value => {
 	const w = setup(value);
 	const latest = w.results.at(-1);
 	expect(latest?.ok).toBe(false);

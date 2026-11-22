@@ -36,17 +36,21 @@ It never grants or withholds execution permission.
 - `jev_search_relevance`: candidate relevance and the submitted reason.
 - `jev_reaim`: record an actual owner replacement of direction, not a bypass.
 - `jev_course_check`: whether work conforms to the current plan.
-- `jev_acceptance`: separate business and architecture evidence.
+- `jev_acceptance`: `outcome` reviews observed delivery; business and architecture are separate.
 - `jev_review`: checkpoint, commit or diff review.
 - `jev_text_review`: exact text against submitted register rules.
 - `jev_anti_slop`: external-artifact findings, always diagnostic.
-- `jev_context`: trusted source listing/reading and original finding material.
+- `jev_context`: trusted sources and exact session-local diagnostic results.
+- `jev_fact_check`: observed evidence, relevance and owner-question coverage for draft claims.
+- `jev_issue`: optional tracker draft preparation, readback verification and linked developer review.
+- `jev_todo`: optional review, resumption and cleanup proposals for an observed backlog.
+- `jev_autonomy`: control for a bound supervised run. The strict catalog omits `jev_fact_check`, `jev_issue` and `jev_todo`.
 
-Use the route advertised by OMP: run `<tool> --help` and `<tool> -j '<JSON>'` in `bash` for
-mounted commands, or invoke directly listed tools with their JSON arguments. Read-only questions,
-project inspection and external reads need no triage ritual. For a
-development task, use triage, requirements and staged planning to improve the work, not as permission
-gates. Preserve exact owner words and source bytes; archive provenance is not truth or authority.
+For mounted commands, run `<tool> --help`, then submit `<tool> -j '<JSON>'` in `bash` without a
+PTY. Use typed arguments when the host lists the tool directly. For a development task, check
+requirements against the owner's exact words before editing and call `jev_acceptance` with
+`aspect: "outcome"` after verification. Triage and staged planning are useful when their
+diagnostics answer a concrete question. Recheck only when new evidence addresses a named gap.
 
 ## Architecture & Data Flow
 
@@ -61,8 +65,9 @@ Ordinary `src/` stays flat, with no build step; the optional autonomy module liv
 - `gates.ts` - pure shell/tool effect classifiers and target-against-plan comparison. No ordinary execution or completion gate remains.
 - `activities.ts` - validated diagnostic activities, owner-update classification and conformance checks. Repeated unchanged material is deduplicated. Stale state or changed plan bytes invalidate the answer, not continued work.
 - `artifact.ts` - reading a `local://` artifact from disk, so the plan review binds an approval to the artifact's bytes rather than to the caller's copy.
-- `controller.ts` - twelve tools, `/jev` and `/jev-status`, owner-source capture, source validation and nonblocking background post-effect diagnostics. Context reads bypass the explicit judgment queue. Ordinary tool calls and completion never await Jev.
-- `guidance.ts` - registered tool schemas, descriptions and diagnostic examples. `jev-skill.md` is the injected workflow asset and must agree with the current contract.
+- `controller.ts` - ordinary tool registration, commands, native observations, source validation and detached diagnostics. Context reads bypass the explicit judgment queue. Ordinary work and completion do not await an acceptance verdict.
+- `guidance.ts` - canonical tool schemas and examples; `src/jev-skill.md` is the injected ordinary workflow and `skills/jevstice/SKILL.md` is the discoverable package skill. Update applicable surfaces when changing a public contract.
+- `diagnosticResults.ts`, `factCheck.ts`, `issueWork.ts`, `todoWork.ts` - session-local results and optional workflows grounded in observed evidence.
 - `context.ts` - immutable project-local owner and approved-artifact records under `.omp/jev/context`, with identity/digest verification on reads; archive reads restore no approval.
 - `autonomy/index.ts` - strict-only extension entry, loaded by the supervisor instead of the manifest: it registers deny hooks, requires both nonempty run/store locators, then dynamically loads the runtime.
 - `autonomy/runtime.ts` - opt-in strict runtime: restored workflow state, explicit decision context, durable intent admission, dependency hashing, matched native result settlement, evidence-bound completion and `jev_autonomy`.
@@ -87,11 +92,11 @@ still runs when diagnostics are off and strict durable state is not discarded.
 - `src/` - ordinary runtime code, flat, one concern per file, plus `jev-skill.md` (ordinary workflow guidance only; the strict autonomous guidance lives in `autonomy/runtime.ts`).
 - `autonomy/` - the optional strict module: `index.ts` (explicit entry), `runtime.ts`, `store.ts`, `scope.ts` and `driver.ts`. Not in the package manifest, never imported by ordinary code.
 - `tests/` - flat `*.test.ts` mirroring src modules, plus `tests/helpers.ts` (fake judge, fake host, fake artifacts, `boundaryConfig`).
-- `tools/` - live smoke against the production judge and the real OMP host, the release demo runner (`release-demos.ts`), plus `tools/README.md`.
-- `scenarios/` - the normative Gherkin files, one per tool area. English only. `tests/scenarios/run.test.ts` parses them and turns every scenario into a test: a scenario whose steps are all defined in `tests/scenarios/steps/` runs against production code, and a missing step fails the suite unless the scenario id is one of the exact known-unsupported allowlist entries. A now-supported allowlist entry also fails, so progress cannot hide behind the allowlist.
-- `demos/` - recorded evidence: `demos/tools/<tool>/` holds the per-tool terminal GIF, tape and sanitized session evidence; `demos/comparisons/{game,ui}/` holds the matched with/without-addon runs with their original sources, screenshots and verification logs.
-- `docs/` - README banner, the optional autonomy module's lifecycle/deployment reference, the release brief and the Reddit/Twitter release drafts.
-- `PRD.md` is the owner-approved, tracked source of the functional requirements. `ACCEPTANCE.md`, `PLAN.md`, `TASKS.md` and `evidence/` are ignored working records. Do not remove `PRD.md` from the index.
+- `tools/` - verification against deterministic fixtures, the production judge and the real OMP host; see `tools/README.md`.
+- `scenarios/` - English Gherkin: one feature per tool, plus configuration, session-mode, owner-follow-up and cross-tool diagnostics. Keep stable feature-scoped IDs and use observable consequences. The Bun runner binds steps in `tests/scenarios/steps/`; missing steps fail except the explicitly documented unsupported host boundaries.
+- `demos/` and `site/` - separate recorded/public presentation work; demo output does not establish release acceptance. Keep raw session evidence local.
+- `docs/` - architecture and operational references. Press drafts and kits remain local.
+- `PRD.md` - tracked product requirements, constraints and source history. `TODO.md`, `PLAN.md`, `TASKS.md`, `ACCEPTANCE.md` and `evidence/` are local working records, not release inputs.
 
 ## Development Commands
 
@@ -104,9 +109,6 @@ bun tools/live-smoke.ts host --scenario workflow    # real omp host
 bun tools/autonomy-smoke.ts --scenario startup --deadline 300 # strict real-host startup
 bun tools/autonomy-smoke.ts --scenario all --deadline 600     # all strict live scenarios
 bun run autonomy status                                    # autonomy/driver.ts: start|resume|status|stop
-bun tools/release-demos.ts list                            # public tools with recorded demo scenarios
-bun tools/release-demos.ts run <tool> --save <dir>         # one real session, evidence saved
-bun tools/release-demos.ts record <tool>                   # render the GIF with vhs
 ```
 
 Historical test counts, blocking-workflow probes and recovery approvals are not verification of the current diagnostic contract. Record current commands and observed results in `HANDOFF.md` and `tools/README.md`; do not claim release readiness or whole-autonomy acceptance from an earlier run.
@@ -144,42 +146,21 @@ There is no build, lint/format tooling or CI. The only CLI is the opt-in strict 
 ## Runtime/Tooling Preferences
 
 - Bun >= 1.1 is required and is both runtime and test runner; this code is not Node-tested. Use `bun run`, not `node`/`npx`/`npm`.
-- TypeScript is typecheck-only (`noEmit`): there is no compiled artifact and no `dist/`. Shipping is `git clone` into `~/.omp/agent/extensions/jevstice`; the manifest entry is already declared and dependencies auto-install on first run. No npm publish.
+- TypeScript is typecheck-only (`noEmit`): there is no compiled artifact and no `dist/`. Install a checkout with `omp plugin link <checkout>` to load both the manifest entry and `skills/jevstice/SKILL.md`. For a one-session checkout, pass the package directory to `omp --no-extensions -e <checkout>` to discover the skill as well as the entry. No npm publish.
 - Do not add lint/format tooling, build steps, or schema/validation dependencies without asking - their absence is a deliberate choice.
 
 ## Testing & QA
 
-- Framework: `bun:test` only. Run everything with `bun test`; single file: `bun test tests/gates.test.ts`.
-- Layout: flat module tests plus cross-cutting anti-slop, autonomous entry/runtime/store/scope/driver/smoke-oracle tests and `tools/live-smoke.test.ts`. Seventeen test files in the last recorded baseline. Autonomous runtime tests use real local child processes and native scopes; no unit test calls a network judge.
-- Shared seams in `tests/helpers.ts` supply fake judges/hosts, artifact roots and shipped diagnostic config. Unit tests never call a network judge.
+- Run `bun test tests/scenarios/run.test.ts` for executable Gherkin; run `bun test` and `bun run typecheck` for a release candidate.
+- Use the shared deterministic fixtures in `tests/helpers.ts`; unit and Gherkin tests do not call the network judge. Use temporary artifacts where bytes or paths form part of the contract.
 - Negative, malformed, below-floor and unavailable results must assert non-approval **and continued ordinary work/completion**. Preserve actual supervisor-safety rejection tests. Plan tests read real temporary artifacts; no API key may enter submitted material.
 - Static check: `python3 ~/.omp/agent/managed-skills/code-guard/scripts/guard.py --deep` runs `tsc --noEmit` over `src`, `autonomy` and `tests` (the repo has no prettier/eslint config, so that channel reports "skipped").
 - No coverage thresholds, no CI. The repo's own bar: a claim is done only with observed tool output recorded, never an agent's assertion - apply that when reporting test results.
 
-## Historical execution retrospective — not current blocking policy
+## Release preparation
 
-I prolonged the owner's wait through the execution errors below. The work repaired real regressions, but I did not prove the original ordinary-addon failure fixed or deliver the requested full-autonomy outcome.
+- Compare `HEAD` and the latest release tag; reconcile `package.json` and `CHANGELOG.md`. Follow SemVer for the public tool surface.
+- Group runtime changes with their tests, schemas, skills and user documentation. Keep site or demo changes separate. Do not include local configuration, raw receipts, caches, credentials or press drafts.
+- Verify the candidate with the full suite, typecheck and a fresh OMP run covering the changed boundary. Record commands and observed results in `HANDOFF.md` and `tools/README.md`. Distinguish deterministic coverage, live host observations and Jev verdicts. Do not infer full strict autonomy acceptance from startup or unit tests.
+- Keep preparation local unless the owner expressly authorizes tagging, pushing or publishing. Do not sweep pre-existing changes into a commit.
 
-- **Missed injected guidance.** I verified the physical module split before checking its workflow asset, requiring another change and final verification round. Inventory entry points, inherited activation variables and injected guidance before the final isolation checks.
-- **Unproductive decision rounds.** I spent reviews without settling decisions, including local refusals never sent to Jev. Submit one claim with exact artifact quotes and observed output. Retry a substantive judgment only with new settling evidence or a changed implementation; do not paraphrase or switch channels to escape a hold. Preserve accepted stages, floors and OPEN findings; continuation permission is not approval.
-- **Unverified tools and protocol.** I delegated an LSP-required move without checking worker tools and asserted an RPC field the installed host did not return. Verify the actual execution context first. Keep required operations inline when the worker lacks the tool; distinguish a faulty test assumption from a product defect.
-- **Premature completion tracking.** I closed items before owner-level proof, although final reports disclosed gaps. Require current evidence for named criteria and required acceptance before closing a deliverable. Keep unmet criteria OPEN; green tests and safe waiting do not prove full delivery. Do not repeat an unchanged nonterminal trial or replay an unknown effect to obtain a pass.
-
-The seven-scenario matrix recorded about 49.5 minutes of scenario runtime, not a measured wasted-time total. Necessary verification was part of the work; the exact avoidable delay was not measured. Evidence: the session transcript, `/tmp/jev-autonomy-smoke-NcZOpe/matrix.json` and the ordinary-guidance before/after probes.
-
-| Conclusion and corrective rule | Jev verdict | Confidence |
-| --- | --- | --- |
-| Inventory injected guidance before final isolation verification | supported | 0.86 |
-| Bound review attempts by materially changed evidence | supported | 0.84 |
-| Verify actual worker and protocol capabilities | supported | 0.90 |
-| Bind completion markers to the owner's observed outcome | supported | 0.98 |
-
-An initial broader diagnosis/prioritization claim was inconclusive at 0.38 and was not adopted; the guidance finding was narrowed and settled with the exact controller-to-asset dependency. These four approvals concern the retrospective and rules, not earlier addon/autonomy correctness or unresolved implementation acceptance.
-
-An earlier draft's style check (0.24), the append-scope consultation (0.54) and automatic write preflight remained inconclusive. Normal-mode continuation allowed this append after three blocked calls; it did not approve those OPEN decisions.
-
-Subsequent whole-task acceptance checks were inconclusive: business 0.20 and architecture 0.28. No whole-task approval was obtained; this does not revoke or widen the four per-conclusion approvals above. Further unchanged submissions were stopped.
-
-The follow-up repair confirmed that a held finding incorrectly merged distinct consultation questions into one refusal budget: three usable independent answers exhausted it, and a fourth question never reached Jev. The correction reuses the existing per-question boundary without lowering approval floors or clearing the finding. Jev supported this decision at 0.98; failing-before/passing-after regressions and fresh-process activity/host evidence are recorded in `tools/README.md`. This targeted repair does not claim full autonomy delivery or turn the earlier whole-task acceptance findings into approvals.
-
-Latest follow-up acceptance remained unapproved: business returned `business_gap` at 0.35; architecture's aspect verdict passed, but its three plan-topic evidence checks stayed below the floor at 0.41, 0.48 and 0.65. Both acceptance budgets reached 3/3, permitting continuation with those findings OPEN rather than approved. The repair choice at 0.98 and developer review at 0.88 concern the targeted ordinary-addon correction, not full autonomy or whole-task acceptance.

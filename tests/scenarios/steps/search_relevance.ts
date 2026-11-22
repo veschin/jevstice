@@ -100,7 +100,7 @@ given("ordinary Jev diagnostics are enabled", value => {
 
 // Scenario 1 -----------------------------------------------------------------
 
-given("two candidates each carry an exact evidence excerpt and a submitted reason", value => {
+given("each of two candidates has an exact excerpt and the executor's reason for considering it", value => {
 	const w = setup(value);
 	w.params = validParams();
 	w.candidates = twoCandidates();
@@ -111,7 +111,7 @@ when("the judge selects the second candidate at the confidence floor", async val
 	await run(world(value));
 });
 
-then("the result identifies only the second submitted candidate", value => {
+then("only the second submitted candidate appears as the selection", value => {
 	const w = world(value);
 	const selected = w.candidates?.[1];
 	expect(w.outcome?.ok).toBe(true);
@@ -136,7 +136,7 @@ then("no judge-authored explanation is added", value => {
 
 // Scenario 2 (outline) -------------------------------------------------------
 
-given("the submission has {string}", (value, defect) => {
+given("the query or candidate list has {string}", (value, defect) => {
 	const w = setup(value);
 	w.defect = defect;
 	w.params =
@@ -186,7 +186,7 @@ given("the judge decides at the floor that no submitted candidate answers the qu
 	w.table.candidate = { label: "none_relevant", confidence: POLICY.minConfidenceToApprove };
 });
 
-when("the result is returned", async value => {
+when("the executor submits the search question and candidate excerpts", async value => {
 	await run(world(value));
 });
 
@@ -220,10 +220,6 @@ given("the judge selects {string} below the confidence floor", (value, selection
 		label: selection === "one candidate" ? "candidate_1" : "none_relevant",
 		confidence: POLICY.minConfidenceToApprove - 0.1,
 	};
-});
-
-when("the result is classified", async value => {
-	await run(world(value));
 });
 
 then("no candidate is treated as selected", value => {
@@ -267,7 +263,7 @@ given("a candidate was selected for the current query", async value => {
 	w.ctx = ctx;
 });
 
-when("the executor opens or cites that source", async value => {
+when("the executor writes a note citing the selected source", async value => {
 	const w = world(value);
 	expect(w.pi).toBeDefined();
 	expect(w.ctx).toBeDefined();
@@ -284,7 +280,7 @@ then("the selection does not itself authorize a project change or publication", 
 	expect(w.selection?.["title"]).toBe(twoCandidates()[0]?.title);
 });
 
-then("host permissions and the current task remain authoritative", value => {
+then("the citation moves the project revision without changing the owner objective", value => {
 	const w = world(value);
 	expect(w.block).toBeUndefined();
 	expect(toolText(w.context)).toContain("Current objective: Report the coverage of the last run");
@@ -292,7 +288,7 @@ then("host permissions and the current task remain authoritative", value => {
 	expect(toolDetails(w.context)["revision"]).toBe(1);
 });
 
-then("any action diagnostic is recorded separately", value => {
+then("the note write is recorded separately as unchecked work", value => {
 	const w = world(value);
 	const after = (toolDetails(w.context)["diagnostics"] as { work?: { not_checked?: number } } | undefined)?.work?.not_checked;
 	expect(w.selectionNotChecked).toBe(0);
@@ -302,7 +298,7 @@ then("any action diagnostic is recorded separately", value => {
 
 // Scenario 6 -----------------------------------------------------------------
 
-given("a valid search-relevance submission", value => {
+given("the executor has a valid query and candidate list", value => {
 	const w = setup(value);
 	w.params = validParams();
 	w.candidates = twoCandidates();
@@ -331,7 +327,7 @@ then("the executor may continue independent work", value => {
 
 // Scenario 7 -----------------------------------------------------------------
 
-given("the same query and candidates were already judged", async value => {
+given("a prior judgment exists for this query and candidate list", async value => {
 	const w = setup(value);
 	w.params = validParams();
 	w.candidates = twoCandidates();

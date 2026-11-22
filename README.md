@@ -40,13 +40,19 @@ Jevstice observes visible tool boundaries, not private reasoning: it cannot read
 | Host | [oh-my-pi](https://github.com/can1357/oh-my-pi) |
 | Judge key | `TYPESAFE_API_KEY`, `JEVI_API_KEY`, or a command in `TYPESAFE_API_KEY_COMMAND` |
 
-### 1. Clone the extension
+### 1. Install the addon
 
 ```sh
-git clone https://github.com/veschin/jevstice.git ~/.omp/agent/extensions/jevstice
+git clone https://github.com/veschin/jevstice.git ~/.omp/jevstice
+omp plugin link ~/.omp/jevstice
 ```
 
-OMP reads the manifest entry `src/index.ts` from `package.json`. Dependencies install on first run; run `bun install` in the checkout if your setup does not install them.
+OMP loads `src/index.ts` from the package manifest and discovers the bundled
+[`skills/jevstice/SKILL.md`](skills/jevstice/SKILL.md) from the same package. There is no
+separate skill installation. If you already cloned into `~/.omp/agent/extensions/jevstice`,
+run `omp plugin link ~/.omp/agent/extensions/jevstice` once to register that checkout as a
+package; you do not need to move it. Run `bun install` in the checkout if OMP has not installed
+its dependencies.
 
 ### 2. Provide the key
 
@@ -60,17 +66,22 @@ The key is read lazily and passed only to the judge client. A missing or rejecte
 
 ### 3. Restart OMP
 
-The host loads extension schemas and hooks at process start. Restart OMP after installing or updating the extension.
+Restart OMP after installing or updating the addon. Run `omp read skill://jevstice` to
+verify skill discovery, or ask the assistant to read `skill://jevstice` in a session.
+To make this a standing instruction, add the following to your global `AGENTS.md`:
+
+> At OMP session startup, read `skill://jevstice` once if the Jevstice skill is available.
+> Follow it for Jev checks; if it is unavailable or checks are off, continue without Jev.
 
 To load a checkout for one session without changing the installation:
 
 ```sh
-omp --no-extensions -e /path/to/jevstice/src/index.ts
+omp --no-extensions -e /path/to/jevstice
 ```
 
 ## Tools
 
-Jevstice registers thirteen tools in ordinary sessions. `src/guidance.ts` defines their descriptions and schemas. Ordinary startup shows a short workflow instead of the full catalog.
+Jevstice registers fifteen tools in ordinary sessions. `src/guidance.ts` defines their descriptions and schemas. Ordinary startup shows a short workflow instead of the full catalog.
 
 For the bundled workflow, link the checkout with `omp plugin link /path/to/jevstice` and restart
 OMP. In OMP 19.1, run `<tool> --help` in `bash` for Jev commands, then pass the arguments with
@@ -84,15 +95,47 @@ OMP. In OMP 19.1, run `<tool> --help` in `bash` for Jev commands, then pass the 
 | `jev_requirements` | Does each proposed requirement follow from the owner's request, and does the set cover it? |
 | `jev_plan_review` | Does the outline, each plan section and the assembled plan serve the task? |
 | `jev_consult` | One diagnostic choice, score or boolean question. |
-| `jev_context` | List or read the project's trusted context archive, including requirement and plan snapshots. |
+| `jev_context` | Which archived sources and session results apply to the current task? |
 | `jev_course_check` | Does the submitted current-work claim, proposed next action and evidence follow the approved task? |
 | `jev_acceptance` | Which plan tasks or requirements does the observed work establish, and what can be removed? |
 | `jev_review` | Does a checkpoint, commit or diff hold up as developer work? |
 | `jev_reaim` | Is this an owner change of direction that replaces the current task? |
 | `jev_text_review` | Which prose fragments violate the submitted rules, and which rule does each violate? |
 | `jev_anti_slop` | Do the artifact's claims, inferences, hypotheses and language hold against quoted evidence? |
+| `jev_issue` | Can a developer act on this GitHub or GitLab issue without guessing, and does the observed implementation meet its requirements? |
+| `jev_todo` | Which tasks serve the plan, which checks would catch the wrong result, and what work is ready to resume? |
 
 `jev_consult` accepts only `mode: "choice"`, `mode: "score"` or `mode: "boolean"`. Every mode answers one question and grants no approval, permission or execution authority. The former `mode: "recovery"` and its `repair`/`resolve` phases are gone: a diagnosis never authorizes or blocks an effect.
+
+### Optional issue and TODO workflows
+
+Call `jev_issue prepare` before filing. Submit observed tracker inventory, exact title and body, and
+evidence for the observation, expected behavior and reproducible conditions. Report hypotheses as
+hypotheses; a proposed fix is not required. After separate authorization for the exact post, use `gh`
+or `glab` to file it. Read the issue back with the direct client command for that host, repository
+and issue number. Pass that command as `readback.source` to `jev_issue verify`; the tool uses its full
+observed output. An ambiguous receipt calls for readback, not a blind retry.
+
+The developer reads the filed issue, relevant comments and linked evidence, then uses `understand`
+to separate requirements from reports, causes and proposed fixes. `develop` takes that review's
+`resultId` as `priorResult` and checks that each supported requirement has a scoped change or
+verification and a command that can catch the wrong result. `accept` takes the development result's
+ID and uses the observed checks run after that result and the last tracked edit. Keep open
+requirements visible. Revisit `understand` when the issue's title, body or relevant comments
+change the work. Result IDs are session-local. Jev neither posts nor closes issues.
+
+After planning substantial work, keep one versioned project TODO and call `jev_todo review`. Name
+each task's observable result, requirement or consuming dependency, and a check with a concrete
+wrong result. Reuse an adequate existing test; use Gherkin when contrasting cases clarify required
+behavior. To resume, open the whole TODO with the native read tool (`TODO.md:raw`), reread its cited
+plan, inputs and persisted check output, and call `jev_todo` with `{"action":"resume","source":"TODO.md:raw"}`.
+`cleanup` proposes moving completed epics out of the active set only when the owner-specified
+threshold is met. It preserves task IDs, evidence and links, and never edits the file.
+
+Ordinary tool results expose a session-local `resultId`. Use `jev_context` with
+`{"action":"result","sourceId":"result-1"}` to inspect an exact input, its linked prior results, and
+whether it still applies. `/jev-status` lists recent results separately from coverage counts.
+Passing one check does not pass a later check or grant permission.
 
 Two command names are registered; `/jev` takes `off`, `on` or no argument:
 

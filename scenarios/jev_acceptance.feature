@@ -2,10 +2,12 @@
 # Requirements: PRD FR-14, FR-15, FR-26, FR-39, FR-43; FR-73, FR-74.
 # Source contract: src/guidance.ts ACCEPTANCE_DESCRIPTION; src/jev-skill.md section 8.
 # Executable: tests/scenarios/steps/acceptance.ts; run by tests/scenarios/run.test.ts.
-Feature: Business and architecture acceptance rest on observed evidence
-  Each aspect is submitted and recorded separately at the current revision.
-  Acceptance is diagnostic evidence for the owner; it neither authorizes execution
-  nor holds ordinary completion, and a failed aspect is corrected with new evidence.
+Feature: Check the delivered outcome against observed work
+  For ordinary project work, request jev_acceptance with aspect outcome. Jev reads
+  the recorded code changes and execution rather than asking for a claim. With a
+  registered plan it checks each task before reviewing the integrated change.
+  Optional business and architecture submissions keep separate records for the
+  current revision. None of these diagnostics stops ordinary work or completion.
 
   Background:
     Given a development task is registered at the current work revision
@@ -13,7 +15,7 @@ Feature: Business and architecture acceptance rest on observed evidence
 
   # FR-14, FR-15; implementation src/activities.ts acceptance
   @jev_acceptance_01 @fr_14 @fr_15
-  Scenario: Business and architecture are independent records
+  Scenario: Business evidence does not establish an architecture verdict
     Given the executor submits business acceptance with execution and code evidence
     When that aspect passes at its floor
     Then business acceptance is recorded for the current revision
@@ -22,15 +24,15 @@ Feature: Business and architecture acceptance rest on observed evidence
 
   # FR-14; implementation src/activities.ts aspect replacement
   @jev_acceptance_02 @fr_14
-  Scenario: Recording one aspect replaces only its own earlier verdict
+  Scenario: Revisiting business acceptance does not replace the architecture result
     Given both aspects were accepted at revision 5
     When business is submitted again at revision 5 and changes its verdict
-    Then the business record is replaced
+    Then the new business verdict replaces the earlier business verdict
     And the architecture record at revision 5 is unchanged
 
   # FR-26; implementation src/activities.ts evidence kinds preflight
   @jev_acceptance_03 @fr_26
-  Scenario Outline: Acceptance requires execution and code evidence before judging
+  Scenario Outline: The judge needs quotes from execution and changed code
     Given an acceptance submission carries "<evidence>"
     When the tool validates it
     Then no judge request is made
@@ -45,7 +47,7 @@ Feature: Business and architecture acceptance rest on observed evidence
 
   # FR-26; implementation src/activities.ts readEvidence
   @jev_acceptance_04 @fr_26
-  Scenario: The executor's claim is not evidence for itself
+  Scenario: Saying that a feature works does not verify it
     Given the claim asserts that a feature works
     When the submission carries that claim text and no execution or code item
     Then it is refused before judgment
@@ -53,7 +55,7 @@ Feature: Business and architecture acceptance rest on observed evidence
 
   # FR-26; implementation src/activities.ts evidence-basis questions; the command/output check is judged, not text-parsed
   @jev_acceptance_05 @fr_26
-  Scenario: Execution evidence carries a command and its observed output
+  Scenario: A test command alone does not show that it ran
     Given an acceptance submission includes an execution item
     When that item is validated
     Then the item contains the command that ran and its observed output
@@ -62,16 +64,16 @@ Feature: Business and architecture acceptance rest on observed evidence
 
   # FR-26; implementation src/activities.ts topic_i_execution and topic_i_code answers; the evidence id is returned
   @jev_acceptance_06 @fr_26
-  Scenario: Every plan topic names the evidence it rests on
+  Scenario: Each of three planned behaviors gets its own evidence basis
     Given the approved plan has three topics
     When acceptance is judged
-    Then each topic receives its own verdict
+    Then Jev reports a separate verdict for each topic
     And each passed topic identifies the submitted evidence that establishes it
     And a topic without supporting evidence is not reported as met
 
   # FR-26, FR-74; implementation src/activities.ts approving and unmet branches
   @jev_acceptance_07 @fr_26
-  Scenario: One unmet topic prevents whole-aspect acceptance
+  Scenario: A favorable overall answer cannot make up for a missing topic
     Given the aspect-level answer approves the claim
     When at least one plan topic remains below its floor
     Then the aspect is not accepted
@@ -80,7 +82,7 @@ Feature: Business and architecture acceptance rest on observed evidence
 
   # FR-20; implementation src/activities.ts below-floor and defect labels
   @jev_acceptance_08 @fr_20
-  Scenario Outline: Uncertainty and established gaps are distinguishable
+  Scenario Outline: An uncertain answer is not a confirmed defect
     Given the judge returns "<answer>"
     When the acceptance result is recorded
     Then the class is "<class>"
@@ -94,7 +96,7 @@ Feature: Business and architecture acceptance rest on observed evidence
 
   # FR-36, FR-37; implementation src/state.ts recordAcceptance, recordAction
   @jev_acceptance_09 @fr_36
-  Scenario: A later work change invalidates earlier acceptance
+  Scenario: A verdict from revision 4 does not apply to revision 5
     Given both aspects were accepted at revision 4
     When a consequential implementation action advances the work to revision 5
     Then neither earlier acceptance counts for revision 5
@@ -103,7 +105,7 @@ Feature: Business and architecture acceptance rest on observed evidence
 
   # FR-73; implementation src/controller.ts tool boundary
   @jev_acceptance_10 @fr_73
-  Scenario: Acceptance is not an execution or completion permission
+  Scenario: A refusal remains visible but cannot stop ordinary work
     Given an acceptance judgment is refused
     When the executor continues implementation and ends the session
     Then neither action is blocked by the refusal
@@ -112,7 +114,7 @@ Feature: Business and architecture acceptance rest on observed evidence
 
   # FR-73; implementation src/activities.ts review, courseCheck
   @jev_acceptance_11 @fr_73
-  Scenario: Other checks never substitute for acceptance
+  Scenario: A sound code review and an on-course check do not verify delivery
     Given a developer review passed and a course check reported on course
     When the executor relies on them as acceptance
     Then business and architecture acceptance remain missing
@@ -120,7 +122,7 @@ Feature: Business and architecture acceptance rest on observed evidence
 
   # FR-39; implementation src/controller.ts diagnoseCompletion
   @jev_acceptance_12 @fr_39
-  Scenario: Completion reviews each plan task against observed work
+  Scenario: Ordinary completion checks the registered plan without a manual call
     Given a developed task reaches completion with a registered plan
     When the ordinary completion boundary is observed
     Then the addon collects observed code and execution evidence
@@ -129,17 +131,17 @@ Feature: Business and architecture acceptance rest on observed evidence
 
   # FR-43; implementation src/activities.ts unmetSections
   @jev_acceptance_13 @fr_43
-  Scenario: Missing evidence returns the unmet requirement and its verification section
+  Scenario: A missing observation points back to the plan's verification instructions
     Given acceptance evidence is missing or unsuitable for one requirement
     When the result is returned
-    Then it names the unmet requirement
+    Then the result identifies the requirement not yet demonstrated
     And it names that requirement's approved verification section
     And it directs the executor to observe that behavior before changing implementation
     And only an established defect directs an implementation repair
 
   # FR-73, FR-74; implementation src/activities.ts stale path
   @jev_acceptance_14 @fr_73
-  Scenario: A changed task or plan discards an in-flight acceptance answer
+  Scenario: An answer belongs to the task and revision that were submitted
     Given an acceptance judgment is in flight
     When the task, revision or approved plan changes before the answer returns
     Then the answer is discarded as stale
@@ -148,9 +150,27 @@ Feature: Business and architecture acceptance rest on observed evidence
 
   # FR-73, FR-75; implementation src/controller.ts pending-effect acceptance prerequisite
   @jev_acceptance_15 @fr_73
-  Scenario: Acceptance is not judged while a background effect is unobserved
+  Scenario: A still-running background effect leaves acceptance unchecked
     Given an asynchronous project effect has been launched and not yet settled
     When the executor submits acceptance
     Then the result names unobserved background effects as the prerequisite
     And no acceptance judgment is made and no finding is recorded
     And ordinary work and completion continue
+
+  @jev_acceptance_16
+  Scenario: Outcome checks recorded verification after it finishes and reuses the result
+    Given recorded code changes and a running verification for an approved requirement
+    When the executor checks outcome acceptance without a claim or quotes
+    Then Jev reports the pending verification without judging the outcome
+    When the verification finishes and the executor checks again
+    Then the outcome passes and cites the recorded code and completed test output
+    And repeating the check on unchanged work returns the verdict without another judgment
+    When the executor edits the code and checks again without rerunning verification
+    Then Jev asks for execution evidence and does not reuse the previous verdict
+
+  @jev_acceptance_17
+  Scenario: Passing the plan task lets Jev check the assembled result separately
+    Given a registered plan with an observed result for its task
+    When the executor checks outcome acceptance without a claim or quotes
+    Then the plan task passes with the recorded test output as its basis
+    And Jev runs an integrated review and reports its own evidence and verdict

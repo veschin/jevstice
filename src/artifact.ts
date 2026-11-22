@@ -28,11 +28,14 @@ function localArtifactPath(host: ArtifactHost, name: string): string | null {
 }
 
 /** Read exact UTF-8 bytes as text; reject invalid encoding instead of normalizing the plan. */
-export async function readLocalArtifact(host: ArtifactHost, name: string): Promise<string | null> {
+export async function readLocalArtifact(host: ArtifactHost, name: string, maxBytes?: number): Promise<string | null> {
 	const path = localArtifactPath(host, name);
 	if (path === null) return null;
 	try {
-		return artifactDecoder.decode(await Bun.file(path).arrayBuffer());
+		const file = Bun.file(path);
+		if (maxBytes !== undefined && file.size > maxBytes) return null;
+		const bytes = await file.arrayBuffer();
+		return maxBytes !== undefined && bytes.byteLength > maxBytes ? null : artifactDecoder.decode(bytes);
 	} catch {
 		return null;
 	}

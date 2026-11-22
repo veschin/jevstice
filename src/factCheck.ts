@@ -59,13 +59,14 @@ type SourceKind = "public document" | "local material" | "observed execution" | 
 export interface FactSource {
 	kind: SourceKind;
 	text: string;
+	whole?: boolean;
 }
 
 const nonempty = (value: unknown, max: number): value is string =>
 	typeof value === "string" && value.length <= max && value.trim().length > 0;
 
 export const factCheck = async (
-	judge: Judge, state: JevState, params: unknown, objective: string, observed: ReadonlyMap<string, FactSource>,
+	judge: Judge, state: JevState, params: unknown, objective: string, observed: (source: string) => FactSource | undefined,
 ): Promise<ToolOutcome> => {
 	const input = asRecord(params);
 	const artifact = input?.["artifact"];
@@ -101,7 +102,7 @@ export const factCheck = async (
 			const key = JSON.stringify([locator, excerpt]);
 			let entry = sameQuoteEvidence.get(key);
 			if (entry === undefined) {
-				const source = locator === "owner" ? { kind: "owner text" as const, text: objective } : observed.get(locator);
+				const source = locator === "owner" ? { kind: "owner text" as const, text: objective } : observed(locator);
 				entry = { source: locator, quote: excerpt, verified: source?.text.includes(excerpt) === true, kind: source?.kind ?? "unobserved" };
 				sameQuoteEvidence.set(key, entry);
 			}

@@ -16,6 +16,8 @@
  */
 import { planSections, type PlanSection } from "./artifact.js";
 import { antiSlopProtocol, type AntiSlopProtocol } from "./antiSlopProtocol.js";
+import type { PriorFact, VerifyObserved } from "./diagnosticResults.js";
+import type { FactSource } from "./factCheck.js";
 import { namesExternalDeliverable } from "./screen.js";
 import {
 	answerOf,
@@ -78,6 +80,9 @@ export interface ActivityDeps {
 	judge: Judge;
 	config: JevConfig;
 	readArtifact?: (url: string) => Promise<string | null>;
+	observeSource?: (source: string) => FactSource | undefined;
+	verifyObserved?: VerifyObserved;
+	priorFact?: (artifact: string, claim: string) => PriorFact | undefined;
 }
 
 const DATA_RULE =
@@ -2298,7 +2303,7 @@ export async function observedOutcome(
 	const codeItems = numbered.filter(item => item.kind === "code");
 	const missingEvidence = [
 		...(executionItems.length === 0 ? ["execution"] : []),
-		...(codeItems.length === 0 ? ["code"] : []),
+		...(codeItems.length === 0 && executionItems.length === 0 ? ["code"] : []),
 	];
 	if (missingEvidence.length > 0) {
 		return {
@@ -2911,7 +2916,11 @@ function readAntiSlop(params: unknown): { ok: true; input: AntiSlopInput } | { o
 		) {
 			return { ok: false, problem: `part must be {index, total} with 1 <= index <= total <= ${POLICY.maxAntiSlopParts}` };
 		}
-		part = { index, total };
+		const documentDigest = partRecord?.["documentDigest"];
+		if (documentDigest !== undefined && (typeof documentDigest !== "string" || !/^[0-9a-f]{64}$/u.test(documentDigest))) {
+			return { ok: false, problem: "part.documentDigest must be a lowercase SHA-256 of the exact joined document" };
+		}
+		part = { index, total, ...(documentDigest === undefined ? {} : { documentDigest }) };
 	}
 	return { ok: true, input: { artifact, language, register, purpose, audience, rules, claims, inferences, part, protocol } };
 }
@@ -2938,6 +2947,13 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 		return notChecked("out_of_scope", "the review applies to an external deliverable, and none is in scope");
 	}
 	const input = parsed.input;
+	if (state.autonomous !== true && deps.verifyObserved !== undefined && input.part.total > 1 && input.part.documentDigest === undefined) {
+		return refused("multipart review requires part.documentDigest for the exact ordered document");
+	}
+	const verify = deps.verifyObserved;
+	const evidenceByClaim = input.claims.map(claim => verify === undefined ? claim.evidence : claim.evidence.filter(
+		item => item.source !== undefined && verify(item.source, item.quote)));
+	const priorFacts = input.claims.map(claim => claim.kind === "fact" ? deps.priorFact?.(input.artifact, claim.text) : undefined);
 	const protocolLines = input.protocol === undefined
 		? []
 		: [
@@ -2953,7 +2969,11 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 		return refused(`the artifact carries ${fragments.length} fragments and only ${POLICY.maxTextFragments} are reviewed; split it into parts`);
 	}
 	const partDigest = sha256(input.artifact);
-	const rulesDigest = sha256(JSON.stringify({ rules: input.rules, protocol: input.protocol ?? null }));
+	if (input.part.total === 1 && input.part.documentDigest !== undefined && input.part.documentDigest !== partDigest) {
+		return refused("part.documentDigest does not match the exact reviewed document");
+	}
+	const rulesDigest = sha256(JSON.stringify({ rules: input.rules, protocol: input.protocol ?? null,
+		...(verify === undefined ? {} : { purpose: input.purpose, audience: input.audience }) }));
 	const subject = scope.taskFingerprint ?? `quiet:${sha256(scope.request)}`;
 	const addFinding = (
 		findings: AntiSlopFinding[],
@@ -2991,8 +3011,9 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 				falseMeaning: "the falsifier is not observable, does not refute the hypothesis, or is not a condition at all",
 			});
 		}
-		if (claim.evidence.length > 0) {
-			const evidenceLines = claim.evidence
+		const evidence = evidenceByClaim[index]!;
+		if (priorFacts[index] === undefined && evidence.length > 0) {
+			const evidenceLines = evidence
 				.map(item => `[${item.sourceClass}] ${item.quote}${item.source === undefined ? "" : ` (source: ${item.source})`}`)
 				.join("\n");
 			questions.push({
@@ -3087,7 +3108,7 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 				part: input.part,
 				rules: input.rules,
 				protocol: input.protocol ?? null,
-				claims: input.claims,
+				claims: input.claims.map((claim, index) => ({ ...claim, evidence: evidenceByClaim[index], priorFact: priorFacts[index] })),
 				inferences: input.inferences,
 				fragments,
 			},
@@ -3100,6 +3121,7 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 				? existing.taskFingerprint === undefined
 				: existing.taskFingerprint === scope.taskFingerprint;
 		if (existing.request !== scope.request || !sameTask) return true;
+		if (existing.part.documentDigest !== input.part.documentDigest) return true;
 		if (existing.part.index === input.part.index) return false;
 		if (existing.part.total !== input.part.total) return false;
 		return (
@@ -3123,7 +3145,24 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 		let verdict = "unverified";
 		let confidence = 0;
 		const basis = claim;
-		const usableEvidence = claim.evidence.length > 0;
+		const verifiedEvidence = evidenceByClaim[index]!;
+		const usableEvidence = verifiedEvidence.length > 0;
+		const prior = priorFacts[index];
+		if (prior !== undefined) {
+			confidence = prior.confidence ?? 0;
+			verdict = prior.verdict;
+			if (verdict === "contradicted") {
+				trust = "distrusted";
+				addFinding(findings, "contradicted_claim", "blocker", claim.id, verdict, confidence, basis);
+			} else if (verdict === "supported") {
+				trust = verifiedEvidence.some(item => ANTI_SLOP_ACCEPTED_SOURCES[item.sourceClass]) ? "trusted" : "low_trust";
+			} else {
+				uncertain.push(`claim ${claim.id}: prior fact-check did not establish this assertion (${verdict})`);
+				addFinding(findings, "unverified_claim", "warning", claim.id, verdict, confidence, basis);
+			}
+			claimResults.push({ id: claim.id, trust, verdict, confidence });
+			continue;
+		}
 		if (claim.kind === "hypothesis" && claim.falsifier === undefined) {
 			trust = "distrusted";
 			verdict = "unfalsifiable";
@@ -3171,7 +3210,7 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 					const label = answer.label ?? "unverified";
 					confidence = answer.confidence;
 					if (label === "supported" && confidence >= POLICY.antiSlopFloor) {
-						const accepted = claim.evidence.some(
+						const accepted = verifiedEvidence.some(
 							item => ANTI_SLOP_ACCEPTED_SOURCES[item.sourceClass] === true,
 						);
 						trust = accepted ? "trusted" : "low_trust";
@@ -3325,7 +3364,7 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 				...findingLines,
 				...protocolLines,
 			].join("\n"),
-			details: { kind: "unclear", approved: false, part: input.part, revision: scope.revision, subject, uncertain, findings, inferences: inferenceResults, relevance: relevanceResults, protocol: input.protocol ?? null },
+			details: { kind: "unclear", approved: false, part: input.part, revision: scope.revision, subject, uncertain, findings, claims: claimResults, inferences: inferenceResults, relevance: relevanceResults, protocol: input.protocol ?? null },
 		};
 	}
 	const review: AntiSlopReviewRecord = {
@@ -3334,7 +3373,7 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 		revision: scope.revision,
 		part: input.part,
 		partDigest,
-		...(state.autonomous === true ? { artifact: input.artifact } : {}),
+		artifact: input.artifact,
 		language: input.language,
 		register: input.register,
 		rulesDigest,
@@ -3407,8 +3446,9 @@ export async function antiSlop(deps: ActivityDeps, state: JevState, params: unkn
 export async function actionCheck(
 	deps: ActivityDeps,
 	state: JevState,
-	action: { tool: string; target: string; change: string; callId?: string },
+	action: { tool: string; target: string; change: string; callId?: string; reviewRevision?: number },
 	actualInput?: unknown,
+	currentReview?: (partDigest: string, part: AntiSlopPart) => boolean,
 ): Promise<ToolOutcome> {
 	const request = state.task?.request ?? state.simple?.request ?? state.request?.text;
 	const simple = state.task === undefined && (state.simple !== undefined || state.request?.weight === "quiet");
@@ -3517,7 +3557,8 @@ export async function actionCheck(
 		);
 		const delivers = choseLabel(call.outcome, EXTERNAL_DELIVERY_QUESTION, "delivers", POLICY.antiSlopFloor);
 		if (!doesNotDeliver) {
-			const status = antiSlopStatus(state, antiSlopForAction);
+			const status = antiSlopStatus(state, state.autonomous === true || action.reviewRevision === undefined
+				? antiSlopForAction : { ...antiSlopForAction, revision: action.reviewRevision });
 			if (!status.complete) {
 				const missing = status.missing.length === 0 ? "" : ` Missing review part(s): ${status.missing.join(", ")}.`;
 				const blockers = status.blockers.length === 0 ? "" : ` Unwaived blocker(s): ${status.blockers.map(finding => finding.id).join(", ")}.`;
@@ -3547,6 +3588,19 @@ export async function actionCheck(
 					text: "Delivery conformance not established: delivery of exactly the current reviewed bytes is unproved. This is safety evidence about the material that was delivered; host permissions are unchanged.",
 					details: { approved: false, kind: "unclear", antiSlopRequired: true, delivery: deliveryAnswer?.label },
 				};
+			}
+			if (state.autonomous !== true) {
+				const payload = asRecord(actualInput);
+				const sent = payload?.["body"] ?? payload?.["content"] ?? payload?.["text"];
+				const exact = status.reviews.every(review => review.artifact !== undefined && sha256(review.artifact) === review.partDigest &&
+					(currentReview === undefined || currentReview(review.partDigest, review.part)));
+				if (!delivers || !exact || typeof sent !== "string" || sent !== status.reviews.map(review => review.artifact).join("")) {
+					return {
+						ok: true,
+						text: "Delivery conformance not established: the observed content does not prove delivery of the exact reviewed bytes. Jev did not authorize or block delivery.",
+						details: { kind: "unclear", approved: false, antiSlopRequired: true, delivery: deliveryAnswer?.label },
+					};
+				}
 			}
 			if (delivers) antiSlopDelivery = true;
 		}

@@ -176,6 +176,7 @@ export interface AntiSlopInference {
 export interface AntiSlopPart {
 	index: number;
 	total: number;
+	documentDigest?: string;
 }
 
 /** The review's trust mark for one claim or inference (FR-48). */
@@ -232,7 +233,7 @@ export interface AntiSlopReviewRecord {
 	revision: number;
 	part: AntiSlopPart;
 	partDigest: string;
-	/** Exact strict-mode review bytes; a digest-only legacy record cannot authorize strict delivery. */
+	/** Exact reviewed bytes. A legacy digest-only record cannot establish delivery equivalence. */
 	artifact?: string;
 	language: string;
 	register: string;

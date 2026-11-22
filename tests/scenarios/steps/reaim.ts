@@ -3,13 +3,15 @@ import { reaim } from "../../../src/activities.js";
 import { freshState, recordRecovery, registerTask, type JevState } from "../../../src/state.js";
 import type { Evidence, ToolOutcome } from "../../../src/types.js";
 import { answeringJudge, boundaryConfig, failingJudge, type FakeAnswerSource } from "../../helpers.js";
-import { given, then, when } from "../registry.js";
+import { scoped } from "../registry.js";
 
 /**
  * Step definitions for `scenarios/jev_reaim.feature`. Every step drives production code
  * (`reaim`, `recordRecovery`, `registerTask`) over a fake judge; none of them restates the
  * implementation's own assertions.
  */
+
+const { given, then, when } = scoped("jev_reaim.feature");
 
 interface ReaimWorld {
 	state: JevState;
@@ -86,7 +88,7 @@ when("the executor submits those exact words with matching authentic user eviden
 	await submit(world(value));
 });
 
-then("the reported objective is the login redirect request under a new task identity", value => {
+then("Jev reports the login redirect objective under a different task ID", value => {
 	const w = world(value);
 	expect(w.outcome?.ok).toBe(true);
 	expect(w.state.task?.request).toBe(w.interjection);
@@ -131,7 +133,7 @@ then("the current task remains unchanged", value => {
 	expect(w.state.task?.fingerprint).toBe(w.before);
 });
 
-then("caller-supplied text is not accepted as owner direction", value => {
+then("Jev does not treat the executor's proposed words as the owner's", value => {
 	const w = world(value);
 	expect(w.outcome?.text).toContain("current messages");
 });
@@ -153,7 +155,7 @@ when("the submitted evidence lacks an identical user-kind quote", async value =>
 	await submit(w);
 });
 
-then("the re-aim is refused locally", value => {
+then("Jev refuses the request without asking the judge", value => {
 	const w = world(value);
 	expect(w.outcome?.ok).toBe(false);
 	expect(w.calls).toBe(0);
@@ -189,7 +191,7 @@ then("the judge does not establish a replacement at the floor", value => {
 	expect(w.calls).toBe(1);
 });
 
-then("the current task and its approvals remain in force", value => {
+then("the existing task keeps its requirement and plan approvals", value => {
 	const w = world(value);
 	expect(w.state.task?.fingerprint).toBe(w.before);
 	expect(w.state.plan).toBeDefined();
@@ -214,7 +216,7 @@ when("the executor calls jev_reaim", async value => {
 	await submit(w);
 });
 
-then("the result names triage as the missing step", value => {
+then("Jev points the executor to jev_triage", value => {
 	expect(world(value).outcome?.text).toContain("jev_triage");
 });
 
@@ -249,7 +251,7 @@ then("the judge does not establish an owner replacement", value => {
 	expect(world(value).outcome?.ok).toBe(false);
 });
 
-then("the finding remains recorded", value => {
+then("the original finding is still present", value => {
 	const w = world(value);
 	expect(w.state.hold?.id).toBe(w.hold?.id);
 	expect(w.state.hold).toBeDefined();
@@ -276,7 +278,7 @@ when("the re-aim is approved", async value => {
 	await submit(world(value));
 });
 
-then("the new task records external scope", value => {
+then("the replacement task is marked external", value => {
 	const w = world(value);
 	expect(w.outcome?.ok).toBe(true);
 	expect(w.state.task?.external).toBe(true);
@@ -299,6 +301,7 @@ given("a valid re-aim submission", value => {
 	w.interjection = "Ship the dashboard instead.";
 	w.state.request = { text: w.interjection, weight: "judged" };
 	w.state.ownerMessages = [w.interjection];
+	w.before = w.state.task?.fingerprint ?? "";
 	w.table.reaim = { probability: 0.2 };
 });
 
@@ -306,9 +309,10 @@ when("the replacement probability is below the floor", async value => {
 	await submit(world(value));
 });
 
-then("the previous task remains current", value => {
+then("the task ID and objective stay the same", value => {
 	const w = world(value);
 	expect(w.state.task?.request).toBe("old course");
+	expect(w.state.task?.fingerprint).toBe(w.before);
 });
 
 then("the result is classified as a refusal of the replacement claim", value => {
@@ -329,7 +333,7 @@ when("the judge is unavailable", async value => {
 	await submit(w);
 });
 
-then("the result states that no judgment exists", value => {
+then("Jev reports there was no decision", value => {
 	expect(world(value).outcome?.text).toContain("No judge decision exists");
 });
 

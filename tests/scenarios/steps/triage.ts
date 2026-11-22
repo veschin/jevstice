@@ -15,9 +15,11 @@ import {
 	toolCallEvent,
 	type FakeAnswerSource,
 } from "../../helpers.js";
-import { given, then, when } from "../registry.js";
+import { scoped } from "../registry.js";
 
 /** Steps for `scenarios/jev_triage.feature`, driving the production triage activity. */
+
+const { given, then, when } = scoped("jev_triage.feature");
 
 interface TriageWorld {
 	state: JevState;
@@ -52,13 +54,17 @@ async function run(w: TriageWorld, state: JevState = w.state): Promise<ToolOutco
 	return outcome;
 }
 
+given("no development task is registered", value => {
+	expect(setup(value).state.task).toBeUndefined();
+});
+
 when("the owner asks to {string}", (value, request) => {
 	const w = setup(value);
 	w.request = request;
 	w.state.request = { text: request, weight: weightOf(request) };
 });
 
-when("the executor performs only the requested recognized read-only work", value => {
+when("the executor carries out only the recognized read-only request", value => {
 	const w = setup(value);
 	w.outcome = { ok: true, text: String(weightOf(w.request)), details: {} };
 });
@@ -91,7 +97,7 @@ when("triage decides at the floor that the request requires development", async 
 	w.outcome = await run(w);
 });
 
-then("the exact owner request is registered as the task objective", value => {
+then("the registered objective reproduces the owner's words exactly", value => {
 	const w = world(value);
 	expect(w.state.task?.request).toBe(w.request);
 });
@@ -122,7 +128,7 @@ when("triage decides at the floor that the request is simple", async value => {
 	w.outcome = await run(w);
 });
 
-then("the result lists the deeper stages that are unnecessary", value => {
+then("the result lists the reviews the executor can skip", value => {
 	expect(world(value).outcome?.text).toContain("Skipped activities");
 });
 
@@ -157,7 +163,7 @@ when("triage judges each topic for this specific request", async value => {
 	});
 });
 
-then("{string} is retained only at the floor", (value, topic) => {
+then("{string} is kept when it meets the confidence threshold", (value, topic) => {
 	const w = world(value);
 	expect(w.outcome?.details?.["topics"]).toContain(topic);
 });
@@ -183,7 +189,7 @@ when("the addon prepares guidance", () => {
 	// The prompt is prepared locally; no catalog is selected here.
 });
 
-then("no generic expertise catalog is selected automatically", value => {
+then("the guidance does not select a generic expertise catalog", value => {
 	expect(world(value).calls).toEqual([]);
 });
 
@@ -218,7 +224,7 @@ when("triage settles depth and external scope in one batch", async value => {
 	w.outcome = await run(w);
 });
 
-then("the registered task records the external classification", value => {
+then("the task record classifies the document as external", value => {
 	const w = world(value);
 	expect(w.state.task?.external).toBe(true);
 	expect(w.calls).toHaveLength(1);
@@ -255,7 +261,7 @@ when("the result is recorded", async value => {
 	w.outcome = await run(w);
 });
 
-then("the deliverable is kept in external review scope", value => {
+then("the document stays in scope for external review", value => {
 	expect(world(value).state.task?.external).toBe(true);
 });
 
@@ -288,7 +294,7 @@ then("no development task and no simple result are registered", value => {
 	expect(w.state.simple).toBeUndefined();
 });
 
-then("the result is classified as inconclusive rather than a defect", value => {
+then("the result reports uncertainty, not an established defect", value => {
 	expect(world(value).outcome?.details?.["kind"]).toBe("unclear");
 });
 
@@ -314,7 +320,7 @@ then("no judge request is made", value => {
 	expect(world(value).calls).toEqual([]);
 });
 
-then("the result names the current owner message and its digest", value => {
+then("the result includes the actual owner message and its digest", value => {
 	const w = world(value);
 	expect(w.outcome?.text).toContain(w.state.request?.text ?? "");
 	expect(w.outcome?.text).toContain(sha256(w.state.request?.text ?? "").slice(0, 12));
@@ -342,7 +348,7 @@ then("the result names the existing task as the prerequisite", value => {
 	expect(world(value).outcome?.text).toContain("already registered");
 });
 
-then("it directs the executor to requirements, planning or jev_reaim", value => {
+then("the result points to requirements, plan review or jev_reaim", value => {
 	expect(world(value).outcome?.text).toContain("jev_reaim");
 });
 
@@ -375,7 +381,7 @@ then("the work is recorded as not yet reviewed rather than approved", value => {
 	expect(world(value).state.task).toBeUndefined();
 });
 
-then("the host remains the authority for the action", value => {
+then("the host still decides whether the action is allowed", value => {
 	expect(world(value).outcome?.text).not.toContain("permission");
 });
 
@@ -400,7 +406,7 @@ then("no development or simple registration is created", value => {
 	expect(w.state.simple).toBeUndefined();
 });
 
-then("the triage result states that no judgment exists", value => {
+then("the tool reports that no judgment was made", value => {
 	expect(world(value).outcome?.text).toContain("No judge decision exists");
 });
 

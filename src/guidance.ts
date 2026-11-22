@@ -50,10 +50,11 @@ const TEXT_REVIEW_DESCRIPTION =
 
 const ANTI_SLOP_DESCRIPTION =
 	"Use before delivering an external document, research output, legal or other external communication, including a new tracker issue. Arguments: artifact (required: the exact text), language, register, purpose, audience (all required), rules (required array of {class, rule, severity?: blocker|warning}; use [] for built-in Russian or English checks alone; other languages need explicit rules), claims (required array of {id, text, kind: fact|hypothesis, evidence [{kind, quote, source?, sourceClass}], falsifier?}; use [] only for text without factual assertions; a hypothesis needs a falsifier), inferences (optional: {id, premises, warrant, conclusion}), part (optional: {index, total} for numbered parts). Russian and English automatically receive independent symbols, wording, syntax and coherence checks in addition to supplied rules. Findings identify severity, quote the affected sentence when localized reliably or the enclosing paragraph otherwise, and specify a repair; the executor edits the text, not the tool. Use severity blocker for an explicit mandatory rule and warning for editorial preferences. If scope or configuration skips the review, the result gives the reason. Unlisted claims are not fact-checked. An inconclusive or unavailable result is not clean. Report findings and incomplete checks without repeating unchanged submissions to seek approval. All findings are diagnostic and never block execution or delivery.\n\n" +
+	"In ordinary sessions, open factual sources first so their exact quotes can be verified. A current fact-check may be reused for the exact assertion and draft. For multipart submissions, set part.documentDigest to the lower-case SHA-256 of all exact part texts concatenated in index order, with no inserted separator.\n\n" +
 	ANTI_SLOP_PROTOCOL_GUIDANCE;
 
 const CONTEXT_DESCRIPTION =
-	"Read the project's trusted context archive. Arguments: action (required: list or read); sourceId (required for read, omitted for list). list returns stable identifiers with kind (owner, requirements or plan), origin, session and approval metadata, and the latest recorded finding's exact original submission and result - read the recorded material there instead of repeating it. read returns the exact stored content and its digest. The archive holds authentic owner messages and approved requirement and plan snapshots captured by the addon: provenance says where the text came from, not that its assertions are true. Cite stored text in any tool's evidence as {kind, quote, sourceId}, using kind user for owner text; owner is the archive's provenance kind, not an evidence kind. The controller resolves the identifier against the archive, checks the quote is present and rejects missing, changed or mismatched sources without a judge call. Reading never restores approval, permission or execution authority.";
+	"Read trusted archived sources and ordinary session diagnostic results. action: list shows sources, recent results and the latest finding. action: read takes the archive sourceId and returns exact archived content and its digest. action: result takes a displayed result ID in sourceId and returns its input, verdict, provenance, linked prior results and current or historical status. Use archived evidence as {kind,quote,sourceId}, with kind user for owner text. Provenance is not factual truth or authority. Reading never restores approval or permission.";
 
 const COURSE_CHECK_DESCRIPTION =
 	"Check manually whether current work follows the approved task. Arguments: claim (required: one concise statement of the current work); nextAction (optional: what you intend to do next); evidence (optional: quoted {kind, quote, source?, sourceId?} items). The check evaluates the claim and proposed action against the approved objective, requirements, plan and recent observed actions, and works before any recent action once a plan exists. No plan or insufficient context returns a named prerequisite, not a clean result. A below-floor on_course is no reliable approval and not a proven deviation; only off_course establishes one. An unsupported, off-course or unavailable verdict records a diagnostic finding; an approving check neither erases another finding nor authorizes a file change, nor replaces acceptance. Findings never block execution or completion. Automatic interval and completion checks still run on their own.";
@@ -171,9 +172,9 @@ export function createToolCatalog(z: SchemaBuilder): ToolCatalogEntry[] {
 		{
 			name: "jev_context",
 			label: "Jev context",
-			description: CONTEXT_DESCRIPTION,
+			description: CONTEXT_DESCRIPTION + " Ordinary list includes diagnostic result IDs and their applicability. Use action=result with sourceId set to a result ID to inspect the exact submission and result.",
 			parameters: z.object({
-				action: z.enum(["list", "read"]),
+				action: z.enum(["list", "read", "result"]),
 				sourceId: z.string().optional(),
 			}),
 			example: { action: "list" },
@@ -304,7 +305,7 @@ export function createToolCatalog(z: SchemaBuilder): ToolCatalogEntry[] {
 						}),
 					)
 					.optional(),
-				part: z.object({ index: z.number(), total: z.number() }).optional(),
+				part: z.object({ index: z.number(), total: z.number(), documentDigest: z.string().optional() }).optional(),
 			}),
 			example: {
 				artifact: "The export command supports --dry-run as of version 2.2.",
@@ -362,6 +363,64 @@ export function createToolCatalog(z: SchemaBuilder): ToolCatalogEntry[] {
 					statement: "The survey included 72 respondents.",
 					evidence: [{ source: "survey/methods.md", quote: "Seventy-two participants submitted responses." }],
 				}],
+			},
+		},
+		{
+			name: "jev_issue",
+			label: "Jev issue",
+			description: "Optional two-sided repository issue workflow. Author: prepare checks the observed issue inventory {target,query,issues:[{url,title,body}]} for duplicates, and separates reproduction, observed and expected behavior, diagnosis and proposed fixes. After exact authorization, publish via gh or glab and verify the observed same-target readback. For any filed issue phase, run `gh api --hostname HOST repos/OWNER/REPO/issues/NUMBER` or `glab api --hostname HOST projects/URL_ENCODED_PROJECT/issues/NUMBER`; use the exact command as readback.source. Developer: understand reviews exact material segments and emits obligation IDs; use scope for a narrower outcome. develop takes the understand result ID as priorResult and steps that map each obligation to a proposed change or verification, exact bash command, expected observation and counterexample. accept takes the develop result ID as priorResult and checks the implementation and terminal results recorded by OMP after the last edit. Use matching issue bytes in each phase. The tool does not publish, implement or close issues and grants no permission.",
+			parameters: z.object({
+				phase: z.enum(["prepare", "verify", "understand", "develop", "accept"]),
+				target: z.object({ platform: z.enum(["github", "gitlab"]), host: z.string(), destination: z.string() }),
+				title: z.string(),
+				body: z.string(),
+				inventory: z.object({ source: z.string(), quote: z.string() }).optional(),
+				readback: z.object({ source: z.string(), quote: z.string().optional() }).optional(),
+				priorResult: z.string().optional(),
+				fields: z.array(z.object({
+					kind: z.enum(["observation", "expected", "reproduction", "hypothesis", "remedy"]),
+					quote: z.string(),
+					evidence: z.array(z.object({ source: z.string(), quote: z.string() })).optional(),
+				})).optional(),
+				segments: z.array(z.object({
+					kind: z.enum(["observation", "expected", "reproduction", "hypothesis", "remedy", "acceptance"]),
+					quote: z.string(),
+					disposition: z.enum(["accept", "narrow", "already_satisfied", "disagree", "unresolved"]),
+					basis: z.string(),
+					scope: z.string().optional(),
+					origin: z.object({ source: z.string(), quote: z.string() }).optional(),
+					evidence: z.array(z.object({ source: z.string(), quote: z.string() })).optional(),
+				})).optional(),
+				steps: z.array(z.object({
+					segment: z.string(),
+					change: z.string(),
+					command: z.string(),
+					expected: z.string(),
+					rejects: z.string(),
+					evidence: z.array(z.object({ source: z.string(), quote: z.string() })).optional(),
+				})).optional(),
+			}),
+			example: {
+				phase: "verify",
+				target: { platform: "github", host: "github.com", destination: "acme/export" },
+				title: "Dry-run writes files",
+				body: "Running `export --dry-run` created an output file.",
+				readback: { source: "gh api --hostname github.com repos/acme/export/issues/12" },
+			},
+		},
+		{
+			name: "jev_todo",
+			label: "Jev TODO",
+			description: "Optional project backlog diagnostic after planning. Read the whole file with the native read tool (for example TODO.md:raw), then pass {action,source,threshold?,artifact?}. The tool uses the observed bytes; do not copy the file into the call. A version 1 JSON object lives in a jev-todo-v1 Markdown fence or standalone JSON. It has plan {source,quote}, requirements [{id,source,quote}], and epics [{id,tasks,archived?}]. Tasks have {id,result,requirements,needs?,check?,inputs?,question?,report?}. A need names {id,output,when?:verified|reported}; a check names {procedure,wrongResult,existing?}. Inputs quote whole current reads. A report names {kind:verified|blocked,fingerprint,procedure,observation:{source,quote}}. Reread persisted check output on resumption; it must include the exact `jev-todo-v1 <task-id> <fingerprint> <kind>` line and actual output. Review separates necessity, usefulness of checks, dependencies and coverage. Resume selects ready work and distinguishes stale and missing evidence. Cleanup only proposes a change when an explicit owner threshold is reached; no default and no file writes.",
+			parameters: z.object({
+				action: z.enum(["review", "resume", "cleanup"]),
+				source: z.string(),
+				artifact: z.string().optional(),
+				threshold: z.number().optional(),
+			}),
+			example: {
+				action: "resume",
+				source: "TODO.md:raw",
 			},
 		},
 		{

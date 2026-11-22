@@ -48,12 +48,14 @@ const ORDINARY_TOOLS = [
 	"jev_context",
 	"jev_course_check",
 	"jev_fact_check",
+	"jev_issue",
 	"jev_plan_review",
 	"jev_reaim",
 	"jev_requirements",
 	"jev_review",
 	"jev_search_relevance",
 	"jev_text_review",
+	"jev_todo",
 	"jev_triage",
 ];
 
@@ -750,6 +752,26 @@ describe("request and revision invalidation", () => {
 	});
 });
 
+test("a finalized plan retains the exact approved requirements result", async () => {
+	const dir = await fakeArtifacts({ "x-plan.md": PLAN_BODY });
+	const ctx = fakeCtx({ artifactsDir: dir });
+	const { pi } = controllerFor({ needs_development: NEEDS_DEVELOPMENT, ...PLAN_APPROVED });
+	await planned(pi, ctx);
+	const summary = toolDetails(await pi.callTool("jev_context", { action: "list" }, ctx));
+	const results = summary["results"] as Array<{ id: string; tool: string; prior: string[]; applicability: string }>;
+	const req = results.find(row => row.tool === "jev_requirements");
+	const final = results.find(row => row.tool === "jev_plan_review");
+	if (!req || !final) throw new Error("Expected recorded requirements and finalized plan.");
+	expect(req.applicability).toBe("current");
+	expect(final.prior).toEqual([req.id]);
+	const inspect = () => pi.callTool("jev_context", { action: "result", sourceId: final.id }, ctx).then(toolDetails);
+	expect((await inspect())["result"]).toMatchObject({ input: { phase: "finalize", plan: PLAN_ARTIFACT }, prior: [req.id] });
+	await writeFile(join(dir, "local", "x-plan.md"), `${PLAN_BODY}\nUnreviewed edit.\n`);
+	expect((await inspect())["result"]).toMatchObject({ applicability: "historical" });
+	pi.callCommand("jev-status", "", ctx);
+	expect(await until(() => lastMessage(pi, "jev.status")?.includes(`historical, ${final.id}`) === true, 500)).toBe(true);
+});
+
 describe("automatic action diagnostics", () => {
 	test("a planned snapshot runs one diagnostic in the background and never blocks the next action or stop", async () => {
 		const ctx = fakeCtx({ artifactsDir: await fakeArtifacts({ "x-plan.md": PLAN_BODY }) });
@@ -935,7 +957,7 @@ describe("automatic evidence-based acceptance", () => {
 			const messages = await pi.emit("context", { messages: [] }, ctx);
 			expect(JSON.stringify(messages)).toContain("src/a.ts");
 			pi.callCommand("jev-status", "", ctx);
-			expect(lastMessage(pi, "jev.status")).toContain("collect");
+			expect(await until(() => lastMessage(pi, "jev.status")?.includes("collect") === true, 500)).toBe(true);
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
 		}

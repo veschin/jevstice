@@ -238,7 +238,7 @@ function claim(store: AutonomyStore, id: string): AutonomyRun {
 // Scenario 1: ordinary sessions never activate strict authority.
 // ---------------------------------------------------------------------------
 
-given("an ordinary OMP session loads the package manifest", async value => {
+given("an OMP session loaded Jevstice through its ordinary package entry", async value => {
 	const world = w(value);
 	world.pi = fakePi();
 	await ordinaryExtension({ ...world.pi.api, zod: fakeZod() });
@@ -248,7 +248,7 @@ given("an ordinary OMP session loads the package manifest", async value => {
 	expect(manifest.omp?.extensions).toEqual(["src/index.ts"]);
 });
 
-given("inherited autonomy store or run variables are present", value => {
+given("the environment contains both autonomy run and store locators", value => {
 	const world = w(value);
 	const fixture = ensureFixture(value, { store: false });
 	world.inheritedStorePath = fixture.storePath;
@@ -258,7 +258,7 @@ given("inherited autonomy store or run variables are present", value => {
 	expect(process.env["JEVSTICE_AUTONOMY_RUN"]).toBe("inherited-run-id");
 });
 
-when("the executor calls an ordinary or strict tool", async value => {
+when("the ordinary executor reads a file or requests delegation", async value => {
 	const world = w(value);
 	const pi = world.pi;
 	if (pi === undefined) throw new Error("the ordinary session was not registered");
@@ -272,7 +272,7 @@ when("the executor calls an ordinary or strict tool", async value => {
 	}
 });
 
-then("no strict run ownership or execution authority is created", value => {
+then("the session neither acquires a strict run nor exposes jev_autonomy", value => {
 	const world = w(value);
 	for (const results of world.toolResults ?? []) {
 		expect(blockReason(results)).toBeUndefined();
@@ -283,7 +283,7 @@ then("no strict run ownership or execution authority is created", value => {
 	expect(world.pi?.tools.has("jev_autonomy")).toBe(false);
 });
 
-then("the strict module is not imported by the ordinary entry", () => {
+then("the ordinary entry still does not load the strict module", () => {
 	const source = readFileSync(new URL("../../../src/index.ts", import.meta.url), "utf8");
 	expect(source).not.toMatch(/(?:import[^;]*|import\s*\()\s*["'][^"']*autonomy[^"']*["']/s);
 	const manifest = JSON.parse(readFileSync(new URL("../../../package.json", import.meta.url), "utf8")) as {
@@ -292,7 +292,7 @@ then("the strict module is not imported by the ordinary entry", () => {
 	expect(manifest.omp?.extensions?.some(entry => entry.includes("autonomy")) ?? false).toBe(false);
 });
 
-then("ordinary diagnostics follow the ordinary contract", async value => {
+then("the ordinary diagnostic tools remain available without a stop hold", async value => {
 	const world = w(value);
 	const pi = world.pi;
 	if (pi === undefined) throw new Error("the ordinary session was not registered");
@@ -399,7 +399,7 @@ function askForMore(world: AutonomyWorld): void {
 	}
 }
 
-given("a committed run policy sets {string}", (value, limit) => {
+given("the owner committed a run policy with a fixed {string}", (value, limit) => {
 	const world = w(value);
 	world.limit = limit;
 	const fixture = ensureFixture(value);
@@ -425,7 +425,7 @@ given("a committed run policy sets {string}", (value, limit) => {
 	expect(process.env["JEVSTICE_AUTONOMY_MAX_JUDGE_CALLS"]).toBe("999999");
 });
 
-when("the executor or a model message asks for more", value => {
+when("the executor or a model message requests an expansion", value => {
 	const world = w(value);
 	try {
 		askForMore(world);
@@ -435,7 +435,7 @@ when("the executor or a model message asks for more", value => {
 	}
 });
 
-then("the committed value remains the limit", value => {
+then("the original value still governs the run", value => {
 	const world = w(value);
 	const original = world.originalPolicy;
 	if (original === undefined) throw new Error("no committed policy was recorded");
@@ -473,7 +473,7 @@ then("the committed value remains the limit", value => {
 	}
 });
 
-then("no Jev verdict, prompt text or inherited environment expands it", value => {
+then("a Jev verdict, prompt text and inherited variables cannot raise that limit", value => {
 	const world = w(value);
 	const store = storeOf(value);
 	const run = store.read(world.runId);
@@ -501,7 +501,7 @@ then("no Jev verdict, prompt text or inherited environment expands it", value =>
 // Scenario 4: no side effect starts before its durable intent.
 // ---------------------------------------------------------------------------
 
-given("a consequential strict invocation is proposed", value => {
+given("the executor proposed a consequential invocation", value => {
 	const world = w(value);
 	ensureFixture(value);
 	const created = storeOf(value).create("Commit a consequential invocation", policy(w(value).fixture!.root));
@@ -511,7 +511,7 @@ given("a consequential strict invocation is proposed", value => {
 	world.bytes = new TextEncoder().encode("exact artifact payload");
 });
 
-when("the supervisor admits it", value => {
+when("the supervisor allows the invocation", value => {
 	const world = w(value);
 	const store = storeOf(value);
 	const id = world.runId;
@@ -536,7 +536,7 @@ when("the supervisor admits it", value => {
 	);
 });
 
-then("the exact intent and required artifact bytes are committed atomically", value => {
+then("the ledger commits the exact intent and its required artifact bytes together", value => {
 	const world = w(value);
 	const store = storeOf(value);
 	const run = store.read(world.runId);
@@ -558,7 +558,7 @@ then("the exact intent and required artifact bytes are committed atomically", va
 	})).toBe(true);
 });
 
-then("a failed commit means no effect starts", value => {
+then("the invocation cannot start if that commit fails", value => {
 	const world = w(value);
 	const store = storeOf(value);
 	const before = store.read(world.runId);
@@ -594,7 +594,7 @@ then("a failed commit means no effect starts", value => {
 	})).toBe(false);
 });
 
-then("native journal entries reference the ledger rather than grant permission", value => {
+then("the native journal points to the ledger but cannot authorize an invocation", value => {
 	const world = w(value);
 	const store = storeOf(value);
 	const before = store.read(world.runId);
@@ -621,7 +621,7 @@ then("native journal entries reference the ledger rather than grant permission",
 // Scenario 5: overlapping writable roots have one owner.
 // ---------------------------------------------------------------------------
 
-given("one nonterminal run owns a canonical writable root", value => {
+given("an active run owns a canonical writable project root", value => {
 	const world = w(value);
 	ensureFixture(value);
 	const created = storeOf(value).create("Own the canonical project root", policy(w(value).fixture!.root));
@@ -630,7 +630,7 @@ given("one nonterminal run owns a canonical writable root", value => {
 	expect(created.status).not.toBe("completed");
 });
 
-when("another run requests the same or an overlapping root", value => {
+when("a second run claims the same root or an overlapping root", value => {
 	const world = w(value);
 	const fixture = w(value).fixture;
 	if (fixture === undefined) throw new Error("no fixture");
@@ -652,7 +652,7 @@ when("another run requests the same or an overlapping root", value => {
 	expect(world.askError).toMatch(/overlapping/);
 });
 
-then("the second run is refused", value => {
+then("the supervisor refuses the second claim", value => {
 	const world = w(value);
 	const fixtures = w(value).fixture;
 	if (fixtures === undefined) throw new Error("no fixture");
@@ -661,7 +661,7 @@ then("the second run is refused", value => {
 	expect(fixtures.store?.list()[0]?.status).toBe("ready");
 });
 
-then("a symlink alias does not bypass the conflict", value => {
+then("a symlink to the root does not make the claim independent", value => {
 	const world = w(value);
 	const fixture = w(value).fixture;
 	if (fixture === undefined) throw new Error("no fixture");
@@ -679,7 +679,7 @@ then("a symlink alias does not bypass the conflict", value => {
 	expect(fixture.store?.list().map(run => run.id)).toEqual([world.firstRunId]);
 });
 
-then("disjoint roots may proceed independently", value => {
+then("a run on a disjoint root can acquire its own ownership", value => {
 	const fixture = w(value).fixture;
 	if (fixture === undefined) throw new Error("no fixture");
 	const sibling = join(fixture.dir, "sibling");
@@ -694,7 +694,7 @@ then("disjoint roots may proceed independently", value => {
 // Scenario 9: stopping is not a rollback claim.
 // ---------------------------------------------------------------------------
 
-given("a stopped run has observed or possible effects", value => {
+given("the operator stopped a run with observed or possible effects", value => {
 	const world = w(value);
 	ensureFixture(value);
 	const fixture = w(value).fixture;
@@ -719,14 +719,14 @@ given("a stopped run has observed or possible effects", value => {
 	expect(stopped.status).toBe("cancelled");
 });
 
-when("the operator inspects the run", value => {
+when("the operator reads the stopped run's status", value => {
 	const world = w(value);
 	const fixture = w(value).fixture;
 	if (fixture === undefined) throw new Error("no fixture");
 	world.statusRows = statusAutonomy({ store: fixture.storePath, run: world.runId });
 });
 
-then("the status reports cancellation and containment facts", value => {
+then("the report shows the cancellation and what was contained", value => {
 	const world = w(value);
 	const row = world.statusRows?.[0];
 	if (row === undefined) throw new Error("status produced no row");
@@ -738,7 +738,7 @@ then("the status reports cancellation and containment facts", value => {
 	expect(row.effects).toEqual(["project"]);
 });
 
-then("it does not claim that executed effects were rolled back", value => {
+then("the report makes no claim that an executed effect was undone", value => {
 	const world = w(value);
 	const row = world.statusRows?.[0];
 	if (row === undefined) throw new Error("status produced no row");
@@ -749,7 +749,7 @@ then("it does not claim that executed effects were rolled back", value => {
 	expect(run.checkpoint.actions.at(-1)?.excerpt).toBe("observed effect");
 });
 
-then("unknown effects still require reconciliation", value => {
+then("any effect still unknown must be reconciled", value => {
 	const world = w(value);
 	const fixture = w(value).fixture;
 	if (fixture === undefined) throw new Error("no fixture");
@@ -766,7 +766,7 @@ then("unknown effects still require reconciliation", value => {
 // Scenario 14: missing containment capability refuses strict execution.
 // ---------------------------------------------------------------------------
 
-given("Linux systemd, cgroup v2 or whole-scope fencing is unavailable", async value => {
+given("Linux systemd, cgroup v2 or whole-scope fencing is missing", async value => {
 	const world = w(value);
 	const emptyPath = freshDirectory("jev-autonomy-nocap-");
 	setTrackedEnv("PATH", emptyPath);
@@ -780,7 +780,7 @@ given("Linux systemd, cgroup v2 or whole-scope fencing is unavailable", async va
 	world.capabilityError = failure;
 });
 
-when("the owner starts a strict run", async value => {
+when("the owner requests a strict supervisor launch", async value => {
 	const world = w(value);
 	const fixture = ensureFixture(value, { store: false });
 	const objectiveFile = join(fixture.dir, "objective.txt");
@@ -802,7 +802,7 @@ when("the owner starts a strict run", async value => {
 	world.startError = failure;
 });
 
-then("the run is refused or held with the missing capability named", value => {
+then("the owner sees a refusal or wait that identifies the missing capability", value => {
 	const world = w(value);
 	expect(world.startError).toMatch(/autonomous scope capability is unavailable/);
 	expect(world.startError).toMatch(/whole-scope containment requires/);
@@ -813,7 +813,7 @@ then("the run is refused or held with the missing capability named", value => {
 	expect(existsSync(fixture.storePath)).toBe(false);
 });
 
-then("process-group signalling is not used as a containment substitute", value => {
+then("the supervisor does not fall back to process-group signalling", value => {
 	const world = w(value);
 	const fixture = world.fixture;
 	if (fixture === undefined) throw new Error("no fixture");
@@ -823,7 +823,7 @@ then("process-group signalling is not used as a containment substitute", value =
 	expect(world.capabilityError).toMatch(/whole-scope containment/);
 });
 
-then("no strict guarantee is silently downgraded", value => {
+then("it does not start execution under weaker guarantees", value => {
 	const world = w(value);
 	const fixture = world.fixture;
 	if (fixture === undefined) throw new Error("no fixture");
@@ -835,7 +835,7 @@ then("no strict guarantee is silently downgraded", value => {
 // Scenario 15: status reports committed facts without granting permission.
 // ---------------------------------------------------------------------------
 
-given("a bound strict run with a pending intent and a recorded finding", value => {
+given("a strict run has a waiting intent and a recorded diagnostic finding", value => {
 	const world = w(value);
 	ensureFixture(value);
 	const fixture = w(value).fixture;
@@ -873,14 +873,14 @@ given("a bound strict run with a pending intent and a recorded finding", value =
 	expect(store.read(created.id).status).toBe("waiting");
 });
 
-when("the owner requests autonomy status", value => {
+when("the owner reads status through the supervisor", value => {
 	const world = w(value);
 	const fixture = w(value).fixture;
 	if (fixture === undefined) throw new Error("no fixture");
 	world.statusRows = statusAutonomy({ store: fixture.storePath, run: world.runId });
 });
 
-then("the report names the run, status, budget and pending-effect facts that are stored", value => {
+then("the report shows the committed run identifier, state, usage counts and pending intents", value => {
 	const world = w(value);
 	const row = world.statusRows?.[0];
 	if (row === undefined) throw new Error("status produced no row");
@@ -899,7 +899,7 @@ then("the report names the run, status, budget and pending-effect facts that are
 	expect(row.fences).toBe(run.fences.length);
 });
 
-then("it does not print the objective or stored secrets", value => {
+then("the report omits the objective and stored secrets", value => {
 	const world = w(value);
 	const serialized = JSON.stringify(world.statusRows);
 	expect(serialized).not.toContain("confidential launch codes");
@@ -909,7 +909,7 @@ then("it does not print the objective or stored secrets", value => {
 	expect(world.statusRows?.[0]?.objectiveChars).toBeTruthy();
 });
 
-then("the act of reading status changes no ownership, intent or effect", value => {
+then("reading the report does not alter ownership, intents or effects", value => {
 	const world = w(value);
 	const fixture = w(value).fixture;
 	if (fixture === undefined) throw new Error("no fixture");
@@ -930,7 +930,7 @@ then("the act of reading status changes no ownership, intent or effect", value =
 // Scenario 18: strict mode has no continuation or waiver escape hatch.
 // ---------------------------------------------------------------------------
 
-given("a strict run has a diagnostic finding", value => {
+given("the run has a recorded finding", value => {
 	const world = w(value);
 	ensureFixture(value);
 	const fixture = w(value).fixture;
@@ -955,7 +955,7 @@ given("a strict run has a diagnostic finding", value => {
 	expect(store.read(created.id).checkpoint.hold?.id).toBe("finding-strict");
 });
 
-when("an owner-like approval message or /jev-continue text appears", async value => {
+when("a message looks like an owner approval or contains /jev-continue", async value => {
 	const world = w(value);
 	const fixture = w(value).fixture;
 	if (fixture === undefined) throw new Error("no fixture");
@@ -974,7 +974,7 @@ when("an owner-like approval message or /jev-continue text appears", async value
 	expect(code).toBe(2);
 });
 
-then("it creates no continuation, waiver or repair authority", value => {
+then("the message grants no continuation, waiver or repair authority", value => {
 	const world = w(value);
 	const commands = world.strictCommands ?? [];
 	for (const forbidden of ["jev-continue", "jev-waive", "jev-repair", "continue", "waive"]) {
@@ -995,7 +995,7 @@ then("it creates no continuation, waiver or repair authority", value => {
 	expect(world.statusRows?.[0]?.status).toBe("running");
 });
 
-then("only the operator stop channel changes run control", async value => {
+then("the supervisor accepts operator stop through its separate control channel", async value => {
 	const world = w(value);
 	const fixture = w(value).fixture;
 	if (fixture === undefined) throw new Error("no fixture");
@@ -1016,7 +1016,7 @@ then("only the operator stop channel changes run control", async value => {
 	expect(store.read(world.runId).status).toBe("cancelled");
 });
 
-then("the finding remains diagnostic evidence", value => {
+then("the finding stays in the record as a diagnostic", value => {
 	const world = w(value);
 	const run = storeOf(value).read(world.runId);
 	if (world.finding === undefined) throw new Error("no finding was recorded");
@@ -1882,12 +1882,12 @@ async function waitFor(predicate: () => boolean, timeoutMs = 10_000): Promise<vo
 // Scenario 2: strict execution starts only through its explicit supervisor.
 // ---------------------------------------------------------------------------
 
-given("the owner runs the autonomy supervisor with an objective and policy", value => {
+given("the owner supplied an objective and policy to the autonomy supervisor", value => {
 	const world = w(value);
 	startLive(world, { child: "real" });
 });
 
-when("both run and store locators are valid", async value => {
+when("the supervisor starts a child with valid run and store locators", async value => {
 	const world = w(value);
 	const live = world.live;
 	if (live === undefined) throw new Error("the supervisor was not started");
@@ -1910,7 +1910,7 @@ when("both run and store locators are valid", async value => {
 	expect(process.env["JEVSTICE_AUTONOMY_RUN"]).toBeUndefined();
 });
 
-then("the supervised child loads the strict entry explicitly", value => {
+then("the child starts with the explicit strict extension and committed run binding", value => {
 	const world = w(value);
 	const live = world.live;
 	if (live === undefined || live.runId === undefined) throw new Error("no supervised run was observed");
@@ -1962,7 +1962,7 @@ then("the supervised child loads the strict entry explicitly", value => {
 	});
 });
 
-then("missing or invalid locators refuse the run rather than falling back", async value => {
+then("missing or invalid locators are refused without ordinary-mode fallback", async value => {
 	const world = w(value);
 	const live = world.live;
 	if (live === undefined || live.runId === undefined) throw new Error("no supervised run was observed");
@@ -2023,7 +2023,7 @@ then("missing or invalid locators refuse the run rather than falling back", asyn
 // Scenario 8: operator stop closes admission without waiting for Jev.
 // ---------------------------------------------------------------------------
 
-given("a strict run is active", async value => {
+given("the supervised run has an active executor", async value => {
 	const world = w(value);
 	const live = startLive(world);
 	const run = await waitForRun(
@@ -2042,7 +2042,7 @@ given("a strict run is active", async value => {
 	expect(world.liveJudgeCalls).toBe(1);
 });
 
-when("the operator sends stop through the supervisor", async value => {
+when("the operator stops the run through the supervisor", async value => {
 	const world = w(value);
 	const live = world.live;
 	if (live === undefined || live.runId === undefined) throw new Error("no active strict run");
@@ -2051,7 +2051,7 @@ when("the operator sends stop through the supervisor", async value => {
 	expect(live.result.status).toBe("cancelled");
 });
 
-then("admission closes immediately and queued wakeups are cancelled", value => {
+then("the supervisor immediately closes admission and cancels queued wakeups", value => {
 	const world = w(value);
 	const live = world.live;
 	if (live === undefined || live.runId === undefined) throw new Error("no active strict run");
@@ -2078,7 +2078,7 @@ then("admission closes immediately and queued wakeups are cancelled", value => {
 	expect(lateWake).toBe(false);
 });
 
-then("active work is aborted without a Jev call", async value => {
+then("it aborts active work without asking Jev", async value => {
 	const world = w(value);
 	const live = world.live;
 	const observed = world.observed;
@@ -2099,7 +2099,7 @@ then("active work is aborted without a Jev call", async value => {
 	).toBe(false);
 });
 
-then("cancellation is acknowledged as durable only after its commit", value => {
+then("it confirms durable cancellation only after the cancellation is committed", value => {
 	const world = w(value);
 	const live = world.live;
 	if (live === undefined || live.runId === undefined) throw new Error("no active strict run");
@@ -2117,7 +2117,7 @@ then("cancellation is acknowledged as durable only after its commit", value => {
 	expect(events.some(event => event.kind === "cancel" && asRecord(event.data)?.["reason"] === "operator stop")).toBe(true);
 });
 
-then("a failed commit still stops work and suppresses relaunch without claiming durability", async value => {
+then("if that commit fails, the supervisor still aborts and does not relaunch or claim durability", async value => {
 	const world = w(value);
 	const live = startLive(world);
 	const running = await waitForRun(
@@ -2164,7 +2164,7 @@ then("a failed commit still stops work and suppresses relaunch without claiming 
 // Scenario 20: a rotation request is not a completed run.
 // ---------------------------------------------------------------------------
 
-given("a strict run requests session rotation", async value => {
+given("the active run has requested a new executor session", async value => {
 	const world = w(value);
 	const live = startLive(world);
 	const run = await waitForRun(
@@ -2191,7 +2191,7 @@ given("a strict run requests session rotation", async value => {
 	expect(store.events(run.id).some(event => event.kind === "completed")).toBe(false);
 });
 
-when("the supervisor records the lifecycle transition", async value => {
+when("the supervisor processes the rotation request", async value => {
 	const world = w(value);
 	const live = world.live;
 	const rotation = world.rotation;
@@ -2210,7 +2210,7 @@ when("the supervisor records the lifecycle transition", async value => {
 	expect(processIdentity(rotated.child?.pid ?? -1)).not.toBeNull();
 });
 
-then("the run is not marked completed by the rotation request", value => {
+then("the run still has no terminal completion record", value => {
 	const world = w(value);
 	const live = world.live;
 	if (live === undefined || live.runId === undefined) throw new Error("no rotated run");
@@ -2221,7 +2221,7 @@ then("the run is not marked completed by the rotation request", value => {
 	expect(store.events(run.id).some(event => event.kind === "completed")).toBe(false);
 });
 
-then("the current scope is fenced before any replacement launch", async value => {
+then("the supervisor fences the old executor's entire scope before launching the replacement", async value => {
 	const world = w(value);
 	const live = world.live;
 	const rotation = world.rotation;
@@ -2247,7 +2247,7 @@ then("the current scope is fenced before any replacement launch", async value =>
 	expect(run.fences.some(fence => fence.scope.unit === rotation.oldScope.unit)).toBe(true);
 });
 
-then("a replacement requires its own committed decision", async value => {
+then("the replacement launch requires a separate committed lifecycle decision", async value => {
 	const world = w(value);
 	const live = world.live;
 	const rotation = world.rotation;
@@ -2275,7 +2275,7 @@ then("a replacement requires its own committed decision", async value => {
 // Scenario 6: Jev verdicts do not decide strict admission.
 // ---------------------------------------------------------------------------
 
-given("a strict invocation is deterministically safe within the envelope", async value => {
+given("a project write is permitted by the committed policy", async value => {
 	const world = w(value);
 	const env = makeRuntimeEnv("Write a small safe note in the project.");
 	const harness = await spawnRuntime(env);
@@ -2289,7 +2289,7 @@ given("a strict invocation is deterministically safe within the envelope", async
 	expect(env.store.read(env.runId).checkpoint.hold).toBeUndefined();
 });
 
-when("its Jev diagnostic is negative, unavailable or below the floor", async value => {
+when("Jev reports the write as off course and outside its assessed authority", async value => {
 	const world = w(value);
 	const harness = world.runtime;
 	const input = world.input;
@@ -2316,7 +2316,7 @@ when("its Jev diagnostic is negative, unavailable or below the floor", async val
 	expect(admitted["ok"]).toBe(true);
 });
 
-then("the result remains recorded as that diagnostic", value => {
+then("the negative assessment is retained as a diagnostic", value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined || world.callId === undefined) throw new Error("no admitted invocation");
@@ -2330,7 +2330,7 @@ then("the result remains recorded as that diagnostic", value => {
 	world.response = payload;
 });
 
-then("it does not by itself block admission, reconciliation, rotation or completion", async value => {
+then("the write can be admitted and settled while jev_autonomy remains able to request rotation", async value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined || world.callId === undefined) throw new Error("no admitted invocation");
@@ -2364,7 +2364,7 @@ then("it does not by itself block admission, reconciliation, rotation or complet
 	expect(stopped["decision"]).toBeNull();
 });
 
-then("it does not authorize an effect either", async value => {
+then("the diagnostic grants no authority for an unsupported effect", async value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined) throw new Error("no bound runtime");
@@ -2394,7 +2394,7 @@ then("it does not authorize an effect either", async value => {
 // Scenario 7: a stale diagnostic cannot describe current strict work.
 // ---------------------------------------------------------------------------
 
-given("a diagnostic is bound to an earlier run, revision, policy or artifact bytes", async value => {
+given("a diagnostic request is tied to a particular run, revision, policy and set of artifact bytes", async value => {
 	const world = w(value);
 	const env = makeRuntimeEnv("Write a diagnostic-bound note in the project.");
 	const harness = await spawnRuntime(env);
@@ -2413,7 +2413,7 @@ given("a diagnostic is bound to an earlier run, revision, policy or artifact byt
 	world.revision = harness.store.read(harness.runId).checkpoint.revision;
 });
 
-when("the current work differs", async value => {
+when("its binding no longer matches the current work", async value => {
 	const world = w(value);
 	const harness = world.runtime;
 	const input = world.input;
@@ -2429,7 +2429,7 @@ when("the current work differs", async value => {
 	expect(admitted["ok"]).toBe(true);
 });
 
-then("the answer is recorded as stale", value => {
+then("the ledger marks the answer stale", value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined) throw new Error("no bound runtime");
@@ -2440,7 +2440,7 @@ then("the answer is recorded as stale", value => {
 	expect(String(data?.["reason"])).toMatch(/no longer describes this exact call|revision|session/);
 });
 
-then("it is not attached as evidence for the current decision", value => {
+then("the current decision carries no evidence from that answer", value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined || world.callId === undefined) throw new Error("no admitted invocation");
@@ -2450,7 +2450,7 @@ then("it is not attached as evidence for the current decision", value => {
 	expect(eventsOf(harness, "judge.result")).toHaveLength(1);
 });
 
-then("it changes no admission state", value => {
+then("the stale answer does not change admission", value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined || world.callId === undefined) throw new Error("no admitted invocation");
@@ -2466,7 +2466,7 @@ then("it changes no admission state", value => {
 // Scenario 10: an intent without a result is unknown, not failed.
 // ---------------------------------------------------------------------------
 
-given("a committed invocation has no recorded terminal result", async value => {
+given("a durable tool intent has no terminal result on record", async value => {
 	const world = w(value);
 	const env = makeRuntimeEnv("Write the observed output in the project.");
 	const harness = await spawnRuntime(env);
@@ -2491,7 +2491,7 @@ given("a committed invocation has no recorded terminal result", async value => {
 	expect(env.store.read(env.runId).checkpoint.completion).toBeUndefined();
 });
 
-when("the run is recovered", async value => {
+when("a replacement executor recovers the run", async value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined) throw new Error("no bound runtime to recover");
@@ -2509,7 +2509,7 @@ when("the run is recovered", async value => {
 	expect(recovered.store.read(env.runId).fences.some(fence => fence.scope.unit === harness.scope.unit)).toBe(true);
 });
 
-then("the intent is treated as unknown", value => {
+then("the pending intent represents an unknown effect rather than a failure", value => {
 	const world = w(value);
 	const harness = world.recovered;
 	if (harness === undefined || world.callId === undefined) throw new Error("the run was not recovered");
@@ -2523,7 +2523,7 @@ then("the intent is treated as unknown", value => {
 	expect(eventsOf(harness, "result.recorded").some(event => asRecord(event.data)?.["toolCallId"] === world.callId)).toBe(false);
 });
 
-then("observable state is inspected before any retry", async value => {
+then("jev_autonomy requires observed evidence to reconcile the intent", async value => {
 	const world = w(value);
 	const harness = world.recovered;
 	if (harness === undefined || world.callId === undefined || world.input === undefined) {
@@ -2560,7 +2560,7 @@ then("observable state is inspected before any retry", async value => {
 	expect(run.checkpoint.actions.at(-1)?.excerpt).toContain("fresh read of out.txt");
 });
 
-then("a retry occurs only when observed state or provider idempotency proves it safe", async value => {
+then("a retry needs observable proof that it is safe or a provider idempotency guarantee", async value => {
 	const world = w(value);
 	const harness = world.recovered;
 	if (harness === undefined) throw new Error("the run was not recovered");
@@ -2589,7 +2589,7 @@ then("a retry occurs only when observed state or provider idempotency proves it 
 	expect(harness.store.read(harness.runId).pending).toEqual({});
 });
 
-then("an irreconcilable effect remains a deterministic safety wait", async value => {
+then("an effect that cannot be reconciled keeps the run waiting", async value => {
 	const world = w(value);
 	const harness = world.recovered;
 	if (harness === undefined) throw new Error("the run was not recovered");
@@ -2645,7 +2645,7 @@ then("an irreconcilable effect remains a deterministic safety wait", async value
 // Scenario 11: restart restores records but not stale permission.
 // ---------------------------------------------------------------------------
 
-given("a run was checkpointed with accepted requirements and plan details", async value => {
+given("a checkpoint retains accepted requirements and accepted plan details", async value => {
 	const world = w(value);
 	const env = makeRuntimeEnv("Build the fixed output and verify it with a command.");
 	const harness = await spawnRuntime(env);
@@ -2680,7 +2680,7 @@ given("a run was checkpointed with accepted requirements and plan details", asyn
 	expect(run.checkpoint.plan?.planUrl).toBe("local://plan.md");
 });
 
-when("a replacement session resumes the run", async value => {
+when("the run resumes in a replacement session", async value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined) throw new Error("no bound runtime");
@@ -2688,7 +2688,7 @@ when("a replacement session resumes the run", async value => {
 	world.response = valueOf(await harness.rpc.send("state"));
 });
 
-then("the committed record and unchanged decisions are restored", value => {
+then("the replacement sees the committed record and still-current decisions", value => {
 	const world = w(value);
 	const state = asRecord(world.response);
 	const harness = world.runtime;
@@ -2703,7 +2703,7 @@ then("the committed record and unchanged decisions are restored", value => {
 	expect(eventsOf(harness, "bind_session").length).toBeGreaterThan(0);
 });
 
-then("changed dependencies invalidate only the affected acceptance and completion", async value => {
+then("changed dependencies invalidate affected acceptance and completion without discarding unrelated decisions", async value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined) throw new Error("no bound runtime");
@@ -2720,7 +2720,7 @@ then("changed dependencies invalidate only the affected acceptance and completio
 	expect(eventsOf(harness, "manifest.changed").length).toBeGreaterThan(0);
 });
 
-then("prior execution acceptance requires fresh observation", async value => {
+then("the replacement needs fresh observations to establish execution acceptance", async value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined) throw new Error("no bound runtime");
@@ -2742,7 +2742,7 @@ then("prior execution acceptance requires fresh observation", async value => {
 	expect(run.checkpoint.acceptance.filter(record => record.approved && record.revision === run.checkpoint.revision)).toEqual([]);
 });
 
-then("a fork or summary does not independently inherit ownership", async value => {
+then("neither a fork nor a session summary confers ownership on its own", async value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined) throw new Error("no bound runtime");
@@ -2780,7 +2780,7 @@ try {
 // Scenario 12: diagnostic retry budgets skip judgment only.
 // ---------------------------------------------------------------------------
 
-given("the judge budget or retry deadline is exhausted", async value => {
+given("the run has used all of its judge calls", async value => {
 	const world = w(value);
 	const env = makeRuntimeEnv("Write a bounded note with an exhausted judge budget.");
 	const harness = await spawnRuntime(env);
@@ -2798,7 +2798,7 @@ given("the judge budget or retry deadline is exhausted", async value => {
 	expect(env.store.read(env.runId).judgeCalls).toBe(run.policy.maxJudgeCalls);
 });
 
-when("a strict lifecycle diagnostic is due", async value => {
+when("the run reaches a point that would request a diagnostic", async value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined || world.input === undefined || world.callId === undefined) {
@@ -2813,7 +2813,7 @@ when("a strict lifecycle diagnostic is due", async value => {
 	);
 });
 
-then("that diagnostic request is skipped and recorded as such", value => {
+then("the run records the diagnostic as skipped", value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined) throw new Error("no bound runtime");
@@ -2828,7 +2828,7 @@ then("that diagnostic request is skipped and recorded as such", value => {
 	expect(run.waiting?.kind).toBe("resource");
 });
 
-then("actual executive progress follows deterministic safety facts", async value => {
+then("further execution continues to depend on deterministic safety checks", async value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined || world.input === undefined || world.callId === undefined) {
@@ -2855,7 +2855,7 @@ then("actual executive progress follows deterministic safety facts", async value
 	expect(harness.store.read(harness.runId).pending).toEqual({});
 });
 
-then("an unchanged refused artifact does not become approved by repetition", async value => {
+then("retrying an unchanged refused artifact does not turn its finding into an approval", async value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined || world.input === undefined) throw new Error("no bound runtime");
@@ -2884,7 +2884,7 @@ then("an unchanged refused artifact does not become approved by repetition", asy
 // Scenario 13: strict completion records evidence and discloses gaps.
 // ---------------------------------------------------------------------------
 
-given("observed execution and captured code evidence for the current revision", async value => {
+given("the current revision has observed execution and retained code evidence", async value => {
 	const world = w(value);
 	const env = makeRuntimeEnv("Build the fixed output, verify it and disclose every gap.", {}, true);
 	const harness = await spawnRuntime(env);
@@ -2918,7 +2918,7 @@ given("observed execution and captured code evidence for the current revision", 
 	expect(run.checkpoint.revision).toBeGreaterThan(0);
 });
 
-when("the run reaches a terminal stop", async value => {
+when("the executor stops with no pending effect to settle", async value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined) throw new Error("no bound runtime");
@@ -2926,7 +2926,7 @@ when("the run reaches a terminal stop", async value => {
 	world.judged = valueOf(await harness.rpc.send("stop"));
 });
 
-then("the run can commit completion without a Jev approval", value => {
+then("the run can record terminal completion without Jev approval", value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined) throw new Error("no bound runtime");
@@ -2937,7 +2937,7 @@ then("the run can commit completion without a Jev approval", value => {
 	expect(eventsOf(harness, "completed")).toHaveLength(1);
 });
 
-then("missing or failed acceptance and review evidence is recorded", value => {
+then("the completion record identifies missing or failed acceptance and review evidence", value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined) throw new Error("no bound runtime");
@@ -2954,7 +2954,7 @@ then("missing or failed acceptance and review evidence is recorded", value => {
 	expect(Array.isArray(review?.["blockers"])).toBe(true);
 });
 
-then("terminal completion is not presented as a claim that those checks passed", value => {
+then("the terminal result is distinct from a successful acceptance or review", value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined) throw new Error("no bound runtime");
@@ -2971,7 +2971,7 @@ then("terminal completion is not presented as a claim that those checks passed",
 // Scenario 16: context and course diagnostics remain callable in a strict run.
 // ---------------------------------------------------------------------------
 
-given("a bound strict run with an approved plan", async value => {
+given("a bound run has an approved plan", async value => {
 	const world = w(value);
 	const env = makeRuntimeEnv("Build the fixed output inside the approved plan.");
 	const harness = await spawnRuntime(env);
@@ -2986,7 +2986,7 @@ given("a bound strict run with an approved plan", async value => {
 	world.response = state;
 });
 
-when("the executor calls jev_context or jev_course_check", async value => {
+when("the executor uses jev_context or jev_course_check", async value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined) throw new Error("no bound runtime");
@@ -3011,7 +3011,7 @@ when("the executor calls jev_context or jev_course_check", async value => {
 	await harness.rpc.send("setJudge", { answers: { course: { label: "on_course", confidence: 0.95 } } });
 });
 
-then("the call is treated as a safe diagnostic device", async value => {
+then("the tool call is handled as a diagnostic", async value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined) throw new Error("no bound runtime");
@@ -3029,7 +3029,7 @@ then("the call is treated as a safe diagnostic device", async value => {
 	expect(unknown["value"]).toBe(true);
 });
 
-then("it does not create a project effect", async value => {
+then("neither tool creates an intent for a project effect", async value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined) throw new Error("no bound runtime");
@@ -3050,7 +3050,7 @@ then("it does not create a project effect", async value => {
 	);
 });
 
-then("its answer is bound to the current run and revision", async value => {
+then("its result is tied to the active run and work revision", async value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined) throw new Error("no bound runtime");
@@ -3076,7 +3076,7 @@ then("its answer is bound to the current run and revision", async value => {
 // Scenario 17: publication uses only authorized, reviewed bytes.
 // ---------------------------------------------------------------------------
 
-given("the committed policy authorizes the publication effect class", async value => {
+given("the owner's committed policy allows publication", async value => {
 	const world = w(value);
 	const env = makeRuntimeEnv(
 		"Deliver the exact reviewed result to the external audience.",
@@ -3087,7 +3087,7 @@ given("the committed policy authorizes the publication effect class", async valu
 	world.runtime = await spawnRuntime(env);
 });
 
-given("the exact artifact bytes have a current review", async value => {
+given("a current review covers the exact artifact bytes", async value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined) throw new Error("no runtime was started");
@@ -3116,7 +3116,7 @@ given("the exact artifact bytes have a current review", async value => {
 	expect(run.checkpoint.antiSlopReviews?.[0]?.partDigest).toBe(sha256(artifact));
 });
 
-when("the run delivers the artifact", async value => {
+when("the executor submits those bytes in a publication invocation", async value => {
 	const world = w(value);
 	const record = asRecord(world.response);
 	const harness = record?.["harness"] as RuntimeHarness | undefined;
@@ -3175,7 +3175,7 @@ when("the run delivers the artifact", async value => {
 	world.response = { harness, artifact, review, input };
 });
 
-then("the deterministic policy admits the effect", value => {
+then("the runtime admits the invocation under the committed policy", value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined || world.callId === undefined) throw new Error("no delivered artifact");
@@ -3185,7 +3185,7 @@ then("the deterministic policy admits the effect", value => {
 	expect(eventsOf(harness, "intent.admit").some(event => asRecord(event.data)?.["id"] === world.callId)).toBe(true);
 });
 
-then("delivered content matches the reviewed bytes", value => {
+then("the committed publication payload matches the reviewed bytes", value => {
 	const world = w(value);
 	const harness = world.runtime;
 	const record = asRecord(world.response);
@@ -3202,7 +3202,7 @@ then("delivered content matches the reviewed bytes", value => {
 	expect(payload?.["invocation"]).toBe(JSON.stringify(input));
 });
 
-then("a Jev finding is recorded as evidence, not as delivery permission", value => {
+then("the Jev finding is retained as evidence rather than used as permission to publish", value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined || world.callId === undefined) throw new Error("no delivered artifact");
@@ -3221,7 +3221,7 @@ then("a Jev finding is recorded as evidence, not as delivery permission", value 
 // Scenario 19: a known-running asynchronous effect keeps the run uncompleted.
 // ---------------------------------------------------------------------------
 
-given("a committed strict intent has a native background job known to be running", async value => {
+given("a committed invocation returned a native receipt saying its background job is running", async value => {
 	const world = w(value);
 	const env = makeRuntimeEnv("Run the background worker and observe its result.");
 	const harness = await spawnRuntime(env);
@@ -3256,14 +3256,14 @@ given("a committed strict intent has a native background job known to be running
 	world.revision = harness.store.read(env.runId).checkpoint.revision;
 });
 
-when("the run evaluates completion or rotation", async value => {
+when("the executor ends its turn before the job reports a terminal result", async value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined) throw new Error("no bound runtime");
 	world.judged = valueOf(await harness.rpc.send("stop"));
 });
 
-then("the run remains in a waiting state for that effect", value => {
+then("the run waits for the pending background effect", value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined || world.callId === undefined) throw new Error("no bound runtime");
@@ -3273,7 +3273,7 @@ then("the run remains in a waiting state for that effect", value => {
 	expect(run.status).not.toBe("completed");
 });
 
-then("the launch receipt is not recorded as a completed effect", value => {
+then("the launch receipt does not count as a terminal result", value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined || world.callId === undefined) throw new Error("no bound runtime");
@@ -3287,7 +3287,7 @@ then("the launch receipt is not recorded as a completed effect", value => {
 	expect(eventsOf(harness, "completed")).toEqual([]);
 });
 
-then("terminal completion is not committed before observation", value => {
+then("the run cannot commit completion before observing the outcome", value => {
 	const world = w(value);
 	const harness = world.runtime;
 	if (harness === undefined) throw new Error("no bound runtime");
@@ -3299,4 +3299,75 @@ then("terminal completion is not committed before observation", value => {
 	expect(run.status).not.toBe("infeasible");
 	expect(eventsOf(harness, "completed")).toEqual([]);
 	expect(run.pending["long-call"]).toBeDefined();
+});
+
+then("jev_autonomy status reports the pending intent without settling it", async value => {
+	const { runtime, callId } = w(value);
+	if (runtime === undefined || callId === undefined) throw new Error("no bound runtime with a running job");
+	const before = runtime.store.read(runtime.runId);
+	const reply = valueOf(await runtime.rpc.send("control", { params: { action: "status" } }));
+	expect(reply["isError"]).toBe(false);
+	const details = asRecord(reply["details"]);
+	expect(details?.["bound"]).toBe(true);
+	const run = asRecord(details?.["run"]);
+	expect(run?.["id"]).toBe(runtime.runId);
+	expect(run?.["pending"]).toEqual([callId]);
+	expect(asRecord(run?.["waiting"])?.["kind"]).toBe("pending_effects");
+	const after = runtime.store.read(runtime.runId);
+	expect(after.pending).toEqual(before.pending);
+	expect(after.checkpoint.completion).toBeUndefined();
+});
+
+const INFEASIBLE_EVIDENCE = "The approved fixture was not supplied, and no approved substitute is available.";
+
+given("a bound run has no pending intent and Jev is unavailable", async value => {
+	const world = w(value);
+	const env = makeRuntimeEnv("Process the approved fixture.");
+	const runtime = await spawnRuntime(env);
+	await runtime.rpc.send("state");
+	await runtime.rpc.send("setJudge", { fail: "the judge transport is unavailable" });
+	const run = env.store.read(env.runId);
+	expect(run.pending).toEqual({});
+	world.runtime = runtime;
+	world.judgeCalls = run.judgeCalls;
+});
+
+when("the executor calls jev_autonomy infeasible first without evidence and then with an observed blocker", async value => {
+	const world = w(value);
+	const runtime = world.runtime;
+	if (runtime === undefined) throw new Error("no bound run");
+	const params = { action: "infeasible", reason: "The required fixture is unavailable." };
+	const unsupported = valueOf(await runtime.rpc.send("control", { params }));
+	expect(runtime.store.read(runtime.runId).status).not.toBe("infeasible");
+	const evidenced = valueOf(await runtime.rpc.send("control", { params: { ...params, evidence: INFEASIBLE_EVIDENCE } }));
+	world.response = { unsupported, evidenced };
+});
+
+then("the unsupported declaration is refused", value => {
+	const reply = asRecord(asRecord(w(value).response)?.["unsupported"]);
+	expect(reply?.["isError"]).toBe(true);
+	expect(JSON.stringify(reply?.["content"])).toContain("needs actual observed evidence");
+});
+
+then("the evidenced declaration records terminal infeasibility as executor-declared and unverified", value => {
+	const world = w(value);
+	const runtime = world.runtime;
+	if (runtime === undefined) throw new Error("no bound run");
+	const reply = asRecord(asRecord(world.response)?.["evidenced"]);
+	expect(reply?.["isError"]).toBe(false);
+	expect(reply?.["details"]).toMatchObject({ status: "infeasible", declaredBy: "executor", verified: false });
+	const declarations = eventsOf(runtime, "infeasible");
+	expect(declarations).toHaveLength(1);
+	expect(declarations[0]?.data).toMatchObject({ declaredBy: "executor", verified: false, evidence: INFEASIBLE_EVIDENCE });
+	expect(runtime.store.read(runtime.runId).status).toBe("infeasible");
+});
+
+then("the declaration neither requests a Jev judgment nor counts as successful completion", value => {
+	const { runtime, judgeCalls } = w(value);
+	if (runtime === undefined || judgeCalls === undefined) throw new Error("no bound run with a judge call baseline");
+	const run = runtime.store.read(runtime.runId);
+	expect(run.judgeCalls).toBe(judgeCalls);
+	expect(eventsOf(runtime, "judge.request")).toEqual([]);
+	expect(eventsOf(runtime, "completed")).toEqual([]);
+	expect(run.checkpoint.completion).toBeUndefined();
 });

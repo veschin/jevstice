@@ -1,203 +1,189 @@
 # language: en
 # Requirements: PRD FR-57 through FR-66; FR-73, FR-76.
-# Source contract: docs/autonomy.md; AGENTS.md optional strict module.
-# Executable: tests/scenarios/steps/autonomy.ts; run by tests/scenarios/run.test.ts.
-# The strict module is optional, Linux/systemd-specific and not loaded by the package manifest.
-# Open real-host strict acceptance is recorded in HANDOFF.md, not by a pending scenario tag.
-Feature: Optional strict supervision preserves owner safety limits
-  The owner authorizes one objective and an envelope once. The supervisor enforces roots,
-  effect classes, resource limits, ownership and containment deterministically. Jev reviews
-  are diagnostic evidence in this mode too; they neither add nor remove authority.
+# Contract: docs/autonomy.md. Executable bindings: tests/scenarios/steps/autonomy.ts.
+Feature: Supervise an opt-in autonomy run within the owner's authority
+  The optional supervisor binds one objective to the roots, effects and limits the owner authorized.
+  In a supervised session, jev_autonomy reports or requests run transitions. Jev findings describe
+  the work; they cannot change what the executor is allowed to do.
 
-  # FR-57, FR-66; implementation src/index.ts, autonomy/index.ts
   @jev_autonomy_01 @fr_57
-  Scenario: Ordinary sessions never activate strict authority
-    Given an ordinary OMP session loads the package manifest
-    And inherited autonomy store or run variables are present
-    When the executor calls an ordinary or strict tool
-    Then no strict run ownership or execution authority is created
-    And the strict module is not imported by the ordinary entry
-    And ordinary diagnostics follow the ordinary contract
+  Scenario: Inherited run locators leave an ordinary OMP session unchanged
+    Given an OMP session loaded Jevstice through its ordinary package entry
+    And the environment contains both autonomy run and store locators
+    When the ordinary executor reads a file or requests delegation
+    Then the session neither acquires a strict run nor exposes jev_autonomy
+    And the ordinary entry still does not load the strict module
+    And the ordinary diagnostic tools remain available without a stop hold
 
-  # FR-57, FR-66; implementation autonomy/index.ts, autonomy/driver.ts
   @jev_autonomy_02 @fr_57
-  Scenario: Strict execution starts only through its explicit supervisor
-    Given the owner runs the autonomy supervisor with an objective and policy
-    When both run and store locators are valid
-    Then the supervised child loads the strict entry explicitly
-    And missing or invalid locators refuse the run rather than falling back
+  Scenario: Only an explicit supervisor launch binds the strict child
+    Given the owner supplied an objective and policy to the autonomy supervisor
+    When the supervisor starts a child with valid run and store locators
+    Then the child starts with the explicit strict extension and committed run binding
+    And missing or invalid locators are refused without ordinary-mode fallback
 
-  # FR-64; implementation autonomy/driver.ts parseAutonomyPolicy
   @jev_autonomy_03 @fr_64
-  Scenario Outline: The authorized envelope is frozen and non-expandable
-    Given a committed run policy sets "<limit>"
-    When the executor or a model message asks for more
-    Then the committed value remains the limit
-    And no Jev verdict, prompt text or inherited environment expands it
+  Scenario Outline: A request cannot enlarge the committed "<limit>"
+    Given the owner committed a run policy with a fixed "<limit>"
+    When the executor or a model message requests an expansion
+    Then the original value still governs the run
+    And a Jev verdict, prompt text and inherited variables cannot raise that limit
     Examples:
-      | limit                  |
-      | canonical project roots|
-      | project effect class   |
-      | publication effect     |
-      | maxJudgeCalls          |
-      | maxExecutorCalls       |
-      | maxRuntimeMs           |
-      | maxContextBytes        |
-      | maxArtifactBytes       |
+      | limit                   |
+      | canonical project roots |
+      | project effect class    |
+      | publication effect      |
+      | maxJudgeCalls           |
+      | maxExecutorCalls        |
+      | maxRuntimeMs            |
+      | maxContextBytes         |
+      | maxArtifactBytes        |
 
-  # FR-59; implementation autonomy/store.ts, autonomy/runtime.ts
   @jev_autonomy_04 @fr_59
-  Scenario: No side effect starts before its durable intent
-    Given a consequential strict invocation is proposed
-    When the supervisor admits it
-    Then the exact intent and required artifact bytes are committed atomically
-    And a failed commit means no effect starts
-    And native journal entries reference the ledger rather than grant permission
+  Scenario: A consequential call can start only after its intent is durable
+    Given the executor proposed a consequential invocation
+    When the supervisor allows the invocation
+    Then the ledger commits the exact intent and its required artifact bytes together
+    And the invocation cannot start if that commit fails
+    And the native journal points to the ledger but cannot authorize an invocation
 
-  # FR-61; implementation autonomy/store.ts ownership epochs
   @jev_autonomy_05 @fr_61
-  Scenario: Overlapping writable roots have one owner
-    Given one nonterminal run owns a canonical writable root
-    When another run requests the same or an overlapping root
-    Then the second run is refused
-    And a symlink alias does not bypass the conflict
-    And disjoint roots may proceed independently
+  Scenario: Two active runs cannot own overlapping writable roots
+    Given an active run owns a canonical writable project root
+    When a second run claims the same root or an overlapping root
+    Then the supervisor refuses the second claim
+    And a symlink to the root does not make the claim independent
+    And a run on a disjoint root can acquire its own ownership
 
-  # FR-57, FR-73; implementation autonomy/runtime.ts diagnostic binding
   @jev_autonomy_06 @fr_73
-  Scenario: Jev verdicts do not decide strict admission
-    Given a strict invocation is deterministically safe within the envelope
-    When its Jev diagnostic is negative, unavailable or below the floor
-    Then the result remains recorded as that diagnostic
-    And it does not by itself block admission, reconciliation, rotation or completion
-    And it does not authorize an effect either
+  Scenario: A negative Jev finding changes neither permission nor progress
+    Given a project write is permitted by the committed policy
+    When Jev reports the write as off course and outside its assessed authority
+    Then the negative assessment is retained as a diagnostic
+    And the write can be admitted and settled while jev_autonomy remains able to request rotation
+    And the diagnostic grants no authority for an unsupported effect
 
-  # FR-58, FR-73; implementation autonomy/runtime.ts stale checks
   @jev_autonomy_07 @fr_58
-  Scenario: A stale diagnostic cannot describe current strict work
-    Given a diagnostic is bound to an earlier run, revision, policy or artifact bytes
-    When the current work differs
-    Then the answer is recorded as stale
-    And it is not attached as evidence for the current decision
-    And it changes no admission state
+  Scenario: A diagnostic about older work cannot become current evidence
+    Given a diagnostic request is tied to a particular run, revision, policy and set of artifact bytes
+    When its binding no longer matches the current work
+    Then the ledger marks the answer stale
+    And the current decision carries no evidence from that answer
+    And the stale answer does not change admission
 
-  # FR-65; implementation autonomy/driver.ts stopAutonomy, scope fencing
   @jev_autonomy_08 @fr_65
-  Scenario: Operator stop closes admission without waiting for Jev
-    Given a strict run is active
-    When the operator sends stop through the supervisor
-    Then admission closes immediately and queued wakeups are cancelled
-    And active work is aborted without a Jev call
-    And cancellation is acknowledged as durable only after its commit
-    And a failed commit still stops work and suppresses relaunch without claiming durability
+  Scenario: Operator stop interrupts the executor without asking Jev
+    Given the supervised run has an active executor
+    When the operator stops the run through the supervisor
+    Then the supervisor immediately closes admission and cancels queued wakeups
+    And it aborts active work without asking Jev
+    And it confirms durable cancellation only after the cancellation is committed
+    And if that commit fails, the supervisor still aborts and does not relaunch or claim durability
 
-  # FR-65; implementation autonomy/driver.ts fencing
   @jev_autonomy_09 @fr_65
-  Scenario: Stopping is not a rollback claim
-    Given a stopped run has observed or possible effects
-    When the operator inspects the run
-    Then the status reports cancellation and containment facts
-    And it does not claim that executed effects were rolled back
-    And unknown effects still require reconciliation
+  Scenario: Cancellation reports containment without promising rollback
+    Given the operator stopped a run with observed or possible effects
+    When the operator reads the stopped run's status
+    Then the report shows the cancellation and what was contained
+    And the report makes no claim that an executed effect was undone
+    And any effect still unknown must be reconciled
 
-  # FR-61; implementation autonomy/runtime.ts reconcile
   @jev_autonomy_10 @fr_61
-  Scenario: An intent without a result is unknown, not failed
-    Given a committed invocation has no recorded terminal result
-    When the run is recovered
-    Then the intent is treated as unknown
-    And observable state is inspected before any retry
-    And a retry occurs only when observed state or provider idempotency proves it safe
-    And an irreconcilable effect remains a deterministic safety wait
+  Scenario: Recovery does not replay an invocation whose result is missing
+    Given a durable tool intent has no terminal result on record
+    When a replacement executor recovers the run
+    Then the pending intent represents an unknown effect rather than a failure
+    And jev_autonomy requires observed evidence to reconcile the intent
+    And a retry needs observable proof that it is safe or a provider idempotency guarantee
+    And an effect that cannot be reconciled keeps the run waiting
 
-  # FR-60, FR-62; implementation autonomy/store.ts sessions, runtime restore
   @jev_autonomy_11 @fr_60
-  Scenario: Restart restores records but not stale permission
-    Given a run was checkpointed with accepted requirements and plan details
-    When a replacement session resumes the run
-    Then the committed record and unchanged decisions are restored
-    And changed dependencies invalidate only the affected acceptance and completion
-    And prior execution acceptance requires fresh observation
-    And a fork or summary does not independently inherit ownership
+  Scenario: A replacement session keeps records but must refresh execution evidence
+    Given a checkpoint retains accepted requirements and accepted plan details
+    When the run resumes in a replacement session
+    Then the replacement sees the committed record and still-current decisions
+    And changed dependencies invalidate affected acceptance and completion without discarding unrelated decisions
+    And the replacement needs fresh observations to establish execution acceptance
+    And neither a fork nor a session summary confers ownership on its own
 
-  # FR-62; implementation autonomy/store.ts decisions, driver retry
   @jev_autonomy_12 @fr_62
-  Scenario: Diagnostic retry budgets skip judgment only
-    Given the judge budget or retry deadline is exhausted
-    When a strict lifecycle diagnostic is due
-    Then that diagnostic request is skipped and recorded as such
-    And actual executive progress follows deterministic safety facts
-    And an unchanged refused artifact does not become approved by repetition
+  Scenario: Exhausting the judge budget does not prevent authorized execution
+    Given the run has used all of its judge calls
+    When the run reaches a point that would request a diagnostic
+    Then the run records the diagnostic as skipped
+    And further execution continues to depend on deterministic safety checks
+    And retrying an unchanged refused artifact does not turn its finding into an approval
 
-  # FR-63; implementation autonomy/runtime.ts completion
   @jev_autonomy_13 @fr_63
-  Scenario: Strict completion records evidence and discloses gaps
-    Given observed execution and captured code evidence for the current revision
-    When the run reaches a terminal stop
-    Then the run can commit completion without a Jev approval
-    And missing or failed acceptance and review evidence is recorded
-    And terminal completion is not presented as a claim that those checks passed
+  Scenario: Completion preserves diagnostic gaps instead of claiming all checks passed
+    Given the current revision has observed execution and retained code evidence
+    When the executor stops with no pending effect to settle
+    Then the run can record terminal completion without Jev approval
+    And the completion record identifies missing or failed acceptance and review evidence
+    And the terminal result is distinct from a successful acceptance or review
 
-  # FR-66; implementation autonomy/scope.ts capability check
   @jev_autonomy_14 @fr_66
-  Scenario: Missing containment capability refuses strict execution
-    Given Linux systemd, cgroup v2 or whole-scope fencing is unavailable
-    When the owner starts a strict run
-    Then the run is refused or held with the missing capability named
-    And process-group signalling is not used as a containment substitute
-    And no strict guarantee is silently downgraded
+  Scenario: Strict execution requires whole-scope containment
+    Given Linux systemd, cgroup v2 or whole-scope fencing is missing
+    When the owner requests a strict supervisor launch
+    Then the owner sees a refusal or wait that identifies the missing capability
+    And the supervisor does not fall back to process-group signalling
+    And it does not start execution under weaker guarantees
 
-  # FR-64; implementation autonomy/driver.ts statusAutonomy
   @jev_autonomy_15 @fr_64
-  Scenario: Status reports committed facts without granting permission
-    Given a bound strict run with a pending intent and a recorded finding
-    When the owner requests autonomy status
-    Then the report names the run, status, budget and pending-effect facts that are stored
-    And it does not print the objective or stored secrets
-    And the act of reading status changes no ownership, intent or effect
+  Scenario: Supervisor status reports run facts without exposing the objective
+    Given a strict run has a waiting intent and a recorded diagnostic finding
+    When the owner reads status through the supervisor
+    Then the report shows the committed run identifier, state, usage counts and pending intents
+    And the report omits the objective and stored secrets
+    And reading the report does not alter ownership, intents or effects
 
-  # FR-58, FR-73; implementation autonomy/runtime.ts safe devices
   @jev_autonomy_16 @fr_58
-  Scenario: Context and course diagnostics remain callable in a strict run
-    Given a bound strict run with an approved plan
-    When the executor calls jev_context or jev_course_check
-    Then the call is treated as a safe diagnostic device
-    And it does not create a project effect
-    And its answer is bound to the current run and revision
+  Scenario: Reading context or checking course creates no project effect
+    Given a bound run has an approved plan
+    When the executor uses jev_context or jev_course_check
+    Then the tool call is handled as a diagnostic
+    And neither tool creates an intent for a project effect
+    And its result is tied to the active run and work revision
 
-  # FR-63, FR-73; implementation autonomy/runtime.ts reviewed delivery
   @jev_autonomy_17 @fr_63
-  Scenario: Publication uses only authorized, reviewed bytes
-    Given the committed policy authorizes the publication effect class
-    And the exact artifact bytes have a current review
-    When the run delivers the artifact
-    Then the deterministic policy admits the effect
-    And delivered content matches the reviewed bytes
-    And a Jev finding is recorded as evidence, not as delivery permission
+  Scenario: Publication authority and reviewed bytes are recorded separately
+    Given the owner's committed policy allows publication
+    And a current review covers the exact artifact bytes
+    When the executor submits those bytes in a publication invocation
+    Then the runtime admits the invocation under the committed policy
+    And the committed publication payload matches the reviewed bytes
+    And the Jev finding is retained as evidence rather than used as permission to publish
 
-  # FR-76; implementation autonomy/index.ts no recovery mode
   @jev_autonomy_18 @fr_76
-  Scenario: Strict mode has no continuation or waiver escape hatch
-    Given a strict run has a diagnostic finding
-    When an owner-like approval message or /jev-continue text appears
-    Then it creates no continuation, waiver or repair authority
-    And only the operator stop channel changes run control
-    And the finding remains diagnostic evidence
+  Scenario: Approval-like text cannot change supervisor control
+    Given the run has a recorded finding
+    When a message looks like an owner approval or contains /jev-continue
+    Then the message grants no continuation, waiver or repair authority
+    And the supervisor accepts operator stop through its separate control channel
+    And the finding stays in the record as a diagnostic
 
-  # FR-62; implementation autonomy/runtime.ts pending effect observation (repair in progress)
   @jev_autonomy_19 @fr_62
-  Scenario: A known-running asynchronous effect keeps the strict run uncompleted
-    Given a committed strict intent has a native background job known to be running
-    When the run evaluates completion or rotation
-    Then the run remains in a waiting state for that effect
-    And the launch receipt is not recorded as a completed effect
-    And terminal completion is not committed before observation
+  Scenario: A running background job is still pending at the end of a turn
+    Given a committed invocation returned a native receipt saying its background job is running
+    When the executor ends its turn before the job reports a terminal result
+    Then the run waits for the pending background effect
+    And the launch receipt does not count as a terminal result
+    And the run cannot commit completion before observing the outcome
+    And jev_autonomy status reports the pending intent without settling it
 
-  # FR-65; implementation autonomy/driver.ts rotation handling (repair in progress)
   @jev_autonomy_20 @fr_65
-  Scenario: A rotation request is not a completed run
-    Given a strict run requests session rotation
-    When the supervisor records the lifecycle transition
-    Then the run is not marked completed by the rotation request
-    And the current scope is fenced before any replacement launch
-    And a replacement requires its own committed decision
+  Scenario: Rotation replaces a fenced executor without completing the run
+    Given the active run has requested a new executor session
+    When the supervisor processes the rotation request
+    Then the run still has no terminal completion record
+    And the supervisor fences the old executor's entire scope before launching the replacement
+    And the replacement launch requires a separate committed lifecycle decision
+
+  @jev_autonomy_21
+  Scenario: An evidenced infeasibility declaration ends the run without independent verification
+    Given a bound run has no pending intent and Jev is unavailable
+    When the executor calls jev_autonomy infeasible first without evidence and then with an observed blocker
+    Then the unsupported declaration is refused
+    And the evidenced declaration records terminal infeasibility as executor-declared and unverified
+    And the declaration neither requests a Jev judgment nor counts as successful completion

@@ -104,7 +104,7 @@ given("a current {word} target with changed-code quotes and observed verificatio
 	w.table.review = { label: "sound", confidence: POLICY.minConfidenceToApprove };
 });
 
-when("the executor submits the target, a supported claim and that evidence", async value => {
+when("the executor requests a review of that target with the claim and evidence", async value => {
 	await run(world(value));
 });
 
@@ -134,7 +134,7 @@ then("the review remains evidence for the developer question only", value => {
 
 // Scenario 2 (outline) -------------------------------------------------------
 
-given("the review omits {string}", (value, field) => {
+given("the review request has no {string}", (value, field) => {
 	const w = setup(value);
 	const params = validParams("diff", "HEAD~1..HEAD");
 	if (field === "kind") delete params["kind"];
@@ -175,7 +175,7 @@ given("the executor submits kind {string}", (value, kind) => {
 	w.params = params;
 });
 
-when("the review is validated", async value => {
+when("Jev checks the review kind", async value => {
 	await run(world(value));
 });
 
@@ -218,7 +218,7 @@ then("the finding is recorded with the target and class", value => {
 	expect(hold?.result?.["reviewKind"]).toBe(w.params?.["kind"]);
 });
 
-then("the result directs the executor to correct the quoted change", value => {
+then("the result asks the executor to correct the quoted change", value => {
 	expect(world(value).text).toContain("correct the quoted change");
 });
 
@@ -289,7 +289,7 @@ when("both acceptance aspects are missing", value => {
 	expect(acceptanceAt(w.state, "architecture")).toBeUndefined();
 });
 
-then("the result states that acceptance remains separate", value => {
+then("the review explicitly distinguishes its verdict from acceptance", value => {
 	const w = world(value);
 	expect(w.outcome?.text).toContain("This is evidence, not approval");
 	expect(w.outcome?.text).toContain("business and architecture acceptance decide completion");
@@ -324,7 +324,7 @@ when("the review is judged", async value => {
 	w.firstOutcome = w.outcome;
 });
 
-then("the judge receives exactly those quoted items", value => {
+then("the judge receives the two quotes unchanged", value => {
 	const w = world(value);
 	const received = w.callStates[0] as Record<string, unknown> | undefined;
 	expect(received?.["quotes"]).toEqual([
@@ -362,7 +362,7 @@ when("the judge is unavailable", async value => {
 	);
 });
 
-then("the result states that no judgment exists", value => {
+then("Jev reports that no decision exists", value => {
 	expect(world(value).outcome?.text).toContain("No judge decision exists");
 });
 
@@ -399,7 +399,7 @@ then("no additional judge request is made", value => {
 	expect(world(value).calls).toBe(1);
 });
 
-then("the recorded result is returned", value => {
+then("Jev returns the previously recorded review", value => {
 	const w = world(value);
 	// The ledger reports the recorded refusal rather than re-emitting the first result object; the
 	// prior finding is what the repeated submission receives.

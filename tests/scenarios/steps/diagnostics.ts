@@ -27,6 +27,7 @@ import {
 	toolFailed,
 	toolResultEvent,
 	toolText,
+	until,
 	type FakeAnswerSource,
 	type FakePi,
 } from "../../helpers.js";
@@ -925,9 +926,10 @@ given("business acceptance is recorded while architecture acceptance is missing"
 	expect(acceptance.map(entry => entry["aspect"])).toEqual(["business"]);
 });
 
-when("the owner runs /jev-status", value => {
+when("the owner runs /jev-status", async value => {
 	const world = setup(value);
 	world.pi.callCommand("jev-status", "", world.ctx);
+	expect(await until(() => lastMessage(world, "jev.status").length > 0)).toBe(true);
 });
 
 then("the report shows the work group and the checks group separately", value => {
